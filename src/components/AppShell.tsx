@@ -1,5 +1,6 @@
 import { Link, Outlet, useNavigate } from "@tanstack/react-router";
 import type { ReactNode } from "react";
+import { useAuth } from "@/hooks/useAuth";
 
 const NAV = [
   { to: "/", label: "Home", exact: true },

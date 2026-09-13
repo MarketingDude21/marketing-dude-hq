@@ -14,7 +14,193 @@ export type Database = {
   }
   public: {
     Tables: {
-      [_ in never]: never
+      agent_photos: {
+        Row: {
+          agent_id: string
+          caption: string | null
+          created_at: string
+          id: string
+          storage_path: string | null
+          tags: string[]
+          updated_at: string
+          url: string | null
+        }
+        Insert: {
+          agent_id: string
+          caption?: string | null
+          created_at?: string
+          id?: string
+          storage_path?: string | null
+          tags?: string[]
+          updated_at?: string
+          url?: string | null
+        }
+        Update: {
+          agent_id?: string
+          caption?: string | null
+          created_at?: string
+          id?: string
+          storage_path?: string | null
+          tags?: string[]
+          updated_at?: string
+          url?: string | null
+        }
+        Relationships: [
+          {
+            foreignKeyName: "agent_photos_agent_id_fkey"
+            columns: ["agent_id"]
+            isOneToOne: false
+            referencedRelation: "agents"
+            referencedColumns: ["id"]
+          },
+        ]
+      }
+      agents: {
+        Row: {
+          brokerage: string | null
+          created_at: string
+          email: string | null
+          full_name: string | null
+          headshot_url: string | null
+          id: string
+          market_area: string | null
+          phone: string | null
+          subscription_status: string
+          updated_at: string
+          voice_answers: Json
+          voice_summary: string | null
+          website: string | null
+        }
+        Insert: {
+          brokerage?: string | null
+          created_at?: string
+          email?: string | null
+          full_name?: string | null
+          headshot_url?: string | null
+          id: string
+          market_area?: string | null
+          phone?: string | null
+          subscription_status?: string
+          updated_at?: string
+          voice_answers?: Json
+          voice_summary?: string | null
+          website?: string | null
+        }
+        Update: {
+          brokerage?: string | null
+          created_at?: string
+          email?: string | null
+          full_name?: string | null
+          headshot_url?: string | null
+          id?: string
+          market_area?: string | null
+          phone?: string | null
+          subscription_status?: string
+          updated_at?: string
+          voice_answers?: Json
+          voice_summary?: string | null
+          website?: string | null
+        }
+        Relationships: []
+      }
+      feedback_history: {
+        Row: {
+          agent_id: string
+          created_at: string
+          id: string
+          notes: string | null
+          post_id: string | null
+          rating: string | null
+          updated_at: string
+        }
+        Insert: {
+          agent_id: string
+          created_at?: string
+          id?: string
+          notes?: string | null
+          post_id?: string | null
+          rating?: string | null
+          updated_at?: string
+        }
+        Update: {
+          agent_id?: string
+          created_at?: string
+          id?: string
+          notes?: string | null
+          post_id?: string | null
+          rating?: string | null
+          updated_at?: string
+        }
+        Relationships: [
+          {
+            foreignKeyName: "feedback_history_agent_id_fkey"
+            columns: ["agent_id"]
+            isOneToOne: false
+            referencedRelation: "agents"
+            referencedColumns: ["id"]
+          },
+          {
+            foreignKeyName: "feedback_history_post_id_fkey"
+            columns: ["post_id"]
+            isOneToOne: false
+            referencedRelation: "generated_posts"
+            referencedColumns: ["id"]
+          },
+        ]
+      }
+      generated_posts: {
+        Row: {
+          agent_id: string
+          content: string
+          content_type: string
+          created_at: string
+          id: string
+          metadata: Json
+          month: string | null
+          platform: string | null
+          scheduled_for: string | null
+          status: string
+          title: string | null
+          updated_at: string
+        }
+        Insert: {
+          agent_id: string
+          content: string
+          content_type?: string
+          created_at?: string
+          id?: string
+          metadata?: Json
+          month?: string | null
+          platform?: string | null
+          scheduled_for?: string | null
+          status?: string
+          title?: string | null
+          updated_at?: string
+        }
+        Update: {
+          agent_id?: string
+          content?: string
+          content_type?: string
+          created_at?: string
+          id?: string
+          metadata?: Json
+          month?: string | null
+          platform?: string | null
+          scheduled_for?: string | null
+          status?: string
+          title?: string | null
+          updated_at?: string
+        }
+        Relationships: [
+          {
+            foreignKeyName: "generated_posts_agent_id_fkey"
+            columns: ["agent_id"]
+            isOneToOne: false
+            referencedRelation: "agents"
+            referencedColumns: ["id"]
+          },
+        ]
+      }
     }
     Views: {
       [_ in never]: never

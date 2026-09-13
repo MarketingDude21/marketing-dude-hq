@@ -1,0 +1,150 @@
+import { createFileRoute, Link, useNavigate } from "@tanstack/react-router";
+import { useState } from "react";
+import { AmbientBackground, BrandMark } from "@/components/AppShell";
+import { backendConfigured } from "@/lib/backend";
+
+export const Route = createFileRoute("/login")({
+  head: () => ({
+    meta: [
+      { title: "Sign in — Your Marketing Dude" },
+      {
+        name: "description",
+        content:
+          "Sign in to Your Marketing Dude — one login for Voice DNA, your database builder, and monthly marketing content.",
+      },
+      { property: "og:title", content: "Sign in — Your Marketing Dude" },
+      {
+        property: "og:description",
+        content: "One login. Your whole marketing brain.",
+      },
+      { property: "og:type", content: "website" },
+      { name: "twitter:card", content: "summary_large_image" },
+    ],
+  }),
+  component: LoginPage,
+});
+
+function LoginPage() {
+  const [mode, setMode] = useState<"signin" | "signup">("signin");
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
+  const navigate = useNavigate();
+
+  const onSubmit = (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!backendConfigured) return;
+    navigate({ to: "/" });
+  };
+
+  return (
+    <div className="relative min-h-screen w-full overflow-hidden bg-background text-foreground">
+      <AmbientBackground />
+      <div className="relative z-10 mx-auto flex min-h-screen max-w-6xl flex-col items-center justify-center gap-10 px-6 py-16 lg:flex-row lg:gap-16">
+        <div className="max-w-xl flex-1">
+          <Link to="/" className="flex items-center gap-3">
+            <BrandMark size="size-11" />
+            <span className="font-display text-xl font-semibold tracking-tight">
+              Your Marketing Dude
+            </span>
+          </Link>
+          <h1 className="mt-8 font-display text-5xl font-bold leading-[0.98] tracking-tight md:text-6xl">
+            Your marketing,
+            <br />
+            <span className="bg-gradient-to-r from-primary to-accent bg-clip-text text-transparent">
+              on autopilot.
+            </span>
+          </h1>
+          <p className="mt-5 max-w-md text-lg text-muted-foreground">
+            One brain that writes your posts, builds your list, and learns your
+            voice every month.
+          </p>
+          <div className="mt-8 flex flex-wrap gap-2">
+            {["Voice DNA", "SOI Database", "Content Engine"].map((t) => (
+              <span
+                key={t}
+                className="inline-flex items-center rounded-full border border-border bg-glass px-4 py-2 text-sm font-medium text-muted-foreground backdrop-blur-xl"
+              >
+                {t}
+              </span>
+            ))}
+          </div>
+        </div>
+
+        <div className="w-full max-w-md rounded-3xl border border-border bg-glass p-7 backdrop-blur-2xl sm:p-9">
+          <div className="flex rounded-2xl bg-muted p-1 text-sm font-semibold">
+            {(["signin", "signup"] as const).map((m) => (
+              <button
+                key={m}
+                type="button"
+                onClick={() => setMode(m)}
+                className={`flex-1 rounded-xl py-2.5 text-center transition-colors ${
+                  mode === m
+                    ? "bg-foreground text-ink"
+                    : "text-muted-foreground hover:text-foreground"
+                }`}
+              >
+                {m === "signin" ? "Sign in" : "Sign up"}
+              </button>
+            ))}
+          </div>
+
+          <form onSubmit={onSubmit} className="mt-6 space-y-4">
+            <label className="block">
+              <span className="text-sm font-medium text-muted-foreground">
+                Email
+              </span>
+              <input
+                type="email"
+                required
+                value={email}
+                onChange={(e) => setEmail(e.target.value)}
+                placeholder="you@yourbrokerage.com"
+                className="mt-1.5 w-full rounded-2xl bg-muted px-4 py-3 text-base outline-none ring-ring transition focus:ring-2"
+              />
+            </label>
+            <label className="block">
+              <span className="text-sm font-medium text-muted-foreground">
+                Password
+              </span>
+              <input
+                type="password"
+                required
+                value={password}
+                onChange={(e) => setPassword(e.target.value)}
+                placeholder="••••••••"
+                className="mt-1.5 w-full rounded-2xl bg-muted px-4 py-3 text-base outline-none ring-ring transition focus:ring-2"
+              />
+            </label>
+            <button
+              type="submit"
+              className="w-full rounded-2xl bg-primary py-3.5 text-base font-semibold text-primary-foreground shadow-lg shadow-primary/30 transition-transform hover:-translate-y-0.5"
+            >
+              {mode === "signin" ? "Sign in" : "Create my account"}
+            </button>
+          </form>
+
+          <div className="my-6 flex items-center gap-3 text-xs uppercase tracking-[0.18em] text-muted-foreground/60">
+            <span className="h-px flex-1 bg-border" /> or{" "}
+            <span className="h-px flex-1 bg-border" />
+          </div>
+          <button
+            type="button"
+            className="w-full rounded-2xl border border-border bg-glass py-3 text-base font-semibold transition-colors hover:bg-secondary"
+          >
+            Continue with Google
+          </button>
+
+          {!backendConfigured && (
+            <p className="mt-5 rounded-xl border border-border bg-muted px-4 py-3 text-center text-xs text-muted-foreground">
+              Accounts turn on once this project is connected to your database
+              in Project Settings → Connectors.
+            </p>
+          )}
+          <p className="mt-5 text-center text-sm text-muted-foreground">
+            $97/month · cancel anytime
+          </p>
+        </div>
+      </div>
+    </div>
+  );
+}

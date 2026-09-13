@@ -1,24 +1,201 @@
-import { createFileRoute } from "@tanstack/react-router";
+import { createFileRoute, Link } from "@tanstack/react-router";
+import { AppShell } from "@/components/AppShell";
 
-// No head() here: the home route inherits title/description/og/twitter from
-// __root.tsx, and ships no og:image so serve-time hosting can inject the
-// project's social preview (explicit og:image or latest screenshot).
 export const Route = createFileRoute("/")({
-  component: Index,
+  head: () => ({
+    meta: [
+      { title: "Your Marketing Dude — Your marketing, on autopilot" },
+      {
+        name: "description",
+        content:
+          "One dashboard for real estate agents: Voice DNA, database building, and monthly marketing content — one brain that gets smarter every month.",
+      },
+      { property: "og:title", content: "Your Marketing Dude" },
+      {
+        property: "og:description",
+        content:
+          "Log in once. Voice DNA, your database, and monthly content all draw from the same agent profile.",
+      },
+      { property: "og:type", content: "website" },
+      { name: "twitter:card", content: "summary_large_image" },
+    ],
+  }),
+  component: HomePage,
 });
 
-// IMPORTANT: Replace this placeholder. See ./README.md for routing conventions.
-function Index() {
+const MODULES = [
+  {
+    to: "/database",
+    tag: "SOI Builder",
+    tagClass: "bg-primary/15 text-primary",
+    dotClass: "bg-primary",
+    title: "Build My Database",
+    desc: "Clean your contacts into sharp marketing lists.",
+    meta: "Pick up where you left off",
+    action: "Open",
+  },
+  {
+    to: "/voice",
+    tag: "Voice DNA",
+    tagClass: "bg-accent/15 text-accent",
+    dotClass: "bg-accent",
+    title: "My Voice DNA",
+    desc: "15-question interview captures how you talk.",
+    meta: "Complete the interview",
+    action: "Review",
+  },
+  {
+    to: "/marketing",
+    tag: "Content Generator",
+    tagClass: "bg-secondary text-foreground",
+    dotClass: "bg-foreground",
+    title: "Monthly Marketing",
+    desc: "Drafted posts, emails & video scripts in your voice.",
+    meta: "This month's set",
+    action: "View",
+  },
+] as const;
+
+function HomePage() {
   return (
-    <div
-      className="flex min-h-screen items-center justify-center"
-      style={{ backgroundColor: "#fcfbf8" }}
-    >
-      <img
-        data-lovable-blank-page-placeholder="REMOVE_THIS"
-        src="https://cdn.gpteng.co/blank-app-v1.svg"
-        alt="Your app will live here!"
-      />
-    </div>
+    <AppShell>
+      <div className="grid grid-cols-12 gap-5 pt-4">
+        {/* hero */}
+        <section className="col-span-12 lg:col-span-7">
+          <div className="mb-5 inline-flex items-center gap-2 rounded-full border border-border bg-glass px-3 py-1 text-xs font-medium text-muted-foreground backdrop-blur-xl">
+            <span className="size-1.5 rounded-full bg-accent" /> 3 tools · one
+            connected brain · smarter every month
+          </div>
+          <h1 className="font-display text-5xl font-bold leading-[0.98] tracking-tight md:text-6xl">
+            Your marketing,
+            <br />
+            <span className="bg-gradient-to-r from-primary to-accent bg-clip-text text-transparent">
+              on autopilot.
+            </span>
+          </h1>
+          <p className="mt-5 max-w-md text-lg text-muted-foreground">
+            Log in once. Voice DNA, your database, and monthly content all draw
+            from the same agent profile.
+          </p>
+          <div className="mt-8 flex flex-wrap items-center gap-3">
+            <Link
+              to="/voice"
+              className="rounded-full bg-foreground px-6 py-3 text-sm font-semibold text-ink"
+            >
+              Start my Voice DNA
+            </Link>
+            <Link
+              to="/database"
+              className="rounded-full border border-input px-6 py-3 text-sm font-semibold text-foreground/80 transition-colors hover:text-foreground"
+            >
+              Build my database
+            </Link>
+          </div>
+          <div className="mt-9 grid max-w-md grid-cols-3 gap-6">
+            <div>
+              <div className="font-display text-2xl font-bold">3</div>
+              <div className="text-xs text-muted-foreground">
+                tools, one login
+              </div>
+            </div>
+            <div>
+              <div className="font-display text-2xl font-bold">15</div>
+              <div className="text-xs text-muted-foreground">
+                questions to your voice
+              </div>
+            </div>
+            <div>
+              <div className="font-display text-2xl font-bold">1</div>
+              <div className="text-xs text-muted-foreground">
+                shared agent brain
+              </div>
+            </div>
+          </div>
+        </section>
+
+        {/* brain card */}
+        <aside className="col-span-12 lg:col-span-5">
+          <div className="relative h-full overflow-hidden rounded-3xl border border-border bg-glass p-6 backdrop-blur-2xl">
+            <div className="absolute -right-16 -top-16 h-40 w-40 rounded-full bg-accent/20 blur-2xl" />
+            <div className="relative">
+              <div className="font-display text-base font-semibold">
+                One profile, everywhere
+              </div>
+              <p className="mt-1 text-xs text-muted-foreground">
+                Voice DNA, photos, and feedback feed every tool you use.
+              </p>
+              <div className="mt-5 space-y-3">
+                {[
+                  ["Voice DNA", "Captures how you write & speak"],
+                  ["Agent photos", "Pulled into posts automatically"],
+                  ["Feedback learned", "Each edit sharpens the next draft"],
+                ].map(([label, detail]) => (
+                  <div
+                    key={label}
+                    className="flex items-center justify-between rounded-xl bg-secondary px-4 py-3"
+                  >
+                    <span className="text-sm text-foreground/70">{label}</span>
+                    <span className="text-xs font-medium text-foreground">
+                      {detail}
+                    </span>
+                  </div>
+                ))}
+              </div>
+              <div className="mt-5 rounded-xl bg-gradient-to-r from-primary/20 to-accent/20 p-4">
+                <div className="text-xs uppercase tracking-widest text-muted-foreground">
+                  Agent brain
+                </div>
+                <div className="mt-1 font-display text-2xl font-bold">
+                  Smarter every month
+                </div>
+                <div className="mt-1 text-xs text-muted-foreground">
+                  The more you use it, the more it sounds like you.
+                </div>
+              </div>
+            </div>
+          </div>
+        </aside>
+
+        {/* modules */}
+        <section className="col-span-12 mt-4">
+          <div className="mb-4 flex items-end justify-between">
+            <h2 className="font-display text-xl font-semibold">
+              Your workspace
+            </h2>
+            <span className="text-sm text-muted-foreground">
+              Pick up where you left off
+            </span>
+          </div>
+          <div className="grid grid-cols-1 gap-5 md:grid-cols-3">
+            {MODULES.map((m) => (
+              <Link
+                key={m.to}
+                to={m.to}
+                className="group rounded-3xl border border-border bg-glass p-6 backdrop-blur-2xl transition hover:bg-secondary"
+              >
+                <div
+                  className={`mb-4 inline-flex items-center gap-2 rounded-full px-3 py-1 text-xs font-semibold ${m.tagClass}`}
+                >
+                  <span className={`size-1.5 rounded-full ${m.dotClass}`} />{" "}
+                  {m.tag}
+                </div>
+                <h3 className="font-display text-lg font-semibold">
+                  {m.title}
+                </h3>
+                <p className="mt-2 text-sm text-muted-foreground">{m.desc}</p>
+                <div className="mt-5 flex items-center justify-between">
+                  <span className="text-xs text-muted-foreground/70">
+                    {m.meta}
+                  </span>
+                  <span className="text-sm font-semibold text-foreground group-hover:text-accent">
+                    {m.action} →
+                  </span>
+                </div>
+              </Link>
+            ))}
+          </div>
+        </section>
+      </div>
+    </AppShell>
   );
 }

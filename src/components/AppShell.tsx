@@ -33,6 +33,7 @@ export function AmbientBackground() {
 
 export function AppShell({ children }: { children?: ReactNode }) {
   const navigate = useNavigate();
+  const { user, signOut } = useAuth();
   return (
     <div className="relative min-h-screen w-full overflow-hidden bg-background text-foreground">
       <AmbientBackground />
@@ -63,12 +64,29 @@ export function AppShell({ children }: { children?: ReactNode }) {
           ))}
         </nav>
         <div className="flex items-center gap-3">
-          <button
-            onClick={() => navigate({ to: "/login" })}
-            className="rounded-full bg-primary px-5 py-2 text-sm font-semibold text-primary-foreground shadow-lg shadow-primary/30 transition-transform hover:-translate-y-0.5"
-          >
-            Sign in
-          </button>
+          {user ? (
+            <>
+              <span className="hidden text-sm text-muted-foreground sm:inline">
+                {user.email}
+              </span>
+              <button
+                onClick={async () => {
+                  await signOut();
+                  navigate({ to: "/login" });
+                }}
+                className="rounded-full border border-border bg-glass px-5 py-2 text-sm font-semibold transition-colors hover:bg-secondary"
+              >
+                Sign out
+              </button>
+            </>
+          ) : (
+            <button
+              onClick={() => navigate({ to: "/login" })}
+              className="rounded-full bg-primary px-5 py-2 text-sm font-semibold text-primary-foreground shadow-lg shadow-primary/30 transition-transform hover:-translate-y-0.5"
+            >
+              Sign in
+            </button>
+          )}
         </div>
       </header>
       <main className="relative z-10 mx-auto max-w-7xl px-6 pb-20">

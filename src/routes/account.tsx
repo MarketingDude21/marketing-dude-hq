@@ -89,7 +89,7 @@ function AccountPage() {
     setStatus(null);
     const { error } = await supabase
       .from("agents")
-      .upsert({ id: user.id, email: user.email, ...profile });
+      .upsert({ id: user.id, email: user.email ?? null, ...profile });
     setSaving(false);
     setStatus(error ? error.message : "Profile saved.");
   };

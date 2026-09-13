@@ -1,7 +1,8 @@
 import { createFileRoute, Link, useNavigate } from "@tanstack/react-router";
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { AmbientBackground, BrandMark } from "@/components/AppShell";
-import { backendConfigured } from "@/lib/backend";
+import { supabase } from "@/integrations/supabase/client";
+import { useAuth } from "@/hooks/useAuth";
 
 export const Route = createFileRoute("/login")({
   head: () => ({
@@ -26,14 +27,55 @@ export const Route = createFileRoute("/login")({
 
 function LoginPage() {
   const [mode, setMode] = useState<"signin" | "signup">("signin");
+  const [fullName, setFullName] = useState("");
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
   const navigate = useNavigate();
+  const { session } = useAuth();
 
-  const onSubmit = (e: React.FormEvent) => {
+  useEffect(() => {
+    if (session) navigate({ to: "/" });
+  }, [session, navigate]);
+
+  const onSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!backendConfigured) return;
-    navigate({ to: "/" });
+    setBusy(true);
+    setError(null);
+    setNotice(null);
+    try {
+      if (mode === "signin") {
+        const { error } = await supabase.auth.signInWithPassword({
+          email,
+          password,
+        });
+        if (error) throw error;
+        navigate({ to: "/" });
+      } else {
+        const { data, error } = await supabase.auth.signUp({
+          email,
+          password,
+          options: {
+            emailRedirectTo: `${window.location.origin}/`,
+            data: { full_name: fullName },
+          },
+        });
+        if (error) throw error;
+        if (!data.session) {
+          setNotice(
+            "Check your inbox and click the confirmation link to finish setting up your account.",
+          );
+        } else {
+          navigate({ to: "/" });
+        }
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Something went wrong.");
+    } finally {
+      setBusy(false);
+    }
   };
 
   return (
@@ -76,7 +118,11 @@ function LoginPage() {
               <button
                 key={m}
                 type="button"
-                onClick={() => setMode(m)}
+                onClick={() => {
+                  setMode(m);
+                  setError(null);
+                  setNotice(null);
+                }}
                 className={`flex-1 rounded-xl py-2.5 text-center transition-colors ${
                   mode === m
                     ? "bg-foreground text-ink"
@@ -89,6 +135,19 @@ function LoginPage() {
           </div>
 
           <form onSubmit={onSubmit} className="mt-6 space-y-4">
+            {mode === "signup" && (
+              <label className="block">
+                <span className="text-sm font-medium text-muted-foreground">
+                  Full name
+                </span>
+                <input
+                  value={fullName}
+                  onChange={(e) => setFullName(e.target.value)}
+                  placeholder="Jane Agent"
+                  className="mt-1.5 w-full rounded-2xl bg-muted px-4 py-3 text-base outline-none ring-ring transition focus:ring-2"
+                />
+              </label>
+            )}
             <label className="block">
               <span className="text-sm font-medium text-muted-foreground">
                 Email
@@ -109,6 +168,7 @@ function LoginPage() {
               <input
                 type="password"
                 required
+                minLength={6}
                 value={password}
                 onChange={(e) => setPassword(e.target.value)}
                 placeholder="••••••••"
@@ -117,29 +177,28 @@ function LoginPage() {
             </label>
             <button
               type="submit"
-              className="w-full rounded-2xl bg-primary py-3.5 text-base font-semibold text-primary-foreground shadow-lg shadow-primary/30 transition-transform hover:-translate-y-0.5"
+              disabled={busy}
+              className="w-full rounded-2xl bg-primary py-3.5 text-base font-semibold text-primary-foreground shadow-lg shadow-primary/30 transition-transform hover:-translate-y-0.5 disabled:opacity-60"
             >
-              {mode === "signin" ? "Sign in" : "Create my account"}
+              {busy
+                ? "One moment…"
+                : mode === "signin"
+                  ? "Sign in"
+                  : "Create my account"}
             </button>
           </form>
 
-          <div className="my-6 flex items-center gap-3 text-xs uppercase tracking-[0.18em] text-muted-foreground/60">
-            <span className="h-px flex-1 bg-border" /> or{" "}
-            <span className="h-px flex-1 bg-border" />
-          </div>
-          <button
-            type="button"
-            className="w-full rounded-2xl border border-border bg-glass py-3 text-base font-semibold transition-colors hover:bg-secondary"
-          >
-            Continue with Google
-          </button>
-
-          {!backendConfigured && (
-            <p className="mt-5 rounded-xl border border-border bg-muted px-4 py-3 text-center text-xs text-muted-foreground">
-              Accounts turn on once this project is connected to your database
-              in Project Settings → Connectors.
+          {error && (
+            <p className="mt-4 rounded-xl border border-destructive/40 bg-destructive/10 px-4 py-3 text-sm text-destructive-foreground">
+              {error}
             </p>
           )}
+          {notice && (
+            <p className="mt-4 rounded-xl border border-border bg-muted px-4 py-3 text-sm text-muted-foreground">
+              {notice}
+            </p>
+          )}
+
           <p className="mt-5 text-center text-sm text-muted-foreground">
             $97/month · cancel anytime
           </p>

@@ -200,7 +200,7 @@ function LoginPage() {
           )}
 
           <p className="mt-5 text-center text-sm text-muted-foreground">
-            $97/month · cancel anytime
+            $149/month · cancel anytime
           </p>
         </div>
       </div>

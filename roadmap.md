@@ -4,3 +4,4 @@
 - [ ] Auth: email/password + Google; note user must connect existing Supabase via Project Settings → Connectors → Supabase
 - [ ] yourmarketingdude.com forwards here — login is the entry point; no marketing site needed
 - [ ] Modules: placeholder pages for the 3 tools (link out / embed to be decided)
+- [x] SOI Builder native integration at src/lib/soi-builder.ts (email identity bridge, team/client access, uploads, process, review flags, export)

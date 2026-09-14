@@ -79,6 +79,7 @@ export type Database = {
           headshot_url: string | null
           id: string
           market_area: string | null
+          metadata: Json
           phone: string | null
           subscription_status: string
           updated_at: string
@@ -94,6 +95,7 @@ export type Database = {
           headshot_url?: string | null
           id: string
           market_area?: string | null
+          metadata?: Json
           phone?: string | null
           subscription_status?: string
           updated_at?: string
@@ -109,6 +111,7 @@ export type Database = {
           headshot_url?: string | null
           id?: string
           market_area?: string | null
+          metadata?: Json
           phone?: string | null
           subscription_status?: string
           updated_at?: string

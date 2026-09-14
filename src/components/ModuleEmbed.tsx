@@ -20,11 +20,9 @@ export function ModuleEmbed({
         </div>
         <a
           href={src}
-          target="_blank"
-          rel="noreferrer"
           className="rounded-full border border-border bg-glass px-4 py-1.5 text-xs font-medium text-muted-foreground backdrop-blur-xl transition-colors hover:text-foreground"
         >
-          Open in new tab ↗
+          Open full page
         </a>
       </div>
       <div className="mt-5 overflow-hidden rounded-3xl border border-border bg-glass backdrop-blur-2xl">

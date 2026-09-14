@@ -163,7 +163,7 @@ function AccountPage() {
               <span className="text-sm capitalize text-foreground/70">
                 {plan === "active" ? "Pro plan" : `${plan} plan`}
               </span>
-              <span className="font-display text-sm font-bold">$97/mo</span>
+              <span className="font-display text-sm font-bold">$149/mo</span>
             </div>
             <p className="mt-3 text-xs text-muted-foreground">
               Billing management arrives with payments setup.

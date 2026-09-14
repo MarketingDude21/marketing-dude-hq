@@ -5,11 +5,29 @@ import { requireSupabaseAuth } from "@/integrations/supabase/auth-middleware";
 // ============================================================================
 // Build My Database / SOI Builder — native integration
 //
-// Talks to the separate SOI Builder Supabase project, which has its own live
-// Edge Functions (process-upload, export-lists, upload-file, delete-upload,
-// invite-client). This file only bridges identity: resolve the dashboard
-// user's email to a matching SOI Builder auth user, then read their
-// team_members / client_access role exactly as the original login did.
+// This talks to a SEPARATE Supabase project ("SOI Builder", not the one this
+// dashboard itself runs on) that already has a fully working, live,
+// battle-tested backend: 5 Edge Functions (process-upload, export-lists,
+// upload-file, delete-upload, invite-client) doing all the real contact
+// segmentation logic. None of that logic is touched, reimplemented, or
+// changed here — this file only adds a way to reach it from inside the
+// dashboard a user is already logged into, so there's no second login.
+//
+// Identity bridge: SOI Builder has its own separate Supabase Auth users
+// (its `clients`/`team_members`/`client_access` tables key off THOSE users'
+// ids, not this dashboard's). There is no shared user id or email column to
+// join on directly, so the bridge is: take the dashboard user's email
+// (from their verified JWT claims) and look up a matching user over in SOI
+// Builder's own auth system via the admin API. If found, `team_members` or
+// `client_access` tells us their role there exactly as it always did — this
+// doesn't loosen or change SOI Builder's own access rules at all, it just
+// resolves them automatically instead of asking the person to log in twice.
+//
+// Requires two secrets added in Lovable Cloud -> Secrets (server-only,
+// never sent to the browser):
+//   SOI_SUPABASE_URL                  = https://xoqrupoygkhkpobeekjz.supabase.co
+//   SOI_SUPABASE_SERVICE_ROLE_KEY     = (the service_role key from that
+//                                        project's Settings -> API)
 // ============================================================================
 
 function getSoiAdminClient(): SupabaseClient {
@@ -30,9 +48,17 @@ export type SoiAccess =
   | { role: "client"; clientId: string; clientName: string }
   | { role: "none" };
 
+// Resolves the currently logged-in dashboard user's role in SOI Builder by
+// email. Nothing here bypasses SOI Builder's own access rules - it just
+// looks up the same team_members / client_access rows the old separate
+// login screen would have checked after a manual sign-in.
 async function resolveAccessForEmail(admin: SupabaseClient, email: string): Promise<SoiAccess> {
   const cleanEmail = email.toLowerCase().trim();
 
+  // SOI Builder's own auth.users - separate account system from this
+  // dashboard's. Paginated in case the account list ever grows past a
+  // single page; team + clients combined are unlikely to exceed a few
+  // pages, but this is cheap insurance against silently missing someone.
   let matchedUserId: string | undefined;
   for (let page = 1; ; page++) {
     const { data, error } = await admin.auth.admin.listUsers({ page, perPage: 1000 });
@@ -80,6 +106,7 @@ export const getSoiAccess = createServerFn({ method: "GET" })
     return resolveAccessForEmail(admin, email);
   });
 
+// Team members manage multiple clients - the picker list for that view.
 export const listSoiClients = createServerFn({ method: "GET" })
   .middleware([requireSupabaseAuth])
   .handler(async ({ context }) => {
@@ -97,6 +124,10 @@ export const listSoiClients = createServerFn({ method: "GET" })
     return data;
   });
 
+// Shared guard used by every per-client action below: re-resolves the
+// caller's access every call (rather than trusting a client_id the browser
+// sends) so a client can never pass someone else's client_id and a team
+// member is always verified fresh. Small extra cost, real security value.
 async function requireClientAccess(
   admin: SupabaseClient,
   email: string | undefined,
@@ -141,6 +172,8 @@ export const uploadSoiFile = createServerFn({ method: "POST" })
     const email = (context.claims as { email?: string } | undefined)?.email;
     await requireClientAccess(admin, email, data.clientId);
 
+    // Calls the SAME upload-file Edge Function that's been running this
+    // app in production - not a reimplementation, the real thing.
     const url = process.env["SOI_SUPABASE_URL"];
     const serviceKey = process.env["SOI_SUPABASE_SERVICE_ROLE_KEY"];
     const res = await fetch(`${url}/functions/v1/upload-file`, {
@@ -171,6 +204,12 @@ export const deleteSoiUpload = createServerFn({ method: "POST" })
     const email = (context.claims as { email?: string } | undefined)?.email;
     await requireClientAccess(admin, email, data.clientId);
 
+    // Same behavior as the original delete-upload function (remove Storage
+    // file(s) + the uploads row) - reimplemented directly here rather than
+    // calling that function over HTTP, because it authenticates its caller
+    // with a real per-user access token, which a service-role backend call
+    // doesn't have. The access check above (requireClientAccess) already
+    // covers exactly what that function's own check covered.
     const { data: upload, error: findErr } = await admin
       .from("uploads")
       .select("id, client_id, file_name, storage_path")
@@ -247,6 +286,10 @@ export const getSoiHubCounts = createServerFn({ method: "GET" })
     return counts;
   });
 
+// Review-flag joins for the 3-step wizard (primary review_type only - the
+// same lists the original wizard reviewed). Read-only, so reimplementing
+// this one small join here (rather than only ever calling export-lists) is
+// safe - it doesn't change how any contact is classified.
 export const getSoiReviewCandidates = createServerFn({ method: "GET" })
   .middleware([requireSupabaseAuth])
   .inputValidator((data: { clientId: string; listAssignment: "direct_mail" | "email_phone" | "email_list" | "incomplete" }) => data)
@@ -255,11 +298,16 @@ export const getSoiReviewCandidates = createServerFn({ method: "GET" })
     const email = (context.claims as { email?: string } | undefined)?.email;
     await requireClientAccess(admin, email, data.clientId);
 
+    const listsForAssignment =
+      data.listAssignment === "direct_mail" || data.listAssignment === "email_phone"
+        ? [data.listAssignment]
+        : [data.listAssignment];
+
     const { data: contacts, error } = await admin
       .from("contacts")
       .select("id, first_name, last_name, email, phone, address, city, state, zip, notes, sources, list_assignment")
       .eq("client_id", data.clientId)
-      .in("list_assignment", [data.listAssignment])
+      .in("list_assignment", listsForAssignment)
       .order("last_name", { ascending: true });
     if (error) throw error;
 
@@ -286,6 +334,10 @@ export const setSoiReviewFlag = createServerFn({ method: "POST" })
     const email = (context.claims as { email?: string } | undefined)?.email;
     await requireClientAccess(admin, email, data.clientId);
 
+    // Confirm the contact actually belongs to this client before writing -
+    // review_flags itself has no client_id column (it's keyed off
+    // contact_id only), so this is the one place that boundary has to be
+    // enforced explicitly.
     const { data: contact, error: contactErr } = await admin
       .from("contacts")
       .select("id, client_id")

@@ -13,13 +13,11 @@ const NAV = [
 
 export function BrandMark({ size = "h-14 w-auto" }: { size?: string }) {
   return (
-    <div className="rounded-lg bg-white p-1.5 shadow-sm">
-      <img
-        src={logoAsset.url}
-        alt="Your Marketing Dude"
-        className={`${size} object-contain`}
-      />
-    </div>
+    <img
+      src={logoAsset.url}
+      alt="Your Marketing Dude"
+      className={`${size} object-contain`}
+    />
   );
 }
 

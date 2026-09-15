@@ -51,8 +51,34 @@ const HUB_ORDER = [
 ] as const;
 
 // direct_mail/email_phone: opt-OUT (checking = remove). email_list/incomplete: opt-IN (checking = keep).
-const REVIEW_LISTS = ["direct_mail", "email_phone", "email_list", "incomplete"] as const;
-const OPT_OUT_LISTS = new Set(["direct_mail", "email_phone"]);
+// Review is organized the same way the original SOI Builder review flow was:
+// direct_mail + email_phone are reviewed TOGETHER as one "most complete data"
+// step (matching the same "complete" grouping the Export tab already uses),
+// each row tagged with which list it's actually in.
+const REVIEW_STEPS = [
+  {
+    key: "complete",
+    label: "Your Most Complete Data",
+    lists: ["direct_mail", "email_phone"] as const,
+    optOut: true,
+    description:
+      "Full addresses, plus everyone with a first name, last name, email, and phone. Check off anyone you don't actually know.",
+  },
+  {
+    key: "email_list",
+    label: "Email List",
+    lists: ["email_list"] as const,
+    optOut: false,
+    description: "Everyone else with a usable email. Check off anyone you actually know and want to keep.",
+  },
+  {
+    key: "incomplete",
+    label: "Incomplete",
+    lists: ["incomplete"] as const,
+    optOut: false,
+    description: "Missing enough info to sort automatically. Check off anyone you actually know and want to keep.",
+  },
+] as const;
 
 function Card({ children, className = "" }: { children: React.ReactNode; className?: string }) {
   return (
@@ -291,7 +317,7 @@ function Workspace({ clientId }: { clientId: string }) {
               tab === t ? "bg-secondary text-foreground" : "text-muted-foreground hover:text-foreground"
             }`}
           >
-            {t === "upload" ? "Upload" : t === "hub" ? "Hub" : t === "review" ? "Review" : "Export"}
+            {t === "upload" ? "Upload" : t === "hub" ? "Database Breakdown" : t === "review" ? "Review" : "Export"}
           </button>
         ))}
       </div>
@@ -393,12 +419,20 @@ function UploadTab({ clientId, onProcessed }: { clientId: string; onProcessed: (
       <Card>
         <h2 className="font-display text-lg font-semibold">Add a file</h2>
         <p className="mt-1 text-sm text-muted-foreground">CSV export from your CRM, or a .vcf contacts export.</p>
-        <input
-          type="file"
-          accept=".csv,.vcf"
-          onChange={(e) => e.target.files?.[0] && handleFilePicked(e.target.files[0])}
-          className="mt-4 block w-full text-sm"
-        />
+        <label className="mt-4 flex cursor-pointer flex-col items-start gap-3 rounded-2xl border border-dashed border-border bg-background/40 px-5 py-6 transition-colors hover:bg-secondary/40 sm:flex-row sm:items-center sm:justify-between">
+          <span className="text-sm text-muted-foreground">
+            {pendingFile ? pendingFile.name : "Drop a file here, or click to browse."}
+          </span>
+          <span className="rounded-full bg-primary px-5 py-2 text-sm font-semibold text-primary-foreground shadow-lg shadow-primary/30 transition-transform hover:-translate-y-0.5">
+            Choose file
+          </span>
+          <input
+            type="file"
+            accept=".csv,.vcf"
+            onChange={(e) => e.target.files?.[0] && handleFilePicked(e.target.files[0])}
+            className="hidden"
+          />
+        </label>
         {pendingFile && (
           <div className="mt-4 space-y-3">
             <label className="block text-sm">
@@ -503,53 +537,79 @@ function HubTab({ clientId }: { clientId: string }) {
   );
 }
 
+type ReviewContact = {
+  id: string;
+  first_name: string | null;
+  last_name: string | null;
+  email: string | null;
+  phone: string | null;
+  city: string | null;
+  list_assignment: string | null;
+  flagged: boolean;
+};
+
 function ReviewTab({ clientId }: { clientId: string }) {
-  const [list, setList] = useState<(typeof REVIEW_LISTS)[number]>("direct_mail");
-  const [contacts, setContacts] = useState<
-    Array<{
-      id: string;
-      first_name: string | null;
-      last_name: string | null;
-      email: string | null;
-      phone: string | null;
-      flagged: boolean;
-    }>
-  >([]);
+  const [stepKey, setStepKey] = useState<(typeof REVIEW_STEPS)[number]["key"]>("complete");
+  const step = REVIEW_STEPS.find((s) => s.key === stepKey) ?? REVIEW_STEPS[0];
+  const [contacts, setContacts] = useState<ReviewContact[]>([]);
   const [loading, setLoading] = useState(true);
-  const optOut = OPT_OUT_LISTS.has(list);
+  const [search, setSearch] = useState("");
 
   useEffect(() => {
     setLoading(true);
-    getSoiReviewCandidates({ data: { clientId, listAssignment: list } })
-      .then((rows) => setContacts(rows))
+    setSearch("");
+    Promise.all(step.lists.map((l) => getSoiReviewCandidates({ data: { clientId, listAssignment: l } })))
+      .then((results) => setContacts(results.flat()))
       .finally(() => setLoading(false));
-  }, [clientId, list]);
+  }, [clientId, step]);
 
   async function toggle(contactId: string, next: boolean) {
     setContacts((cs) => cs.map((c) => (c.id === contactId ? { ...c, flagged: next } : c)));
     await setSoiReviewFlag({ data: { clientId, contactId, reviewType: "primary", flagged: next } });
   }
 
+  async function toggleAll(next: boolean) {
+    const ids = filtered.map((c) => c.id);
+    setContacts((cs) => cs.map((c) => (ids.includes(c.id) ? { ...c, flagged: next } : c)));
+    await Promise.all(
+      ids.map((id) => setSoiReviewFlag({ data: { clientId, contactId: id, reviewType: "primary", flagged: next } })),
+    );
+  }
+
+  const q = search.trim().toLowerCase();
+  const filtered = q
+    ? contacts.filter((c) =>
+        [c.first_name, c.last_name, c.email, c.phone].some((v) => (v ?? "").toLowerCase().includes(q)),
+      )
+    : contacts;
+  const allChecked = filtered.length > 0 && filtered.every((c) => c.flagged);
+
   return (
     <div>
       <div className="flex flex-wrap gap-2">
-        {REVIEW_LISTS.map((l) => (
+        {REVIEW_STEPS.map((s) => (
           <button
-            key={l}
-            onClick={() => setList(l)}
+            key={s.key}
+            onClick={() => setStepKey(s.key)}
             className={`rounded-full px-4 py-1.5 text-sm font-medium transition-colors ${
-              list === l ? "bg-secondary" : "border border-border hover:bg-secondary/50"
+              stepKey === s.key ? "bg-secondary" : "border border-border hover:bg-secondary/50"
             }`}
           >
-            {LIST_LABELS[l]}
+            {s.label}
           </button>
         ))}
       </div>
       <p className="mt-3 text-sm text-muted-foreground">
-        {optOut
-          ? "Check anyone you don't recognize to remove them from this list."
-          : "Check anyone you do recognize to keep them on this list."}
+        {contacts.length} contact{contacts.length === 1 ? "" : "s"} on this list. {step.description}
       </p>
+
+      <input
+        value={search}
+        onChange={(e) => setSearch(e.target.value)}
+        placeholder="Search name, email, or phone…"
+        className="mt-4 w-full max-w-md rounded-2xl border border-border bg-background px-4 py-2.5 text-sm outline-none ring-ring transition focus:ring-2"
+      />
+
       <Card className="mt-4">
         {loading ? (
           <p className="text-sm text-muted-foreground">Loading…</p>
@@ -558,20 +618,35 @@ function ReviewTab({ clientId }: { clientId: string }) {
             <table className="w-full text-sm">
               <thead>
                 <tr className="text-left text-muted-foreground">
-                  <th className="pb-2">Name</th>
+                  <th className="pb-2">First name</th>
+                  <th className="pb-2">Last name</th>
                   <th className="pb-2">Email</th>
                   <th className="pb-2">Phone</th>
-                  <th className="pb-2">{optOut ? "Remove" : "Keep"}</th>
+                  <th className="pb-2">City</th>
+                  {step.lists.length > 1 && <th className="pb-2">List</th>}
+                  <th className="pb-2">
+                    <label className="flex items-center gap-1.5">
+                      <input type="checkbox" checked={allChecked} onChange={(e) => toggleAll(e.target.checked)} />
+                      {step.optOut ? "Remove all" : "Keep all"}
+                    </label>
+                  </th>
                 </tr>
               </thead>
               <tbody>
-                {contacts.map((c) => (
+                {filtered.map((c) => (
                   <tr key={c.id} className="border-t border-border">
-                    <td className="py-2">
-                      {c.first_name} {c.last_name}
-                    </td>
+                    <td className="py-2">{c.first_name}</td>
+                    <td className="py-2">{c.last_name}</td>
                     <td className="py-2">{c.email}</td>
                     <td className="py-2">{c.phone}</td>
+                    <td className="py-2">{c.city}</td>
+                    {step.lists.length > 1 && (
+                      <td className="py-2">
+                        <span className="rounded-full bg-muted px-2.5 py-1 text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+                          {LIST_LABELS[c.list_assignment ?? ""] ?? c.list_assignment}
+                        </span>
+                      </td>
+                    )}
                     <td className="py-2">
                       <input type="checkbox" checked={c.flagged} onChange={(e) => toggle(c.id, e.target.checked)} />
                     </td>
@@ -579,7 +654,11 @@ function ReviewTab({ clientId }: { clientId: string }) {
                 ))}
               </tbody>
             </table>
-            {contacts.length === 0 && <p className="text-sm text-muted-foreground">Nobody on this list.</p>}
+            {filtered.length === 0 && (
+              <p className="text-sm text-muted-foreground">
+                {contacts.length === 0 ? "Nobody on this list." : "No matches for that search."}
+              </p>
+            )}
           </div>
         )}
       </Card>

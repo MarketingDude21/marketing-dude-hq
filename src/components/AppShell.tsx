@@ -1,6 +1,7 @@
 import { Link, Outlet, useNavigate } from "@tanstack/react-router";
 import type { ReactNode } from "react";
 import { useAuth } from "@/hooks/useAuth";
+import logoAsset from "@/assets/dude-logo.png.asset.json";
 
 const NAV = [
   { to: "/", label: "Home", exact: true },
@@ -10,13 +11,13 @@ const NAV = [
   { to: "/account", label: "Account", exact: false },
 ] as const;
 
-export function BrandMark({ size = "size-9" }: { size?: string }) {
+export function BrandMark({ size = "h-14 w-auto" }: { size?: string }) {
   return (
-    <div
-      className={`grid ${size} place-items-center rounded-xl bg-gradient-to-br from-primary to-accent font-display text-sm font-bold text-primary-foreground`}
-    >
-      YM
-    </div>
+    <img
+      src={logoAsset.url}
+      alt="Your Marketing Dude"
+      className={`${size} object-contain`}
+    />
   );
 }
 
@@ -38,11 +39,8 @@ export function AppShell({ children }: { children?: ReactNode }) {
     <div className="relative min-h-screen w-full overflow-hidden bg-background text-foreground">
       <AmbientBackground />
       <header className="relative z-10 mx-auto flex max-w-7xl items-center justify-between gap-4 px-6 py-5">
-        <Link to="/" className="flex items-center gap-2.5">
+        <Link to="/" aria-label="Your Marketing Dude home" className="shrink-0">
           <BrandMark />
-          <span className="font-display text-lg font-semibold tracking-tight">
-            Your Marketing Dude
-          </span>
         </Link>
         <nav className="hidden items-center gap-1 rounded-full border border-border bg-glass px-1 py-1 backdrop-blur-xl md:flex">
           {NAV.map((item) => (

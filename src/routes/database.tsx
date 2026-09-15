@@ -1,3 +1,4 @@
+```tsx
 import { useEffect, useMemo, useState } from "react";
 import { createFileRoute } from "@tanstack/react-router";
 import { AppShell } from "@/components/AppShell";
@@ -249,6 +250,60 @@ const MAPPING_FIELDS = [
   { key: "notes", label: "Notes" },
 ] as const;
 
+// Recognized header spellings per field, so a normal CRM export (WiseAgent,
+// Follow Up Boss, a phone contacts export, etc.) maps itself automatically
+// instead of making the person pick every dropdown by hand. Anything that
+// doesn't match one of these still shows up as "— none —" for a manual pick
+// — this only fills in the obvious ones, it never guesses wrong silently
+// because the dropdowns stay fully visible and editable either way.
+const MAPPING_ALIASES: Record<string, string[]> = {
+  first_name: ["first name", "firstname", "first", "fname", "given name"],
+  last_name: ["last name", "lastname", "last", "lname", "surname", "family name"],
+  full_name: ["full name", "fullname", "name", "contact name", "display name"],
+  email: ["email", "e mail", "email address", "e mail address", "primary email", "emails"],
+  phone: [
+    "phone",
+    "phone number",
+    "cell",
+    "cell phone",
+    "mobile",
+    "mobile phone",
+    "home phone",
+    "primary phone",
+    "telephone",
+    "phones",
+  ],
+  address: ["address", "address 1", "street address", "address line 1", "mailing address", "street"],
+  address_2: ["address 2", "address line 2", "apt", "unit", "suite"],
+  city: ["city", "town"],
+  state: ["state", "st", "province"],
+  zip: ["zip", "zip code", "zipcode", "postal code"],
+  notes: ["notes", "note", "comments", "comment"],
+};
+
+function normalizeHeader(header: string): string {
+  return header
+    .toLowerCase()
+    .trim()
+    .replace(/[^a-z0-9]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function guessColumnMapping(headers: string[]): Record<string, string> {
+  const guessed: Record<string, string> = {};
+  const claimed = new Set<string>();
+  for (const field of MAPPING_FIELDS) {
+    const aliases = MAPPING_ALIASES[field.key] ?? [];
+    const match = headers.find((h) => !claimed.has(h) && aliases.includes(normalizeHeader(h)));
+    if (match) {
+      guessed[field.key] = match;
+      claimed.add(match);
+    }
+  }
+  return guessed;
+}
+
 function DatabasePage() {
   const [access, setAccess] = useState<SoiAccess | null>(null);
   const [accessError, setAccessError] = useState<string | null>(null);
@@ -398,7 +453,12 @@ function Workspace({ clientId }: { clientId: string }) {
 
 function UploadTab({ clientId, onProcessed }: { clientId: string; onProcessed: () => void }) {
   const [uploads, setUploads] = useState<Array<{ id: string; file_name: string; source_label: string; status: string }>>([]);
-  const [pendingFile, setPendingFile] = useState<File | null>(null);
+  // Files picked but not yet uploaded, in order. The one being mapped/
+  // uploaded right now is always the front of this queue — selecting
+  // several files at once (or dragging a batch in) queues all of them so
+  // the person doesn't have to reopen the file picker between each one.
+  const [fileQueue, setFileQueue] = useState<File[]>([]);
+  const pendingFile = fileQueue[0] ?? null;
   const [sourceLabel, setSourceLabel] = useState("");
   const [csvPreview, setCsvPreview] = useState<{ headers: string[]; rows: Record<string, string>[] } | null>(null);
   const [mapping, setMapping] = useState<Record<string, string>>({});
@@ -415,12 +475,13 @@ function UploadTab({ clientId, onProcessed }: { clientId: string; onProcessed: (
   // Formats SheetJS can read directly, browser-side, with no server round trip.
   const SPREADSHEET_EXTENSIONS = [".xlsx", ".xls", ".xlsm", ".xlsb", ".ods", ".tsv"];
 
-  async function handleFilePicked(file: File) {
-    setPendingFile(file);
+  async function parseAndStage(file: File) {
     setError(null);
+    setMapping({});
     const lowerName = file.name.toLowerCase();
+    let preview: { headers: string[]; rows: Record<string, string>[] } | null = null;
     if (lowerName.endsWith(".vcf")) {
-      setCsvPreview(null);
+      preview = null;
     } else if (lowerName.endsWith(".numbers")) {
       // Apple's .numbers format is a proprietary bundle, not a spreadsheet
       // format any browser-side library can parse — there's no safe way to
@@ -428,21 +489,33 @@ function UploadTab({ clientId, onProcessed }: { clientId: string; onProcessed: (
       setError(
         "Apple Numbers files (.numbers) can't be read directly. In Numbers, use File > Export To > CSV (or Excel), then upload that file instead.",
       );
-      setCsvPreview(null);
     } else if (SPREADSHEET_EXTENSIONS.some((ext) => lowerName.endsWith(ext))) {
       try {
-        setCsvPreview(await parseSpreadsheet(file));
+        preview = await parseSpreadsheet(file);
       } catch {
         setError(
           "Couldn't read that file. Try re-saving/exporting it as a .csv and uploading that instead.",
         );
-        setCsvPreview(null);
       }
     } else {
       const text = await file.text();
-      setCsvPreview(parseCsv(text));
+      preview = parseCsv(text);
     }
-    if (!sourceLabel) setSourceLabel(file.name.replace(/\.[^.]+$/, ""));
+    setCsvPreview(preview);
+    // Pre-fill the mapping from recognizable column headers so a normal
+    // export doesn't require mapping every field by hand — see
+    // guessColumnMapping's comment above for what counts as "recognizable."
+    if (preview) setMapping(guessColumnMapping(preview.headers));
+    setSourceLabel(file.name.replace(/\.[^.]+$/, ""));
+  }
+
+  async function handleFilesPicked(files: File[]) {
+    if (files.length === 0) return;
+    // A fresh selection replaces whatever was queued before — picking again
+    // is treated as "here's my batch," not "add to the old one."
+    setFileQueue(files);
+    const first = files[0];
+    if (first) await parseAndStage(first);
   }
 
   async function handleUpload() {
@@ -467,10 +540,21 @@ function UploadTab({ clientId, onProcessed }: { clientId: string; onProcessed: (
           },
         });
       }
-      setPendingFile(null);
+      await refresh();
+      // Move on to the next queued file automatically, so a multi-file
+      // batch doesn't require reopening the picker between each one — only
+      // the mapping step (which can genuinely differ file to file) still
+      // needs a look before each individual upload.
+      const rest = fileQueue.slice(1);
+      setFileQueue(rest);
       setCsvPreview(null);
       setMapping({});
-      await refresh();
+      const next = rest[0];
+      if (next) {
+        await parseAndStage(next);
+      } else {
+        setSourceLabel("");
+      }
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -502,18 +586,25 @@ function UploadTab({ clientId, onProcessed }: { clientId: string; onProcessed: (
         </p>
         <label className="mt-4 flex cursor-pointer flex-col items-start gap-3 rounded-2xl border border-dashed border-border bg-background/40 px-5 py-6 transition-colors hover:bg-secondary/40 sm:flex-row sm:items-center sm:justify-between">
           <span className="text-sm text-muted-foreground">
-            {pendingFile ? pendingFile.name : "Drop a file here, or click to browse."}
+            {pendingFile ? pendingFile.name : "Drop one or more files here, or click to browse."}
           </span>
           <span className="rounded-full bg-primary px-5 py-2 text-sm font-semibold text-primary-foreground shadow-lg shadow-primary/30 transition-transform hover:-translate-y-0.5">
-            Choose file
+            Choose files
           </span>
           <input
             type="file"
+            multiple
             accept=".csv,.vcf,.xls,.xlsx,.xlsm,.xlsb,.ods,.tsv,.numbers"
-            onChange={(e) => e.target.files?.[0] && handleFilePicked(e.target.files[0])}
+            onChange={(e) => handleFilesPicked(Array.from(e.target.files ?? []))}
             className="hidden"
           />
         </label>
+        {fileQueue.length > 1 && (
+          <p className="mt-2 text-xs text-muted-foreground">
+            File 1 of {fileQueue.length} in this batch — the rest will come up automatically after you upload
+            this one.
+          </p>
+        )}
         {pendingFile && (
           <div className="mt-4 space-y-3">
             <label className="block text-sm">
@@ -527,7 +618,11 @@ function UploadTab({ clientId, onProcessed }: { clientId: string; onProcessed: (
             </label>
             {csvPreview && (
               <div className="space-y-2">
-                <p className="text-sm text-muted-foreground">Map columns:</p>
+                <p className="text-sm text-muted-foreground">
+                  We matched your columns automatically below — just check them over and fix anything
+                  that's wrong before uploading. (This only tells us which column is which; sorting
+                  contacts into lists happens after, when you click Process.)
+                </p>
                 {MAPPING_FIELDS.map((f) => (
                   <label key={f.key} className="flex items-center justify-between gap-2 text-sm">
                     <span>{f.label}</span>
@@ -548,7 +643,11 @@ function UploadTab({ clientId, onProcessed }: { clientId: string; onProcessed: (
               </div>
             )}
             <Button onClick={handleUpload} disabled={busy}>
-              {busy ? "Uploading…" : "Upload file"}
+              {busy
+                ? "Uploading…"
+                : fileQueue.length > 1
+                  ? `Upload file (1 of ${fileQueue.length})`
+                  : "Upload file"}
             </Button>
           </div>
         )}
@@ -863,3 +962,4 @@ function ExportTab({ clientId }: { clientId: string }) {
     </Card>
   );
 }
+```

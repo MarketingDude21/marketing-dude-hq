@@ -1,3 +1,4 @@
+```tsx
 import { useEffect, useMemo, useState } from "react";
 import { createFileRoute } from "@tanstack/react-router";
 import { AppShell } from "@/components/AppShell";
@@ -159,11 +160,44 @@ function fileToBase64(file: File): Promise<string> {
   });
 }
 
+// Excel/ODS/TSV support: SheetJS is loaded from a CDN at runtime instead of
+// an npm dependency, so this works the moment the file is pasted in — no
+// separate "add a package" step in Lovable needed. Cached after the first
+// load so picking a second spreadsheet file in the same session doesn't
+// re-fetch it. Typed as `any` on purpose: it's a runtime-loaded module a
+// build-time type checker can never see a declaration for.
+let sheetJsPromise: Promise<any> | null = null;
+async function loadSheetJs(): Promise<any> {
+  if (!sheetJsPromise) {
+    // @ts-expect-error — CDN URL module specifier, not resolvable at build time.
+    sheetJsPromise = import(/* @vite-ignore */ "https://cdn.jsdelivr.net/npm/xlsx@0.18.5/+esm");
+  }
+  return sheetJsPromise;
+}
+
+async function parseSpreadsheet(file: File): Promise<{ headers: string[]; rows: Record<string, string>[] }> {
+  const XLSX = await loadSheetJs();
+  const buffer = await file.arrayBuffer();
+  const workbook = XLSX.read(buffer, { type: "array" });
+  const firstSheetName: string | undefined = workbook.SheetNames[0];
+  if (!firstSheetName) return { headers: [], rows: [] };
+  const sheet = workbook.Sheets[firstSheetName];
+  const rawRows: Record<string, unknown>[] = XLSX.utils.sheet_to_json(sheet, { defval: "" });
+  const firstRow = rawRows[0];
+  const headers = firstRow ? Object.keys(firstRow) : [];
+  const rows = rawRows.map((row) => {
+    const out: Record<string, string> = {};
+    for (const h of headers) {
+      const v = row[h];
+      out[h] = v === null || v === undefined ? "" : String(v);
+    }
+    return out;
+  });
+  return { headers, rows };
+}
+
 function parseCsv(text: string): { headers: string[]; rows: Record<string, string>[] } {
-  const lines = text
-    .replace(/\r\n/g, "\n")
-    .split("\n")
-    .filter((l) => l.length > 0);
+  const lines = text.replace(/\r\n/g, "\n").split("\n").filter((l) => l.length > 0);
   if (lines.length === 0) return { headers: [], rows: [] };
   const splitLine = (line: string): string[] => {
     const out: string[] = [];
@@ -269,8 +303,8 @@ function DatabasePage() {
         <PageHeader />
         <Card className="mt-5">
           <p className="text-sm text-muted-foreground">
-            We couldn't set up your Build My Database account automatically. Refresh and try again, or ask your team to
-            check your access.
+            We couldn't set up your Build My Database account automatically. Refresh and try again,
+            or ask your team to check your access.
           </p>
         </Card>
       </AppShell>
@@ -293,7 +327,9 @@ function DatabasePage() {
                 {c.name}
               </button>
             ))}
-            {clients.length === 0 && <p className="text-sm text-muted-foreground">No clients yet.</p>}
+            {clients.length === 0 && (
+              <p className="text-sm text-muted-foreground">No clients yet.</p>
+            )}
           </div>
         </Card>
       </AppShell>
@@ -304,10 +340,7 @@ function DatabasePage() {
 
   return (
     <AppShell>
-      <PageHeader
-        clientName={selected.name}
-        onChangeClient={access.role === "team" ? () => setSelected(null) : undefined}
-      />
+      <PageHeader clientName={selected.name} onChangeClient={access.role === "team" ? () => setSelected(null) : undefined} />
       <Workspace clientId={selected.id} />
     </AppShell>
   );
@@ -365,9 +398,7 @@ function Workspace({ clientId }: { clientId: string }) {
 }
 
 function UploadTab({ clientId, onProcessed }: { clientId: string; onProcessed: () => void }) {
-  const [uploads, setUploads] = useState<
-    Array<{ id: string; file_name: string; source_label: string; status: string }>
-  >([]);
+  const [uploads, setUploads] = useState<Array<{ id: string; file_name: string; source_label: string; status: string }>>([]);
   const [pendingFile, setPendingFile] = useState<File | null>(null);
   const [sourceLabel, setSourceLabel] = useState("");
   const [csvPreview, setCsvPreview] = useState<{ headers: string[]; rows: Record<string, string>[] } | null>(null);
@@ -382,15 +413,35 @@ function UploadTab({ clientId, onProcessed }: { clientId: string; onProcessed: (
   }, [clientId]);
 
   const isVcf = pendingFile?.name.toLowerCase().endsWith(".vcf");
+  // Formats SheetJS can read directly, browser-side, with no server round trip.
+  const SPREADSHEET_EXTENSIONS = [".xlsx", ".xls", ".xlsm", ".xlsb", ".ods", ".tsv"];
 
   async function handleFilePicked(file: File) {
     setPendingFile(file);
     setError(null);
-    if (!file.name.toLowerCase().endsWith(".vcf")) {
+    const lowerName = file.name.toLowerCase();
+    if (lowerName.endsWith(".vcf")) {
+      setCsvPreview(null);
+    } else if (lowerName.endsWith(".numbers")) {
+      // Apple's .numbers format is a proprietary bundle, not a spreadsheet
+      // format any browser-side library can parse — there's no safe way to
+      // read this directly. Numbers itself exports to CSV/Excel in one click.
+      setError(
+        "Apple Numbers files (.numbers) can't be read directly. In Numbers, use File > Export To > CSV (or Excel), then upload that file instead.",
+      );
+      setCsvPreview(null);
+    } else if (SPREADSHEET_EXTENSIONS.some((ext) => lowerName.endsWith(ext))) {
+      try {
+        setCsvPreview(await parseSpreadsheet(file));
+      } catch {
+        setError(
+          "Couldn't read that file. Try re-saving/exporting it as a .csv and uploading that instead.",
+        );
+        setCsvPreview(null);
+      }
+    } else {
       const text = await file.text();
       setCsvPreview(parseCsv(text));
-    } else {
-      setCsvPreview(null);
     }
     if (!sourceLabel) setSourceLabel(file.name.replace(/\.[^.]+$/, ""));
   }
@@ -403,13 +454,7 @@ function UploadTab({ clientId, onProcessed }: { clientId: string; onProcessed: (
       if (isVcf) {
         const content = await fileToBase64(pendingFile);
         await uploadSoiFile({
-          data: {
-            clientId,
-            fileName: pendingFile.name,
-            sourceLabel: sourceLabel || pendingFile.name,
-            kind: "vcf",
-            content,
-          },
+          data: { clientId, fileName: pendingFile.name, sourceLabel: sourceLabel || pendingFile.name, kind: "vcf", content },
         });
       } else {
         if (!csvPreview) throw new Error("No file parsed yet");
@@ -451,7 +496,11 @@ function UploadTab({ clientId, onProcessed }: { clientId: string; onProcessed: (
     <div className="grid gap-5 lg:grid-cols-2">
       <Card>
         <h2 className="font-display text-lg font-semibold">Add a file</h2>
-        <p className="mt-1 text-sm text-muted-foreground">CSV export from your CRM, or a .vcf contacts export.</p>
+        <p className="mt-1 text-sm text-muted-foreground">
+          CSV, Excel, or OpenDocument spreadsheet export from your CRM, or a .vcf contacts export. (Apple
+          Numbers files need to be exported to CSV or Excel first — Numbers can do that in one click via
+          File &gt; Export To.)
+        </p>
         <label className="mt-4 flex cursor-pointer flex-col items-start gap-3 rounded-2xl border border-dashed border-border bg-background/40 px-5 py-6 transition-colors hover:bg-secondary/40 sm:flex-row sm:items-center sm:justify-between">
           <span className="text-sm text-muted-foreground">
             {pendingFile ? pendingFile.name : "Drop a file here, or click to browse."}
@@ -461,7 +510,7 @@ function UploadTab({ clientId, onProcessed }: { clientId: string; onProcessed: (
           </span>
           <input
             type="file"
-            accept=".csv,.vcf"
+            accept=".csv,.vcf,.xls,.xlsx,.xlsm,.xlsb,.ods,.tsv,.numbers"
             onChange={(e) => e.target.files?.[0] && handleFilePicked(e.target.files[0])}
             className="hidden"
           />
@@ -511,10 +560,7 @@ function UploadTab({ clientId, onProcessed }: { clientId: string; onProcessed: (
         <h2 className="font-display text-lg font-semibold">Uploaded files</h2>
         <ul className="mt-3 space-y-2">
           {uploads.map((u) => (
-            <li
-              key={u.id}
-              className="flex items-center justify-between rounded-xl border border-border px-3 py-2 text-sm"
-            >
+            <li key={u.id} className="flex items-center justify-between rounded-xl border border-border px-3 py-2 text-sm">
               <span>
                 {u.file_name} <span className="text-muted-foreground">({u.source_label})</span>
               </span>
@@ -606,7 +652,9 @@ function ReviewTab({ clientId }: { clientId: string }) {
         : getSoiListView({ data: { clientId, view: step.key } }).then((rows) => [
             rows.map((r) => ({ ...r, flagged: false })),
           ]);
-    request.then((results) => setContacts(results.flat())).finally(() => setLoading(false));
+    request
+      .then((results) => setContacts(results.flat()))
+      .finally(() => setLoading(false));
 
     if (step.kind === "review") {
       try {
@@ -649,9 +697,7 @@ function ReviewTab({ clientId }: { clientId: string }) {
     : contacts;
   const allChecked = filtered.length > 0 && filtered.every((c) => c.flagged);
   const showListColumn =
-    step.kind === "review"
-      ? step.lists.length > 1
-      : step.key === "final_full_contact" || step.key === "facebook_audience";
+    step.kind === "review" ? step.lists.length > 1 : step.key === "final_full_contact" || step.key === "facebook_audience";
   const leftOffContact = leftOffId ? contacts.find((c) => c.id === leftOffId) : undefined;
 
   useEffect(() => {
@@ -810,12 +856,7 @@ function ExportTab({ clientId }: { clientId: string }) {
       <h2 className="font-display text-lg font-semibold">Download lists</h2>
       <div className="mt-4 grid gap-2 sm:grid-cols-2">
         {EXPORT_SCOPES.map((s) => (
-          <Button
-            key={s.scope}
-            variant="secondary"
-            onClick={() => handleExport(s.scope)}
-            disabled={busyScope === s.scope}
-          >
+          <Button key={s.scope} variant="secondary" onClick={() => handleExport(s.scope)} disabled={busyScope === s.scope}>
             {busyScope === s.scope ? "Preparing…" : s.label}
           </Button>
         ))}
@@ -823,3 +864,4 @@ function ExportTab({ clientId }: { clientId: string }) {
     </Card>
   );
 }
+```

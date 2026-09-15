@@ -472,6 +472,11 @@ function UploadTab({ clientId, onProcessed }: { clientId: string; onProcessed: (
   const [batchRunning, setBatchRunning] = useState(false);
   const [busy, setBusy] = useState(false);
   const [processResult, setProcessResult] = useState<Record<string, number> | null>(null);
+  // Once Process finishes successfully we jump straight to the Hub tab (the
+  // "new screen" Mike asked for) instead of leaving the results sitting
+  // inline here — this just remembers that this batch has already been run,
+  // so the button still reads "Processed" if he clicks back to this tab.
+  const [processed, setProcessed] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   const refresh = () => listSoiUploads({ data: { clientId } }).then(setUploads);
@@ -524,6 +529,7 @@ function UploadTab({ clientId, onProcessed }: { clientId: string; onProcessed: (
   async function handleFilesPicked(files: File[]) {
     if (files.length === 0) return;
     setError(null);
+    setProcessed(false);
     const items: BatchItem[] = files.map((file) => ({ file, status: "pending" }));
     setBatch(items);
     setBatchRunning(true);
@@ -549,6 +555,10 @@ function UploadTab({ clientId, onProcessed }: { clientId: string; onProcessed: (
     try {
       const result = await processSoiUploads({ data: { clientId } });
       setProcessResult(result.list_counts);
+      setProcessed(true);
+      // Don't make Mike hunt for the results on this screen — jump straight
+      // to the Hub tab where the breakdown actually lives.
+      onProcessed();
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -630,19 +640,16 @@ function UploadTab({ clientId, onProcessed }: { clientId: string; onProcessed: (
         </ul>
         <div className="mt-5 border-t border-border pt-4">
           <Button onClick={handleProcess} disabled={busy || uploads.length === 0}>
-            {busy ? "Processing…" : "Process all uploads"}
+            {busy ? "Processing…" : processed ? "Processed ✓" : "Process all uploads"}
           </Button>
-          {processResult && (
-            <div className="mt-3 text-sm text-muted-foreground">
-              {HUB_ORDER.map((k) => (
-                <div key={k}>
-                  {LIST_LABELS[k]}: {processResult[k] ?? 0}
-                </div>
-              ))}
-              <button onClick={onProcessed} className="mt-2 text-sm font-medium text-primary hover:underline">
-                Go to Hub →
-              </button>
-            </div>
+          {processed && processResult && (
+            <p className="mt-3 text-sm text-muted-foreground">
+              Done — see the breakdown on the{" "}
+              <button onClick={onProcessed} className="font-medium text-primary hover:underline">
+                Database Breakdown
+              </button>{" "}
+              tab.
+            </p>
           )}
         </div>
       </Card>
@@ -697,9 +704,20 @@ function ReviewTab({ clientId }: { clientId: string }) {
   const rowRefs = useMemo(() => new Map<string, HTMLTableRowElement>(), []);
 
   useEffect(() => {
-    setLoading(true);
     setSearch("");
     setJumpTo(null);
+
+    // "Final Combined List" gets its own dedicated Full Contact / Needs Data
+    // component below (FinalCombinedListStep) instead of the generic table -
+    // it fetches its own data, so skip the generic fetch entirely here.
+    if (step.key === "final_full_contact") {
+      setContacts([]);
+      setLoading(false);
+      setLeftOffId(null);
+      return;
+    }
+
+    setLoading(true);
     const request =
       step.kind === "review"
         ? Promise.all(step.lists.map((l) => getSoiReviewCandidates({ data: { clientId, listAssignment: l } })))
@@ -777,39 +795,208 @@ function ReviewTab({ clientId }: { clientId: string }) {
           </button>
         ))}
       </div>
-      <p className="mt-3 text-sm text-muted-foreground">
-        {contacts.length} contact{contacts.length === 1 ? "" : "s"} on this list. {step.description}
-      </p>
-
-      {leftOffContact && (
-        <div className="mt-3 flex flex-wrap items-center justify-between gap-3 rounded-2xl border border-border bg-background/40 px-4 py-3">
-          <p className="text-sm text-muted-foreground">
-            You left off around{" "}
-            <span className="font-semibold text-foreground">
-              {leftOffContact.first_name} {leftOffContact.last_name}
-            </span>{" "}
-            last time.
+      {step.key === "final_full_contact" ? (
+        <FinalCombinedListStep clientId={clientId} />
+      ) : (
+        <>
+          <p className="mt-3 text-sm text-muted-foreground">
+            {contacts.length} contact{contacts.length === 1 ? "" : "s"} on this list. {step.description}
           </p>
+
+          {leftOffContact && (
+            <div className="mt-3 flex flex-wrap items-center justify-between gap-3 rounded-2xl border border-border bg-background/40 px-4 py-3">
+              <p className="text-sm text-muted-foreground">
+                You left off around{" "}
+                <span className="font-semibold text-foreground">
+                  {leftOffContact.first_name} {leftOffContact.last_name}
+                </span>{" "}
+                last time.
+              </p>
+              <div className="flex gap-2">
+                <Button onClick={() => setJumpTo(leftOffContact.id)}>Jump back there</Button>
+                <Button variant="secondary" onClick={() => setLeftOffId(null)}>
+                  Start from the top
+                </Button>
+              </div>
+            </div>
+          )}
+
+          <input
+            value={search}
+            onChange={(e) => setSearch(e.target.value)}
+            placeholder="Search name, email, or phone…"
+            className="mt-4 w-full max-w-md rounded-2xl border border-border bg-background px-4 py-2.5 text-sm outline-none ring-ring transition focus:ring-2"
+          />
+
+          <Card className="mt-4">
+            {loading ? (
+              <p className="text-sm text-muted-foreground">Loading…</p>
+            ) : (
+              <div className="overflow-x-auto">
+                <table className="w-full text-sm">
+                  <thead>
+                    <tr className="text-left text-muted-foreground">
+                      <th className="pb-2">First name</th>
+                      <th className="pb-2">Last name</th>
+                      <th className="pb-2">Email</th>
+                      <th className="pb-2">Phone</th>
+                      <th className="pb-2">City</th>
+                      {showListColumn && <th className="pb-2">List</th>}
+                      {editable && (
+                        <th className="pb-2">
+                          <label className="flex items-center gap-1.5">
+                            <input type="checkbox" checked={allChecked} onChange={(e) => toggleAll(e.target.checked)} />
+                            {step.optOut ? "Remove all" : "Keep all"}
+                          </label>
+                        </th>
+                      )}
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {filtered.map((c) => (
+                      <tr
+                        key={c.id}
+                        ref={(el) => {
+                          if (el) rowRefs.set(c.id, el);
+                          else rowRefs.delete(c.id);
+                        }}
+                        className={`border-t border-border ${c.id === leftOffId ? "bg-secondary/40" : ""}`}
+                      >
+                        <td className="py-2">{c.first_name}</td>
+                        <td className="py-2">{c.last_name}</td>
+                        <td className="py-2">{c.email}</td>
+                        <td className="py-2">{c.phone}</td>
+                        <td className="py-2">{c.city}</td>
+                        {showListColumn && (
+                          <td className="py-2">
+                            <span className="rounded-full bg-muted px-2.5 py-1 text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+                              {LIST_LABELS[c.list_assignment ?? ""] ?? c.list_assignment}
+                            </span>
+                          </td>
+                        )}
+                        {editable && (
+                          <td className="py-2">
+                            <input
+                              type="checkbox"
+                              checked={c.flagged}
+                              onChange={(e) => toggle(c.id, e.target.checked)}
+                            />
+                          </td>
+                        )}
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+                {filtered.length === 0 && (
+                  <p className="text-sm text-muted-foreground">
+                    {contacts.length === 0 ? "Nobody on this list." : "No matches for that search."}
+                  </p>
+                )}
+              </div>
+            )}
+          </Card>
+        </>
+      )}
+    </div>
+  );
+}
+
+// Type of one entry in exportSoiList's `contacts` array (used by the
+// needs_data_list / needs_data_download scopes) - pulled from exportSoiList's
+// own return type instead of hand-duplicated, so this can never drift out of
+// sync with what the server function actually returns.
+type NeedsDataContact = NonNullable<Awaited<ReturnType<typeof exportSoiList>>["contacts"]>[number];
+
+function FinalCombinedListStep({ clientId }: { clientId: string }) {
+  const [view, setView] = useState<"summary" | "select">("summary");
+  const [fullContactCount, setFullContactCount] = useState<number | null>(null);
+  const [needsData, setNeedsData] = useState<NeedsDataContact[] | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [downloading, setDownloading] = useState<string | null>(null);
+  const [search, setSearch] = useState("");
+
+  useEffect(() => {
+    setView("summary");
+    setLoading(true);
+    Promise.all([
+      getSoiListView({ data: { clientId, view: "final_full_contact" } }),
+      exportSoiList({ data: { clientId, scope: "needs_data_list" } }),
+    ])
+      .then(([fullContact, needs]) => {
+        setFullContactCount(fullContact.length);
+        setNeedsData(needs.contacts ?? []);
+      })
+      .finally(() => setLoading(false));
+  }, [clientId]);
+
+  async function downloadCsv(scope: string) {
+    setDownloading(scope);
+    try {
+      const result = await exportSoiList({ data: { clientId, scope } });
+      for (const [name, content] of Object.entries(result.files ?? {})) {
+        const blob = new Blob([content], { type: "text/csv" });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = name;
+        a.click();
+        URL.revokeObjectURL(url);
+      }
+    } finally {
+      setDownloading(null);
+    }
+  }
+
+  async function toggleSelected(contactId: string, next: boolean) {
+    setNeedsData((cur) => (cur ? cur.map((c) => (c.id === contactId ? { ...c, already_selected: next } : c)) : cur));
+    await setSoiReviewFlag({ data: { clientId, contactId, reviewType: "datazap_append", flagged: next } });
+  }
+
+  if (loading || !needsData) {
+    return (
+      <Card className="mt-4">
+        <p className="text-sm text-muted-foreground">Loading…</p>
+      </Card>
+    );
+  }
+
+  if (view === "select") {
+    const q = search.trim().toLowerCase();
+    const filtered = q
+      ? needsData.filter((c) =>
+          [c.first_name, c.last_name, c.email, c.phone].some((v) => (v ?? "").toLowerCase().includes(q)),
+        )
+      : needsData;
+    const selectedCount = needsData.filter((c) => c.already_selected).length;
+    return (
+      <div className="mt-4">
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <div>
+            <h2 className="font-display text-lg font-semibold">Needs Data — select who to research</h2>
+            <p className="mt-1 text-sm text-muted-foreground">
+              Datazap charges per contact appended, so check off only the people worth paying to research.{" "}
+              {selectedCount} selected.
+            </p>
+          </div>
           <div className="flex gap-2">
-            <Button onClick={() => setJumpTo(leftOffContact.id)}>Jump back there</Button>
-            <Button variant="secondary" onClick={() => setLeftOffId(null)}>
-              Start from the top
+            <Button variant="secondary" onClick={() => setView("summary")}>
+              ← Back
+            </Button>
+            <Button
+              onClick={() => downloadCsv("needs_data_download")}
+              disabled={downloading === "needs_data_download" || selectedCount === 0}
+            >
+              {downloading === "needs_data_download" ? "Preparing…" : "Download selected for Datazap"}
             </Button>
           </div>
         </div>
-      )}
-
-      <input
-        value={search}
-        onChange={(e) => setSearch(e.target.value)}
-        placeholder="Search name, email, or phone…"
-        className="mt-4 w-full max-w-md rounded-2xl border border-border bg-background px-4 py-2.5 text-sm outline-none ring-ring transition focus:ring-2"
-      />
-
-      <Card className="mt-4">
-        {loading ? (
-          <p className="text-sm text-muted-foreground">Loading…</p>
-        ) : (
+        <input
+          value={search}
+          onChange={(e) => setSearch(e.target.value)}
+          placeholder="Search name, email, or phone…"
+          className="mt-4 w-full max-w-md rounded-2xl border border-border bg-background px-4 py-2.5 text-sm outline-none ring-ring transition focus:ring-2"
+        />
+        <Card className="mt-4">
           <div className="overflow-x-auto">
             <table className="w-full text-sm">
               <thead>
@@ -818,56 +1005,70 @@ function ReviewTab({ clientId }: { clientId: string }) {
                   <th className="pb-2">Last name</th>
                   <th className="pb-2">Email</th>
                   <th className="pb-2">Phone</th>
-                  <th className="pb-2">City</th>
-                  {showListColumn && <th className="pb-2">List</th>}
-                  {editable && (
-                    <th className="pb-2">
-                      <label className="flex items-center gap-1.5">
-                        <input type="checkbox" checked={allChecked} onChange={(e) => toggleAll(e.target.checked)} />
-                        {step.optOut ? "Remove all" : "Keep all"}
-                      </label>
-                    </th>
-                  )}
+                  <th className="pb-2">Missing</th>
+                  <th className="pb-2">Select</th>
                 </tr>
               </thead>
               <tbody>
                 {filtered.map((c) => (
-                  <tr
-                    key={c.id}
-                    ref={(el) => {
-                      if (el) rowRefs.set(c.id, el);
-                      else rowRefs.delete(c.id);
-                    }}
-                    className={`border-t border-border ${c.id === leftOffId ? "bg-secondary/40" : ""}`}
-                  >
+                  <tr key={c.id} className="border-t border-border">
                     <td className="py-2">{c.first_name}</td>
                     <td className="py-2">{c.last_name}</td>
                     <td className="py-2">{c.email}</td>
                     <td className="py-2">{c.phone}</td>
-                    <td className="py-2">{c.city}</td>
-                    {showListColumn && (
-                      <td className="py-2">
-                        <span className="rounded-full bg-muted px-2.5 py-1 text-xs font-semibold uppercase tracking-wide text-muted-foreground">
-                          {LIST_LABELS[c.list_assignment ?? ""] ?? c.list_assignment}
-                        </span>
-                      </td>
-                    )}
-                    {editable && (
-                      <td className="py-2">
-                        <input type="checkbox" checked={c.flagged} onChange={(e) => toggle(c.id, e.target.checked)} />
-                      </td>
-                    )}
+                    <td className="py-2">
+                      <span className="rounded-full bg-muted px-2.5 py-1 text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+                        {c.missing.join(", ") || "—"}
+                      </span>
+                    </td>
+                    <td className="py-2">
+                      <input
+                        type="checkbox"
+                        checked={c.already_selected}
+                        onChange={(e) => toggleSelected(c.id, e.target.checked)}
+                      />
+                    </td>
                   </tr>
                 ))}
               </tbody>
             </table>
             {filtered.length === 0 && (
               <p className="text-sm text-muted-foreground">
-                {contacts.length === 0 ? "Nobody on this list." : "No matches for that search."}
+                {needsData.length === 0 ? "Nobody needs more data." : "No matches for that search."}
               </p>
             )}
           </div>
-        )}
+        </Card>
+      </div>
+    );
+  }
+
+  return (
+    <div className="mt-4 grid gap-4 sm:grid-cols-2">
+      <Card>
+        <h2 className="font-display text-lg font-semibold">Full Contact</h2>
+        <p className="mt-1 text-sm text-muted-foreground">
+          Everyone who made it through review with a complete record — ready to use.
+        </p>
+        <p className="mt-3 font-display text-3xl font-bold">{fullContactCount ?? 0}</p>
+        <div className="mt-4">
+          <Button onClick={() => downloadCsv("final_full_contact")} disabled={downloading === "final_full_contact"}>
+            {downloading === "final_full_contact" ? "Preparing…" : "Download"}
+          </Button>
+        </div>
+      </Card>
+      <Card>
+        <h2 className="font-display text-lg font-semibold">Needs Data</h2>
+        <p className="mt-1 text-sm text-muted-foreground">
+          Survived review but missing at least one field. Datazap charges per contact appended, so pick exactly who's
+          worth paying to research rather than sending everyone.
+        </p>
+        <p className="mt-3 font-display text-3xl font-bold">{needsData.length}</p>
+        <div className="mt-4">
+          <Button variant="secondary" onClick={() => setView("select")}>
+            Review &amp; select →
+          </Button>
+        </div>
       </Card>
     </div>
   );

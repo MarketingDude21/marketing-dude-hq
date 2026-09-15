@@ -28,6 +28,16 @@ import { requireSupabaseAuth } from "@/integrations/supabase/auth-middleware";
 //   SOI_SUPABASE_URL                  = https://xoqrupoygkhkpobeekjz.supabase.co
 //   SOI_SUPABASE_SERVICE_ROLE_KEY     = (the service_role key from that
 //                                        project's Settings -> API)
+//
+// Auto-provisioning: the first time someone with no existing team_members or
+// client_access row opens Build My Database, provisionSoiClient() creates a
+// SOI Builder client for them automatically (see below) - signing into the
+// dashboard IS the onboarding step now, no separate manual "invite client"
+// action needed for a normal client. IMPORTANT: this treats anyone unknown
+// to SOI Builder as a new CLIENT. If Mike ever adds a new team member, add
+// their team_members row in SOI Builder first (Supabase Studio) BEFORE they
+// ever open Build My Database in the dashboard, or they'll be auto-enrolled
+// as a client instead.
 // ============================================================================
 
 function getSoiAdminClient(): SupabaseClient {
@@ -43,10 +53,7 @@ function getSoiAdminClient(): SupabaseClient {
   });
 }
 
-export type SoiAccess =
-  | { role: "team" }
-  | { role: "client"; clientId: string; clientName: string }
-  | { role: "none" };
+export type SoiAccess = { role: "team" } | { role: "client"; clientId: string; clientName: string } | { role: "none" };
 
 // Resolves the currently logged-in dashboard user's role in SOI Builder by
 // email. Nothing here bypasses SOI Builder's own access rules - it just
@@ -86,11 +93,7 @@ async function resolveAccessForEmail(admin: SupabaseClient, email: string): Prom
     .eq("user_id", matchedUserId)
     .maybeSingle();
   if (accessRow) {
-    const { data: clientRow } = await admin
-      .from("clients")
-      .select("name")
-      .eq("id", accessRow.client_id)
-      .maybeSingle();
+    const { data: clientRow } = await admin.from("clients").select("name").eq("id", accessRow.client_id).maybeSingle();
     return { role: "client", clientId: accessRow.client_id, clientName: clientRow?.name ?? "Your database" };
   }
 
@@ -104,6 +107,99 @@ export const getSoiAccess = createServerFn({ method: "GET" })
     if (!email) return { role: "none" };
     const admin = getSoiAdminClient();
     return resolveAccessForEmail(admin, email);
+  });
+
+function randomSoiPassword(): string {
+  const chars = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghjkmnpqrstuvwxyz23456789";
+  let out = "";
+  for (let i = 0; i < 24; i++) out += chars[Math.floor(Math.random() * chars.length)];
+  return out;
+}
+
+// Auto-provisions a brand-new SOI Builder client the moment someone who
+// isn't already a team member or client there opens Build My Database.
+// Previously a team member had to run the old app's "invite client" flow by
+// hand, one person at a time, before that person could see anything here.
+// Mike's requirement: signing into the unified dashboard IS the client
+// onboarding now, so this has to happen automatically, not as a separate
+// manual step. This does the same two things invite-client always did
+// (create their SOI Builder login, link it to a client record) but from a
+// trusted server context on the dashboard's behalf, since the person
+// arriving here is a brand-new client, not yet a team member with a bearer
+// token invite-client could authenticate.
+export const provisionSoiClient = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .handler(async ({ context }): Promise<SoiAccess> => {
+    const email = (context.claims as { email?: string } | undefined)?.email;
+    if (!email) return { role: "none" };
+    const admin = getSoiAdminClient();
+
+    // Re-check fresh, right before creating anything - never provision over
+    // an existing team_members or client_access row, and safe to call more
+    // than once (e.g. a page refresh mid-provisioning) without duplicating.
+    const existing = await resolveAccessForEmail(admin, email);
+    if (existing.role !== "none") return existing;
+
+    const cleanEmail = email.toLowerCase().trim();
+
+    // A friendlier client name than the raw email, pulled from this same
+    // person's dashboard profile (Voice DNA's agents.full_name) when they
+    // have one set - SOI Builder's own `clients` table has no email column
+    // to look this up by, so there's nothing to borrow from over there.
+    let clientName = cleanEmail;
+    try {
+      const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+      const { data: agentRow } = await supabaseAdmin
+        .from("agents")
+        .select("full_name")
+        .eq("id", context.userId)
+        .maybeSingle();
+      if (agentRow?.full_name) clientName = agentRow.full_name;
+    } catch {
+      // Non-fatal - fall back to using the email as the client name.
+    }
+
+    // Create their SOI Builder login. They'll never actually sign in with
+    // it directly - the dashboard session is what grants access now - so
+    // the password is random and thrown away immediately.
+    let soiUserId: string | undefined;
+    const created = await admin.auth.admin.createUser({
+      email: cleanEmail,
+      password: randomSoiPassword(),
+      email_confirm: true,
+    });
+    if (!created.error) {
+      soiUserId = created.data.user?.id;
+    } else {
+      // Already exists over there under this email but somehow has neither
+      // a team_members nor client_access row (resolveAccessForEmail just
+      // checked and found none) - look the account up rather than failing.
+      for (let page = 1; ; page++) {
+        const { data, error } = await admin.auth.admin.listUsers({ page, perPage: 1000 });
+        if (error) throw error;
+        const found = data.users.find((u) => (u.email ?? "").toLowerCase() === cleanEmail);
+        if (found) {
+          soiUserId = found.id;
+          break;
+        }
+        if (data.users.length < 1000) break;
+      }
+    }
+    if (!soiUserId) throw new Error("Could not create your Build My Database account.");
+
+    const { data: clientRow, error: clientErr } = await admin
+      .from("clients")
+      .insert({ name: clientName })
+      .select("id, name")
+      .single();
+    if (clientErr) throw clientErr;
+
+    const { error: accessErr } = await admin
+      .from("client_access")
+      .upsert({ user_id: soiUserId, client_id: clientRow.id }, { onConflict: "user_id,client_id" });
+    if (accessErr) throw accessErr;
+
+    return { role: "client", clientId: clientRow.id, clientName: clientRow.name ?? clientName };
   });
 
 // Team members manage multiple clients - the picker list for that view.
@@ -142,7 +238,7 @@ async function requireClientAccess(
 
 export const listSoiUploads = createServerFn({ method: "GET" })
   .middleware([requireSupabaseAuth])
-  .inputValidator((data: { clientId: string }) => data)
+  .validator((data: { clientId: string }) => data)
   .handler(async ({ data, context }) => {
     const admin = getSoiAdminClient();
     const email = (context.claims as { email?: string } | undefined)?.email;
@@ -158,14 +254,9 @@ export const listSoiUploads = createServerFn({ method: "GET" })
 
 export const uploadSoiFile = createServerFn({ method: "POST" })
   .middleware([requireSupabaseAuth])
-  .inputValidator(
-    (data: {
-      clientId: string;
-      fileName: string;
-      sourceLabel: string;
-      kind: "vcf" | "mapped_csv";
-      content: string;
-    }) => data,
+  .validator(
+    (data: { clientId: string; fileName: string; sourceLabel: string; kind: "vcf" | "mapped_csv"; content: string }) =>
+      data,
   )
   .handler(async ({ data, context }) => {
     const admin = getSoiAdminClient();
@@ -198,7 +289,7 @@ export const uploadSoiFile = createServerFn({ method: "POST" })
 
 export const deleteSoiUpload = createServerFn({ method: "POST" })
   .middleware([requireSupabaseAuth])
-  .inputValidator((data: { clientId: string; uploadId: string }) => data)
+  .validator((data: { clientId: string; uploadId: string }) => data)
   .handler(async ({ data, context }) => {
     const admin = getSoiAdminClient();
     const email = (context.claims as { email?: string } | undefined)?.email;
@@ -226,7 +317,7 @@ export const deleteSoiUpload = createServerFn({ method: "POST" })
 
 export const processSoiUploads = createServerFn({ method: "POST" })
   .middleware([requireSupabaseAuth])
-  .inputValidator((data: { clientId: string }) => data)
+  .validator((data: { clientId: string }) => data)
   .handler(async ({ data, context }) => {
     const admin = getSoiAdminClient();
     const email = (context.claims as { email?: string } | undefined)?.email;
@@ -267,7 +358,7 @@ const HUB_LISTS = [
 
 export const getSoiHubCounts = createServerFn({ method: "GET" })
   .middleware([requireSupabaseAuth])
-  .inputValidator((data: { clientId: string }) => data)
+  .validator((data: { clientId: string }) => data)
   .handler(async ({ data, context }) => {
     const admin = getSoiAdminClient();
     const email = (context.claims as { email?: string } | undefined)?.email;
@@ -292,7 +383,9 @@ export const getSoiHubCounts = createServerFn({ method: "GET" })
 // safe - it doesn't change how any contact is classified.
 export const getSoiReviewCandidates = createServerFn({ method: "GET" })
   .middleware([requireSupabaseAuth])
-  .inputValidator((data: { clientId: string; listAssignment: "direct_mail" | "email_phone" | "email_list" | "incomplete" }) => data)
+  .validator(
+    (data: { clientId: string; listAssignment: "direct_mail" | "email_phone" | "email_list" | "incomplete" }) => data,
+  )
   .handler(async ({ data, context }) => {
     const admin = getSoiAdminClient();
     const email = (context.claims as { email?: string } | undefined)?.email;
@@ -328,7 +421,7 @@ export const getSoiReviewCandidates = createServerFn({ method: "GET" })
 
 export const setSoiReviewFlag = createServerFn({ method: "POST" })
   .middleware([requireSupabaseAuth])
-  .inputValidator((data: { clientId: string; contactId: string; reviewType: string; flagged: boolean }) => data)
+  .validator((data: { clientId: string; contactId: string; reviewType: string; flagged: boolean }) => data)
   .handler(async ({ data, context }) => {
     const admin = getSoiAdminClient();
     const email = (context.claims as { email?: string } | undefined)?.email;
@@ -350,7 +443,12 @@ export const setSoiReviewFlag = createServerFn({ method: "POST" })
     const { error } = await admin
       .from("review_flags")
       .upsert(
-        { contact_id: data.contactId, review_type: data.reviewType, flagged: data.flagged, flagged_by: email ?? "unknown" },
+        {
+          contact_id: data.contactId,
+          review_type: data.reviewType,
+          flagged: data.flagged,
+          flagged_by: email ?? "unknown",
+        },
         { onConflict: "contact_id,review_type" },
       );
     if (error) throw error;
@@ -359,7 +457,7 @@ export const setSoiReviewFlag = createServerFn({ method: "POST" })
 
 export const exportSoiList = createServerFn({ method: "POST" })
   .middleware([requireSupabaseAuth])
-  .inputValidator((data: { clientId: string; scope: string }) => data)
+  .validator((data: { clientId: string; scope: string }) => data)
   .handler(async ({ data, context }) => {
     const admin = getSoiAdminClient();
     const email = (context.claims as { email?: string } | undefined)?.email;

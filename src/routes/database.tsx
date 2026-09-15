@@ -11,6 +11,7 @@ import {
   processSoiUploads,
   getSoiHubCounts,
   getSoiReviewCandidates,
+  getSoiListView,
   setSoiReviewFlag,
   exportSoiList,
   type SoiAccess,
@@ -51,14 +52,14 @@ const HUB_ORDER = [
 ] as const;
 
 // direct_mail/email_phone: opt-OUT (checking = remove). email_list/incomplete: opt-IN (checking = keep).
-// Review is organized the same way the original SOI Builder review flow was:
-// direct_mail + email_phone are reviewed TOGETHER as one "most complete data"
-// step (matching the same "complete" grouping the Export tab already uses),
-// each row tagged with which list it's actually in.
+// This whole tab bar matches the original SOI Builder app's own review flow
+// tab-for-tab: 3 editable review steps, then read-only browsable lists for
+// everything else the old app also let you look through (not just download).
 const REVIEW_STEPS = [
   {
     key: "complete",
     label: "Your Most Complete Data",
+    kind: "review" as const,
     lists: ["direct_mail", "email_phone"] as const,
     optOut: true,
     description:
@@ -67,6 +68,7 @@ const REVIEW_STEPS = [
   {
     key: "email_list",
     label: "Email List",
+    kind: "review" as const,
     lists: ["email_list"] as const,
     optOut: false,
     description: "Everyone else with a usable email. Check off anyone you actually know and want to keep.",
@@ -74,9 +76,40 @@ const REVIEW_STEPS = [
   {
     key: "incomplete",
     label: "Incomplete",
+    kind: "review" as const,
     lists: ["incomplete"] as const,
     optOut: false,
     description: "Missing enough info to sort automatically. Check off anyone you actually know and want to keep.",
+  },
+  {
+    key: "final_full_contact",
+    label: "Final Combined List",
+    kind: "view" as const,
+    description: "Everyone who made it through review with a complete record — ready to use.",
+  },
+  {
+    key: "nonqualified",
+    label: "Nonqualified",
+    kind: "view" as const,
+    description: "Didn't qualify for any list.",
+  },
+  {
+    key: "facebook_audience",
+    label: "Facebook Audience",
+    kind: "view" as const,
+    description: "Everyone with an email or phone, excluding realtors and businesses.",
+  },
+  {
+    key: "realtor_excluded",
+    label: "Realtors",
+    kind: "view" as const,
+    description: "Excluded as fellow real estate agents, not clients.",
+  },
+  {
+    key: "business_excluded",
+    label: "Businesses",
+    kind: "view" as const,
+    description: "Excluded as businesses, not individuals.",
   },
 ] as const;
 
@@ -548,23 +581,55 @@ type ReviewContact = {
   flagged: boolean;
 };
 
+function positionKey(clientId: string, stepKey: string): string {
+  return `soi-review-position:${clientId}:${stepKey}`;
+}
+
 function ReviewTab({ clientId }: { clientId: string }) {
   const [stepKey, setStepKey] = useState<(typeof REVIEW_STEPS)[number]["key"]>("complete");
   const step = REVIEW_STEPS.find((s) => s.key === stepKey) ?? REVIEW_STEPS[0];
+  const editable = step.kind === "review";
   const [contacts, setContacts] = useState<ReviewContact[]>([]);
   const [loading, setLoading] = useState(true);
   const [search, setSearch] = useState("");
+  const [leftOffId, setLeftOffId] = useState<string | null>(null);
+  const [jumpTo, setJumpTo] = useState<string | null>(null);
+  const rowRefs = useMemo(() => new Map<string, HTMLTableRowElement>(), []);
 
   useEffect(() => {
     setLoading(true);
     setSearch("");
-    Promise.all(step.lists.map((l) => getSoiReviewCandidates({ data: { clientId, listAssignment: l } })))
-      .then((results) => setContacts(results.flat()))
-      .finally(() => setLoading(false));
+    setJumpTo(null);
+    const request =
+      step.kind === "review"
+        ? Promise.all(step.lists.map((l) => getSoiReviewCandidates({ data: { clientId, listAssignment: l } })))
+        : getSoiListView({ data: { clientId, view: step.key } }).then((rows) => [
+            rows.map((r) => ({ ...r, flagged: false })),
+          ]);
+    request.then((results) => setContacts(results.flat())).finally(() => setLoading(false));
+
+    if (step.kind === "review") {
+      try {
+        setLeftOffId(localStorage.getItem(positionKey(clientId, step.key)));
+      } catch {
+        setLeftOffId(null);
+      }
+    } else {
+      setLeftOffId(null);
+    }
   }, [clientId, step]);
+
+  function savePosition(contactId: string) {
+    try {
+      localStorage.setItem(positionKey(clientId, step.key), contactId);
+    } catch {
+      // Browser storage isn't available - resume just won't be offered next time.
+    }
+  }
 
   async function toggle(contactId: string, next: boolean) {
     setContacts((cs) => cs.map((c) => (c.id === contactId ? { ...c, flagged: next } : c)));
+    savePosition(contactId);
     await setSoiReviewFlag({ data: { clientId, contactId, reviewType: "primary", flagged: next } });
   }
 
@@ -583,6 +648,19 @@ function ReviewTab({ clientId }: { clientId: string }) {
       )
     : contacts;
   const allChecked = filtered.length > 0 && filtered.every((c) => c.flagged);
+  const showListColumn =
+    step.kind === "review"
+      ? step.lists.length > 1
+      : step.key === "final_full_contact" || step.key === "facebook_audience";
+  const leftOffContact = leftOffId ? contacts.find((c) => c.id === leftOffId) : undefined;
+
+  useEffect(() => {
+    if (!jumpTo) return;
+    const row = rowRefs.get(jumpTo);
+    if (row) row.scrollIntoView({ behavior: "smooth", block: "center" });
+    setJumpTo(null);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [jumpTo]);
 
   return (
     <div>
@@ -602,6 +680,24 @@ function ReviewTab({ clientId }: { clientId: string }) {
       <p className="mt-3 text-sm text-muted-foreground">
         {contacts.length} contact{contacts.length === 1 ? "" : "s"} on this list. {step.description}
       </p>
+
+      {leftOffContact && (
+        <div className="mt-3 flex flex-wrap items-center justify-between gap-3 rounded-2xl border border-border bg-background/40 px-4 py-3">
+          <p className="text-sm text-muted-foreground">
+            You left off around{" "}
+            <span className="font-semibold text-foreground">
+              {leftOffContact.first_name} {leftOffContact.last_name}
+            </span>{" "}
+            last time.
+          </p>
+          <div className="flex gap-2">
+            <Button onClick={() => setJumpTo(leftOffContact.id)}>Jump back there</Button>
+            <Button variant="secondary" onClick={() => setLeftOffId(null)}>
+              Start from the top
+            </Button>
+          </div>
+        </div>
+      )}
 
       <input
         value={search}
@@ -623,33 +719,44 @@ function ReviewTab({ clientId }: { clientId: string }) {
                   <th className="pb-2">Email</th>
                   <th className="pb-2">Phone</th>
                   <th className="pb-2">City</th>
-                  {step.lists.length > 1 && <th className="pb-2">List</th>}
-                  <th className="pb-2">
-                    <label className="flex items-center gap-1.5">
-                      <input type="checkbox" checked={allChecked} onChange={(e) => toggleAll(e.target.checked)} />
-                      {step.optOut ? "Remove all" : "Keep all"}
-                    </label>
-                  </th>
+                  {showListColumn && <th className="pb-2">List</th>}
+                  {editable && (
+                    <th className="pb-2">
+                      <label className="flex items-center gap-1.5">
+                        <input type="checkbox" checked={allChecked} onChange={(e) => toggleAll(e.target.checked)} />
+                        {step.optOut ? "Remove all" : "Keep all"}
+                      </label>
+                    </th>
+                  )}
                 </tr>
               </thead>
               <tbody>
                 {filtered.map((c) => (
-                  <tr key={c.id} className="border-t border-border">
+                  <tr
+                    key={c.id}
+                    ref={(el) => {
+                      if (el) rowRefs.set(c.id, el);
+                      else rowRefs.delete(c.id);
+                    }}
+                    className={`border-t border-border ${c.id === leftOffId ? "bg-secondary/40" : ""}`}
+                  >
                     <td className="py-2">{c.first_name}</td>
                     <td className="py-2">{c.last_name}</td>
                     <td className="py-2">{c.email}</td>
                     <td className="py-2">{c.phone}</td>
                     <td className="py-2">{c.city}</td>
-                    {step.lists.length > 1 && (
+                    {showListColumn && (
                       <td className="py-2">
                         <span className="rounded-full bg-muted px-2.5 py-1 text-xs font-semibold uppercase tracking-wide text-muted-foreground">
                           {LIST_LABELS[c.list_assignment ?? ""] ?? c.list_assignment}
                         </span>
                       </td>
                     )}
-                    <td className="py-2">
-                      <input type="checkbox" checked={c.flagged} onChange={(e) => toggle(c.id, e.target.checked)} />
-                    </td>
+                    {editable && (
+                      <td className="py-2">
+                        <input type="checkbox" checked={c.flagged} onChange={(e) => toggle(c.id, e.target.checked)} />
+                      </td>
+                    )}
                   </tr>
                 ))}
               </tbody>

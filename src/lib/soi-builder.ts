@@ -419,6 +419,107 @@ export const getSoiReviewCandidates = createServerFn({ method: "GET" })
     return contacts.map((c) => ({ ...c, flagged: flagsById.get(c.id) ?? false }));
   });
 
+type SoiContactRow = {
+  id: string;
+  first_name: string | null;
+  last_name: string | null;
+  email: string | null;
+  phone: string | null;
+  address: string | null;
+  city: string | null;
+  state: string | null;
+  zip: string | null;
+  notes: string | null;
+  sources: string[] | null;
+  list_assignment: string | null;
+};
+
+async function fetchContactsForList(
+  admin: SupabaseClient,
+  clientId: string,
+  listAssignment: string,
+): Promise<SoiContactRow[]> {
+  const { data, error } = await admin
+    .from("contacts")
+    .select("id, first_name, last_name, email, phone, address, city, state, zip, notes, sources, list_assignment")
+    .eq("client_id", clientId)
+    .eq("list_assignment", listAssignment)
+    .order("last_name", { ascending: true });
+  if (error) throw error;
+  return data ?? [];
+}
+
+async function fetchFlagsById(
+  admin: SupabaseClient,
+  contactIds: string[],
+  reviewType: string,
+): Promise<Map<string, boolean>> {
+  const flagsById = new Map<string, boolean>();
+  if (!contactIds.length) return flagsById;
+  const { data, error } = await admin
+    .from("review_flags")
+    .select("contact_id, flagged")
+    .eq("review_type", reviewType)
+    .in("contact_id", contactIds);
+  if (error) throw error;
+  for (const f of data ?? []) flagsById.set(f.contact_id, f.flagged);
+  return flagsById;
+}
+
+// Browsable (read-only, no checkboxes) views the old app's tab bar showed
+// alongside the 3 review steps: the pure "everyone in this bucket" lists
+// (nonqualified/realtor_excluded/business_excluded), and two COMPUTED
+// populations that span multiple list_assignment values, matching the exact
+// same logic export-lists already uses for those two CSV scopes - safe to
+// mirror here since these are read-only, nothing is reclassified.
+export const getSoiListView = createServerFn({ method: "GET" })
+  .middleware([requireSupabaseAuth])
+  .validator(
+    (data: {
+      clientId: string;
+      view: "nonqualified" | "realtor_excluded" | "business_excluded" | "facebook_audience" | "final_full_contact";
+    }) => data,
+  )
+  .handler(async ({ data, context }): Promise<SoiContactRow[]> => {
+    const admin = getSoiAdminClient();
+    const email = (context.claims as { email?: string } | undefined)?.email;
+    await requireClientAccess(admin, email, data.clientId);
+
+    if (data.view === "nonqualified" || data.view === "realtor_excluded" || data.view === "business_excluded") {
+      return fetchContactsForList(admin, data.clientId, data.view);
+    }
+
+    if (data.view === "facebook_audience") {
+      // Same rule as export-lists' facebook_audience scope: everyone not
+      // realtor/business-excluded, with an email or phone to target with.
+      const lists = ["direct_mail", "email_phone", "email_list", "incomplete", "nonqualified"];
+      const groups = await Promise.all(lists.map((l) => fetchContactsForList(admin, data.clientId, l)));
+      return groups.flat().filter((c) => !!(c.email || c.phone));
+    }
+
+    // "final_full_contact" - same survivor + full-8-field rule export-lists
+    // uses for its matching CSV scope.
+    const reviewLists = ["direct_mail", "email_phone", "email_list", "incomplete"] as const;
+    const groups = await Promise.all(reviewLists.map((l) => fetchContactsForList(admin, data.clientId, l)));
+    const allContacts = groups.flat();
+    const flagsById = await fetchFlagsById(
+      admin,
+      allContacts.map((c) => c.id),
+      "primary",
+    );
+
+    function isSurvivor(c: SoiContactRow): boolean {
+      const flagged = flagsById.get(c.id) ?? false;
+      if (c.list_assignment === "direct_mail" || c.list_assignment === "email_phone") return !flagged;
+      if (c.list_assignment === "email_list" || c.list_assignment === "incomplete") return flagged;
+      return false;
+    }
+    function isFullContact(c: SoiContactRow): boolean {
+      return !!(c.first_name && c.last_name && c.email && c.phone && c.address && c.city && c.state && c.zip);
+    }
+    return allContacts.filter((c) => isSurvivor(c) && isFullContact(c));
+  });
+
 export const setSoiReviewFlag = createServerFn({ method: "POST" })
   .middleware([requireSupabaseAuth])
   .validator((data: { clientId: string; contactId: string; reviewType: string; flagged: boolean }) => data)

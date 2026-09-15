@@ -83,11 +83,8 @@ function LoginPage() {
       <AmbientBackground />
       <div className="relative z-10 mx-auto flex min-h-screen max-w-6xl flex-col items-center justify-center gap-10 px-6 py-16 lg:flex-row lg:gap-16">
         <div className="max-w-xl flex-1">
-          <Link to="/" className="flex items-center gap-3">
-            <BrandMark size="size-11" />
-            <span className="font-display text-xl font-semibold tracking-tight">
-              Your Marketing Dude
-            </span>
+          <Link to="/" aria-label="Your Marketing Dude home" className="inline-flex">
+            <BrandMark size="h-24 w-auto" />
           </Link>
           <h1 className="mt-8 font-display text-5xl font-bold leading-[0.98] tracking-tight md:text-6xl">
             Your marketing,

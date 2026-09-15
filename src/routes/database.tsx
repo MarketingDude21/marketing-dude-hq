@@ -454,19 +454,22 @@ function Workspace({ clientId }: { clientId: string }) {
   );
 }
 
+// Formats SheetJS can read directly, browser-side, with no server round trip.
+const SPREADSHEET_EXTENSIONS = [".xlsx", ".xls", ".xlsm", ".xlsb", ".ods", ".tsv"];
+
+type BatchItem = { file: File; status: "pending" | "uploading" | "done" | "error"; error?: string };
+
 function UploadTab({ clientId, onProcessed }: { clientId: string; onProcessed: () => void }) {
   const [uploads, setUploads] = useState<
     Array<{ id: string; file_name: string; source_label: string; status: string }>
   >([]);
-  // Files picked but not yet uploaded, in order. The one being mapped/
-  // uploaded right now is always the front of this queue — selecting
-  // several files at once (or dragging a batch in) queues all of them so
-  // the person doesn't have to reopen the file picker between each one.
-  const [fileQueue, setFileQueue] = useState<File[]>([]);
-  const pendingFile = fileQueue[0] ?? null;
-  const [sourceLabel, setSourceLabel] = useState("");
-  const [csvPreview, setCsvPreview] = useState<{ headers: string[]; rows: Record<string, string>[] } | null>(null);
-  const [mapping, setMapping] = useState<Record<string, string>>({});
+  // The current drag/pick batch and how far it's gotten — files upload
+  // automatically the moment they're picked (parsed, columns auto-matched,
+  // sent) with no per-file "confirm and click Upload" step, so a whole
+  // batch goes straight through to the Process step without stopping to
+  // ask for anything, matching how the old app worked.
+  const [batch, setBatch] = useState<BatchItem[]>([]);
+  const [batchRunning, setBatchRunning] = useState(false);
   const [busy, setBusy] = useState(false);
   const [processResult, setProcessResult] = useState<Record<string, number> | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -476,99 +479,68 @@ function UploadTab({ clientId, onProcessed }: { clientId: string; onProcessed: (
     refresh();
   }, [clientId]);
 
-  const isVcf = pendingFile?.name.toLowerCase().endsWith(".vcf");
-  // Formats SheetJS can read directly, browser-side, with no server round trip.
-  const SPREADSHEET_EXTENSIONS = [".xlsx", ".xls", ".xlsm", ".xlsb", ".ods", ".tsv"];
-
-  async function parseAndStage(file: File) {
-    setError(null);
-    setMapping({});
+  async function uploadOneFile(file: File): Promise<void> {
     const lowerName = file.name.toLowerCase();
-    let preview: { headers: string[]; rows: Record<string, string>[] } | null = null;
-    if (lowerName.endsWith(".vcf")) {
-      preview = null;
-    } else if (lowerName.endsWith(".numbers")) {
+    const sourceLabel = file.name.replace(/\.[^.]+$/, "");
+    if (lowerName.endsWith(".numbers")) {
       // Apple's .numbers format is a proprietary bundle, not a spreadsheet
       // format any browser-side library can parse — there's no safe way to
       // read this directly. Numbers itself exports to CSV/Excel in one click.
-      setError(
-        "Apple Numbers files (.numbers) can't be read directly. In Numbers, use File > Export To > CSV (or Excel), then upload that file instead.",
+      throw new Error(
+        "Apple Numbers files (.numbers) can't be read directly — use File > Export To > CSV (or Excel) in Numbers first.",
       );
-    } else if (SPREADSHEET_EXTENSIONS.some((ext) => lowerName.endsWith(ext))) {
+    }
+    if (lowerName.endsWith(".vcf")) {
+      const content = await fileToBase64(file);
+      await uploadSoiFile({ data: { clientId, fileName: file.name, sourceLabel, kind: "vcf", content } });
+      return;
+    }
+    let preview: { headers: string[]; rows: Record<string, string>[] };
+    if (SPREADSHEET_EXTENSIONS.some((ext) => lowerName.endsWith(ext))) {
       try {
         preview = await parseSpreadsheet(file);
       } catch {
-        setError("Couldn't read that file. Try re-saving/exporting it as a .csv and uploading that instead.");
+        throw new Error("Couldn't read that file — try re-saving/exporting it as a .csv instead.");
       }
     } else {
-      const text = await file.text();
-      preview = parseCsv(text);
+      preview = parseCsv(await file.text());
     }
-    setCsvPreview(preview);
-    // Pre-fill the mapping from recognizable column headers so a normal
-    // export doesn't require mapping every field by hand — see
-    // guessColumnMapping's comment above for what counts as "recognizable."
-    if (preview) setMapping(guessColumnMapping(preview.headers));
-    setSourceLabel(file.name.replace(/\.[^.]+$/, ""));
+    // Auto-match columns from the file's own headers (First Name, Email,
+    // etc.) — see guessColumnMapping's comment for what counts as
+    // recognizable. No manual mapping step; this is what lets a batch go
+    // straight through without stopping for each file.
+    const mapping = guessColumnMapping(preview.headers);
+    await uploadSoiFile({
+      data: {
+        clientId,
+        fileName: file.name,
+        sourceLabel,
+        kind: "mapped_csv",
+        content: JSON.stringify({ mapping, rows: preview.rows }),
+      },
+    });
   }
 
   async function handleFilesPicked(files: File[]) {
     if (files.length === 0) return;
-    // A fresh selection replaces whatever was queued before — picking again
-    // is treated as "here's my batch," not "add to the old one."
-    setFileQueue(files);
-    const first = files[0];
-    if (first) await parseAndStage(first);
-  }
-
-  async function handleUpload() {
-    if (!pendingFile) return;
-    setBusy(true);
     setError(null);
-    try {
-      if (isVcf) {
-        const content = await fileToBase64(pendingFile);
-        await uploadSoiFile({
-          data: {
-            clientId,
-            fileName: pendingFile.name,
-            sourceLabel: sourceLabel || pendingFile.name,
-            kind: "vcf",
-            content,
-          },
-        });
-      } else {
-        if (!csvPreview) throw new Error("No file parsed yet");
-        await uploadSoiFile({
-          data: {
-            clientId,
-            fileName: pendingFile.name,
-            sourceLabel: sourceLabel || pendingFile.name,
-            kind: "mapped_csv",
-            content: JSON.stringify({ mapping, rows: csvPreview.rows }),
-          },
-        });
+    const items: BatchItem[] = files.map((file) => ({ file, status: "pending" }));
+    setBatch(items);
+    setBatchRunning(true);
+    for (let i = 0; i < items.length; i++) {
+      const item = items[i];
+      if (!item) continue;
+      setBatch((cur) => cur.map((it, idx) => (idx === i ? { ...it, status: "uploading" } : it)));
+      try {
+        await uploadOneFile(item.file);
+        setBatch((cur) => cur.map((it, idx) => (idx === i ? { ...it, status: "done" } : it)));
+      } catch (e) {
+        const message = e instanceof Error ? e.message : String(e);
+        setBatch((cur) => cur.map((it, idx) => (idx === i ? { ...it, status: "error", error: message } : it)));
       }
-      await refresh();
-      // Move on to the next queued file automatically, so a multi-file
-      // batch doesn't require reopening the picker between each one — only
-      // the mapping step (which can genuinely differ file to file) still
-      // needs a look before each individual upload.
-      const rest = fileQueue.slice(1);
-      setFileQueue(rest);
-      setCsvPreview(null);
-      setMapping({});
-      const next = rest[0];
-      if (next) {
-        await parseAndStage(next);
-      } else {
-        setSourceLabel("");
-      }
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
-    } finally {
-      setBusy(false);
     }
+    setBatchRunning(false);
+    await refresh();
   }
 
   async function handleProcess() {
@@ -594,7 +566,9 @@ function UploadTab({ clientId, onProcessed }: { clientId: string; onProcessed: (
         </p>
         <label className="mt-4 flex cursor-pointer flex-col items-start gap-3 rounded-2xl border border-dashed border-border bg-background/40 px-5 py-6 transition-colors hover:bg-secondary/40 sm:flex-row sm:items-center sm:justify-between">
           <span className="text-sm text-muted-foreground">
-            {pendingFile ? pendingFile.name : "Drop one or more files here, or click to browse."}
+            {batchRunning
+              ? "Uploading…"
+              : "Drop one or more files here, or click to browse — they upload automatically."}
           </span>
           <span className="rounded-full bg-primary px-5 py-2 text-sm font-semibold text-primary-foreground shadow-lg shadow-primary/30 transition-transform hover:-translate-y-0.5">
             Choose files
@@ -607,52 +581,28 @@ function UploadTab({ clientId, onProcessed }: { clientId: string; onProcessed: (
             className="hidden"
           />
         </label>
-        {fileQueue.length > 1 && (
-          <p className="mt-2 text-xs text-muted-foreground">
-            File 1 of {fileQueue.length} in this batch — the rest will come up automatically after you upload this one.
-          </p>
-        )}
-        {pendingFile && (
-          <div className="mt-4 space-y-3">
-            <label className="block text-sm">
-              <span className="text-muted-foreground">Source label</span>
-              <input
-                value={sourceLabel}
-                onChange={(e) => setSourceLabel(e.target.value)}
-                className="mt-1 w-full rounded-xl border border-border bg-background px-3 py-2 text-sm"
-                placeholder="e.g. WiseAgent, Gmail, iPhone"
-              />
-            </label>
-            {csvPreview && (
-              <div className="space-y-2">
-                <p className="text-sm text-muted-foreground">
-                  We matched your columns automatically below — just check them over and fix anything that's wrong
-                  before uploading. (This only tells us which column is which; sorting contacts into lists happens
-                  after, when you click Process.)
-                </p>
-                {MAPPING_FIELDS.map((f) => (
-                  <label key={f.key} className="flex items-center justify-between gap-2 text-sm">
-                    <span>{f.label}</span>
-                    <select
-                      value={mapping[f.key] ?? ""}
-                      onChange={(e) => setMapping((m) => ({ ...m, [f.key]: e.target.value }))}
-                      className="rounded-lg border border-border bg-background px-2 py-1 text-sm"
-                    >
-                      <option value="">— none —</option>
-                      {csvPreview.headers.map((h) => (
-                        <option key={h} value={h}>
-                          {h}
-                        </option>
-                      ))}
-                    </select>
-                  </label>
-                ))}
-              </div>
-            )}
-            <Button onClick={handleUpload} disabled={busy}>
-              {busy ? "Uploading…" : fileQueue.length > 1 ? `Upload file (1 of ${fileQueue.length})` : "Upload file"}
-            </Button>
-          </div>
+        {batch.length > 0 && (
+          <ul className="mt-4 space-y-1.5">
+            {batch.map((item, idx) => (
+              <li key={idx} className="flex items-center justify-between gap-2 text-sm">
+                <span className="truncate">{item.file.name}</span>
+                <span
+                  className={
+                    item.status === "done"
+                      ? "text-xs font-medium text-primary"
+                      : item.status === "error"
+                        ? "text-xs font-medium text-destructive"
+                        : "text-xs text-muted-foreground"
+                  }
+                >
+                  {item.status === "pending" && "Waiting…"}
+                  {item.status === "uploading" && "Uploading…"}
+                  {item.status === "done" && "Uploaded ✓"}
+                  {item.status === "error" && (item.error ?? "Failed")}
+                </span>
+              </li>
+            ))}
+          </ul>
         )}
         {error && <p className="mt-3 text-sm text-destructive">{error}</p>}
       </Card>

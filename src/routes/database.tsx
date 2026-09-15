@@ -3,6 +3,7 @@ import { createFileRoute } from "@tanstack/react-router";
 import { AppShell } from "@/components/AppShell";
 import {
   getSoiAccess,
+  provisionSoiClient,
   listSoiClients,
   listSoiUploads,
   uploadSoiFile,
@@ -165,12 +166,17 @@ function DatabasePage() {
   useEffect(() => {
     getSoiAccess()
       .then(async (a) => {
-        setAccess(a);
-        if (a.role === "team") {
+        // First time anyone new opens this: auto-create their Build My
+        // Database client record right here, instead of showing a "not set
+        // up yet" message and waiting on a team member to do it by hand.
+        // Signing into the dashboard is the onboarding step now.
+        const resolved = a.role === "none" ? await provisionSoiClient() : a;
+        setAccess(resolved);
+        if (resolved.role === "team") {
           const list = await listSoiClients();
           setClients(list.map((c) => ({ id: c.id, name: c.name })));
-        } else if (a.role === "client") {
-          setSelected({ id: a.clientId, name: a.clientName });
+        } else if (resolved.role === "client") {
+          setSelected({ id: resolved.clientId, name: resolved.clientName });
         }
       })
       .catch((e) => setAccessError(e instanceof Error ? e.message : String(e)));
@@ -204,7 +210,8 @@ function DatabasePage() {
         <PageHeader />
         <Card className="mt-5">
           <p className="text-sm text-muted-foreground">
-            Your account isn't set up in Build My Database yet. Ask your team to add you as a client or team member.
+            We couldn't set up your Build My Database account automatically. Refresh and try again, or ask your team to
+            check your access.
           </p>
         </Card>
       </AppShell>

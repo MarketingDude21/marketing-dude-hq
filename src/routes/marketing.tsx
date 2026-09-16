@@ -120,6 +120,7 @@ function MarketingPage() {
   const [accessError, setAccessError] = useState<string | null>(null);
   const [agents, setAgents] = useState<AgentOption[]>([]);
   const [selected, setSelected] = useState<AgentOption | null>(null);
+  const [managingAgent, setManagingAgent] = useState<AgentOption | null>(null);
 
   useEffect(() => {
     getMarketingAccess()
@@ -170,6 +171,15 @@ function MarketingPage() {
     );
   }
 
+  if (access.role === "admin" && managingAgent) {
+    return (
+      <AppShell>
+        <PageHeader />
+        <ManageMonthsScreen agent={managingAgent} onBack={() => setManagingAgent(null)} />
+      </AppShell>
+    );
+  }
+
   if (access.role === "admin" && !selected) {
     return (
       <AppShell>
@@ -181,13 +191,20 @@ function MarketingPage() {
           </p>
           <div className="mt-4 grid gap-2 sm:grid-cols-2 lg:grid-cols-3">
             {agents.map((a) => (
-              <button
+              <div
                 key={a.id}
-                onClick={() => setSelected(a)}
-                className="rounded-2xl border border-border bg-glass px-4 py-3 text-left text-sm font-medium transition-colors hover:bg-secondary"
+                className="rounded-2xl border border-border bg-glass px-4 py-3 transition-colors hover:bg-secondary"
               >
-                {a.name}
-              </button>
+                <button onClick={() => setSelected(a)} className="block w-full text-left text-sm font-medium">
+                  {a.name}
+                </button>
+                <button
+                  onClick={() => setManagingAgent(a)}
+                  className="mt-1 text-xs font-semibold text-primary hover:underline"
+                >
+                  Manage months →
+                </button>
+              </div>
             ))}
             {agents.length === 0 && <p className="text-sm text-muted-foreground">No agents yet.</p>}
           </div>
@@ -1012,11 +1029,15 @@ function DriveTab({ agentId, isAdmin }: { agentId: string; isAdmin: boolean }) {
 // stays the source for clients already set up that way while a fully native
 // baseline-content editor is still on the roadmap.
 //
-// One shared screen for both admin-acting-as-agent and the agent's own
-// login — the "Send to Agent" button is the only thing gated on isAdmin.
+// Month-folder setup (add/remove) is a genuinely separate, admin-only step —
+// see ManageMonthsScreen, reached from the agent picker, never from inside
+// this tab. This tab itself is the same screen for admin-acting-as-agent and
+// the agent's own login: pick an already-set-up month, generate, review. The
+// "Send to Agent" button inside MonthWorkspace is the only thing here still
+// gated on isAdmin.
 // ============================================================================
 
-function ContentCalendarTab({ agentId, isAdmin }: { agentId: string; isAdmin: boolean }) {
+function ManageMonthsScreen({ agent, onBack }: { agent: AgentOption; onBack: () => void }) {
   const [folders, setFolders] = useState<ContentFolder[] | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [addOpen, setAddOpen] = useState(false);
@@ -1024,22 +1045,20 @@ function ContentCalendarTab({ agentId, isAdmin }: { agentId: string; isAdmin: bo
   const [newFolderId, setNewFolderId] = useState("");
   const [addBusy, setAddBusy] = useState(false);
   const [addError, setAddError] = useState<string | null>(null);
-  const [activeFolder, setActiveFolder] = useState<ContentFolder | null>(null);
   const [busyFolderId, setBusyFolderId] = useState<string | null>(null);
 
   function reload() {
     setFolders(null);
     setError(null);
-    listContentFolders({ data: { agentId } })
+    listContentFolders({ data: { agentId: agent.id } })
       .then((f) => setFolders(f))
       .catch((e) => setError(e instanceof Error ? e.message : String(e)));
   }
 
   useEffect(() => {
     reload();
-    setActiveFolder(null);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [agentId]);
+  }, [agent.id]);
 
   async function addFolder() {
     if (!newMonth.trim() || !newFolderId.trim()) {
@@ -1050,7 +1069,7 @@ function ContentCalendarTab({ agentId, isAdmin }: { agentId: string; isAdmin: bo
     setAddError(null);
     try {
       const res = await addContentFolder({
-        data: { agentId, month: newMonth.trim(), driveFolderId: newFolderId.trim() },
+        data: { agentId: agent.id, month: newMonth.trim(), driveFolderId: newFolderId.trim() },
       });
       setFolders(res.folders);
       setNewMonth("");
@@ -1066,7 +1085,7 @@ function ContentCalendarTab({ agentId, isAdmin }: { agentId: string; isAdmin: bo
   async function removeFolder(folderId: string) {
     setBusyFolderId(folderId);
     try {
-      const res = await removeContentFolder({ data: { agentId, folderId } });
+      const res = await removeContentFolder({ data: { agentId: agent.id, folderId } });
       setFolders(res.folders);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
@@ -1075,30 +1094,28 @@ function ContentCalendarTab({ agentId, isAdmin }: { agentId: string; isAdmin: bo
     }
   }
 
-  if (activeFolder) {
-    return (
-      <MonthWorkspace agentId={agentId} isAdmin={isAdmin} folder={activeFolder} onBack={() => setActiveFolder(null)} />
-    );
-  }
-
   return (
-    <div className="space-y-4">
+    <div className="mt-5 space-y-4">
+      <button onClick={onBack} className="text-xs font-semibold text-muted-foreground hover:text-foreground">
+        ← All agents
+      </button>
+
       <Card>
-        <h3 className="font-display text-sm font-semibold">Create your monthly content</h3>
-        <p className="mt-1 text-xs text-muted-foreground">
-          {isAdmin
-            ? "The same monthly folder setup we've always used — one Google Drive folder per month, full of the post, email, and video briefs your team writes. Add a month below, then open it to generate that month's content in this agent's voice, review it, and send it over."
-            : "Pick a month below to generate this month's posts, emails, and video scripts in your own voice, then review and approve them."}
+        <h2 className="font-display text-lg font-semibold">Manage months — {agent.name}</h2>
+        <p className="mt-1 text-sm text-muted-foreground">
+          The same monthly folder setup we've always used — one Google Drive folder per month, full of the post, email,
+          and video briefs your team writes. Add a month below and {agent.name} will be able to pick it and generate
+          that month's content in their own voice.
         </p>
       </Card>
 
       <Card>
         <div className="flex items-center justify-between">
           <h4 className="font-display text-sm font-semibold">Months</h4>
-          {isAdmin && !addOpen && <Button onClick={() => setAddOpen(true)}>+ Add month</Button>}
+          {!addOpen && <Button onClick={() => setAddOpen(true)}>+ Add month</Button>}
         </div>
 
-        {isAdmin && addOpen && (
+        {addOpen && (
           <div className="mt-3 space-y-2 rounded-2xl border border-border bg-background/40 p-4">
             <input
               value={newMonth}
@@ -1127,11 +1144,7 @@ function ContentCalendarTab({ agentId, isAdmin }: { agentId: string; isAdmin: bo
         {error && <p className="mt-3 text-xs text-destructive">{error}</p>}
         {folders === null && !error && <p className="mt-3 text-sm text-muted-foreground">Loading…</p>}
         {folders !== null && folders.length === 0 && (
-          <p className="mt-3 text-sm text-muted-foreground">
-            {isAdmin
-              ? "No month folders yet — add one above to get started."
-              : "No months set up yet — ask your team to add one."}
-          </p>
+          <p className="mt-3 text-sm text-muted-foreground">No month folders yet — add one above to get started.</p>
         )}
         {folders !== null && folders.length > 0 && (
           <div className="mt-3 grid gap-2 sm:grid-cols-2 lg:grid-cols-3">
@@ -1140,20 +1153,74 @@ function ContentCalendarTab({ agentId, isAdmin }: { agentId: string; isAdmin: bo
                 key={f.id}
                 className="flex items-center justify-between gap-2 rounded-2xl border border-border bg-glass px-4 py-3"
               >
-                <button onClick={() => setActiveFolder(f)} className="text-left">
+                <div>
                   <p className="text-sm font-semibold">{f.month}</p>
-                  {isAdmin && <p className="text-[11px] text-muted-foreground">{f.id}</p>}
+                  <p className="text-[11px] text-muted-foreground">{f.id}</p>
+                </div>
+                <button
+                  onClick={() => removeFolder(f.id)}
+                  disabled={busyFolderId === f.id}
+                  className="shrink-0 text-[11px] font-semibold text-destructive hover:underline disabled:opacity-50"
+                >
+                  Remove
                 </button>
-                {isAdmin && (
-                  <button
-                    onClick={() => removeFolder(f.id)}
-                    disabled={busyFolderId === f.id}
-                    className="shrink-0 text-[11px] font-semibold text-destructive hover:underline disabled:opacity-50"
-                  >
-                    Remove
-                  </button>
-                )}
               </div>
+            ))}
+          </div>
+        )}
+      </Card>
+    </div>
+  );
+}
+
+function ContentCalendarTab({ agentId, isAdmin }: { agentId: string; isAdmin: boolean }) {
+  const [folders, setFolders] = useState<ContentFolder[] | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [activeFolder, setActiveFolder] = useState<ContentFolder | null>(null);
+
+  useEffect(() => {
+    setFolders(null);
+    setError(null);
+    setActiveFolder(null);
+    listContentFolders({ data: { agentId } })
+      .then((f) => setFolders(f))
+      .catch((e) => setError(e instanceof Error ? e.message : String(e)));
+  }, [agentId]);
+
+  if (activeFolder) {
+    return (
+      <MonthWorkspace agentId={agentId} isAdmin={isAdmin} folder={activeFolder} onBack={() => setActiveFolder(null)} />
+    );
+  }
+
+  return (
+    <div className="space-y-4">
+      <Card>
+        <h3 className="font-display text-sm font-semibold">Create My Monthly Content</h3>
+        <p className="mt-1 text-xs text-muted-foreground">
+          Pick a month below to generate this month's posts, emails, and video scripts in your own voice, then review
+          and approve them.
+        </p>
+      </Card>
+
+      <Card>
+        <h4 className="font-display text-sm font-semibold">Months</h4>
+
+        {error && <p className="mt-3 text-xs text-destructive">{error}</p>}
+        {folders === null && !error && <p className="mt-3 text-sm text-muted-foreground">Loading…</p>}
+        {folders !== null && folders.length === 0 && (
+          <p className="mt-3 text-sm text-muted-foreground">No months set up yet — ask your team to add one.</p>
+        )}
+        {folders !== null && folders.length > 0 && (
+          <div className="mt-3 grid gap-2 sm:grid-cols-2 lg:grid-cols-3">
+            {folders.map((f) => (
+              <button
+                key={f.id}
+                onClick={() => setActiveFolder(f)}
+                className="rounded-2xl border border-border bg-glass px-4 py-3 text-left text-sm font-semibold transition-colors hover:bg-secondary"
+              >
+                {f.month}
+              </button>
             ))}
           </div>
         )}

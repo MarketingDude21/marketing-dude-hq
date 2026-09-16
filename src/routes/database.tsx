@@ -128,6 +128,31 @@ const REVIEW_STEPS = [
   },
 ] as const;
 
+// Big on-screen headline + a short instructional subheadline for the 3
+// editable review steps only (not the read-only browsable views) - matches
+// the old app's own "who don't you know on this list" framing, exact copy
+// from Mike. Kept as a separate lookup rather than extra fields on
+// REVIEW_STEPS above so that array's per-entry shape doesn't need to change.
+// Mike's said a short how-to video will eventually go in this same spot too -
+// nothing to build for that yet, just keep this location in mind.
+const STEP_COPY: Partial<Record<(typeof REVIEW_STEPS)[number]["key"], { headline: string; subheadline: string }>> = {
+  complete: {
+    headline: "Who Don't You Want To Market To On This List?",
+    subheadline:
+      "Is there anyone on this list you don't know, like, trust, or want to see your content? This list should be comprised of past clients, family, friends, and anyone whom you'd expect to hire you when moving or refer you to a friend.",
+  },
+  email_list: {
+    headline: "Who Don't You Want To Market To On This List?",
+    subheadline:
+      "Is there anyone on this list you don't know, like, trust, or want to see your content? This list should be comprised of past clients, family, friends, and anyone whom you'd expect to hire you when moving or refer you to a friend.",
+  },
+  incomplete: {
+    headline: "Who Should Receive Your Content?",
+    subheadline:
+      "Is there anyone on this list that you want to see your content? Place a check next to anyone you want to add to your marketing lists. This list should be comprised of current leads, past clients, family, friends, and anyone whom you'd expect to hire you when moving or refer you to a friend.",
+  },
+};
+
 function Card({ children, className = "" }: { children: React.ReactNode; className?: string }) {
   return (
     <div className={`rounded-3xl border border-border bg-glass p-6 backdrop-blur-2xl ${className}`}>{children}</div>
@@ -784,7 +809,10 @@ type ReviewContact = {
   last_name: string | null;
   email: string | null;
   phone: string | null;
+  address: string | null;
   city: string | null;
+  state: string | null;
+  zip: string | null;
   list_assignment: string | null;
   flagged: boolean;
 };
@@ -881,7 +909,12 @@ function ReviewTab({ clientId, lastProcessReport }: { clientId: string; lastProc
     step.kind === "review"
       ? step.lists.length > 1
       : step.key === "final_full_contact" || step.key === "facebook_audience";
+  // Incomplete is specifically the "missing some fields" bucket - show every
+  // address field so it's obvious at a glance what's actually missing on
+  // each row, instead of just First/Last/Email/Phone/City like every other step.
+  const showAddressColumns = step.key === "incomplete";
   const leftOffContact = leftOffId ? contacts.find((c) => c.id === leftOffId) : undefined;
+  const stepCopy = STEP_COPY[step.key];
 
   useEffect(() => {
     if (!jumpTo) return;
@@ -911,9 +944,19 @@ function ReviewTab({ clientId, lastProcessReport }: { clientId: string; lastProc
         <FinalCombinedListStep clientId={clientId} />
       ) : (
         <>
-          <p className="mt-3 text-sm text-muted-foreground">
-            {contacts.length} contact{contacts.length === 1 ? "" : "s"} on this list. {step.description}
-          </p>
+          {stepCopy ? (
+            <div className="mt-4">
+              <h1 className="font-display text-2xl font-bold tracking-tight sm:text-3xl">{stepCopy.headline}</h1>
+              <p className="mt-2 max-w-2xl text-sm text-muted-foreground sm:text-base">{stepCopy.subheadline}</p>
+              <p className="mt-3 text-sm text-muted-foreground">
+                {contacts.length} contact{contacts.length === 1 ? "" : "s"} on this list.
+              </p>
+            </div>
+          ) : (
+            <p className="mt-3 text-sm text-muted-foreground">
+              {contacts.length} contact{contacts.length === 1 ? "" : "s"} on this list. {step.description}
+            </p>
+          )}
 
           {leftOffContact && (
             <div className="mt-3 flex flex-wrap items-center justify-between gap-3 rounded-2xl border border-border bg-background/40 px-4 py-3">
@@ -954,7 +997,14 @@ function ReviewTab({ clientId, lastProcessReport }: { clientId: string; lastProc
                       <th className="pb-2">Last name</th>
                       <th className="pb-2">Email</th>
                       <th className="pb-2">Phone</th>
+                      {showAddressColumns && <th className="pb-2">Address</th>}
                       <th className="pb-2">City</th>
+                      {showAddressColumns && (
+                        <>
+                          <th className="pb-2">State</th>
+                          <th className="pb-2">Zip</th>
+                        </>
+                      )}
                       {showListColumn && <th className="pb-2">List</th>}
                       {editable && (
                         <th className="pb-2">
@@ -980,7 +1030,14 @@ function ReviewTab({ clientId, lastProcessReport }: { clientId: string; lastProc
                         <td className="py-2">{c.last_name}</td>
                         <td className="py-2">{c.email}</td>
                         <td className="py-2">{c.phone}</td>
+                        {showAddressColumns && <td className="py-2">{c.address}</td>}
                         <td className="py-2">{c.city}</td>
+                        {showAddressColumns && (
+                          <>
+                            <td className="py-2">{c.state}</td>
+                            <td className="py-2">{c.zip}</td>
+                          </>
+                        )}
                         {showListColumn && (
                           <td className="py-2">
                             <span className="rounded-full bg-muted px-2.5 py-1 text-xs font-semibold uppercase tracking-wide text-muted-foreground">

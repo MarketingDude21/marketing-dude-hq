@@ -1,3 +1,4 @@
+```tsx
 import { useEffect, useRef, useState } from "react";
 import { createFileRoute } from "@tanstack/react-router";
 import { AppShell } from "@/components/AppShell";
@@ -17,9 +18,22 @@ import {
   listAgentDriveMedia,
   setAgentDriveFolder,
   generateMarketingContent,
+  listContentFolders,
+  addContentFolder,
+  removeContentFolder,
+  readContentCalendar,
+  generateMonthlyBatch,
+  scanAgentDrivePhotos,
+  addPhotoPostsToBatch,
+  approveBatch,
+  sendContentToAgent,
   type MarketingAccess,
   type MediaRow,
   type DriveFile,
+  type ContentFolder,
+  type CalendarDoc,
+  type PhotoScanSuggestion,
+  type PostMetadata,
 } from "@/lib/marketing";
 
 export const Route = createFileRoute("/marketing")({
@@ -54,11 +68,14 @@ type Post = {
   month: string | null;
   scheduled_for: string | null;
   created_at: string;
+  metadata: PostMetadata | null;
 };
 
 function Card({ children, className = "" }: { children: React.ReactNode; className?: string }) {
   return (
-    <div className={`rounded-3xl border border-border bg-glass p-6 backdrop-blur-2xl ${className}`}>{children}</div>
+    <div className={`rounded-3xl border border-border bg-glass p-6 backdrop-blur-2xl ${className}`}>
+      {children}
+    </div>
   );
 }
 
@@ -98,7 +115,9 @@ function StatusBadge({ status }: { status: string }) {
         ? "bg-destructive/10 text-destructive"
         : "bg-muted text-muted-foreground";
   const label = status === "approved" ? "Approved" : status === "flagged" ? "Flagged" : "Pending review";
-  return <span className={`rounded-full px-3 py-1 text-xs font-semibold ${styles}`}>{label}</span>;
+  return (
+    <span className={`rounded-full px-3 py-1 text-xs font-semibold ${styles}`}>{label}</span>
+  );
 }
 
 function MarketingPage() {
@@ -149,7 +168,8 @@ function MarketingPage() {
         <PageHeader />
         <Card className="mt-5">
           <p className="text-sm text-muted-foreground">
-            Your account isn't set up in Monthly Marketing yet. Ask your team to add you as an agent.
+            Your account isn't set up in Monthly Marketing yet. Ask your team to add you as an
+            agent.
           </p>
         </Card>
       </AppShell>
@@ -163,7 +183,8 @@ function MarketingPage() {
         <Card className="mt-5">
           <h2 className="font-display text-lg font-semibold">Choose an agent</h2>
           <p className="mt-1 text-sm text-muted-foreground">
-            Pick who you're working on behalf of. Every action you take here is logged against their account, not yours.
+            Pick who you're working on behalf of. Every action you take here is logged against
+            their account, not yours.
           </p>
           <div className="mt-4 grid gap-2 sm:grid-cols-2 lg:grid-cols-3">
             {agents.map((a) => (
@@ -175,7 +196,9 @@ function MarketingPage() {
                 {a.name}
               </button>
             ))}
-            {agents.length === 0 && <p className="text-sm text-muted-foreground">No agents yet.</p>}
+            {agents.length === 0 && (
+              <p className="text-sm text-muted-foreground">No agents yet.</p>
+            )}
           </div>
         </Card>
       </AppShell>
@@ -207,7 +230,9 @@ function PageHeader({
       <div>
         <h1 className="font-display text-2xl font-bold tracking-tight">Monthly Marketing</h1>
         <p className="mt-1 text-sm text-muted-foreground">
-          {agentName ? `Viewing as: ${agentName}` : "Posts, emails, and video scripts in your voice — every month."}
+          {agentName
+            ? `Viewing as: ${agentName}`
+            : "Posts, emails, and video scripts in your voice — every month."}
         </p>
       </div>
       {onChangeAgent && (
@@ -220,11 +245,11 @@ function PageHeader({
 }
 
 function Workspace({ agentId, isAdmin }: { agentId: string; isAdmin: boolean }) {
-  const [tab, setTab] = useState<"posts" | "media" | "drive">("posts");
+  const [tab, setTab] = useState<"posts" | "calendar" | "media" | "drive">("posts");
   return (
     <div className="mt-5">
       <div className="flex flex-wrap gap-1 rounded-full border border-border bg-glass p-1 backdrop-blur-xl w-fit">
-        {(["posts", "media", "drive"] as const).map((t) => (
+        {(["posts", "calendar", "media", "drive"] as const).map((t) => (
           <button
             key={t}
             onClick={() => setTab(t)}
@@ -232,12 +257,19 @@ function Workspace({ agentId, isAdmin }: { agentId: string; isAdmin: boolean }) 
               tab === t ? "bg-secondary text-foreground" : "text-muted-foreground hover:text-foreground"
             }`}
           >
-            {t === "posts" ? "Posts" : t === "media" ? "Media" : "Google Drive"}
+            {t === "posts"
+              ? "Posts"
+              : t === "calendar"
+                ? "Content Calendar"
+                : t === "media"
+                  ? "Media"
+                  : "Google Drive"}
           </button>
         ))}
       </div>
       <div className="mt-5">
         {tab === "posts" && <PostsTab agentId={agentId} />}
+        {tab === "calendar" && <ContentCalendarTab agentId={agentId} isAdmin={isAdmin} />}
         {tab === "media" && <MediaTab agentId={agentId} />}
         {tab === "drive" && <DriveTab agentId={agentId} isAdmin={isAdmin} />}
       </div>
@@ -288,7 +320,9 @@ function PostsTab({ agentId }: { agentId: string }) {
 
       {months.length > 0 && (
         <div className="flex flex-wrap items-center gap-2">
-          <span className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">Month</span>
+          <span className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
+            Month
+          </span>
           <select
             value={month}
             onChange={(e) => setMonth(e.target.value)}
@@ -313,7 +347,8 @@ function PostsTab({ agentId }: { agentId: string }) {
       {posts !== null && posts.length === 0 && (
         <Card>
           <p className="text-sm text-muted-foreground">
-            No posts here yet. Once your team generates this month's content, it'll show up here for review.
+            No posts here yet. Once your team generates this month's content, it'll show up here
+            for review.
           </p>
         </Card>
       )}
@@ -389,8 +424,8 @@ function CreateContentForm({ agentId, onCreated }: { agentId: string; onCreated:
     <Card>
       <h3 className="font-display text-sm font-semibold">Create new content</h3>
       <p className="mt-1 text-xs text-muted-foreground">
-        Tell us what you want and we'll write a full draft in your voice — it'll show up below for you to approve, edit,
-        or flag, same as anything your team generates for you.
+        Tell us what you want and we'll write a full draft in your voice — it'll show up below for
+        you to approve, edit, or flag, same as anything your team generates for you.
       </p>
 
       <div className="mt-4 flex flex-wrap gap-1 rounded-full border border-border bg-glass p-1 w-fit">
@@ -399,7 +434,9 @@ function CreateContentForm({ agentId, onCreated }: { agentId: string; onCreated:
             key={t}
             onClick={() => setContentType(t)}
             className={`rounded-full px-4 py-1.5 text-sm font-medium transition-colors ${
-              contentType === t ? "bg-secondary text-foreground" : "text-muted-foreground hover:text-foreground"
+              contentType === t
+                ? "bg-secondary text-foreground"
+                : "text-muted-foreground hover:text-foreground"
             }`}
           >
             {t === "post" ? "Social post" : t === "email" ? "Email" : "Video script"}
@@ -442,7 +479,11 @@ function CreateContentForm({ agentId, onCreated }: { agentId: string; onCreated:
         />
         {contentType === "post" && (
           <label className="flex items-center gap-2 text-sm text-muted-foreground">
-            <input type="checkbox" checked={useHashtags} onChange={(e) => setUseHashtags(e.target.checked)} />
+            <input
+              type="checkbox"
+              checked={useHashtags}
+              onChange={(e) => setUseHashtags(e.target.checked)}
+            />
             Add hashtags
           </label>
         )}
@@ -533,7 +574,8 @@ function PostCard({
     }
   }
 
-  const typeLabel = post.content_type === "email" ? "Email" : post.content_type === "video" ? "Video script" : "Post";
+  const typeLabel =
+    post.content_type === "email" ? "Email" : post.content_type === "video" ? "Video script" : "Post";
 
   return (
     <Card>
@@ -561,6 +603,17 @@ function PostCard({
             />
           ) : (
             <p className="whitespace-pre-wrap text-sm leading-relaxed">{post.content}</p>
+          )}
+
+          {post.metadata?.canva_link && (
+            <a
+              href={post.metadata.canva_link}
+              target="_blank"
+              rel="noreferrer"
+              className="mt-2 inline-block text-xs font-semibold text-primary hover:underline"
+            >
+              Open Canva template →
+            </a>
           )}
 
           {saveError && <p className="mt-2 text-xs text-destructive">{saveError}</p>}
@@ -706,7 +759,9 @@ function MediaTab({ agentId }: { agentId: string }) {
         const { path, token } = await createMediaUploadUrl({
           data: { agentId, fileName: toUpload.name },
         });
-        const { error: uploadErr } = await supabase.storage.from("media").uploadToSignedUrl(path, token, toUpload);
+        const { error: uploadErr } = await supabase.storage
+          .from("media")
+          .uploadToSignedUrl(path, token, toUpload);
         if (uploadErr) throw uploadErr;
         await finalizeMediaUpload({ data: { agentId, storagePath: path, mediaType } });
         uploaded++;
@@ -755,10 +810,11 @@ function MediaTab({ agentId }: { agentId: string }) {
       <Card>
         <h3 className="font-display text-sm font-semibold">Upload photos or short-form video</h3>
         <p className="mt-1 text-xs text-muted-foreground">
-          Uploaded here, these are used for this agent's content the same way Drive photos are — once something's used
-          in a piece of content, mark it used below and it drops out of the active pool so it doesn't get suggested
-          again. This is separate from this agent's Google Drive folder — Drive photos still work exactly as they do
-          today, they just won't show up in this grid unless they're also uploaded here.
+          Uploaded here, these are used for this agent's content the same way Drive photos are —
+          once something's used in a piece of content, mark it used below and it drops out of the
+          active pool so it doesn't get suggested again. This is separate from this agent's Google
+          Drive folder — Drive photos still work exactly as they do today, they just won't show up
+          in this grid unless they're also uploaded here.
         </p>
         <div className="mt-3 flex flex-wrap items-center gap-3">
           <input
@@ -815,9 +871,13 @@ function MediaTab({ agentId }: { agentId: string }) {
         <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-4">
           {media.map((m) => (
             <div key={m.id} className="overflow-hidden rounded-2xl border border-border bg-glass">
-              {m.media_type === "video"
-                ? m.url && <video src={m.url} controls className="aspect-square w-full object-cover" />
-                : m.url && <img src={m.url} alt={m.caption ?? ""} className="aspect-square w-full object-cover" />}
+              {m.media_type === "video" ? (
+                m.url && <video src={m.url} controls className="aspect-square w-full object-cover" />
+              ) : (
+                m.url && (
+                  <img src={m.url} alt={m.caption ?? ""} className="aspect-square w-full object-cover" />
+                )
+              )}
               <div className="flex items-center justify-between gap-1 px-2 pt-2">
                 <span className="rounded-full bg-muted px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">
                   {m.media_type}
@@ -898,16 +958,19 @@ function DriveTab({ agentId, isAdmin }: { agentId: string; isAdmin: boolean }) {
       <Card>
         <h3 className="font-display text-sm font-semibold">This agent's Google Drive folder</h3>
         <p className="mt-1 text-xs text-muted-foreground">
-          A live, read-only view of what's actually in their Drive folder right now — mainly useful for agents on our
-          video services who still send long-form footage through Drive. This never writes anything back to Drive;
-          uploading and marking things used still happens exactly as it does today, over there, untouched.
+          A live, read-only view of what's actually in their Drive folder right now — mainly useful
+          for agents on our video services who still send long-form footage through Drive. This
+          never writes anything back to Drive; uploading and marking things used still happens
+          exactly as it does today, over there, untouched.
         </p>
         {isAdmin && (
           <div className="mt-3 flex flex-wrap items-center gap-2">
             <input
               value={folderInput}
               onChange={(e) => setFolderInput(e.target.value)}
-              placeholder={data?.folderId ? `Currently: ${data.folderId}` : "Paste this agent's Drive folder ID"}
+              placeholder={
+                data?.folderId ? `Currently: ${data.folderId}` : "Paste this agent's Drive folder ID"
+              }
               className="min-w-[220px] flex-1 rounded-xl border border-border bg-glass px-3 py-1.5 text-sm outline-none"
             />
             <Button onClick={saveFolder} disabled={saving || !folderInput.trim()}>
@@ -940,7 +1003,9 @@ function DriveTab({ agentId, isAdmin }: { agentId: string; isAdmin: boolean }) {
 
       {!error && data !== null && data.folderId && data.files.length === 0 && (
         <Card>
-          <p className="text-sm text-muted-foreground">Their Drive folder is connected but empty right now.</p>
+          <p className="text-sm text-muted-foreground">
+            Their Drive folder is connected but empty right now.
+          </p>
         </Card>
       )}
 
@@ -970,3 +1035,566 @@ function DriveTab({ agentId, isAdmin }: { agentId: string; isAdmin: boolean }) {
     </div>
   );
 }
+
+// ============================================================================
+// Content Calendar — the Google Drive-driven batch generation flow, brought
+// back natively so existing clients keep working exactly like they did in
+// the old standalone tool: one Drive folder per month, full of post/email/
+// video briefs, read and rewritten in the agent's voice with one click. This
+// coexists with the native single-item "Create content" form above — Drive
+// stays the source for clients already set up that way while a fully native
+// baseline-content editor is still on the roadmap.
+//
+// One shared screen for both admin-acting-as-agent and the agent's own
+// login — the "Send to Agent" button is the only thing gated on isAdmin.
+// ============================================================================
+
+function ContentCalendarTab({ agentId, isAdmin }: { agentId: string; isAdmin: boolean }) {
+  const [folders, setFolders] = useState<ContentFolder[] | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [addOpen, setAddOpen] = useState(false);
+  const [newMonth, setNewMonth] = useState("");
+  const [newFolderId, setNewFolderId] = useState("");
+  const [addBusy, setAddBusy] = useState(false);
+  const [addError, setAddError] = useState<string | null>(null);
+  const [activeFolder, setActiveFolder] = useState<ContentFolder | null>(null);
+  const [busyFolderId, setBusyFolderId] = useState<string | null>(null);
+
+  function reload() {
+    setFolders(null);
+    setError(null);
+    listContentFolders({ data: { agentId } })
+      .then((f) => setFolders(f))
+      .catch((e) => setError(e instanceof Error ? e.message : String(e)));
+  }
+
+  useEffect(() => {
+    reload();
+    setActiveFolder(null);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [agentId]);
+
+  async function addFolder() {
+    if (!newMonth.trim() || !newFolderId.trim()) {
+      setAddError("Give it a month label and a Drive folder ID or link.");
+      return;
+    }
+    setAddBusy(true);
+    setAddError(null);
+    try {
+      const res = await addContentFolder({
+        data: { agentId, month: newMonth.trim(), driveFolderId: newFolderId.trim() },
+      });
+      setFolders(res.folders);
+      setNewMonth("");
+      setNewFolderId("");
+      setAddOpen(false);
+    } catch (e) {
+      setAddError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setAddBusy(false);
+    }
+  }
+
+  async function removeFolder(folderId: string) {
+    setBusyFolderId(folderId);
+    try {
+      const res = await removeContentFolder({ data: { agentId, folderId } });
+      setFolders(res.folders);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusyFolderId(null);
+    }
+  }
+
+  if (activeFolder) {
+    return (
+      <MonthWorkspace
+        agentId={agentId}
+        isAdmin={isAdmin}
+        folder={activeFolder}
+        onBack={() => setActiveFolder(null)}
+      />
+    );
+  }
+
+  return (
+    <div className="space-y-4">
+      <Card>
+        <h3 className="font-display text-sm font-semibold">Google Drive content calendar</h3>
+        <p className="mt-1 text-xs text-muted-foreground">
+          The same monthly folder setup we've always used — one Google Drive folder per month, full
+          of the post, email, and video briefs your team writes. Add a month below, then open it to
+          generate that month's content in this agent's voice, review it, and send it over.
+        </p>
+      </Card>
+
+      <Card>
+        <div className="flex items-center justify-between">
+          <h4 className="font-display text-sm font-semibold">Months</h4>
+          {!addOpen && <Button onClick={() => setAddOpen(true)}>+ Add month</Button>}
+        </div>
+
+        {addOpen && (
+          <div className="mt-3 space-y-2 rounded-2xl border border-border bg-background/40 p-4">
+            <input
+              value={newMonth}
+              onChange={(e) => setNewMonth(e.target.value)}
+              placeholder='Month label, e.g. "June 2026"'
+              className="w-full rounded-xl border border-border bg-glass px-3 py-2 text-sm outline-none"
+            />
+            <input
+              value={newFolderId}
+              onChange={(e) => setNewFolderId(e.target.value)}
+              placeholder="Google Drive folder ID or link"
+              className="w-full rounded-xl border border-border bg-glass px-3 py-2 text-sm outline-none"
+            />
+            {addError && <p className="text-xs text-destructive">{addError}</p>}
+            <div className="flex gap-2">
+              <Button onClick={addFolder} disabled={addBusy}>
+                {addBusy ? "Adding…" : "Add month"}
+              </Button>
+              <Button variant="secondary" onClick={() => setAddOpen(false)} disabled={addBusy}>
+                Cancel
+              </Button>
+            </div>
+          </div>
+        )}
+
+        {error && <p className="mt-3 text-xs text-destructive">{error}</p>}
+        {folders === null && !error && (
+          <p className="mt-3 text-sm text-muted-foreground">Loading…</p>
+        )}
+        {folders !== null && folders.length === 0 && (
+          <p className="mt-3 text-sm text-muted-foreground">
+            No month folders yet — add one above to get started.
+          </p>
+        )}
+        {folders !== null && folders.length > 0 && (
+          <div className="mt-3 grid gap-2 sm:grid-cols-2 lg:grid-cols-3">
+            {folders.map((f) => (
+              <div
+                key={f.id}
+                className="flex items-center justify-between gap-2 rounded-2xl border border-border bg-glass px-4 py-3"
+              >
+                <button onClick={() => setActiveFolder(f)} className="text-left">
+                  <p className="text-sm font-semibold">{f.month}</p>
+                  <p className="text-[11px] text-muted-foreground">{f.id}</p>
+                </button>
+                <button
+                  onClick={() => removeFolder(f.id)}
+                  disabled={busyFolderId === f.id}
+                  className="shrink-0 text-[11px] font-semibold text-destructive hover:underline disabled:opacity-50"
+                >
+                  Remove
+                </button>
+              </div>
+            ))}
+          </div>
+        )}
+      </Card>
+    </div>
+  );
+}
+
+function MonthWorkspace({
+  agentId,
+  isAdmin,
+  folder,
+  onBack,
+}: {
+  agentId: string;
+  isAdmin: boolean;
+  folder: ContentFolder;
+  onBack: () => void;
+}) {
+  const [docs, setDocs] = useState<CalendarDoc[] | null>(null);
+  const [docsError, setDocsError] = useState<string | null>(null);
+  const [useHashtags, setUseHashtags] = useState(false);
+  const [generating, setGenerating] = useState(false);
+  const [genError, setGenError] = useState<string | null>(null);
+  const [lastBatchId, setLastBatchId] = useState<string | null>(null);
+  const [posts, setPosts] = useState<Post[] | null>(null);
+  const [postsError, setPostsError] = useState<string | null>(null);
+  const [photosOpen, setPhotosOpen] = useState(false);
+  const [approving, setApproving] = useState(false);
+  const [sending, setSending] = useState(false);
+  const [sendNote, setSendNote] = useState<string | null>(null);
+
+  function loadDocs() {
+    setDocs(null);
+    setDocsError(null);
+    readContentCalendar({ data: { agentId, folderId: folder.id } })
+      .then((r) => setDocs(r.docs))
+      .catch((e) => setDocsError(e instanceof Error ? e.message : String(e)));
+  }
+
+  function loadPosts() {
+    setPosts(null);
+    setPostsError(null);
+    listMarketingPosts({ data: { agentId, month: folder.month } })
+      .then((p) => setPosts(p as Post[]))
+      .catch((e) => setPostsError(e instanceof Error ? e.message : String(e)));
+  }
+
+  useEffect(() => {
+    loadDocs();
+    loadPosts();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [agentId, folder.id, folder.month]);
+
+  const batchPosts = (posts ?? []).filter(
+    (p) => p.metadata?.source === "drive_calendar" || p.metadata?.source === "drive_photo_scan",
+  );
+  const socialPosts = batchPosts.filter((p) => p.content_type === "post" && !p.metadata?.canva_link);
+  const canvaPosts = batchPosts.filter((p) => p.content_type === "post" && Boolean(p.metadata?.canva_link));
+  const emails = batchPosts.filter((p) => p.content_type === "email");
+  const videos = batchPosts.filter((p) => p.content_type === "video");
+  const latestFromPosts = batchPosts.length
+    ? (batchPosts[batchPosts.length - 1]?.metadata?.batch_id as string | undefined)
+    : undefined;
+  const activeBatchId = lastBatchId ?? latestFromPosts ?? null;
+
+  async function generate() {
+    setGenerating(true);
+    setGenError(null);
+    try {
+      const res = await generateMonthlyBatch({
+        data: { agentId, folderId: folder.id, month: folder.month, useHashtags },
+      });
+      setLastBatchId(res.batchId);
+      loadPosts();
+    } catch (e) {
+      setGenError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setGenerating(false);
+    }
+  }
+
+  async function approveAllAndDownload() {
+    if (!batchPosts.length) return;
+    setApproving(true);
+    setPostsError(null);
+    try {
+      if (activeBatchId) {
+        await approveBatch({ data: { agentId, batchId: activeBatchId } });
+      }
+      const text = batchPosts
+        .map((p) => {
+          const heading = (p.title || p.content_type).toUpperCase();
+          const canva = p.metadata?.canva_link ? `\nCanva template: ${p.metadata.canva_link}` : "";
+          return `${heading}\n${p.content}${canva}`;
+        })
+        .join("\n\n---\n\n");
+      const blob = new Blob([text], { type: "text/plain" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `${folder.month.replace(/\s+/g, "-")}-content.txt`;
+      a.click();
+      URL.revokeObjectURL(url);
+      loadPosts();
+    } catch (e) {
+      setPostsError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setApproving(false);
+    }
+  }
+
+  async function sendToAgent() {
+    setSending(true);
+    setSendNote(null);
+    try {
+      await sendContentToAgent({ data: { agentId, month: folder.month } });
+      setSendNote("Sent — they'll get an email with a link to review and approve.");
+    } catch (e) {
+      setSendNote(e instanceof Error ? e.message : String(e));
+    } finally {
+      setSending(false);
+    }
+  }
+
+  const postCount = (docs ?? []).filter((d) => d.type === "post").length;
+  const emailCount = (docs ?? []).filter((d) => d.type === "email").length;
+  const videoCount = (docs ?? []).filter((d) => d.type === "video").length;
+
+  return (
+    <div className="space-y-4">
+      <button
+        onClick={onBack}
+        className="text-xs font-semibold text-muted-foreground hover:text-foreground"
+      >
+        ← All months
+      </button>
+
+      <Card>
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <div>
+            <h3 className="font-display text-sm font-semibold">{folder.month}</h3>
+            {docsError ? (
+              <p className="mt-1 text-xs text-destructive">{docsError}</p>
+            ) : docs === null ? (
+              <p className="mt-1 text-xs text-muted-foreground">Reading this month's Drive folder…</p>
+            ) : (
+              <p className="mt-1 text-xs text-muted-foreground">
+                {postCount} post{postCount === 1 ? "" : "s"}, {emailCount} email
+                {emailCount === 1 ? "" : "s"}, {videoCount} video script{videoCount === 1 ? "" : "s"}{" "}
+                found in this month's folder.
+              </p>
+            )}
+          </div>
+          <div className="flex items-center gap-3">
+            <label className="flex items-center gap-2 text-xs text-muted-foreground">
+              <input
+                type="checkbox"
+                checked={useHashtags}
+                onChange={(e) => setUseHashtags(e.target.checked)}
+              />
+              Add hashtags to posts
+            </label>
+            <Button onClick={generate} disabled={generating || docs === null}>
+              {generating ? "Generating…" : "Generate Now"}
+            </Button>
+          </div>
+        </div>
+        {genError && <p className="mt-2 text-xs text-destructive">{genError}</p>}
+      </Card>
+
+      <PhotoScanPanel
+        agentId={agentId}
+        folderId={folder.id}
+        month={folder.month}
+        batchId={activeBatchId}
+        open={photosOpen}
+        onOpen={() => setPhotosOpen(true)}
+        onClose={() => setPhotosOpen(false)}
+        onAdded={loadPosts}
+      />
+
+      <Card>
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <h4 className="font-display text-sm font-semibold">This month's generated content</h4>
+          <div className="flex flex-wrap gap-2">
+            <Button
+              variant="secondary"
+              onClick={approveAllAndDownload}
+              disabled={approving || !batchPosts.length}
+            >
+              {approving ? "Working…" : "Approve All & Download"}
+            </Button>
+            {isAdmin && (
+              <Button onClick={sendToAgent} disabled={sending || !batchPosts.length}>
+                {sending ? "Sending…" : "Send to Agent"}
+              </Button>
+            )}
+          </div>
+        </div>
+        {sendNote && <p className="mt-2 text-xs text-muted-foreground">{sendNote}</p>}
+        {postsError && <p className="mt-2 text-xs text-destructive">{postsError}</p>}
+        {posts !== null && batchPosts.length === 0 && (
+          <p className="mt-3 text-sm text-muted-foreground">
+            Nothing generated for this month yet — hit "Generate Now" above.
+          </p>
+        )}
+      </Card>
+
+      {socialPosts.length > 0 && (
+        <BatchSection title="Social posts" posts={socialPosts} agentId={agentId} onChanged={loadPosts} />
+      )}
+      {canvaPosts.length > 0 && (
+        <BatchSection
+          title="Predesigned Canva templates"
+          posts={canvaPosts}
+          agentId={agentId}
+          onChanged={loadPosts}
+        />
+      )}
+      {emails.length > 0 && (
+        <BatchSection title="Emails" posts={emails} agentId={agentId} onChanged={loadPosts} />
+      )}
+      {videos.length > 0 && (
+        <BatchSection title="Video scripts" posts={videos} agentId={agentId} onChanged={loadPosts} />
+      )}
+    </div>
+  );
+}
+
+function BatchSection({
+  title,
+  posts,
+  agentId,
+  onChanged,
+}: {
+  title: string;
+  posts: Post[];
+  agentId: string;
+  onChanged: () => void;
+}) {
+  const [expanded, setExpanded] = useState<string | null>(null);
+  return (
+    <div>
+      <h4 className="mb-2 text-xs font-semibold uppercase tracking-wider text-muted-foreground">
+        {title}
+      </h4>
+      <div className="space-y-3">
+        {posts.map((post) => (
+          <PostCard
+            key={post.id}
+            post={post}
+            agentId={agentId}
+            expanded={expanded === post.id}
+            onToggle={() => setExpanded((cur) => (cur === post.id ? null : post.id))}
+            onChanged={onChanged}
+          />
+        ))}
+      </div>
+    </div>
+  );
+}
+
+// Scans a handful of unused Drive photos and writes a caption for each, in
+// the agent's voice — ported from analyze-photos.js. Selected suggestions
+// become pending posts in the same batch via addPhotoPostsToBatch.
+function PhotoScanPanel({
+  agentId,
+  folderId,
+  month,
+  batchId,
+  open,
+  onOpen,
+  onClose,
+  onAdded,
+}: {
+  agentId: string;
+  folderId: string;
+  month: string;
+  batchId: string | null;
+  open: boolean;
+  onOpen: () => void;
+  onClose: () => void;
+  onAdded: () => void;
+}) {
+  const [suggestions, setSuggestions] = useState<PhotoScanSuggestion[] | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [scanning, setScanning] = useState(false);
+  const [selected, setSelected] = useState<Set<string>>(new Set());
+  const [adding, setAdding] = useState(false);
+
+  async function scan() {
+    setScanning(true);
+    setError(null);
+    try {
+      const res = await scanAgentDrivePhotos({ data: { agentId, folderId, maxPhotos: 5 } });
+      setSuggestions(res.suggestions);
+      setSelected(new Set(res.suggestions.map((s) => s.fileId)));
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setScanning(false);
+    }
+  }
+
+  function toggle(id: string) {
+    setSelected((cur) => {
+      const next = new Set(cur);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  }
+
+  async function addSelected() {
+    if (!suggestions) return;
+    const items = suggestions
+      .filter((s) => selected.has(s.fileId))
+      .map((s) => ({
+        title: s.description,
+        content: s.suggestedPost,
+        driveFileId: s.fileId,
+        thumbnailUrl: s.thumbnailUrl,
+      }));
+    if (!items.length) return;
+    setAdding(true);
+    setError(null);
+    try {
+      await addPhotoPostsToBatch({ data: { agentId, month, batchId: batchId ?? undefined, items } });
+      setSuggestions(null);
+      setSelected(new Set());
+      onClose();
+      onAdded();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setAdding(false);
+    }
+  }
+
+  if (!open) {
+    return (
+      <Button variant="secondary" onClick={onOpen}>
+        + Add posts from photos
+      </Button>
+    );
+  }
+
+  return (
+    <Card>
+      <div className="flex items-center justify-between">
+        <h4 className="font-display text-sm font-semibold">Add posts from Drive photos</h4>
+        <Button variant="secondary" onClick={onClose}>
+          Close
+        </Button>
+      </div>
+      <p className="mt-1 text-xs text-muted-foreground">
+        Scans a handful of unused photos from this agent's Drive folder and writes a caption for
+        each, in their voice. Pick the ones worth turning into posts.
+      </p>
+
+      {!suggestions && (
+        <div className="mt-3">
+          <Button onClick={scan} disabled={scanning}>
+            {scanning ? "Scanning…" : "Scan photos"}
+          </Button>
+        </div>
+      )}
+
+      {error && <p className="mt-2 text-xs text-destructive">{error}</p>}
+
+      {suggestions && suggestions.length === 0 && (
+        <p className="mt-3 text-sm text-muted-foreground">No unused photos found in this folder.</p>
+      )}
+
+      {suggestions && suggestions.length > 0 && (
+        <div className="mt-3 space-y-3">
+          {suggestions.map((s) => (
+            <label
+              key={s.fileId}
+              className="flex gap-3 rounded-2xl border border-border bg-glass p-3 text-sm"
+            >
+              <input
+                type="checkbox"
+                checked={selected.has(s.fileId)}
+                onChange={() => toggle(s.fileId)}
+                className="mt-1"
+              />
+              <img
+                src={s.thumbnailUrl}
+                alt={s.description}
+                className="h-16 w-16 shrink-0 rounded-xl object-cover"
+              />
+              <div>
+                <p className="text-xs text-muted-foreground">{s.description}</p>
+                <p className="mt-1 whitespace-pre-wrap">{s.suggestedPost}</p>
+              </div>
+            </label>
+          ))}
+          <Button onClick={addSelected} disabled={adding || selected.size === 0}>
+            {adding ? "Adding…" : `Add ${selected.size} selected`}
+          </Button>
+        </div>
+      )}
+    </Card>
+  );
+}
+```

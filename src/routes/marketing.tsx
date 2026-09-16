@@ -1597,4 +1597,3 @@ function PhotoScanPanel({
     </Card>
   );
 }
-```

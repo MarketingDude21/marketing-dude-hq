@@ -1,6 +1,7 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { createFileRoute } from "@tanstack/react-router";
 import { AppShell } from "@/components/AppShell";
+import { supabase } from "@/integrations/supabase/client";
 import {
   getMarketingAccess,
   listMarketingAgents,
@@ -8,8 +9,13 @@ import {
   listMarketingMonths,
   updateMarketingPost,
   submitMarketingFeedback,
-  listMarketingPhotos,
+  listMarketingMedia,
+  createMediaUploadUrl,
+  finalizeMediaUpload,
+  markMediaUsed,
+  deleteMarketingMedia,
   type MarketingAccess,
+  type MediaRow,
 } from "@/lib/marketing";
 
 export const Route = createFileRoute("/marketing")({
@@ -45,8 +51,6 @@ type Post = {
   scheduled_for: string | null;
   created_at: string;
 };
-
-type Photo = { id: string; url: string | null; caption: string | null; tags: string[]; created_at: string };
 
 function Card({ children, className = "" }: { children: React.ReactNode; className?: string }) {
   return (
@@ -212,11 +216,11 @@ function PageHeader({
 }
 
 function Workspace({ agentId }: { agentId: string }) {
-  const [tab, setTab] = useState<"posts" | "photos">("posts");
+  const [tab, setTab] = useState<"posts" | "media">("posts");
   return (
     <div className="mt-5">
       <div className="flex flex-wrap gap-1 rounded-full border border-border bg-glass p-1 backdrop-blur-xl w-fit">
-        {(["posts", "photos"] as const).map((t) => (
+        {(["posts", "media"] as const).map((t) => (
           <button
             key={t}
             onClick={() => setTab(t)}
@@ -224,13 +228,13 @@ function Workspace({ agentId }: { agentId: string }) {
               tab === t ? "bg-secondary text-foreground" : "text-muted-foreground hover:text-foreground"
             }`}
           >
-            {t === "posts" ? "Posts" : "Photos"}
+            {t === "posts" ? "Posts" : "Media"}
           </button>
         ))}
       </div>
       <div className="mt-5">
         {tab === "posts" && <PostsTab agentId={agentId} />}
-        {tab === "photos" && <PhotosTab agentId={agentId} />}
+        {tab === "media" && <MediaTab agentId={agentId} />}
       </div>
     </div>
   );
@@ -484,49 +488,234 @@ function PostCard({
   );
 }
 
-function PhotosTab({ agentId }: { agentId: string }) {
-  const [photos, setPhotos] = useState<Photo[] | null>(null);
+// Photos capped at ~2000px on the long edge before upload — invisible for
+// social content (which gets downsized again on posting anyway) but cuts
+// storage 70-90% versus a raw phone photo. Runs entirely client-side via
+// canvas, no library needed.
+async function resizeImage(file: File, maxEdge = 2000, quality = 0.85): Promise<File> {
+  const bitmap = await createImageBitmap(file).catch(() => null);
+  if (!bitmap) return file; // not a decodable image — upload as-is
+  const scale = Math.min(1, maxEdge / Math.max(bitmap.width, bitmap.height));
+  if (scale === 1) return file; // already small enough
+  const canvas = document.createElement("canvas");
+  canvas.width = Math.round(bitmap.width * scale);
+  canvas.height = Math.round(bitmap.height * scale);
+  const ctx = canvas.getContext("2d");
+  if (!ctx) return file;
+  ctx.drawImage(bitmap, 0, 0, canvas.width, canvas.height);
+  const blob = await new Promise<Blob | null>((resolve) => canvas.toBlob(resolve, "image/jpeg", quality));
+  if (!blob) return file;
+  return new File([blob], file.name.replace(/\.\w+$/, ".jpg"), { type: "image/jpeg" });
+}
+
+// Short-form video only — reads duration client-side before spending any
+// upload bandwidth on something too long to be usable content anyway.
+function getVideoDuration(file: File): Promise<number> {
+  return new Promise((resolve) => {
+    const video = document.createElement("video");
+    video.preload = "metadata";
+    video.onloadedmetadata = () => {
+      URL.revokeObjectURL(video.src);
+      resolve(video.duration);
+    };
+    video.onerror = () => resolve(0);
+    video.src = URL.createObjectURL(file);
+  });
+}
+
+const MAX_VIDEO_SECONDS = 120;
+
+function MediaTab({ agentId }: { agentId: string }) {
+  const [status, setStatus] = useState<"available" | "used">("available");
+  const [media, setMedia] = useState<MediaRow[] | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [uploading, setUploading] = useState(false);
+  const [uploadNote, setUploadNote] = useState<string | null>(null);
+  const [busyId, setBusyId] = useState<string | null>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+
+  function reload() {
+    setMedia(null);
+    setError(null);
+    listMarketingMedia({ data: { agentId, status } })
+      .then((m) => setMedia(m))
+      .catch((e) => setError(e instanceof Error ? e.message : String(e)));
+  }
 
   useEffect(() => {
-    setPhotos(null);
-    listMarketingPhotos({ data: { agentId } })
-      .then((p) => setPhotos(p as Photo[]))
-      .catch((e) => setError(e instanceof Error ? e.message : String(e)));
-  }, [agentId]);
+    reload();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [agentId, status]);
 
-  if (error) {
-    return (
-      <Card>
-        <p className="text-sm text-destructive">{error}</p>
-      </Card>
+  async function handleFiles(fileList: FileList | null) {
+    if (!fileList || !fileList.length) return;
+    setUploading(true);
+    setUploadNote(null);
+    let uploaded = 0;
+    let skipped = 0;
+    for (const file of Array.from(fileList)) {
+      try {
+        const isVideo = file.type.startsWith("video/");
+        const mediaType: "photo" | "video" = isVideo ? "video" : "photo";
+
+        if (isVideo) {
+          const duration = await getVideoDuration(file);
+          if (duration > MAX_VIDEO_SECONDS) {
+            skipped++;
+            continue;
+          }
+        }
+
+        const toUpload = isVideo ? file : await resizeImage(file);
+        const { path, token } = await createMediaUploadUrl({
+          data: { agentId, fileName: toUpload.name },
+        });
+        const { error: uploadErr } = await supabase.storage.from("media").uploadToSignedUrl(path, token, toUpload);
+        if (uploadErr) throw uploadErr;
+        await finalizeMediaUpload({ data: { agentId, storagePath: path, mediaType } });
+        uploaded++;
+      } catch (e) {
+        skipped++;
+        // eslint-disable-next-line no-console
+        console.error("Media upload failed:", e);
+      }
+    }
+    setUploading(false);
+    if (fileInputRef.current) fileInputRef.current.value = "";
+    setUploadNote(
+      skipped > 0
+        ? `Uploaded ${uploaded}, skipped ${skipped} (a video over ${MAX_VIDEO_SECONDS}s, or a file that failed to upload).`
+        : `Uploaded ${uploaded} file${uploaded === 1 ? "" : "s"}.`,
     );
+    if (status === "available") reload();
   }
 
-  if (photos === null) {
-    return (
-      <Card>
-        <p className="text-sm text-muted-foreground">Loading…</p>
-      </Card>
-    );
+  async function markUsed(id: string) {
+    setBusyId(id);
+    try {
+      await markMediaUsed({ data: { agentId, mediaIds: [id] } });
+      reload();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusyId(null);
+    }
   }
 
-  if (photos.length === 0) {
-    return (
-      <Card>
-        <p className="text-sm text-muted-foreground">No photos on file for this agent yet.</p>
-      </Card>
-    );
+  async function remove(id: string) {
+    setBusyId(id);
+    try {
+      await deleteMarketingMedia({ data: { agentId, mediaId: id } });
+      reload();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusyId(null);
+    }
   }
 
   return (
-    <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-4">
-      {photos.map((p) => (
-        <div key={p.id} className="overflow-hidden rounded-2xl border border-border bg-glass">
-          {p.url && <img src={p.url} alt={p.caption ?? ""} className="aspect-square w-full object-cover" />}
-          {p.caption && <p className="p-2 text-xs text-muted-foreground">{p.caption}</p>}
+    <div className="space-y-4">
+      <Card>
+        <h3 className="font-display text-sm font-semibold">Upload photos or short-form video</h3>
+        <p className="mt-1 text-xs text-muted-foreground">
+          Uploaded here, these are used for this agent's content the same way Drive photos are — once something's used
+          in a piece of content, mark it used below and it drops out of the active pool so it doesn't get suggested
+          again. This is separate from this agent's Google Drive folder — Drive photos still work exactly as they do
+          today, they just won't show up in this grid unless they're also uploaded here.
+        </p>
+        <div className="mt-3 flex flex-wrap items-center gap-3">
+          <input
+            ref={fileInputRef}
+            type="file"
+            accept="image/*,video/*"
+            multiple
+            onChange={(e) => handleFiles(e.target.files)}
+            disabled={uploading}
+            className="text-sm text-muted-foreground file:mr-3 file:rounded-full file:border-0 file:bg-primary file:px-4 file:py-2 file:text-sm file:font-semibold file:text-primary-foreground"
+          />
+          {uploading && <span className="text-xs text-muted-foreground">Uploading…</span>}
         </div>
-      ))}
+        {uploadNote && <p className="mt-2 text-xs text-muted-foreground">{uploadNote}</p>}
+      </Card>
+
+      <div className="flex flex-wrap gap-1 rounded-full border border-border bg-glass p-1 backdrop-blur-xl w-fit">
+        {(["available", "used"] as const).map((s) => (
+          <button
+            key={s}
+            onClick={() => setStatus(s)}
+            className={`rounded-full px-4 py-1.5 text-sm font-medium transition-colors ${
+              status === s ? "bg-secondary text-foreground" : "text-muted-foreground hover:text-foreground"
+            }`}
+          >
+            {s === "available" ? "Available" : "Used"}
+          </button>
+        ))}
+      </div>
+
+      {error && (
+        <Card>
+          <p className="text-sm text-destructive">{error}</p>
+        </Card>
+      )}
+
+      {!error && media === null && (
+        <Card>
+          <p className="text-sm text-muted-foreground">Loading…</p>
+        </Card>
+      )}
+
+      {!error && media !== null && media.length === 0 && (
+        <Card>
+          <p className="text-sm text-muted-foreground">
+            {status === "available"
+              ? "Nothing uploaded natively for this agent yet — use the upload box above, or keep managing their Google Drive folder the way you do today."
+              : "Nothing marked used yet."}
+          </p>
+        </Card>
+      )}
+
+      {!error && media !== null && media.length > 0 && (
+        <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-4">
+          {media.map((m) => (
+            <div key={m.id} className="overflow-hidden rounded-2xl border border-border bg-glass">
+              {m.media_type === "video"
+                ? m.url && <video src={m.url} controls className="aspect-square w-full object-cover" />
+                : m.url && <img src={m.url} alt={m.caption ?? ""} className="aspect-square w-full object-cover" />}
+              <div className="flex items-center justify-between gap-1 px-2 pt-2">
+                <span className="rounded-full bg-muted px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">
+                  {m.media_type}
+                </span>
+                <span className="rounded-full bg-muted px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">
+                  {m.source === "upload" ? "Uploaded" : "Drive"}
+                </span>
+              </div>
+              <div className="flex gap-1 p-2">
+                {status === "available" ? (
+                  <button
+                    onClick={() => markUsed(m.id)}
+                    disabled={busyId === m.id}
+                    className="flex-1 rounded-full border border-border px-2 py-1 text-[11px] font-semibold transition-colors hover:bg-secondary disabled:opacity-50"
+                  >
+                    Mark used
+                  </button>
+                ) : (
+                  <span className="flex-1 text-center text-[11px] text-muted-foreground">
+                    {m.used_at ? `Used ${new Date(m.used_at).toLocaleDateString()}` : "Used"}
+                  </span>
+                )}
+                <button
+                  onClick={() => remove(m.id)}
+                  disabled={busyId === m.id}
+                  className="rounded-full border border-destructive/40 px-2 py-1 text-[11px] font-semibold text-destructive transition-colors hover:bg-destructive/10 disabled:opacity-50"
+                >
+                  Delete
+                </button>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
     </div>
   );
 }

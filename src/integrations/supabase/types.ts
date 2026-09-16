@@ -90,6 +90,7 @@ export type Database = {
         Row: {
           brokerage: string | null;
           created_at: string;
+          drive_folder_id: string | null;
           email: string | null;
           full_name: string | null;
           headshot_url: string | null;
@@ -106,6 +107,7 @@ export type Database = {
         Insert: {
           brokerage?: string | null;
           created_at?: string;
+          drive_folder_id?: string | null;
           email?: string | null;
           full_name?: string | null;
           headshot_url?: string | null;
@@ -122,6 +124,7 @@ export type Database = {
         Update: {
           brokerage?: string | null;
           created_at?: string;
+          drive_folder_id?: string | null;
           email?: string | null;
           full_name?: string | null;
           headshot_url?: string | null;

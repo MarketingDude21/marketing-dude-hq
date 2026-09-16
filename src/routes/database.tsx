@@ -57,26 +57,56 @@ const HUB_ORDER = [
 // step). Mike wants the breakdown itself to show Full Direct Mail and
 // Email + Phone combined into one "Complete Data" number, since that matches
 // how the review step already treats them as one combined bucket.
-// checkedKey, when set, names the getSoiHubCounts field holding how many
-// contacts in this bucket are currently checked off (flagged) - Mike wants
-// Email Only and Incomplete to show that as "123/134" so he can reconcile
-// who'll actually make the final list without downloading anything.
+// mode picks how the card's number is computed from `lists`' totals and
+// `checkedLists`' _checked counts (see getSoiHubCounts): "checked" shows
+// checked/total for an opt-IN list (email_list/incomplete - checked = kept);
+// "survivors" shows (total - checked)/total for an opt-OUT list (direct_mail/
+// email_phone - checked = removed, so survivors are the UNCHECKED ones);
+// "none" is just the plain total, no live math. Both live formats give Mike
+// real-time transparency on who'll actually make the final list without
+// downloading anything.
 const BREAKDOWN_CARDS = [
   {
     key: "complete_data",
     label: "Complete Data",
     lists: ["direct_mail", "email_phone"] as const,
-    checkedKey: undefined,
+    checkedLists: ["direct_mail", "email_phone"] as const,
+    mode: "survivors" as const,
   },
-  { key: "email_list", label: "Email Only", lists: ["email_list"] as const, checkedKey: "email_list_checked" as const },
-  { key: "incomplete", label: "Incomplete", lists: ["incomplete"] as const, checkedKey: "incomplete_checked" as const },
-  { key: "nonqualified", label: "Nonqualified", lists: ["nonqualified"] as const, checkedKey: undefined },
-  { key: "realtor_excluded", label: "Realtor Excluded", lists: ["realtor_excluded"] as const, checkedKey: undefined },
+  {
+    key: "email_list",
+    label: "Email Only",
+    lists: ["email_list"] as const,
+    checkedLists: ["email_list"] as const,
+    mode: "checked" as const,
+  },
+  {
+    key: "incomplete",
+    label: "Incomplete",
+    lists: ["incomplete"] as const,
+    checkedLists: ["incomplete"] as const,
+    mode: "checked" as const,
+  },
+  {
+    key: "nonqualified",
+    label: "Nonqualified",
+    lists: ["nonqualified"] as const,
+    checkedLists: [] as const,
+    mode: "none" as const,
+  },
+  {
+    key: "realtor_excluded",
+    label: "Realtor Excluded",
+    lists: ["realtor_excluded"] as const,
+    checkedLists: [] as const,
+    mode: "none" as const,
+  },
   {
     key: "business_excluded",
     label: "Business Excluded",
     lists: ["business_excluded"] as const,
-    checkedKey: undefined,
+    checkedLists: [] as const,
+    mode: "none" as const,
   },
 ] as const;
 
@@ -776,14 +806,24 @@ function DatabaseBreakdown({
         <div className="mt-3 grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
           {BREAKDOWN_CARDS.map((card) => {
             const total = card.lists.reduce((sum: number, l) => sum + (counts[l] ?? 0), 0);
-            const checked = card.checkedKey ? (counts[card.checkedKey] ?? 0) : null;
+            const checkedSum = card.checkedLists.reduce((sum: number, l) => sum + (counts[`${l}_checked`] ?? 0), 0);
+            const display =
+              card.mode === "checked"
+                ? `${checkedSum}/${total}`
+                : card.mode === "survivors"
+                  ? `${total - checkedSum}/${total}`
+                  : total;
+            const caption =
+              card.mode === "checked"
+                ? "checked off / total on list"
+                : card.mode === "survivors"
+                  ? "will make final list / total on list"
+                  : null;
             return (
               <Card key={card.key}>
                 <p className="text-sm text-muted-foreground">{card.label}</p>
-                <p className="mt-1 font-display text-3xl font-bold">
-                  {checked !== null ? `${checked}/${total}` : total}
-                </p>
-                {checked !== null && <p className="mt-1 text-xs text-muted-foreground">checked off / total on list</p>}
+                <p className="mt-1 font-display text-3xl font-bold">{display}</p>
+                {caption && <p className="mt-1 text-xs text-muted-foreground">{caption}</p>}
               </Card>
             );
           })}
@@ -944,11 +984,15 @@ function ReviewTab({ clientId, lastProcessReport }: { clientId: string; lastProc
   const showAddressColumns = true;
   const leftOffContact = leftOffId ? contacts.find((c) => c.id === leftOffId) : undefined;
   const stepCopy = STEP_COPY[step.key];
-  // email_list/incomplete are opt-IN (checking = keep) - show how many of
-  // this list are currently checked to make the final list, live, so Mike
-  // can reconcile the numbers without downloading anything.
+  // Live "how many will actually make the final list" math for every
+  // editable review step, so Mike can reconcile without downloading
+  // anything. email_list/incomplete are opt-IN (checked = kept), so the
+  // number that matters is how many are checked; "Your Most Complete Data"
+  // (direct_mail/email_phone) is opt-OUT (checked = removed), so the number
+  // that matters is how many are UNCHECKED - i.e. total minus checked.
   const checkedCount = contacts.filter((c) => c.flagged).length;
-  const showCheckedCount = step.kind === "review" && step.optOut === false;
+  const showCheckedCount = step.kind === "review";
+  const makesFinalListCount = step.kind === "review" && step.optOut ? contacts.length - checkedCount : checkedCount;
 
   useEffect(() => {
     if (!jumpTo) return;
@@ -985,9 +1029,11 @@ function ReviewTab({ clientId, lastProcessReport }: { clientId: string; lastProc
               {showCheckedCount ? (
                 <p className="mt-3 text-sm text-muted-foreground">
                   <span className="font-semibold text-foreground">
-                    {checkedCount}/{contacts.length}
+                    {makesFinalListCount}/{contacts.length}
                   </span>{" "}
-                  checked off — these are the ones that'll make your final list.
+                  {step.kind === "review" && step.optOut
+                    ? "will make your final list — checked contacts get removed."
+                    : "checked off — these are the ones that'll make your final list."}
                 </p>
               ) : (
                 <p className="mt-3 text-sm text-muted-foreground">

@@ -53,10 +53,7 @@ function getSoiAdminClient(): SupabaseClient {
   });
 }
 
-export type SoiAccess =
-  | { role: "team" }
-  | { role: "client"; clientId: string; clientName: string }
-  | { role: "none" };
+export type SoiAccess = { role: "team" } | { role: "client"; clientId: string; clientName: string } | { role: "none" };
 
 // Resolves the currently logged-in dashboard user's role in SOI Builder by
 // email. Nothing here bypasses SOI Builder's own access rules - it just
@@ -96,11 +93,7 @@ async function resolveAccessForEmail(admin: SupabaseClient, email: string): Prom
     .eq("user_id", matchedUserId)
     .maybeSingle();
   if (accessRow) {
-    const { data: clientRow } = await admin
-      .from("clients")
-      .select("name")
-      .eq("id", accessRow.client_id)
-      .maybeSingle();
+    const { data: clientRow } = await admin.from("clients").select("name").eq("id", accessRow.client_id).maybeSingle();
     return { role: "client", clientId: accessRow.client_id, clientName: clientRow?.name ?? "Your database" };
   }
 
@@ -245,7 +238,7 @@ async function requireClientAccess(
 
 export const listSoiUploads = createServerFn({ method: "GET" })
   .middleware([requireSupabaseAuth])
-  .inputValidator((data: { clientId: string }) => data)
+  .validator((data: { clientId: string }) => data)
   .handler(async ({ data, context }) => {
     const admin = getSoiAdminClient();
     const email = (context.claims as { email?: string } | undefined)?.email;
@@ -261,14 +254,9 @@ export const listSoiUploads = createServerFn({ method: "GET" })
 
 export const uploadSoiFile = createServerFn({ method: "POST" })
   .middleware([requireSupabaseAuth])
-  .inputValidator(
-    (data: {
-      clientId: string;
-      fileName: string;
-      sourceLabel: string;
-      kind: "vcf" | "mapped_csv";
-      content: string;
-    }) => data,
+  .validator(
+    (data: { clientId: string; fileName: string; sourceLabel: string; kind: "vcf" | "mapped_csv"; content: string }) =>
+      data,
   )
   .handler(async ({ data, context }) => {
     const admin = getSoiAdminClient();
@@ -301,7 +289,7 @@ export const uploadSoiFile = createServerFn({ method: "POST" })
 
 export const deleteSoiUpload = createServerFn({ method: "POST" })
   .middleware([requireSupabaseAuth])
-  .inputValidator((data: { clientId: string; uploadId: string }) => data)
+  .validator((data: { clientId: string; uploadId: string }) => data)
   .handler(async ({ data, context }) => {
     const admin = getSoiAdminClient();
     const email = (context.claims as { email?: string } | undefined)?.email;
@@ -329,7 +317,7 @@ export const deleteSoiUpload = createServerFn({ method: "POST" })
 
 export const processSoiUploads = createServerFn({ method: "POST" })
   .middleware([requireSupabaseAuth])
-  .inputValidator((data: { clientId: string }) => data)
+  .validator((data: { clientId: string }) => data)
   .handler(async ({ data, context }) => {
     const admin = getSoiAdminClient();
     const email = (context.claims as { email?: string } | undefined)?.email;
@@ -368,16 +356,18 @@ const HUB_LISTS = [
   "business_excluded",
 ] as const;
 
-// Lists where "checked" means opt-IN (email_list/incomplete - checking keeps
-// them). Mike wants real-time transparency on how many of each will actually
-// make the final list without downloading anything, so the breakdown also
-// reports how many of these two are currently checked (flagged) - out of the
-// total in that bucket - alongside the plain totals for every other card.
-const CHECKED_COUNT_LISTS = ["email_list", "incomplete"] as const;
+// Every list that has a checkbox review step at all - direct_mail/email_phone
+// are opt-OUT (checked = removed), email_list/incomplete are opt-IN (checked
+// = kept). The frontend combines these into "checked/total" (opt-in) or
+// "survivors/total" (opt-out, i.e. total minus checked) as appropriate - see
+// BREAKDOWN_CARDS in database.tsx. Mike wants this same real-time
+// transparency (no downloading needed to see who'll make the final list) on
+// every reviewable bucket, not just the opt-in ones.
+const CHECKED_COUNT_LISTS = ["direct_mail", "email_phone", "email_list", "incomplete"] as const;
 
 export const getSoiHubCounts = createServerFn({ method: "GET" })
   .middleware([requireSupabaseAuth])
-  .inputValidator((data: { clientId: string }) => data)
+  .validator((data: { clientId: string }) => data)
   .handler(async ({ data, context }) => {
     const admin = getSoiAdminClient();
     const email = (context.claims as { email?: string } | undefined)?.email;
@@ -501,7 +491,9 @@ async function fetchContactsWithFlags(
 // safe - it doesn't change how any contact is classified.
 export const getSoiReviewCandidates = createServerFn({ method: "GET" })
   .middleware([requireSupabaseAuth])
-  .inputValidator((data: { clientId: string; listAssignment: "direct_mail" | "email_phone" | "email_list" | "incomplete" }) => data)
+  .validator(
+    (data: { clientId: string; listAssignment: "direct_mail" | "email_phone" | "email_list" | "incomplete" }) => data,
+  )
   .handler(async ({ data, context }) => {
     const admin = getSoiAdminClient();
     const email = (context.claims as { email?: string } | undefined)?.email;
@@ -518,7 +510,7 @@ export const getSoiReviewCandidates = createServerFn({ method: "GET" })
 // mirror here since these are read-only, nothing is reclassified.
 export const getSoiListView = createServerFn({ method: "GET" })
   .middleware([requireSupabaseAuth])
-  .inputValidator(
+  .validator(
     (data: {
       clientId: string;
       view: "nonqualified" | "realtor_excluded" | "business_excluded" | "facebook_audience" | "final_full_contact";
@@ -548,7 +540,9 @@ export const getSoiListView = createServerFn({ method: "GET" })
     // which is exactly the shape that can blow past a URL length limit for
     // a client with a lot of contacts.
     const reviewLists = ["direct_mail", "email_phone", "email_list", "incomplete"] as const;
-    const groups = await Promise.all(reviewLists.map((l) => fetchContactsWithFlags(admin, data.clientId, l, "primary")));
+    const groups = await Promise.all(
+      reviewLists.map((l) => fetchContactsWithFlags(admin, data.clientId, l, "primary")),
+    );
     const allContacts = groups.flat();
 
     function isSurvivor(c: SoiContactRow & { flagged: boolean }): boolean {
@@ -564,7 +558,7 @@ export const getSoiListView = createServerFn({ method: "GET" })
 
 export const setSoiReviewFlag = createServerFn({ method: "POST" })
   .middleware([requireSupabaseAuth])
-  .inputValidator((data: { clientId: string; contactId: string; reviewType: string; flagged: boolean }) => data)
+  .validator((data: { clientId: string; contactId: string; reviewType: string; flagged: boolean }) => data)
   .handler(async ({ data, context }) => {
     const admin = getSoiAdminClient();
     const email = (context.claims as { email?: string } | undefined)?.email;
@@ -586,7 +580,12 @@ export const setSoiReviewFlag = createServerFn({ method: "POST" })
     const { error } = await admin
       .from("review_flags")
       .upsert(
-        { contact_id: data.contactId, review_type: data.reviewType, flagged: data.flagged, flagged_by: email ?? "unknown" },
+        {
+          contact_id: data.contactId,
+          review_type: data.reviewType,
+          flagged: data.flagged,
+          flagged_by: email ?? "unknown",
+        },
         { onConflict: "contact_id,review_type" },
       );
     if (error) throw error;
@@ -595,7 +594,7 @@ export const setSoiReviewFlag = createServerFn({ method: "POST" })
 
 export const exportSoiList = createServerFn({ method: "POST" })
   .middleware([requireSupabaseAuth])
-  .inputValidator((data: { clientId: string; scope: string }) => data)
+  .validator((data: { clientId: string; scope: string }) => data)
   .handler(async ({ data, context }) => {
     const admin = getSoiAdminClient();
     const email = (context.claims as { email?: string } | undefined)?.email;

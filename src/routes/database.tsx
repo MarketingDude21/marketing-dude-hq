@@ -57,13 +57,27 @@ const HUB_ORDER = [
 // step). Mike wants the breakdown itself to show Full Direct Mail and
 // Email + Phone combined into one "Complete Data" number, since that matches
 // how the review step already treats them as one combined bucket.
+// checkedKey, when set, names the getSoiHubCounts field holding how many
+// contacts in this bucket are currently checked off (flagged) - Mike wants
+// Email Only and Incomplete to show that as "123/134" so he can reconcile
+// who'll actually make the final list without downloading anything.
 const BREAKDOWN_CARDS = [
-  { key: "complete_data", label: "Complete Data", lists: ["direct_mail", "email_phone"] as const },
-  { key: "email_list", label: "Email Only", lists: ["email_list"] as const },
-  { key: "incomplete", label: "Incomplete", lists: ["incomplete"] as const },
-  { key: "nonqualified", label: "Nonqualified", lists: ["nonqualified"] as const },
-  { key: "realtor_excluded", label: "Realtor Excluded", lists: ["realtor_excluded"] as const },
-  { key: "business_excluded", label: "Business Excluded", lists: ["business_excluded"] as const },
+  {
+    key: "complete_data",
+    label: "Complete Data",
+    lists: ["direct_mail", "email_phone"] as const,
+    checkedKey: undefined,
+  },
+  { key: "email_list", label: "Email Only", lists: ["email_list"] as const, checkedKey: "email_list_checked" as const },
+  { key: "incomplete", label: "Incomplete", lists: ["incomplete"] as const, checkedKey: "incomplete_checked" as const },
+  { key: "nonqualified", label: "Nonqualified", lists: ["nonqualified"] as const, checkedKey: undefined },
+  { key: "realtor_excluded", label: "Realtor Excluded", lists: ["realtor_excluded"] as const, checkedKey: undefined },
+  {
+    key: "business_excluded",
+    label: "Business Excluded",
+    lists: ["business_excluded"] as const,
+    checkedKey: undefined,
+  },
 ] as const;
 
 // direct_mail/email_phone: opt-OUT (checking = remove). email_list/incomplete: opt-IN (checking = keep).
@@ -142,9 +156,9 @@ const STEP_COPY: Partial<Record<(typeof REVIEW_STEPS)[number]["key"], { headline
       "Is there anyone on this list you don't know, like, trust, or want to see your content? This list should be comprised of past clients, family, friends, and anyone whom you'd expect to hire you when moving or refer you to a friend.",
   },
   email_list: {
-    headline: "Who Don't You Want To Market To On This List?",
+    headline: "Who Should Receive Your Content?",
     subheadline:
-      "Is there anyone on this list you don't know, like, trust, or want to see your content? This list should be comprised of past clients, family, friends, and anyone whom you'd expect to hire you when moving or refer you to a friend.",
+      "Is there anyone on this list that you want to see your content? Place a check next to anyone you want to add to your marketing lists. This list should be comprised of current leads, past clients, family, friends, and anyone whom you'd expect to hire you when moving or refer you to a friend.",
   },
   incomplete: {
     headline: "Who Should Receive Your Content?",
@@ -738,15 +752,20 @@ function formatDedupeReason(key: string): string {
 function DatabaseBreakdown({
   clientId,
   lastProcessReport,
+  refreshSignal,
 }: {
   clientId: string;
   lastProcessReport: ProcessReport | null;
+  // Bumped by ReviewTab any time a checkbox is saved, so the checked/total
+  // numbers below stay live instead of only updating on the next Process run
+  // or tab switch - this is the "reflect the math in real time" Mike asked for.
+  refreshSignal: number;
 }) {
   const [counts, setCounts] = useState<Record<string, number> | null>(null);
   useEffect(() => {
     getSoiHubCounts({ data: { clientId } }).then(setCounts);
-    // Re-fetch whenever a fresh Process run comes in, not just on client change.
-  }, [clientId, lastProcessReport]);
+    // Re-fetch on a fresh Process run and on every saved checkbox change, not just on client change.
+  }, [clientId, lastProcessReport, refreshSignal]);
 
   const duplicatesRemoved = lastProcessReport ? lastProcessReport.raw_total - lastProcessReport.unique_total : 0;
 
@@ -755,14 +774,19 @@ function DatabaseBreakdown({
       <h2 className="font-display text-lg font-semibold">Database Breakdown</h2>
       {counts ? (
         <div className="mt-3 grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
-          {BREAKDOWN_CARDS.map((card) => (
-            <Card key={card.key}>
-              <p className="text-sm text-muted-foreground">{card.label}</p>
-              <p className="mt-1 font-display text-3xl font-bold">
-                {card.lists.reduce((sum: number, l) => sum + (counts[l] ?? 0), 0)}
-              </p>
-            </Card>
-          ))}
+          {BREAKDOWN_CARDS.map((card) => {
+            const total = card.lists.reduce((sum: number, l) => sum + (counts[l] ?? 0), 0);
+            const checked = card.checkedKey ? (counts[card.checkedKey] ?? 0) : null;
+            return (
+              <Card key={card.key}>
+                <p className="text-sm text-muted-foreground">{card.label}</p>
+                <p className="mt-1 font-display text-3xl font-bold">
+                  {checked !== null ? `${checked}/${total}` : total}
+                </p>
+                {checked !== null && <p className="mt-1 text-xs text-muted-foreground">checked off / total on list</p>}
+              </Card>
+            );
+          })}
         </div>
       ) : (
         <p className="mt-3 text-sm text-muted-foreground">Loading…</p>
@@ -831,6 +855,10 @@ function ReviewTab({ clientId, lastProcessReport }: { clientId: string; lastProc
   const [search, setSearch] = useState("");
   const [leftOffId, setLeftOffId] = useState<string | null>(null);
   const [jumpTo, setJumpTo] = useState<string | null>(null);
+  // Bumped after every saved checkbox change, so DatabaseBreakdown's
+  // checked/total numbers refetch and stay live rather than only updating on
+  // the next Process run.
+  const [refreshSignal, setRefreshSignal] = useState(0);
   const rowRefs = useMemo(() => new Map<string, HTMLTableRowElement>(), []);
 
   useEffect(() => {
@@ -888,6 +916,7 @@ function ReviewTab({ clientId, lastProcessReport }: { clientId: string; lastProc
     setContacts((cs) => cs.map((c) => (c.id === contactId ? { ...c, flagged: next } : c)));
     savePosition(contactId);
     await setSoiReviewFlag({ data: { clientId, contactId, reviewType: "primary", flagged: next } });
+    setRefreshSignal((n) => n + 1);
   }
 
   async function toggleAll(next: boolean) {
@@ -896,6 +925,7 @@ function ReviewTab({ clientId, lastProcessReport }: { clientId: string; lastProc
     await Promise.all(
       ids.map((id) => setSoiReviewFlag({ data: { clientId, contactId: id, reviewType: "primary", flagged: next } })),
     );
+    setRefreshSignal((n) => n + 1);
   }
 
   const q = search.trim().toLowerCase();
@@ -909,12 +939,16 @@ function ReviewTab({ clientId, lastProcessReport }: { clientId: string; lastProc
     step.kind === "review"
       ? step.lists.length > 1
       : step.key === "final_full_contact" || step.key === "facebook_audience";
-  // Incomplete is specifically the "missing some fields" bucket - show every
-  // address field so it's obvious at a glance what's actually missing on
-  // each row, instead of just First/Last/Email/Phone/City like every other step.
-  const showAddressColumns = step.key === "incomplete";
+  // Same full-address layout on every screen, not just Incomplete, so Mike
+  // can see how the data sorts on any list at a glance.
+  const showAddressColumns = true;
   const leftOffContact = leftOffId ? contacts.find((c) => c.id === leftOffId) : undefined;
   const stepCopy = STEP_COPY[step.key];
+  // email_list/incomplete are opt-IN (checking = keep) - show how many of
+  // this list are currently checked to make the final list, live, so Mike
+  // can reconcile the numbers without downloading anything.
+  const checkedCount = contacts.filter((c) => c.flagged).length;
+  const showCheckedCount = step.kind === "review" && step.optOut === false;
 
   useEffect(() => {
     if (!jumpTo) return;
@@ -926,7 +960,7 @@ function ReviewTab({ clientId, lastProcessReport }: { clientId: string; lastProc
 
   return (
     <div>
-      <DatabaseBreakdown clientId={clientId} lastProcessReport={lastProcessReport} />
+      <DatabaseBreakdown clientId={clientId} lastProcessReport={lastProcessReport} refreshSignal={refreshSignal} />
       <div className="flex flex-wrap gap-2">
         {REVIEW_STEPS.map((s) => (
           <button
@@ -948,9 +982,18 @@ function ReviewTab({ clientId, lastProcessReport }: { clientId: string; lastProc
             <div className="mt-4">
               <h1 className="font-display text-2xl font-bold tracking-tight sm:text-3xl">{stepCopy.headline}</h1>
               <p className="mt-2 max-w-2xl text-sm text-muted-foreground sm:text-base">{stepCopy.subheadline}</p>
-              <p className="mt-3 text-sm text-muted-foreground">
-                {contacts.length} contact{contacts.length === 1 ? "" : "s"} on this list.
-              </p>
+              {showCheckedCount ? (
+                <p className="mt-3 text-sm text-muted-foreground">
+                  <span className="font-semibold text-foreground">
+                    {checkedCount}/{contacts.length}
+                  </span>{" "}
+                  checked off — these are the ones that'll make your final list.
+                </p>
+              ) : (
+                <p className="mt-3 text-sm text-muted-foreground">
+                  {contacts.length} contact{contacts.length === 1 ? "" : "s"} on this list.
+                </p>
+              )}
             </div>
           ) : (
             <p className="mt-3 text-sm text-muted-foreground">
@@ -993,21 +1036,21 @@ function ReviewTab({ clientId, lastProcessReport }: { clientId: string; lastProc
                 <table className="w-full text-sm">
                   <thead>
                     <tr className="text-left text-muted-foreground">
-                      <th className="pb-2">First name</th>
-                      <th className="pb-2">Last name</th>
-                      <th className="pb-2">Email</th>
-                      <th className="pb-2">Phone</th>
-                      {showAddressColumns && <th className="pb-2">Address</th>}
-                      <th className="pb-2">City</th>
+                      <th className="whitespace-nowrap pb-2 pr-6">First name</th>
+                      <th className="whitespace-nowrap pb-2 pr-6">Last name</th>
+                      <th className="pb-2 pr-6">Email</th>
+                      <th className="whitespace-nowrap pb-2 pr-6">Phone</th>
+                      {showAddressColumns && <th className="pb-2 pr-6">Address</th>}
+                      <th className="whitespace-nowrap pb-2 pr-6">City</th>
                       {showAddressColumns && (
                         <>
-                          <th className="pb-2">State</th>
-                          <th className="pb-2">Zip</th>
+                          <th className="whitespace-nowrap pb-2 pr-6">State</th>
+                          <th className="whitespace-nowrap pb-2 pr-6">Zip</th>
                         </>
                       )}
-                      {showListColumn && <th className="pb-2">List</th>}
+                      {showListColumn && <th className="whitespace-nowrap pb-2 pr-6">List</th>}
                       {editable && (
-                        <th className="pb-2">
+                        <th className="whitespace-nowrap pb-2">
                           <label className="flex items-center gap-1.5">
                             <input type="checkbox" checked={allChecked} onChange={(e) => toggleAll(e.target.checked)} />
                             {step.optOut ? "Remove all" : "Keep all"}
@@ -1026,27 +1069,27 @@ function ReviewTab({ clientId, lastProcessReport }: { clientId: string; lastProc
                         }}
                         className={`border-t border-border ${c.id === leftOffId ? "bg-secondary/40" : ""}`}
                       >
-                        <td className="py-2">{c.first_name}</td>
-                        <td className="py-2">{c.last_name}</td>
-                        <td className="py-2">{c.email}</td>
-                        <td className="py-2">{c.phone}</td>
-                        {showAddressColumns && <td className="py-2">{c.address}</td>}
-                        <td className="py-2">{c.city}</td>
+                        <td className="whitespace-nowrap py-2 pr-6">{c.first_name}</td>
+                        <td className="whitespace-nowrap py-2 pr-6">{c.last_name}</td>
+                        <td className="py-2 pr-6">{c.email}</td>
+                        <td className="whitespace-nowrap py-2 pr-6">{c.phone}</td>
+                        {showAddressColumns && <td className="py-2 pr-6">{c.address}</td>}
+                        <td className="whitespace-nowrap py-2 pr-6">{c.city}</td>
                         {showAddressColumns && (
                           <>
-                            <td className="py-2">{c.state}</td>
-                            <td className="py-2">{c.zip}</td>
+                            <td className="whitespace-nowrap py-2 pr-6">{c.state}</td>
+                            <td className="whitespace-nowrap py-2 pr-6">{c.zip}</td>
                           </>
                         )}
                         {showListColumn && (
-                          <td className="py-2">
+                          <td className="whitespace-nowrap py-2 pr-6">
                             <span className="rounded-full bg-muted px-2.5 py-1 text-xs font-semibold uppercase tracking-wide text-muted-foreground">
                               {LIST_LABELS[c.list_assignment ?? ""] ?? c.list_assignment}
                             </span>
                           </td>
                         )}
                         {editable && (
-                          <td className="py-2">
+                          <td className="py-2 pl-2">
                             <input
                               type="checkbox"
                               checked={c.flagged}
@@ -1183,27 +1226,35 @@ function FinalCombinedListStep({ clientId }: { clientId: string }) {
             <table className="w-full text-sm">
               <thead>
                 <tr className="text-left text-muted-foreground">
-                  <th className="pb-2">First name</th>
-                  <th className="pb-2">Last name</th>
-                  <th className="pb-2">Email</th>
-                  <th className="pb-2">Phone</th>
-                  <th className="pb-2">Missing</th>
-                  <th className="pb-2">Select</th>
+                  <th className="whitespace-nowrap pb-2 pr-6">First name</th>
+                  <th className="whitespace-nowrap pb-2 pr-6">Last name</th>
+                  <th className="pb-2 pr-6">Email</th>
+                  <th className="whitespace-nowrap pb-2 pr-6">Phone</th>
+                  <th className="pb-2 pr-6">Address</th>
+                  <th className="whitespace-nowrap pb-2 pr-6">City</th>
+                  <th className="whitespace-nowrap pb-2 pr-6">State</th>
+                  <th className="whitespace-nowrap pb-2 pr-6">Zip</th>
+                  <th className="whitespace-nowrap pb-2 pr-6">Missing</th>
+                  <th className="whitespace-nowrap pb-2">Select</th>
                 </tr>
               </thead>
               <tbody>
                 {filtered.map((c) => (
                   <tr key={c.id} className="border-t border-border">
-                    <td className="py-2">{c.first_name}</td>
-                    <td className="py-2">{c.last_name}</td>
-                    <td className="py-2">{c.email}</td>
-                    <td className="py-2">{c.phone}</td>
-                    <td className="py-2">
+                    <td className="whitespace-nowrap py-2 pr-6">{c.first_name}</td>
+                    <td className="whitespace-nowrap py-2 pr-6">{c.last_name}</td>
+                    <td className="py-2 pr-6">{c.email}</td>
+                    <td className="whitespace-nowrap py-2 pr-6">{c.phone}</td>
+                    <td className="py-2 pr-6">{c.address}</td>
+                    <td className="whitespace-nowrap py-2 pr-6">{c.city}</td>
+                    <td className="whitespace-nowrap py-2 pr-6">{c.state}</td>
+                    <td className="whitespace-nowrap py-2 pr-6">{c.zip}</td>
+                    <td className="py-2 pr-6">
                       <span className="rounded-full bg-muted px-2.5 py-1 text-xs font-semibold uppercase tracking-wide text-muted-foreground">
                         {c.missing.join(", ") || "—"}
                       </span>
                     </td>
-                    <td className="py-2">
+                    <td className="py-2 pl-2">
                       <input
                         type="checkbox"
                         checked={c.already_selected}

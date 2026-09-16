@@ -33,9 +33,9 @@ export const Route = createFileRoute("/database")({
 type ClientOption = { id: string; name: string };
 
 const LIST_LABELS: Record<string, string> = {
-  direct_mail: "Direct Mail",
+  direct_mail: "Full Direct Mail",
   email_phone: "Email + Phone",
-  email_list: "Email List",
+  email_list: "Email Only",
   incomplete: "Incomplete",
   nonqualified: "Nonqualified",
   realtor_excluded: "Realtor Excluded",
@@ -427,12 +427,25 @@ function PageHeader({
   );
 }
 
+// The full report handed back by processSoiUploads - raw/unique counts and a
+// dedupe/address/borderline breakdown, straight from the real process-upload
+// Edge Function. Pulled from processSoiUploads's own return type (rather than
+// hand-duplicated) so it can never drift out of sync with what it returns.
+type ProcessReport = Awaited<ReturnType<typeof processSoiUploads>>;
+
 function Workspace({ clientId }: { clientId: string }) {
-  const [tab, setTab] = useState<"upload" | "hub" | "review" | "export">("upload");
+  // Just Upload / Review / Export - the old separate "Database Breakdown" tab
+  // tested as confusing on its own, so that same data now lives folded into
+  // the top of Review instead (see DatabaseBreakdown below).
+  const [tab, setTab] = useState<"upload" | "review" | "export">("upload");
+  // The most recent Process run's report (raw/unique/dedupe counts) - lives
+  // here so it survives switching from Upload to Review right after
+  // processing, without needing to persist it anywhere server-side.
+  const [lastProcessReport, setLastProcessReport] = useState<ProcessReport | null>(null);
   return (
     <div className="mt-5">
       <div className="flex flex-wrap gap-1 rounded-full border border-border bg-glass p-1 backdrop-blur-xl w-fit">
-        {(["upload", "hub", "review", "export"] as const).map((t) => (
+        {(["upload", "review", "export"] as const).map((t) => (
           <button
             key={t}
             onClick={() => setTab(t)}
@@ -440,14 +453,15 @@ function Workspace({ clientId }: { clientId: string }) {
               tab === t ? "bg-secondary text-foreground" : "text-muted-foreground hover:text-foreground"
             }`}
           >
-            {t === "upload" ? "Upload" : t === "hub" ? "Database Breakdown" : t === "review" ? "Review" : "Export"}
+            {t === "upload" ? "Upload" : t === "review" ? "Review" : "Export"}
           </button>
         ))}
       </div>
       <div className="mt-5">
-        {tab === "upload" && <UploadTab clientId={clientId} onProcessed={() => setTab("hub")} />}
-        {tab === "hub" && <HubTab clientId={clientId} />}
-        {tab === "review" && <ReviewTab clientId={clientId} />}
+        {tab === "upload" && (
+          <UploadTab clientId={clientId} onProcessed={() => setTab("review")} onReport={setLastProcessReport} />
+        )}
+        {tab === "review" && <ReviewTab clientId={clientId} lastProcessReport={lastProcessReport} />}
         {tab === "export" && <ExportTab clientId={clientId} />}
       </div>
     </div>
@@ -459,7 +473,15 @@ const SPREADSHEET_EXTENSIONS = [".xlsx", ".xls", ".xlsm", ".xlsb", ".ods", ".tsv
 
 type BatchItem = { file: File; status: "pending" | "uploading" | "done" | "error"; error?: string };
 
-function UploadTab({ clientId, onProcessed }: { clientId: string; onProcessed: () => void }) {
+function UploadTab({
+  clientId,
+  onProcessed,
+  onReport,
+}: {
+  clientId: string;
+  onProcessed: () => void;
+  onReport: (report: ProcessReport) => void;
+}) {
   const [uploads, setUploads] = useState<
     Array<{ id: string; file_name: string; source_label: string; status: string }>
   >([]);
@@ -472,10 +494,11 @@ function UploadTab({ clientId, onProcessed }: { clientId: string; onProcessed: (
   const [batchRunning, setBatchRunning] = useState(false);
   const [busy, setBusy] = useState(false);
   const [processResult, setProcessResult] = useState<Record<string, number> | null>(null);
-  // Once Process finishes successfully we jump straight to the Hub tab (the
-  // "new screen" Mike asked for) instead of leaving the results sitting
-  // inline here — this just remembers that this batch has already been run,
-  // so the button still reads "Processed" if he clicks back to this tab.
+  // Once Process finishes successfully we jump straight to the Review tab
+  // (where the breakdown + report now live) instead of leaving the results
+  // sitting inline here — this just remembers that this batch has already
+  // been run, so the button still reads "Processed" if he clicks back to
+  // this tab.
   const [processed, setProcessed] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -556,8 +579,9 @@ function UploadTab({ clientId, onProcessed }: { clientId: string; onProcessed: (
       const result = await processSoiUploads({ data: { clientId } });
       setProcessResult(result.list_counts);
       setProcessed(true);
+      onReport(result);
       // Don't make Mike hunt for the results on this screen — jump straight
-      // to the Hub tab where the breakdown actually lives.
+      // to the Review tab, where the breakdown + report now live.
       onProcessed();
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
@@ -646,7 +670,7 @@ function UploadTab({ clientId, onProcessed }: { clientId: string; onProcessed: (
             <p className="mt-3 text-sm text-muted-foreground">
               Done — see the breakdown on the{" "}
               <button onClick={onProcessed} className="font-medium text-primary hover:underline">
-                Database Breakdown
+                Review
               </button>{" "}
               tab.
             </p>
@@ -657,22 +681,82 @@ function UploadTab({ clientId, onProcessed }: { clientId: string; onProcessed: (
   );
 }
 
-function HubTab({ clientId }: { clientId: string }) {
+// Turns a dedupe_stats key like "exact_email_match" into "Exact email match" -
+// generic on purpose, since the real reason codes live in the process-upload
+// Edge Function and could be renamed/added to there without this needing to
+// change in lockstep.
+function formatDedupeReason(key: string): string {
+  const words = key.replace(/_/g, " ").trim();
+  return words ? words.charAt(0).toUpperCase() + words.slice(1) : key;
+}
+
+// The breakdown counts used to live on their own separate "Database
+// Breakdown" tab - Mike found that confusing and asked for it folded into
+// the top of Review instead, directly above the step tabs. Also surfaces the
+// duplicate-removal report from the most recent Process run (the "little
+// report" the old app had), when there is one.
+function DatabaseBreakdown({
+  clientId,
+  lastProcessReport,
+}: {
+  clientId: string;
+  lastProcessReport: ProcessReport | null;
+}) {
   const [counts, setCounts] = useState<Record<string, number> | null>(null);
   useEffect(() => {
     getSoiHubCounts({ data: { clientId } }).then(setCounts);
-  }, [clientId]);
+    // Re-fetch whenever a fresh Process run comes in, not just on client change.
+  }, [clientId, lastProcessReport]);
 
-  if (!counts) return <Card>Loading…</Card>;
+  const duplicatesRemoved = lastProcessReport ? lastProcessReport.raw_total - lastProcessReport.unique_total : 0;
 
   return (
-    <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
-      {HUB_ORDER.map((k) => (
-        <Card key={k}>
-          <p className="text-sm text-muted-foreground">{LIST_LABELS[k]}</p>
-          <p className="mt-1 font-display text-3xl font-bold">{counts[k] ?? 0}</p>
+    <div className="mb-6">
+      <h2 className="font-display text-lg font-semibold">Database Breakdown</h2>
+      {counts ? (
+        <div className="mt-3 grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
+          {HUB_ORDER.map((k) => (
+            <Card key={k}>
+              <p className="text-sm text-muted-foreground">{LIST_LABELS[k]}</p>
+              <p className="mt-1 font-display text-3xl font-bold">{counts[k] ?? 0}</p>
+            </Card>
+          ))}
+        </div>
+      ) : (
+        <p className="mt-3 text-sm text-muted-foreground">Loading…</p>
+      )}
+
+      {lastProcessReport && (
+        <Card className="mt-4">
+          <h3 className="font-display text-base font-semibold">Just processed</h3>
+          <p className="mt-1 text-sm text-muted-foreground">
+            {lastProcessReport.raw_total} contact{lastProcessReport.raw_total === 1 ? "" : "s"} uploaded →{" "}
+            {lastProcessReport.unique_total} unique ({duplicatesRemoved} duplicate{duplicatesRemoved === 1 ? "" : "s"}{" "}
+            removed).
+          </p>
+          {Object.keys(lastProcessReport.dedupe_stats).length > 0 && (
+            <ul className="mt-2 space-y-1 text-sm text-muted-foreground">
+              {Object.entries(lastProcessReport.dedupe_stats).map(([reason, count]) => (
+                <li key={reason}>
+                  {formatDedupeReason(reason)}: {count}
+                </li>
+              ))}
+            </ul>
+          )}
+          {lastProcessReport.address_corrections.length > 0 && (
+            <p className="mt-2 text-sm text-muted-foreground">
+              {lastProcessReport.address_corrections.length} address correction
+              {lastProcessReport.address_corrections.length === 1 ? "" : "s"} made.
+            </p>
+          )}
+          {lastProcessReport.borderline_flags.length > 0 && (
+            <p className="mt-1 text-sm text-muted-foreground">
+              {lastProcessReport.borderline_flags.length} borderline email/domain flag
+              {lastProcessReport.borderline_flags.length === 1 ? "" : "s"} worth a second look.
+            </p>
+          )}
         </Card>
-      ))}
+      )}
     </div>
   );
 }
@@ -692,7 +776,7 @@ function positionKey(clientId: string, stepKey: string): string {
   return `soi-review-position:${clientId}:${stepKey}`;
 }
 
-function ReviewTab({ clientId }: { clientId: string }) {
+function ReviewTab({ clientId, lastProcessReport }: { clientId: string; lastProcessReport: ProcessReport | null }) {
   const [stepKey, setStepKey] = useState<(typeof REVIEW_STEPS)[number]["key"]>("complete");
   const step = REVIEW_STEPS.find((s) => s.key === stepKey) ?? REVIEW_STEPS[0];
   const editable = step.kind === "review";
@@ -782,6 +866,7 @@ function ReviewTab({ clientId }: { clientId: string }) {
 
   return (
     <div>
+      <DatabaseBreakdown clientId={clientId} lastProcessReport={lastProcessReport} />
       <div className="flex flex-wrap gap-2">
         {REVIEW_STEPS.map((s) => (
           <button
@@ -1075,7 +1160,7 @@ function FinalCombinedListStep({ clientId }: { clientId: string }) {
 }
 
 const EXPORT_SCOPES = [
-  { scope: "complete", label: "Direct Mail + Email/Phone" },
+  { scope: "complete", label: "Full Direct Mail + Email/Phone" },
   { scope: "email_list", label: "Email List" },
   { scope: "incomplete", label: "Incomplete" },
   { scope: "nonqualified", label: "Nonqualified" },

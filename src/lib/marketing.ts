@@ -34,10 +34,7 @@ export type MarketingAccess =
   | { role: "agent"; agentId: string; agentName: string }
   | { role: "none" };
 
-async function resolveAccess(
-  userId: string,
-  email: string | undefined,
-): Promise<MarketingAccess> {
+async function resolveAccess(userId: string, email: string | undefined): Promise<MarketingAccess> {
   const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
 
   if (email) {
@@ -49,11 +46,7 @@ async function resolveAccess(
     if (allow) return { role: "admin" };
   }
 
-  const { data: agent } = await supabaseAdmin
-    .from("agents")
-    .select("id, full_name")
-    .eq("id", userId)
-    .maybeSingle();
+  const { data: agent } = await supabaseAdmin.from("agents").select("id, full_name").eq("id", userId).maybeSingle();
   if (agent) {
     return { role: "agent", agentId: agent.id, agentName: agent.full_name ?? "Your account" };
   }
@@ -92,11 +85,7 @@ export const listMarketingAgents = createServerFn({ method: "GET" })
 // caller's access on every call (never trusts an agentId the browser sends)
 // so an agent can never read or edit someone else's content, and an admin's
 // access is always verified fresh rather than cached client-side.
-async function requireAgentAccess(
-  userId: string,
-  email: string | undefined,
-  requestedAgentId: string,
-): Promise<void> {
+async function requireAgentAccess(userId: string, email: string | undefined, requestedAgentId: string): Promise<void> {
   const access = await resolveAccess(userId, email);
   if (access.role === "admin") return;
   if (access.role === "agent" && access.agentId === requestedAgentId) return;
@@ -117,16 +106,14 @@ type PostRow = {
 
 export const listMarketingPosts = createServerFn({ method: "GET" })
   .middleware([requireSupabaseAuth])
-  .inputValidator((data: { agentId: string; month?: string }) => data)
+  .validator((data: { agentId: string; month?: string }) => data)
   .handler(async ({ data, context }): Promise<PostRow[]> => {
     const email = (context.claims as { email?: string } | undefined)?.email;
     await requireAgentAccess(context.userId, email, data.agentId);
     const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
     let query = supabaseAdmin
       .from("generated_posts")
-      .select(
-        "id, content, content_type, title, platform, status, month, scheduled_for, created_at",
-      )
+      .select("id, content, content_type, title, platform, status, month, scheduled_for, created_at")
       .eq("agent_id", data.agentId)
       .order("created_at", { ascending: true });
     if (data.month) query = query.eq("month", data.month);
@@ -137,7 +124,7 @@ export const listMarketingPosts = createServerFn({ method: "GET" })
 
 export const listMarketingMonths = createServerFn({ method: "GET" })
   .middleware([requireSupabaseAuth])
-  .inputValidator((data: { agentId: string }) => data)
+  .validator((data: { agentId: string }) => data)
   .handler(async ({ data, context }): Promise<string[]> => {
     const email = (context.claims as { email?: string } | undefined)?.email;
     await requireAgentAccess(context.userId, email, data.agentId);
@@ -147,9 +134,7 @@ export const listMarketingMonths = createServerFn({ method: "GET" })
       .select("month")
       .eq("agent_id", data.agentId);
     if (error) throw error;
-    const months = Array.from(
-      new Set((rows ?? []).map((r) => r.month).filter((m): m is string => Boolean(m))),
-    );
+    const months = Array.from(new Set((rows ?? []).map((r) => r.month).filter((m): m is string => Boolean(m))));
     months.sort();
     months.reverse();
     return months;
@@ -157,9 +142,7 @@ export const listMarketingMonths = createServerFn({ method: "GET" })
 
 export const updateMarketingPost = createServerFn({ method: "POST" })
   .middleware([requireSupabaseAuth])
-  .inputValidator(
-    (data: { agentId: string; postId: string; content?: string; status?: string }) => data,
-  )
+  .validator((data: { agentId: string; postId: string; content?: string; status?: string }) => data)
   .handler(async ({ data, context }): Promise<{ ok: true }> => {
     const email = (context.claims as { email?: string } | undefined)?.email;
     await requireAgentAccess(context.userId, email, data.agentId);
@@ -184,19 +167,14 @@ export const updateMarketingPost = createServerFn({ method: "POST" })
     if (data.content !== undefined) update.content = data.content;
     if (data.status !== undefined) update.status = data.status;
 
-    const { error } = await supabaseAdmin
-      .from("generated_posts")
-      .update(update)
-      .eq("id", data.postId);
+    const { error } = await supabaseAdmin.from("generated_posts").update(update).eq("id", data.postId);
     if (error) throw error;
     return { ok: true };
   });
 
 export const submitMarketingFeedback = createServerFn({ method: "POST" })
   .middleware([requireSupabaseAuth])
-  .inputValidator(
-    (data: { agentId: string; postId: string; rating?: string; notes?: string }) => data,
-  )
+  .validator((data: { agentId: string; postId: string; rating?: string; notes?: string }) => data)
   .handler(async ({ data, context }): Promise<{ ok: true }> => {
     const email = (context.claims as { email?: string } | undefined)?.email;
     await requireAgentAccess(context.userId, email, data.agentId);
@@ -232,7 +210,7 @@ type PhotoRow = {
 
 export const listMarketingPhotos = createServerFn({ method: "GET" })
   .middleware([requireSupabaseAuth])
-  .inputValidator((data: { agentId: string }) => data)
+  .validator((data: { agentId: string }) => data)
   .handler(async ({ data, context }): Promise<PhotoRow[]> => {
     const email = (context.claims as { email?: string } | undefined)?.email;
     await requireAgentAccess(context.userId, email, data.agentId);
@@ -244,4 +222,160 @@ export const listMarketingPhotos = createServerFn({ method: "GET" })
       .order("created_at", { ascending: false });
     if (error) throw error;
     return (photos ?? []) as PhotoRow[];
+  });
+
+// ============================================================================
+// Native media library (photos + short-form video) — lives in Monthly
+// Marketing (not Build My Brand) because this is where the files actually
+// get used, each month, to generate content. Coexists with Google Drive:
+// each agent's `photo_source` ('drive' | 'upload' | 'both') decides which
+// pool(s) get queried once content generation is wired up to read this
+// (Phase 2) — existing Drive-based agents default to 'drive' and are
+// completely unaffected by any of this until that agent is switched.
+//
+// Direction confirmed by Mike (2026-09-16): we own the media natively going
+// forward. Drive gets no further development — the three Drive functions
+// already read (drive-photos.js / analyze-photos.js / move-to-used.js) are
+// the last Drive code this touches. No hard upload cap: Mike's own point —
+// once a photo/video is marked "used" it drops out of the active pool the
+// same way Drive's "used" folder does today, so the *visible/active* set
+// stays small on its own without needing an artificial ceiling.
+// ============================================================================
+
+export type MediaRow = {
+  id: string;
+  url: string | null;
+  caption: string | null;
+  tags: string[];
+  media_type: "photo" | "video";
+  source: "upload" | "drive";
+  status: "available" | "used";
+  created_at: string;
+  used_at: string | null;
+};
+
+export const listMarketingMedia = createServerFn({ method: "GET" })
+  .middleware([requireSupabaseAuth])
+  .validator((data: { agentId: string; status?: "available" | "used" }) => data)
+  .handler(async ({ data, context }): Promise<MediaRow[]> => {
+    const email = (context.claims as { email?: string } | undefined)?.email;
+    await requireAgentAccess(context.userId, email, data.agentId);
+    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+    let query = supabaseAdmin
+      .from("agent_photos")
+      .select("id, url, caption, tags, media_type, source, status, created_at, used_at")
+      .eq("agent_id", data.agentId)
+      .order("created_at", { ascending: false });
+    if (data.status) query = query.eq("status", data.status);
+    const { data: rows, error } = await query;
+    if (error) throw error;
+    return (rows ?? []) as MediaRow[];
+  });
+
+// Step 1 of a native upload: mint a short-lived signed Storage upload URL for
+// this exact agent + file, after re-checking the caller actually has access
+// to that agent. The browser uploads the raw bytes straight to Storage using
+// this URL — the file itself never passes through this server function (no
+// base64/JSON relay), so there's no request-size ceiling to worry about for
+// video the way there would be if uploads were proxied through here.
+export const createMediaUploadUrl = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .validator((data: { agentId: string; fileName: string }) => data)
+  .handler(async ({ data, context }): Promise<{ path: string; token: string }> => {
+    const email = (context.claims as { email?: string } | undefined)?.email;
+    await requireAgentAccess(context.userId, email, data.agentId);
+    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+    const safeName = data.fileName.replace(/[^a-zA-Z0-9._-]/g, "_").slice(-120);
+    const path = `${data.agentId}/${crypto.randomUUID()}-${safeName}`;
+    const { data: signed, error } = await supabaseAdmin.storage.from("media").createSignedUploadUrl(path);
+    if (error) throw error;
+    return { path, token: signed.token };
+  });
+
+// Step 2: once the browser's direct upload to Storage succeeds, record the
+// new media row. Re-checks access again, and re-checks the path itself
+// actually belongs to this agent — never trusts anything the browser reports
+// back about its own upload.
+export const finalizeMediaUpload = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .validator((data: { agentId: string; storagePath: string; mediaType: "photo" | "video"; caption?: string }) => data)
+  .handler(async ({ data, context }): Promise<{ ok: true; id: string }> => {
+    const email = (context.claims as { email?: string } | undefined)?.email;
+    await requireAgentAccess(context.userId, email, data.agentId);
+    if (!data.storagePath.startsWith(`${data.agentId}/`)) {
+      throw new Error("Upload path does not belong to this agent.");
+    }
+    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+    const { data: pub } = supabaseAdmin.storage.from("media").getPublicUrl(data.storagePath);
+    const { data: row, error } = await supabaseAdmin
+      .from("agent_photos")
+      .insert({
+        agent_id: data.agentId,
+        url: pub.publicUrl,
+        storage_path: data.storagePath,
+        media_type: data.mediaType,
+        source: "upload",
+        status: "available",
+        caption: data.caption ?? null,
+        tags: [],
+      })
+      .select("id")
+      .single();
+    if (error) throw error;
+    return { ok: true, id: row.id };
+  });
+
+// Marks one or more media items "used" — the native equivalent of Drive's
+// move-to-used.js. Moves the row out of the "available" pool for good
+// without ever deleting the file, so there's always a record of what got
+// used and when (used_at / used_in_post_id). Content generation isn't native
+// yet (Phase 2), so nothing calls this automatically on approve yet — the
+// Media tab below exposes it as a manual action so the team can mark
+// something used the moment it's actually used in a piece of content,
+// same as they'd manually confirm today. Wiring this to fire automatically
+// on approval is a Phase 2 item once generation records which photo went
+// into which post.
+export const markMediaUsed = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .validator((data: { agentId: string; mediaIds: string[]; postId?: string }) => data)
+  .handler(async ({ data, context }): Promise<{ ok: true; updated: number }> => {
+    const email = (context.claims as { email?: string } | undefined)?.email;
+    await requireAgentAccess(context.userId, email, data.agentId);
+    if (!data.mediaIds.length) return { ok: true, updated: 0 };
+    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+    const { error } = await supabaseAdmin
+      .from("agent_photos")
+      .update({
+        status: "used",
+        used_at: new Date().toISOString(),
+        used_in_post_id: data.postId ?? null,
+      })
+      .eq("agent_id", data.agentId)
+      .in("id", data.mediaIds);
+    if (error) throw error;
+    return { ok: true, updated: data.mediaIds.length };
+  });
+
+export const deleteMarketingMedia = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .validator((data: { agentId: string; mediaId: string }) => data)
+  .handler(async ({ data, context }): Promise<{ ok: true }> => {
+    const email = (context.claims as { email?: string } | undefined)?.email;
+    await requireAgentAccess(context.userId, email, data.agentId);
+    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+    const { data: existing, error: fetchErr } = await supabaseAdmin
+      .from("agent_photos")
+      .select("agent_id, storage_path, source")
+      .eq("id", data.mediaId)
+      .maybeSingle();
+    if (fetchErr) throw fetchErr;
+    if (!existing || existing.agent_id !== data.agentId) {
+      throw new Error("Media not found for this agent.");
+    }
+    if (existing.storage_path) {
+      await supabaseAdmin.storage.from("media").remove([existing.storage_path]);
+    }
+    const { error } = await supabaseAdmin.from("agent_photos").delete().eq("id", data.mediaId);
+    if (error) throw error;
+    return { ok: true };
   });

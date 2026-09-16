@@ -212,7 +212,7 @@ type AnthropicResponse = {
 // login for this module anymore, since it's the same app, same session.
 export const generateVoiceDnaProfile = createServerFn({ method: "POST" })
   .middleware([requireSupabaseAuth])
-  .validator((data: GenerateVoiceDnaInput) => data)
+  .inputValidator((data: GenerateVoiceDnaInput) => data)
   .handler(async ({ data }): Promise<{ profile: string }> => {
     const apiKey = process.env["ANTHROPIC_API_KEY"];
     if (!apiKey) {

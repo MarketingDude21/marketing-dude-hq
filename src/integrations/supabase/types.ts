@@ -89,6 +89,7 @@ export type Database = {
       agents: {
         Row: {
           brokerage: string | null;
+          content_folders: Json;
           created_at: string;
           drive_folder_id: string | null;
           email: string | null;
@@ -106,6 +107,7 @@ export type Database = {
         };
         Insert: {
           brokerage?: string | null;
+          content_folders?: Json;
           created_at?: string;
           drive_folder_id?: string | null;
           email?: string | null;
@@ -123,6 +125,7 @@ export type Database = {
         };
         Update: {
           brokerage?: string | null;
+          content_folders?: Json;
           created_at?: string;
           drive_folder_id?: string | null;
           email?: string | null;

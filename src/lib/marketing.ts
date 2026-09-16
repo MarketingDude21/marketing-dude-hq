@@ -1,3 +1,4 @@
+```typescript
 import { createServerFn } from "@tanstack/react-start";
 import { requireSupabaseAuth } from "@/integrations/supabase/auth-middleware";
 import type { TablesInsert } from "@/integrations/supabase/types";
@@ -35,7 +36,10 @@ export type MarketingAccess =
   | { role: "agent"; agentId: string; agentName: string }
   | { role: "none" };
 
-async function resolveAccess(userId: string, email: string | undefined): Promise<MarketingAccess> {
+async function resolveAccess(
+  userId: string,
+  email: string | undefined,
+): Promise<MarketingAccess> {
   const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
 
   if (email) {
@@ -47,7 +51,11 @@ async function resolveAccess(userId: string, email: string | undefined): Promise
     if (allow) return { role: "admin" };
   }
 
-  const { data: agent } = await supabaseAdmin.from("agents").select("id, full_name").eq("id", userId).maybeSingle();
+  const { data: agent } = await supabaseAdmin
+    .from("agents")
+    .select("id, full_name")
+    .eq("id", userId)
+    .maybeSingle();
   if (agent) {
     return { role: "agent", agentId: agent.id, agentName: agent.full_name ?? "Your account" };
   }
@@ -86,7 +94,11 @@ export const listMarketingAgents = createServerFn({ method: "GET" })
 // caller's access on every call (never trusts an agentId the browser sends)
 // so an agent can never read or edit someone else's content, and an admin's
 // access is always verified fresh rather than cached client-side.
-async function requireAgentAccess(userId: string, email: string | undefined, requestedAgentId: string): Promise<void> {
+async function requireAgentAccess(
+  userId: string,
+  email: string | undefined,
+  requestedAgentId: string,
+): Promise<void> {
   const access = await resolveAccess(userId, email);
   if (access.role === "admin") return;
   if (access.role === "agent" && access.agentId === requestedAgentId) return;
@@ -125,7 +137,9 @@ export const listMarketingPosts = createServerFn({ method: "GET" })
     const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
     let query = supabaseAdmin
       .from("generated_posts")
-      .select("id, content, content_type, title, platform, status, month, scheduled_for, created_at, metadata")
+      .select(
+        "id, content, content_type, title, platform, status, month, scheduled_for, created_at, metadata",
+      )
       .eq("agent_id", data.agentId)
       .order("created_at", { ascending: true });
     if (data.month) query = query.eq("month", data.month);
@@ -169,7 +183,9 @@ export const listMarketingMonths = createServerFn({ method: "GET" })
       .select("month")
       .eq("agent_id", data.agentId);
     if (error) throw error;
-    const months = Array.from(new Set((rows ?? []).map((r) => r.month).filter((m): m is string => Boolean(m))));
+    const months = Array.from(
+      new Set((rows ?? []).map((r) => r.month).filter((m): m is string => Boolean(m))),
+    );
     months.sort();
     months.reverse();
     return months;
@@ -177,7 +193,9 @@ export const listMarketingMonths = createServerFn({ method: "GET" })
 
 export const updateMarketingPost = createServerFn({ method: "POST" })
   .middleware([requireSupabaseAuth])
-  .validator((data: { agentId: string; postId: string; content?: string; status?: string }) => data)
+  .validator(
+    (data: { agentId: string; postId: string; content?: string; status?: string }) => data,
+  )
   .handler(async ({ data, context }): Promise<{ ok: true }> => {
     const email = (context.claims as { email?: string } | undefined)?.email;
     await requireAgentAccess(context.userId, email, data.agentId);
@@ -202,14 +220,19 @@ export const updateMarketingPost = createServerFn({ method: "POST" })
     if (data.content !== undefined) update.content = data.content;
     if (data.status !== undefined) update.status = data.status;
 
-    const { error } = await supabaseAdmin.from("generated_posts").update(update).eq("id", data.postId);
+    const { error } = await supabaseAdmin
+      .from("generated_posts")
+      .update(update)
+      .eq("id", data.postId);
     if (error) throw error;
     return { ok: true };
   });
 
 export const submitMarketingFeedback = createServerFn({ method: "POST" })
   .middleware([requireSupabaseAuth])
-  .validator((data: { agentId: string; postId: string; rating?: string; notes?: string }) => data)
+  .validator(
+    (data: { agentId: string; postId: string; rating?: string; notes?: string }) => data,
+  )
   .handler(async ({ data, context }): Promise<{ ok: true }> => {
     const email = (context.claims as { email?: string } | undefined)?.email;
     await requireAgentAccess(context.userId, email, data.agentId);
@@ -322,7 +345,9 @@ export const createMediaUploadUrl = createServerFn({ method: "POST" })
     const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
     const safeName = data.fileName.replace(/[^a-zA-Z0-9._-]/g, "_").slice(-120);
     const path = `${data.agentId}/${crypto.randomUUID()}-${safeName}`;
-    const { data: signed, error } = await supabaseAdmin.storage.from("media").createSignedUploadUrl(path);
+    const { data: signed, error } = await supabaseAdmin.storage
+      .from("media")
+      .createSignedUploadUrl(path);
     if (error) throw error;
     return { path, token: signed.token };
   });
@@ -333,7 +358,14 @@ export const createMediaUploadUrl = createServerFn({ method: "POST" })
 // back about its own upload.
 export const finalizeMediaUpload = createServerFn({ method: "POST" })
   .middleware([requireSupabaseAuth])
-  .validator((data: { agentId: string; storagePath: string; mediaType: "photo" | "video"; caption?: string }) => data)
+  .validator(
+    (data: {
+      agentId: string;
+      storagePath: string;
+      mediaType: "photo" | "video";
+      caption?: string;
+    }) => data,
+  )
   .handler(async ({ data, context }): Promise<{ ok: true; id: string }> => {
     const email = (context.claims as { email?: string } | undefined)?.email;
     await requireAgentAccess(context.userId, email, data.agentId);
@@ -463,7 +495,9 @@ export const listAgentDriveMedia = createServerFn({ method: "GET" })
 
     const apiKey = process.env["GOOGLE_API_KEY"];
     if (!apiKey) {
-      throw new Error("Google Drive isn't connected yet — add GOOGLE_API_KEY in Lovable Cloud → Secrets.");
+      throw new Error(
+        "Google Drive isn't connected yet — add GOOGLE_API_KEY in Lovable Cloud → Secrets.",
+      );
     }
 
     // Find the "used" subfolder first so its contents get excluded — same
@@ -554,7 +588,9 @@ function buildContentPrompt(
   agentCity: string,
   voiceDna: string,
 ): string {
-  const extra = input.instructions?.trim() ? `\n\nADDITIONAL DIRECTION:\n${input.instructions.trim()}` : "";
+  const extra = input.instructions?.trim()
+    ? `\n\nADDITIONAL DIRECTION:\n${input.instructions.trim()}`
+    : "";
 
   if (input.contentType === "post") {
     return (
@@ -611,7 +647,9 @@ export const generateMarketingContent = createServerFn({ method: "POST" })
 
     const apiKey = process.env["ANTHROPIC_API_KEY"];
     if (!apiKey) {
-      throw new Error("Content generation isn't configured yet — add ANTHROPIC_API_KEY in Lovable Cloud → Secrets.");
+      throw new Error(
+        "Content generation isn't configured yet — add ANTHROPIC_API_KEY in Lovable Cloud → Secrets.",
+      );
     }
 
     const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
@@ -625,7 +663,8 @@ export const generateMarketingContent = createServerFn({ method: "POST" })
     const agentName = agent?.full_name ?? "the agent";
     const agentCity = agent?.market_area ?? "their market";
     const voiceDna =
-      agent?.voice_summary ?? "Warm, conversational, authentic real estate agent. Short posts. Real human energy.";
+      agent?.voice_summary ??
+      "Warm, conversational, authentic real estate agent. Short posts. Real human energy.";
 
     const prompt = buildContentPrompt(data, agentName, agentCity, voiceDna);
 
@@ -647,10 +686,7 @@ export const generateMarketingContent = createServerFn({ method: "POST" })
       error?: { message?: string };
     };
     if (!res.ok) throw new Error(json.error?.message ?? `Claude API error (${res.status})`);
-    const raw = (json.content ?? [])
-      .map((b) => b.text ?? "")
-      .join("")
-      .trim();
+    const raw = (json.content ?? []).map((b) => b.text ?? "").join("").trim();
     if (!raw) throw new Error("Empty response from Claude — try again.");
 
     const { data: row, error } = await supabaseAdmin
@@ -721,7 +757,10 @@ export const addContentFolder = createServerFn({ method: "POST" })
   .validator((data: { agentId: string; month: string; driveFolderId: string }) => data)
   .handler(async ({ data, context }): Promise<{ ok: true; folders: ContentFolder[] }> => {
     const email = (context.claims as { email?: string } | undefined)?.email;
-    await requireAgentAccess(context.userId, email, data.agentId);
+    const access = await resolveAccess(context.userId, email);
+    if (access.role !== "admin") {
+      throw new Error("Only team members can add a month folder.");
+    }
     const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
     const { data: agent, error: fetchErr } = await supabaseAdmin
       .from("agents")
@@ -730,15 +769,15 @@ export const addContentFolder = createServerFn({ method: "POST" })
       .maybeSingle();
     if (fetchErr) throw fetchErr;
     const current = ((agent?.content_folders as ContentFolder[] | null) ?? []) as ContentFolder[];
-    const cleanId = data.driveFolderId
-      .replace(/.*\/folders\//, "")
-      .replace(/[?&].*/, "")
-      .trim();
+    const cleanId = data.driveFolderId.replace(/.*\/folders\//, "").replace(/[?&].*/, "").trim();
     if (current.some((f) => f.id === cleanId)) {
       throw new Error("That folder ID is already in this agent's list.");
     }
     const next = [{ id: cleanId, month: data.month.trim() }, ...current];
-    const { error } = await supabaseAdmin.from("agents").update({ content_folders: next }).eq("id", data.agentId);
+    const { error } = await supabaseAdmin
+      .from("agents")
+      .update({ content_folders: next })
+      .eq("id", data.agentId);
     if (error) throw error;
     return { ok: true, folders: next };
   });
@@ -748,7 +787,10 @@ export const removeContentFolder = createServerFn({ method: "POST" })
   .validator((data: { agentId: string; folderId: string }) => data)
   .handler(async ({ data, context }): Promise<{ ok: true; folders: ContentFolder[] }> => {
     const email = (context.claims as { email?: string } | undefined)?.email;
-    await requireAgentAccess(context.userId, email, data.agentId);
+    const access = await resolveAccess(context.userId, email);
+    if (access.role !== "admin") {
+      throw new Error("Only team members can remove a month folder.");
+    }
     const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
     const { data: agent, error: fetchErr } = await supabaseAdmin
       .from("agents")
@@ -758,7 +800,10 @@ export const removeContentFolder = createServerFn({ method: "POST" })
     if (fetchErr) throw fetchErr;
     const current = ((agent?.content_folders as ContentFolder[] | null) ?? []) as ContentFolder[];
     const next = current.filter((f) => f.id !== data.folderId);
-    const { error } = await supabaseAdmin.from("agents").update({ content_folders: next }).eq("id", data.agentId);
+    const { error } = await supabaseAdmin
+      .from("agents")
+      .update({ content_folders: next })
+      .eq("id", data.agentId);
     if (error) throw error;
     return { ok: true, folders: next };
   });
@@ -836,18 +881,17 @@ function parsePostDoc(text: string, title: string): CalendarDoc | null {
     text.match(/<(https?:\/\/canva\.[^\s>]+)>/i) ||
     text.match(/(https?:\/\/canva\.link\/\S+)/i) ||
     text.match(/(https?:\/\/www\.canva\.com\/\S+)/i);
-  if (canvaMatch)
-    canva = canvaMatch[1]!
-      .trim()
-      .replace(/[<>()[\]]/g, "")
-      .replace(/\*\*/g, "")
-      .trim();
+  if (canvaMatch) canva = canvaMatch[1]!.trim().replace(/[<>()[\]]/g, "").replace(/\*\*/g, "").trim();
 
   return { type: "post", title, goal, image, canva, copy };
 }
 
 function parseEmailDoc(text: string, title: string): CalendarDoc | null {
-  const goal = extractSection(text, "Email Goal", ["Subject Line Options", "Email Instructions", "SUBJECT LINE"]);
+  const goal = extractSection(text, "Email Goal", [
+    "Subject Line Options",
+    "Email Instructions",
+    "SUBJECT LINE",
+  ]);
   const subjectSection =
     extractSection(text, "SUBJECT LINE OPTIONS?(?:\\s*\\([^)]*\\))?", [
       "Email Instructions",
@@ -884,14 +928,7 @@ function parseEmailDoc(text: string, title: string): CalendarDoc | null {
 
   const subjects = (subjectSection || "")
     .split("\n")
-    .map((l) =>
-      l
-        .replace(/^[-*•\d.)\s]+/, "")
-        .replace(/\*\*/g, "")
-        .replace(/\*/g, "")
-        .replace(/\\/g, "")
-        .trim(),
-    )
+    .map((l) => l.replace(/^[-*•\d.)\s]+/, "").replace(/\*\*/g, "").replace(/\*/g, "").replace(/\\/g, "").trim())
     .filter((l) => l.length > 5 && !/^Pick\s+\d/i.test(l));
 
   return { type: "email", title, goal, subjects, instructions: instructionsText };
@@ -1016,10 +1053,7 @@ async function callClaude(apiKey: string, prompt: string, maxTokens: number): Pr
   });
   const json = (await res.json()) as { content?: { text?: string }[]; error?: { message?: string } };
   if (!res.ok) throw new Error(json.error?.message ?? `Claude API error (${res.status})`);
-  return (json.content ?? [])
-    .map((b) => b.text ?? "")
-    .join("")
-    .trim();
+  return (json.content ?? []).map((b) => b.text ?? "").join("").trim();
 }
 
 function cleanCopy(text: string): string {
@@ -1038,10 +1072,8 @@ export const generateMonthlyBatch = createServerFn({ method: "POST" })
 
     const googleKey = process.env["GOOGLE_API_KEY"];
     const anthropicKey = process.env["ANTHROPIC_API_KEY"];
-    if (!googleKey)
-      throw new Error("Google Drive isn't connected yet — add GOOGLE_API_KEY in Lovable Cloud → Secrets.");
-    if (!anthropicKey)
-      throw new Error("Content generation isn't configured yet — add ANTHROPIC_API_KEY in Lovable Cloud → Secrets.");
+    if (!googleKey) throw new Error("Google Drive isn't connected yet — add GOOGLE_API_KEY in Lovable Cloud → Secrets.");
+    if (!anthropicKey) throw new Error("Content generation isn't configured yet — add ANTHROPIC_API_KEY in Lovable Cloud → Secrets.");
 
     const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
     const { data: agent, error: agentErr } = await supabaseAdmin
@@ -1053,7 +1085,8 @@ export const generateMonthlyBatch = createServerFn({ method: "POST" })
     const agentName = agent?.full_name ?? "the agent";
     const agentCity = agent?.market_area ?? "their market";
     const dna =
-      agent?.voice_summary ?? "Warm, conversational, authentic real estate agent. Short posts. Real human energy.";
+      agent?.voice_summary ??
+      "Warm, conversational, authentic real estate agent. Short posts. Real human energy.";
 
     const docs = await fetchCalendarDocs(data.folderId, googleKey);
     const postDocs = docs.filter((d): d is Extract<CalendarDoc, { type: "post" }> => d.type === "post");
@@ -1101,13 +1134,7 @@ export const generateMonthlyBatch = createServerFn({ method: "POST" })
             title: doc.title,
             status: "pending",
             month: data.month,
-            metadata: {
-              batch_id: batchId,
-              month: data.month,
-              canva_link: doc.canva || null,
-              goal: doc.goal,
-              source: "drive_calendar",
-            },
+            metadata: { batch_id: batchId, month: data.month, canva_link: doc.canva || null, goal: doc.goal, source: "drive_calendar" },
           });
         }
       });
@@ -1123,9 +1150,8 @@ export const generateMonthlyBatch = createServerFn({ method: "POST" })
           instructions,
         );
       const isLocalLetter =
-        /observations|Local Letter|three to four|reads like a note|newsletter.*rewrite|sound like a note/i.test(
-          instructions,
-        ) || /CRITICAL RULES FOR THIS FORMAT|Do NOT use headers|Do NOT write bullet/i.test(instructions);
+        /observations|Local Letter|three to four|reads like a note|newsletter.*rewrite|sound like a note/i.test(instructions) ||
+        /CRITICAL RULES FOR THIS FORMAT|Do NOT use headers|Do NOT write bullet/i.test(instructions);
 
       let emailPrompt: string;
       if (isPromptBrief) {
@@ -1182,9 +1208,7 @@ export const generateMonthlyBatch = createServerFn({ method: "POST" })
           .map((s) => s.replace(/^\d+\.\s*/, "").trim());
         rows.push({
           agent_id: data.agentId,
-          content:
-            (subjects.length ? `SUBJECT OPTIONS:\n${subjects.map((s, i) => `${i + 1}. ${s}`).join("\n")}\n\n` : "") +
-            body,
+          content: (subjects.length ? `SUBJECT OPTIONS:\n${subjects.map((s, i) => `${i + 1}. ${s}`).join("\n")}\n\n` : "") + body,
           content_type: "email",
           title: ed.title.replace("Email — ", ""),
           status: "pending",
@@ -1252,10 +1276,8 @@ export const scanAgentDrivePhotos = createServerFn({ method: "POST" })
     await requireAgentAccess(context.userId, email, data.agentId);
     const googleKey = process.env["GOOGLE_API_KEY"];
     const anthropicKey = process.env["ANTHROPIC_API_KEY"];
-    if (!googleKey)
-      throw new Error("Google Drive isn't connected yet — add GOOGLE_API_KEY in Lovable Cloud → Secrets.");
-    if (!anthropicKey)
-      throw new Error("Photo captioning isn't configured yet — add ANTHROPIC_API_KEY in Lovable Cloud → Secrets.");
+    if (!googleKey) throw new Error("Google Drive isn't connected yet — add GOOGLE_API_KEY in Lovable Cloud → Secrets.");
+    if (!anthropicKey) throw new Error("Photo captioning isn't configured yet — add ANTHROPIC_API_KEY in Lovable Cloud → Secrets.");
 
     const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
     const { data: agent } = await supabaseAdmin
@@ -1328,11 +1350,7 @@ export const scanAgentDrivePhotos = createServerFn({ method: "POST" })
 
           const res = await fetch("https://api.anthropic.com/v1/messages", {
             method: "POST",
-            headers: {
-              "Content-Type": "application/json",
-              "x-api-key": anthropicKey,
-              "anthropic-version": "2023-06-01",
-            },
+            headers: { "Content-Type": "application/json", "x-api-key": anthropicKey, "anthropic-version": "2023-06-01" },
             body: JSON.stringify({
               model: "claude-haiku-4-5-20251001",
               max_tokens: 300,
@@ -1349,10 +1367,7 @@ export const scanAgentDrivePhotos = createServerFn({ method: "POST" })
           });
           const claudeData = (await res.json()) as { content?: { text?: string }[]; error?: { message?: string } };
           if (!res.ok) throw new Error(claudeData.error?.message ?? "Claude API error");
-          const raw = (claudeData.content ?? [])
-            .map((b) => b.text ?? "")
-            .join("")
-            .trim();
+          const raw = (claudeData.content ?? []).map((b) => b.text ?? "").join("").trim();
           const descMatch = raw.match(/DESCRIPTION:\s*(.+)/i);
           const postMatch = raw.match(/POST:\s*([\s\S]+)/i);
           return {
@@ -1469,7 +1484,8 @@ export const sendContentToAgent = createServerFn({ method: "POST" })
     if (!contactId) throw new Error(`Could not find or create a GoHighLevel contact for ${agent.email}.`);
 
     const firstName = agent.full_name?.split(" ")[0] ?? "there";
-    const reviewUrl = (process.env["APP_URL"] ?? "https://marketing-dude-hq.lovable.app") + "/marketing";
+    const reviewUrl =
+      (process.env["APP_URL"] ?? "https://marketing-dude-hq.lovable.app") + "/marketing";
     const emailHtml = `
 <html><body style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;padding:20px;color:#1A1A18;">
   <h2 style="font-size:22px;font-weight:600;margin-bottom:8px;">Hey ${firstName} — your ${data.month} content is ready!</h2>
@@ -1498,3 +1514,4 @@ export const sendContentToAgent = createServerFn({ method: "POST" })
     }
     return { ok: true };
   });
+```

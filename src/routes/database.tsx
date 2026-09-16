@@ -51,6 +51,21 @@ const HUB_ORDER = [
   "business_excluded",
 ] as const;
 
+// Database Breakdown summary cards - separate from LIST_LABELS/HUB_ORDER
+// above (those still label each contact's own individual list_assignment for
+// the per-row "List" badge on the combined "Your Most Complete Data" review
+// step). Mike wants the breakdown itself to show Full Direct Mail and
+// Email + Phone combined into one "Complete Data" number, since that matches
+// how the review step already treats them as one combined bucket.
+const BREAKDOWN_CARDS = [
+  { key: "complete_data", label: "Complete Data", lists: ["direct_mail", "email_phone"] as const },
+  { key: "email_list", label: "Email Only", lists: ["email_list"] as const },
+  { key: "incomplete", label: "Incomplete", lists: ["incomplete"] as const },
+  { key: "nonqualified", label: "Nonqualified", lists: ["nonqualified"] as const },
+  { key: "realtor_excluded", label: "Realtor Excluded", lists: ["realtor_excluded"] as const },
+  { key: "business_excluded", label: "Business Excluded", lists: ["business_excluded"] as const },
+] as const;
+
 // direct_mail/email_phone: opt-OUT (checking = remove). email_list/incomplete: opt-IN (checking = keep).
 // This whole tab bar matches the original SOI Builder app's own review flow
 // tab-for-tab: 3 editable review steps, then read-only browsable lists for
@@ -715,10 +730,12 @@ function DatabaseBreakdown({
       <h2 className="font-display text-lg font-semibold">Database Breakdown</h2>
       {counts ? (
         <div className="mt-3 grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
-          {HUB_ORDER.map((k) => (
-            <Card key={k}>
-              <p className="text-sm text-muted-foreground">{LIST_LABELS[k]}</p>
-              <p className="mt-1 font-display text-3xl font-bold">{counts[k] ?? 0}</p>
+          {BREAKDOWN_CARDS.map((card) => (
+            <Card key={card.key}>
+              <p className="text-sm text-muted-foreground">{card.label}</p>
+              <p className="mt-1 font-display text-3xl font-bold">
+                {card.lists.reduce((sum: number, l) => sum + (counts[l] ?? 0), 0)}
+              </p>
             </Card>
           ))}
         </div>
@@ -782,6 +799,7 @@ function ReviewTab({ clientId, lastProcessReport }: { clientId: string; lastProc
   const editable = step.kind === "review";
   const [contacts, setContacts] = useState<ReviewContact[]>([]);
   const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState<string | null>(null);
   const [search, setSearch] = useState("");
   const [leftOffId, setLeftOffId] = useState<string | null>(null);
   const [jumpTo, setJumpTo] = useState<string | null>(null);
@@ -790,6 +808,7 @@ function ReviewTab({ clientId, lastProcessReport }: { clientId: string; lastProc
   useEffect(() => {
     setSearch("");
     setJumpTo(null);
+    setLoadError(null);
 
     // "Final Combined List" gets its own dedicated Full Contact / Needs Data
     // component below (FinalCombinedListStep) instead of the generic table -
@@ -808,7 +827,15 @@ function ReviewTab({ clientId, lastProcessReport }: { clientId: string; lastProc
         : getSoiListView({ data: { clientId, view: step.key } }).then((rows) => [
             rows.map((r) => ({ ...r, flagged: false })),
           ]);
-    request.then((results) => setContacts(results.flat())).finally(() => setLoading(false));
+    request
+      .then((results) => setContacts(results.flat()))
+      // A failed fetch used to just leave this list empty with no
+      // explanation while the error surfaced as an uncaught rejection
+      // elsewhere - show it here instead, on the step it actually happened
+      // on, so it's obvious this is "the list failed to load" rather than
+      // "this list is genuinely empty."
+      .catch((e) => setLoadError(e instanceof Error ? e.message : String(e)))
+      .finally(() => setLoading(false));
 
     if (step.kind === "review") {
       try {
@@ -916,6 +943,8 @@ function ReviewTab({ clientId, lastProcessReport }: { clientId: string; lastProc
           <Card className="mt-4">
             {loading ? (
               <p className="text-sm text-muted-foreground">Loading…</p>
+            ) : loadError ? (
+              <p className="text-sm text-destructive">Couldn't load this list: {loadError}</p>
             ) : (
               <div className="overflow-x-auto">
                 <table className="w-full text-sm">
@@ -997,12 +1026,14 @@ function FinalCombinedListStep({ clientId }: { clientId: string }) {
   const [fullContactCount, setFullContactCount] = useState<number | null>(null);
   const [needsData, setNeedsData] = useState<NeedsDataContact[] | null>(null);
   const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState<string | null>(null);
   const [downloading, setDownloading] = useState<string | null>(null);
   const [search, setSearch] = useState("");
 
   useEffect(() => {
     setView("summary");
     setLoading(true);
+    setLoadError(null);
     Promise.all([
       getSoiListView({ data: { clientId, view: "final_full_contact" } }),
       exportSoiList({ data: { clientId, scope: "needs_data_list" } }),
@@ -1011,6 +1042,7 @@ function FinalCombinedListStep({ clientId }: { clientId: string }) {
         setFullContactCount(fullContact.length);
         setNeedsData(needs.contacts ?? []);
       })
+      .catch((e) => setLoadError(e instanceof Error ? e.message : String(e)))
       .finally(() => setLoading(false));
   }, [clientId]);
 
@@ -1035,6 +1067,14 @@ function FinalCombinedListStep({ clientId }: { clientId: string }) {
   async function toggleSelected(contactId: string, next: boolean) {
     setNeedsData((cur) => (cur ? cur.map((c) => (c.id === contactId ? { ...c, already_selected: next } : c)) : cur));
     await setSoiReviewFlag({ data: { clientId, contactId, reviewType: "datazap_append", flagged: next } });
+  }
+
+  if (loadError) {
+    return (
+      <Card className="mt-4">
+        <p className="text-sm text-destructive">Couldn't load this list: {loadError}</p>
+      </Card>
+    );
   }
 
   if (loading || !needsData) {

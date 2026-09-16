@@ -1,4 +1,3 @@
-```typescript
 import { createServerFn } from "@tanstack/react-start";
 import { requireSupabaseAuth } from "@/integrations/supabase/auth-middleware";
 import type { TablesInsert } from "@/integrations/supabase/types";
@@ -1514,4 +1513,3 @@ export const sendContentToAgent = createServerFn({ method: "POST" })
     }
     return { ok: true };
   });
-```

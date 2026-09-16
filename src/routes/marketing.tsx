@@ -14,8 +14,12 @@ import {
   finalizeMediaUpload,
   markMediaUsed,
   deleteMarketingMedia,
+  listAgentDriveMedia,
+  setAgentDriveFolder,
+  generateMarketingContent,
   type MarketingAccess,
   type MediaRow,
+  type DriveFile,
 } from "@/lib/marketing";
 
 export const Route = createFileRoute("/marketing")({
@@ -186,7 +190,7 @@ function MarketingPage() {
         agentName={selected.name}
         onChangeAgent={access.role === "admin" ? () => setSelected(null) : undefined}
       />
-      <Workspace agentId={selected.id} />
+      <Workspace agentId={selected.id} isAdmin={access.role === "admin"} />
     </AppShell>
   );
 }
@@ -215,12 +219,12 @@ function PageHeader({
   );
 }
 
-function Workspace({ agentId }: { agentId: string }) {
-  const [tab, setTab] = useState<"posts" | "media">("posts");
+function Workspace({ agentId, isAdmin }: { agentId: string; isAdmin: boolean }) {
+  const [tab, setTab] = useState<"posts" | "media" | "drive">("posts");
   return (
     <div className="mt-5">
       <div className="flex flex-wrap gap-1 rounded-full border border-border bg-glass p-1 backdrop-blur-xl w-fit">
-        {(["posts", "media"] as const).map((t) => (
+        {(["posts", "media", "drive"] as const).map((t) => (
           <button
             key={t}
             onClick={() => setTab(t)}
@@ -228,13 +232,14 @@ function Workspace({ agentId }: { agentId: string }) {
               tab === t ? "bg-secondary text-foreground" : "text-muted-foreground hover:text-foreground"
             }`}
           >
-            {t === "posts" ? "Posts" : "Media"}
+            {t === "posts" ? "Posts" : t === "media" ? "Media" : "Google Drive"}
           </button>
         ))}
       </div>
       <div className="mt-5">
         {tab === "posts" && <PostsTab agentId={agentId} />}
         {tab === "media" && <MediaTab agentId={agentId} />}
+        {tab === "drive" && <DriveTab agentId={agentId} isAdmin={isAdmin} />}
       </div>
     </div>
   );
@@ -279,6 +284,8 @@ function PostsTab({ agentId }: { agentId: string }) {
 
   return (
     <div className="space-y-4">
+      <CreateContentForm agentId={agentId} onCreated={reload} />
+
       {months.length > 0 && (
         <div className="flex flex-wrap items-center gap-2">
           <span className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">Month</span>
@@ -323,6 +330,135 @@ function PostsTab({ agentId }: { agentId: string }) {
           />
         ))}
     </div>
+  );
+}
+
+// Lets an agent (or an admin acting as them) write a quick idea and get a
+// full draft back in their own voice — no Drive content calendar involved.
+// Works identically whether a normal agent is self-serving or an admin is
+// doing it on their behalf via the "act as" picker above, since both cases
+// resolve to the same agentId this component already receives.
+function CreateContentForm({ agentId, onCreated }: { agentId: string; onCreated: () => void }) {
+  const [open, setOpen] = useState(false);
+  const [contentType, setContentType] = useState<"post" | "email" | "video">("post");
+  const [title, setTitle] = useState("");
+  const [goal, setGoal] = useState("");
+  const [instructions, setInstructions] = useState("");
+  const [hook, setHook] = useState("");
+  const [useHashtags, setUseHashtags] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  async function generate() {
+    if (!goal.trim()) {
+      setError("Tell us what this should be about first.");
+      return;
+    }
+    setBusy(true);
+    setError(null);
+    try {
+      await generateMarketingContent({
+        data: {
+          agentId,
+          contentType,
+          title,
+          goal,
+          instructions: instructions.trim() || undefined,
+          hook: contentType === "video" ? hook.trim() || undefined : undefined,
+          useHashtags: contentType === "post" ? useHashtags : undefined,
+        },
+      });
+      setTitle("");
+      setGoal("");
+      setInstructions("");
+      setHook("");
+      setOpen(false);
+      onCreated();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  if (!open) {
+    return <Button onClick={() => setOpen(true)}>+ New content</Button>;
+  }
+
+  return (
+    <Card>
+      <h3 className="font-display text-sm font-semibold">Create new content</h3>
+      <p className="mt-1 text-xs text-muted-foreground">
+        Tell us what you want and we'll write a full draft in your voice — it'll show up below for you to approve, edit,
+        or flag, same as anything your team generates for you.
+      </p>
+
+      <div className="mt-4 flex flex-wrap gap-1 rounded-full border border-border bg-glass p-1 w-fit">
+        {(["post", "email", "video"] as const).map((t) => (
+          <button
+            key={t}
+            onClick={() => setContentType(t)}
+            className={`rounded-full px-4 py-1.5 text-sm font-medium transition-colors ${
+              contentType === t ? "bg-secondary text-foreground" : "text-muted-foreground hover:text-foreground"
+            }`}
+          >
+            {t === "post" ? "Social post" : t === "email" ? "Email" : "Video script"}
+          </button>
+        ))}
+      </div>
+
+      <div className="mt-4 space-y-3">
+        <input
+          value={title}
+          onChange={(e) => setTitle(e.target.value)}
+          placeholder="Title (just for your own reference)"
+          className="w-full rounded-xl border border-border bg-glass px-3 py-2 text-sm outline-none"
+        />
+        <textarea
+          value={goal}
+          onChange={(e) => setGoal(e.target.value)}
+          placeholder={
+            contentType === "post"
+              ? `What's this post about? e.g. "Just closed a first-time buyer in 12 days, wanted to share the excitement"`
+              : contentType === "email"
+                ? `What's the goal of this email? e.g. "Monthly check-in for past clients, mention rates dropped"`
+                : "What's this video about?"
+          }
+          className="min-h-[90px] w-full rounded-xl border border-border bg-glass px-3 py-2 text-sm outline-none"
+        />
+        {contentType === "video" && (
+          <input
+            value={hook}
+            onChange={(e) => setHook(e.target.value)}
+            placeholder="Any specific hook/opening line direction? (optional)"
+            className="w-full rounded-xl border border-border bg-glass px-3 py-2 text-sm outline-none"
+          />
+        )}
+        <textarea
+          value={instructions}
+          onChange={(e) => setInstructions(e.target.value)}
+          placeholder="Anything else it should include? (optional)"
+          className="min-h-[60px] w-full rounded-xl border border-border bg-glass px-3 py-2 text-sm outline-none"
+        />
+        {contentType === "post" && (
+          <label className="flex items-center gap-2 text-sm text-muted-foreground">
+            <input type="checkbox" checked={useHashtags} onChange={(e) => setUseHashtags(e.target.checked)} />
+            Add hashtags
+          </label>
+        )}
+      </div>
+
+      {error && <p className="mt-3 text-xs text-destructive">{error}</p>}
+
+      <div className="mt-4 flex gap-2">
+        <Button onClick={generate} disabled={busy}>
+          {busy ? "Writing…" : "Generate"}
+        </Button>
+        <Button variant="secondary" onClick={() => setOpen(false)} disabled={busy}>
+          Cancel
+        </Button>
+      </div>
+    </Card>
   );
 }
 
@@ -713,6 +849,121 @@ function MediaTab({ agentId }: { agentId: string }) {
                 </button>
               </div>
             </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// Live, read-only view of an agent's actual Google Drive folder — mainly for
+// agents on YMD's video services who still send long-form footage through
+// Drive. Nothing here ever writes back to Drive; their existing Drive
+// workflow (upload, the "used" subfolder move) is completely untouched.
+function DriveTab({ agentId, isAdmin }: { agentId: string; isAdmin: boolean }) {
+  const [data, setData] = useState<{ folderId: string | null; files: DriveFile[] } | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [folderInput, setFolderInput] = useState("");
+  const [saving, setSaving] = useState(false);
+
+  function reload() {
+    setData(null);
+    setError(null);
+    listAgentDriveMedia({ data: { agentId } })
+      .then((d) => setData(d))
+      .catch((e) => setError(e instanceof Error ? e.message : String(e)));
+  }
+
+  useEffect(() => {
+    reload();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [agentId]);
+
+  async function saveFolder() {
+    setSaving(true);
+    setError(null);
+    try {
+      await setAgentDriveFolder({ data: { agentId, driveFolderId: folderInput } });
+      setFolderInput("");
+      reload();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <div className="space-y-4">
+      <Card>
+        <h3 className="font-display text-sm font-semibold">This agent's Google Drive folder</h3>
+        <p className="mt-1 text-xs text-muted-foreground">
+          A live, read-only view of what's actually in their Drive folder right now — mainly useful for agents on our
+          video services who still send long-form footage through Drive. This never writes anything back to Drive;
+          uploading and marking things used still happens exactly as it does today, over there, untouched.
+        </p>
+        {isAdmin && (
+          <div className="mt-3 flex flex-wrap items-center gap-2">
+            <input
+              value={folderInput}
+              onChange={(e) => setFolderInput(e.target.value)}
+              placeholder={data?.folderId ? `Currently: ${data.folderId}` : "Paste this agent's Drive folder ID"}
+              className="min-w-[220px] flex-1 rounded-xl border border-border bg-glass px-3 py-1.5 text-sm outline-none"
+            />
+            <Button onClick={saveFolder} disabled={saving || !folderInput.trim()}>
+              Save folder ID
+            </Button>
+          </div>
+        )}
+      </Card>
+
+      {error && (
+        <Card>
+          <p className="text-sm text-destructive">{error}</p>
+        </Card>
+      )}
+
+      {!error && data === null && (
+        <Card>
+          <p className="text-sm text-muted-foreground">Loading…</p>
+        </Card>
+      )}
+
+      {!error && data !== null && !data.folderId && (
+        <Card>
+          <p className="text-sm text-muted-foreground">
+            No Drive folder connected for this agent yet
+            {isAdmin ? " — paste their folder ID above." : " — ask your team to connect one."}
+          </p>
+        </Card>
+      )}
+
+      {!error && data !== null && data.folderId && data.files.length === 0 && (
+        <Card>
+          <p className="text-sm text-muted-foreground">Their Drive folder is connected but empty right now.</p>
+        </Card>
+      )}
+
+      {!error && data !== null && data.files.length > 0 && (
+        <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-4">
+          {data.files.map((f) => (
+            <a
+              key={f.id}
+              href={f.viewUrl}
+              target="_blank"
+              rel="noreferrer"
+              className="overflow-hidden rounded-2xl border border-border bg-glass"
+            >
+              <img src={f.thumbnailUrl} alt={f.name} className="aspect-square w-full object-cover" />
+              <div className="flex items-center justify-between gap-1 px-2 py-2">
+                <span className="truncate text-[11px] text-muted-foreground">{f.name}</span>
+                {f.isVideo && (
+                  <span className="shrink-0 rounded-full bg-muted px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">
+                    Video
+                  </span>
+                )}
+              </div>
+            </a>
           ))}
         </div>
       )}

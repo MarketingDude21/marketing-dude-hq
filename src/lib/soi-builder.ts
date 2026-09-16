@@ -238,7 +238,7 @@ async function requireClientAccess(
 
 export const listSoiUploads = createServerFn({ method: "GET" })
   .middleware([requireSupabaseAuth])
-  .inputValidator((data: { clientId: string }) => data)
+  .validator((data: { clientId: string }) => data)
   .handler(async ({ data, context }) => {
     const admin = getSoiAdminClient();
     const email = (context.claims as { email?: string } | undefined)?.email;
@@ -254,7 +254,7 @@ export const listSoiUploads = createServerFn({ method: "GET" })
 
 export const uploadSoiFile = createServerFn({ method: "POST" })
   .middleware([requireSupabaseAuth])
-  .inputValidator(
+  .validator(
     (data: { clientId: string; fileName: string; sourceLabel: string; kind: "vcf" | "mapped_csv"; content: string }) =>
       data,
   )
@@ -289,7 +289,7 @@ export const uploadSoiFile = createServerFn({ method: "POST" })
 
 export const deleteSoiUpload = createServerFn({ method: "POST" })
   .middleware([requireSupabaseAuth])
-  .inputValidator((data: { clientId: string; uploadId: string }) => data)
+  .validator((data: { clientId: string; uploadId: string }) => data)
   .handler(async ({ data, context }) => {
     const admin = getSoiAdminClient();
     const email = (context.claims as { email?: string } | undefined)?.email;
@@ -317,7 +317,7 @@ export const deleteSoiUpload = createServerFn({ method: "POST" })
 
 export const processSoiUploads = createServerFn({ method: "POST" })
   .middleware([requireSupabaseAuth])
-  .inputValidator((data: { clientId: string }) => data)
+  .validator((data: { clientId: string }) => data)
   .handler(async ({ data, context }) => {
     const admin = getSoiAdminClient();
     const email = (context.claims as { email?: string } | undefined)?.email;
@@ -358,7 +358,7 @@ const HUB_LISTS = [
 
 export const getSoiHubCounts = createServerFn({ method: "GET" })
   .middleware([requireSupabaseAuth])
-  .inputValidator((data: { clientId: string }) => data)
+  .validator((data: { clientId: string }) => data)
   .handler(async ({ data, context }) => {
     const admin = getSoiAdminClient();
     const email = (context.claims as { email?: string } | undefined)?.email;
@@ -377,48 +377,6 @@ export const getSoiHubCounts = createServerFn({ method: "GET" })
     return counts;
   });
 
-// Review-flag joins for the 3-step wizard (primary review_type only - the
-// same lists the original wizard reviewed). Read-only, so reimplementing
-// this one small join here (rather than only ever calling export-lists) is
-// safe - it doesn't change how any contact is classified.
-export const getSoiReviewCandidates = createServerFn({ method: "GET" })
-  .middleware([requireSupabaseAuth])
-  .inputValidator(
-    (data: { clientId: string; listAssignment: "direct_mail" | "email_phone" | "email_list" | "incomplete" }) => data,
-  )
-  .handler(async ({ data, context }) => {
-    const admin = getSoiAdminClient();
-    const email = (context.claims as { email?: string } | undefined)?.email;
-    await requireClientAccess(admin, email, data.clientId);
-
-    const listsForAssignment =
-      data.listAssignment === "direct_mail" || data.listAssignment === "email_phone"
-        ? [data.listAssignment]
-        : [data.listAssignment];
-
-    const { data: contacts, error } = await admin
-      .from("contacts")
-      .select("id, first_name, last_name, email, phone, address, city, state, zip, notes, sources, list_assignment")
-      .eq("client_id", data.clientId)
-      .in("list_assignment", listsForAssignment)
-      .order("last_name", { ascending: true });
-    if (error) throw error;
-
-    const ids = contacts.map((c) => c.id);
-    const flagsById = new Map<string, boolean>();
-    if (ids.length) {
-      const { data: flags, error: flagsErr } = await admin
-        .from("review_flags")
-        .select("contact_id, flagged")
-        .eq("review_type", "primary")
-        .in("contact_id", ids);
-      if (flagsErr) throw flagsErr;
-      for (const f of flags ?? []) flagsById.set(f.contact_id, f.flagged);
-    }
-
-    return contacts.map((c) => ({ ...c, flagged: flagsById.get(c.id) ?? false }));
-  });
-
 type SoiContactRow = {
   id: string;
   first_name: string | null;
@@ -434,37 +392,90 @@ type SoiContactRow = {
   list_assignment: string | null;
 };
 
+const PAGE_SIZE = 1000;
+
+// Plain paginated fetch of everyone in one list_assignment bucket. Loops on
+// .range() instead of a single unbounded select - PostgREST caps a single
+// request at 1000 rows by default, and several of Mike's real buckets
+// (nonqualified alone has run past 3000) blow past that easily.
 async function fetchContactsForList(
   admin: SupabaseClient,
   clientId: string,
   listAssignment: string,
 ): Promise<SoiContactRow[]> {
-  const { data, error } = await admin
-    .from("contacts")
-    .select("id, first_name, last_name, email, phone, address, city, state, zip, notes, sources, list_assignment")
-    .eq("client_id", clientId)
-    .eq("list_assignment", listAssignment)
-    .order("last_name", { ascending: true });
-  if (error) throw error;
-  return data ?? [];
+  let rows: SoiContactRow[] = [];
+  for (let from = 0; ; from += PAGE_SIZE) {
+    const { data, error } = await admin
+      .from("contacts")
+      .select("id, first_name, last_name, email, phone, address, city, state, zip, notes, sources, list_assignment")
+      .eq("client_id", clientId)
+      .eq("list_assignment", listAssignment)
+      .order("last_name", { ascending: true })
+      .range(from, from + PAGE_SIZE - 1);
+    if (error) throw error;
+    rows = rows.concat(data ?? []);
+    if (!data || data.length < PAGE_SIZE) break;
+  }
+  return rows;
 }
 
-async function fetchFlagsById(
+// Same idea, but also joins in each contact's review_flags.flagged - using
+// PostgREST's embedded-resource join (contacts JOIN review_flags server
+// side) instead of fetching contacts, collecting their ids, then a second
+// "WHERE contact_id IN (id1, id2, id3, ...)" lookup. That second shape is
+// exactly what previously broke export-lists outright for a big client (see
+// that function's own header comment in the recovered backup) - the id list
+// gets long enough to blow past a single request's URL length limit.
+// getSoiReviewCandidates and getSoiListView's final_full_contact branch had
+// that same latent bug; it just never got exercised by a small enough test
+// client until now. Paginated the same way as fetchContactsForList above.
+async function fetchContactsWithFlags(
   admin: SupabaseClient,
-  contactIds: string[],
+  clientId: string,
+  listAssignment: string,
   reviewType: string,
-): Promise<Map<string, boolean>> {
-  const flagsById = new Map<string, boolean>();
-  if (!contactIds.length) return flagsById;
-  const { data, error } = await admin
-    .from("review_flags")
-    .select("contact_id, flagged")
-    .eq("review_type", reviewType)
-    .in("contact_id", contactIds);
-  if (error) throw error;
-  for (const f of data ?? []) flagsById.set(f.contact_id, f.flagged);
-  return flagsById;
+): Promise<(SoiContactRow & { flagged: boolean })[]> {
+  let rows: (SoiContactRow & { flagged: boolean })[] = [];
+  for (let from = 0; ; from += PAGE_SIZE) {
+    const { data, error } = await admin
+      .from("contacts")
+      .select(
+        "id, first_name, last_name, email, phone, address, city, state, zip, notes, sources, list_assignment, review_flags(flagged)",
+      )
+      .eq("client_id", clientId)
+      .eq("list_assignment", listAssignment)
+      .eq("review_flags.review_type", reviewType)
+      .order("last_name", { ascending: true })
+      .range(from, from + PAGE_SIZE - 1);
+    if (error) throw error;
+    const page = (data ?? []).map((row: Record<string, unknown>) => {
+      const { review_flags, ...contact } = row;
+      const rf = review_flags as { flagged: boolean }[] | { flagged: boolean } | null;
+      const flagged = Array.isArray(rf) ? rf.some((r) => r?.flagged) : !!rf?.flagged;
+      return { ...(contact as SoiContactRow), flagged };
+    });
+    rows = rows.concat(page);
+    if (page.length < PAGE_SIZE) break;
+  }
+  return rows;
 }
+
+// Review-flag joins for the 3-step wizard (primary review_type only - the
+// same lists the original wizard reviewed). Read-only, so reimplementing
+// this one small join here (rather than only ever calling export-lists) is
+// safe - it doesn't change how any contact is classified.
+export const getSoiReviewCandidates = createServerFn({ method: "GET" })
+  .middleware([requireSupabaseAuth])
+  .validator(
+    (data: { clientId: string; listAssignment: "direct_mail" | "email_phone" | "email_list" | "incomplete" }) => data,
+  )
+  .handler(async ({ data, context }) => {
+    const admin = getSoiAdminClient();
+    const email = (context.claims as { email?: string } | undefined)?.email;
+    await requireClientAccess(admin, email, data.clientId);
+
+    return fetchContactsWithFlags(admin, data.clientId, data.listAssignment, "primary");
+  });
 
 // Browsable (read-only, no checkboxes) views the old app's tab bar showed
 // alongside the 3 review steps: the pure "everyone in this bucket" lists
@@ -474,7 +485,7 @@ async function fetchFlagsById(
 // mirror here since these are read-only, nothing is reclassified.
 export const getSoiListView = createServerFn({ method: "GET" })
   .middleware([requireSupabaseAuth])
-  .inputValidator(
+  .validator(
     (data: {
       clientId: string;
       view: "nonqualified" | "realtor_excluded" | "business_excluded" | "facebook_audience" | "final_full_contact";
@@ -498,20 +509,20 @@ export const getSoiListView = createServerFn({ method: "GET" })
     }
 
     // "final_full_contact" - same survivor + full-8-field rule export-lists
-    // uses for its matching CSV scope.
+    // uses for its matching CSV scope. Uses the same join-based, paginated
+    // fetch as getSoiReviewCandidates above - this branch used to build a
+    // flat id list across all 4 review lists and look up flags separately,
+    // which is exactly the shape that can blow past a URL length limit for
+    // a client with a lot of contacts.
     const reviewLists = ["direct_mail", "email_phone", "email_list", "incomplete"] as const;
-    const groups = await Promise.all(reviewLists.map((l) => fetchContactsForList(admin, data.clientId, l)));
-    const allContacts = groups.flat();
-    const flagsById = await fetchFlagsById(
-      admin,
-      allContacts.map((c) => c.id),
-      "primary",
+    const groups = await Promise.all(
+      reviewLists.map((l) => fetchContactsWithFlags(admin, data.clientId, l, "primary")),
     );
+    const allContacts = groups.flat();
 
-    function isSurvivor(c: SoiContactRow): boolean {
-      const flagged = flagsById.get(c.id) ?? false;
-      if (c.list_assignment === "direct_mail" || c.list_assignment === "email_phone") return !flagged;
-      if (c.list_assignment === "email_list" || c.list_assignment === "incomplete") return flagged;
+    function isSurvivor(c: SoiContactRow & { flagged: boolean }): boolean {
+      if (c.list_assignment === "direct_mail" || c.list_assignment === "email_phone") return !c.flagged;
+      if (c.list_assignment === "email_list" || c.list_assignment === "incomplete") return c.flagged;
       return false;
     }
     function isFullContact(c: SoiContactRow): boolean {
@@ -522,7 +533,7 @@ export const getSoiListView = createServerFn({ method: "GET" })
 
 export const setSoiReviewFlag = createServerFn({ method: "POST" })
   .middleware([requireSupabaseAuth])
-  .inputValidator((data: { clientId: string; contactId: string; reviewType: string; flagged: boolean }) => data)
+  .validator((data: { clientId: string; contactId: string; reviewType: string; flagged: boolean }) => data)
   .handler(async ({ data, context }) => {
     const admin = getSoiAdminClient();
     const email = (context.claims as { email?: string } | undefined)?.email;
@@ -558,7 +569,7 @@ export const setSoiReviewFlag = createServerFn({ method: "POST" })
 
 export const exportSoiList = createServerFn({ method: "POST" })
   .middleware([requireSupabaseAuth])
-  .inputValidator((data: { clientId: string; scope: string }) => data)
+  .validator((data: { clientId: string; scope: string }) => data)
   .handler(async ({ data, context }) => {
     const admin = getSoiAdminClient();
     const email = (context.claims as { email?: string } | undefined)?.email;

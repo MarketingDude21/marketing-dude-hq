@@ -110,11 +110,47 @@ export type PostMetadata = {
   batch_id?: string | undefined;
   canva_link?: string | undefined;
   goal?: string | undefined;
+  image_suggestion?: string | undefined;
   source?: string | undefined;
   drive_file_id?: string | undefined;
   drive_thumbnail_url?: string | undefined;
+  media_id?: string | null | undefined;
+  media_url?: string | null | undefined;
+  media_type?: string | null | undefined;
   [key: string]: string | number | boolean | null | undefined;
 };
+
+// Auto-suggests a photo/video per post from the agent's native Media library
+// (the "available" pool), cycling through in FIFO order so several posts
+// generated in the same batch don't all get the same suggestion. This is the
+// native replacement for the old app's Drive-tag matchPhoto(): since native
+// media isn't tag-categorized (no tagging UI exists for it yet), suggestion
+// here is FIFO — oldest available first — rather than keyword-matched. The
+// "Change photo" picker on each post lets the team override the suggestion,
+// same as the old app's "Change Photo" button did, and an override is logged
+// to feedback_history as a learning signal exactly like the old app's photo
+// picker did when a VA chose something different than the auto-match.
+async function assignSuggestedMedia(
+  agentId: string,
+  count: number,
+): Promise<({ id: string; url: string; mediaType: string } | null)[]> {
+  if (count <= 0) return [];
+  const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+  const { data, error } = await supabaseAdmin
+    .from("agent_photos")
+    .select("id, url, media_type")
+    .eq("agent_id", agentId)
+    .eq("status", "available")
+    .order("created_at", { ascending: true })
+    .limit(50);
+  if (error) throw error;
+  const pool = (data ?? []).filter((m) => Boolean(m.url));
+  if (!pool.length) return Array.from({ length: count }, () => null);
+  return Array.from({ length: count }, (_, i) => {
+    const m = pool[i % pool.length]!;
+    return { id: m.id, url: m.url as string, mediaType: m.media_type };
+  });
+}
 
 export type PostRow = {
   id: string;
@@ -156,7 +192,7 @@ export const approveBatch = createServerFn({ method: "POST" })
     const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
     const { data: rows, error: fetchErr } = await supabaseAdmin
       .from("generated_posts")
-      .select("id")
+      .select("id, metadata")
       .eq("agent_id", data.agentId)
       .eq("metadata->>batch_id", data.batchId);
     if (fetchErr) throw fetchErr;
@@ -167,6 +203,24 @@ export const approveBatch = createServerFn({ method: "POST" })
       .update({ status: "approved", updated_at: new Date().toISOString() })
       .in("id", ids);
     if (error) throw error;
+
+    // Same auto-mark-used behavior as the single-post approve path, applied
+    // to the whole batch at once.
+    const mediaIds = Array.from(
+      new Set(
+        (rows ?? [])
+          .map((r) => (r.metadata as PostMetadata | null)?.media_id)
+          .filter((id): id is string => Boolean(id)),
+      ),
+    );
+    if (mediaIds.length) {
+      await supabaseAdmin
+        .from("agent_photos")
+        .update({ status: "used", used_at: new Date().toISOString() })
+        .in("id", mediaIds)
+        .eq("status", "available");
+    }
+
     return { ok: true, updated: ids.length };
   });
 
@@ -201,7 +255,7 @@ export const updateMarketingPost = createServerFn({ method: "POST" })
     // can never reach into a different agent's row.
     const { data: existing, error: fetchErr } = await supabaseAdmin
       .from("generated_posts")
-      .select("agent_id")
+      .select("agent_id, metadata")
       .eq("id", data.postId)
       .maybeSingle();
     if (fetchErr) throw fetchErr;
@@ -217,6 +271,89 @@ export const updateMarketingPost = createServerFn({ method: "POST" })
 
     const { error } = await supabaseAdmin.from("generated_posts").update(update).eq("id", data.postId);
     if (error) throw error;
+
+    // Auto-mark the attached photo/video "used" the moment a post is
+    // approved — the native equivalent of the old app's move-to-used, which
+    // also only ever fired once content was actually approved, never at
+    // suggestion time.
+    if (data.status === "approved") {
+      const mediaId = (existing.metadata as PostMetadata | null)?.media_id;
+      if (mediaId) {
+        await supabaseAdmin
+          .from("agent_photos")
+          .update({ status: "used", used_at: new Date().toISOString(), used_in_post_id: data.postId })
+          .eq("id", mediaId)
+          .eq("status", "available");
+      }
+    }
+
+    return { ok: true };
+  });
+
+// Lets the team swap the auto-suggested photo/video on a post for a
+// different one from this agent's native Media library, or remove it
+// entirely (mediaId: null). Ported concept from the old app's photo picker —
+// including logging the swap to feedback_history as a learning signal, same
+// as the old app did when a VA picked something other than the suggestion.
+export const setPostMedia = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .validator((data: { agentId: string; postId: string; mediaId: string | null }) => data)
+  .handler(async ({ data, context }): Promise<{ ok: true }> => {
+    const email = (context.claims as { email?: string } | undefined)?.email;
+    await requireAgentAccess(context.userId, email, data.agentId);
+    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+
+    const { data: existing, error: fetchErr } = await supabaseAdmin
+      .from("generated_posts")
+      .select("agent_id, metadata")
+      .eq("id", data.postId)
+      .maybeSingle();
+    if (fetchErr) throw fetchErr;
+    if (!existing || existing.agent_id !== data.agentId) {
+      throw new Error("Post not found for this agent.");
+    }
+    const prevMediaId = (existing.metadata as PostMetadata | null)?.media_id ?? null;
+
+    let mediaUrl: string | null = null;
+    let mediaType: string | null = null;
+    if (data.mediaId) {
+      const { data: media, error: mediaErr } = await supabaseAdmin
+        .from("agent_photos")
+        .select("id, url, media_type, agent_id")
+        .eq("id", data.mediaId)
+        .maybeSingle();
+      if (mediaErr) throw mediaErr;
+      if (!media || media.agent_id !== data.agentId) {
+        throw new Error("That media item doesn't belong to this agent.");
+      }
+      mediaUrl = media.url;
+      mediaType = media.media_type;
+    }
+
+    const nextMetadata = {
+      ...((existing.metadata as Record<string, unknown> | null) ?? {}),
+      media_id: data.mediaId,
+      media_url: mediaUrl,
+      media_type: mediaType,
+    };
+
+    const { error } = await supabaseAdmin
+      .from("generated_posts")
+      .update({ metadata: nextMetadata, updated_at: new Date().toISOString() })
+      .eq("id", data.postId);
+    if (error) throw error;
+
+    if (data.mediaId !== prevMediaId) {
+      await supabaseAdmin.from("feedback_history").insert({
+        agent_id: data.agentId,
+        post_id: data.postId,
+        rating: "photo_changed",
+        notes: data.mediaId
+          ? `Photo changed to media ${data.mediaId}${prevMediaId ? ` (was ${prevMediaId})` : ""}.`
+          : `Photo removed${prevMediaId ? ` (was ${prevMediaId})` : ""}.`,
+      });
+    }
+
     return { ok: true };
   });
 
@@ -641,6 +778,8 @@ export const generateMarketingContent = createServerFn({ method: "POST" })
       agent?.voice_summary ?? "Warm, conversational, authentic real estate agent. Short posts. Real human energy.";
 
     const prompt = buildContentPrompt(data, agentName, agentCity, voiceDna);
+    const suggestedMedia =
+      data.contentType === "post" ? ((await assignSuggestedMedia(data.agentId, 1))[0] ?? null) : null;
 
     const res = await fetch("https://api.anthropic.com/v1/messages", {
       method: "POST",
@@ -681,6 +820,9 @@ export const generateMarketingContent = createServerFn({ method: "POST" })
           hook: data.hook ?? null,
           use_hashtags: data.useHashtags ?? null,
           source: "native_generate",
+          media_id: suggestedMedia?.id ?? null,
+          media_url: suggestedMedia?.url ?? null,
+          media_type: suggestedMedia?.mediaType ?? null,
         },
       })
       .select("id")
@@ -1107,10 +1249,12 @@ export const generateMonthlyBatch = createServerFn({ method: "POST" })
 
       const raw = await callClaude(anthropicKey, postPrompt, 4000);
       const blocks = raw.split("---").filter((b) => b.trim());
+      const media = await assignSuggestedMedia(data.agentId, postDocs.length);
       blocks.forEach((block, i) => {
         const rm = block.match(/REWRITTEN:\s*([\s\S]*?)$/);
         const rewritten = rm ? cleanCopy(rm[1]!.trim()) : "";
         const doc = postDocs[i];
+        const pick = media[i] ?? null;
         if (rewritten && doc) {
           rows.push({
             agent_id: data.agentId,
@@ -1124,7 +1268,11 @@ export const generateMonthlyBatch = createServerFn({ method: "POST" })
               month: data.month,
               canva_link: doc.canva || null,
               goal: doc.goal,
+              image_suggestion: doc.image || null,
               source: "content_calendar",
+              media_id: pick?.id ?? null,
+              media_url: pick?.url ?? null,
+              media_type: pick?.mediaType ?? null,
             },
           });
         }

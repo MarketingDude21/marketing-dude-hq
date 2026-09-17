@@ -78,6 +78,46 @@ type Post = {
   metadata: PostMetadata | null;
 };
 
+// Content is grouped and ordered by kind everywhere it's shown in a batch
+// (the Posts tab and the calendar review screen) so the four different
+// pieces of content Mike's team produces each month never get mixed
+// together in one visually identical pile — added per Mike's request
+// (2026-09-18) for a clearer, more obviously-categorized layout with icons.
+// Order is fixed: posts, then Canva templates, then emails, then video
+// scripts.
+type ContentCategory = "post" | "canva" | "email" | "video";
+
+const CATEGORY_ORDER: ContentCategory[] = ["post", "canva", "email", "video"];
+
+const CATEGORY_META: Record<ContentCategory, { label: string; icon: string; accent: string }> = {
+  post: {
+    label: "Posts",
+    icon: "📝",
+    accent: "border-sky-500/30 bg-sky-500/10 text-sky-700 dark:text-sky-300",
+  },
+  canva: {
+    label: "Canva Templates",
+    icon: "🎨",
+    accent: "border-violet-500/30 bg-violet-500/10 text-violet-700 dark:text-violet-300",
+  },
+  email: {
+    label: "Emails",
+    icon: "✉️",
+    accent: "border-emerald-500/30 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300",
+  },
+  video: {
+    label: "Video Scripts",
+    icon: "🎬",
+    accent: "border-amber-500/30 bg-amber-500/10 text-amber-700 dark:text-amber-300",
+  },
+};
+
+function categorizePost(post: Post): ContentCategory {
+  if (post.content_type === "email") return "email";
+  if (post.content_type === "video") return "video";
+  return post.metadata?.canva_link ? "canva" : "post";
+}
+
 function Card({ children, className = "" }: { children: React.ReactNode; className?: string }) {
   return (
     <div className={`rounded-3xl border border-border bg-glass p-6 backdrop-blur-2xl ${className}`}>{children}</div>
@@ -495,11 +535,12 @@ function PostsTab({ agentId, isAdmin }: { agentId: string; isAdmin: boolean }) {
   const [month, setMonth] = useState<string>("");
   const [posts, setPosts] = useState<Post[] | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [collapsed, setCollapsed] = useState<Set<string>>(new Set());
   const [approvingAll, setApprovingAll] = useState(false);
+  const [approveNote, setApproveNote] = useState<string | null>(null);
   const [sending, setSending] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
   const [driveFolderId, setDriveFolderId] = useState<string | null>(null);
+  const [driveError, setDriveError] = useState<string | null>(null);
   const [scanOpen, setScanOpen] = useState(false);
 
   function reload() {
@@ -517,8 +558,14 @@ function PostsTab({ agentId, isAdmin }: { agentId: string; isAdmin: boolean }) {
       .then((m) => setMonths(m))
       .catch(() => {});
     listAgentDriveMedia({ data: { agentId } })
-      .then((d) => setDriveFolderId(d.folderId))
-      .catch(() => setDriveFolderId(null));
+      .then((d) => {
+        setDriveFolderId(d.folderId);
+        setDriveError(null);
+      })
+      .catch((e) => {
+        setDriveFolderId(null);
+        setDriveError(e instanceof Error ? e.message : String(e));
+      });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [agentId]);
 
@@ -527,11 +574,23 @@ function PostsTab({ agentId, isAdmin }: { agentId: string; isAdmin: boolean }) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [agentId, month]);
 
+  // Explicit confirmation text after this finishes — added per Mike's
+  // report (2026-09-18) that clicking Approve all didn't seem to do
+  // anything until he navigated away and back. The status badges on each
+  // card do update immediately once reload() resolves, but there was no
+  // unmistakable, un-missable confirmation that the click itself worked, so
+  // this adds one plainly on the screen without needing to go find it.
   async function approveAll() {
     setApprovingAll(true);
     setActionError(null);
+    setApproveNote(null);
     try {
-      await approveAllPending({ data: month ? { agentId, month } : { agentId } });
+      const res = await approveAllPending({ data: month ? { agentId, month } : { agentId } });
+      setApproveNote(
+        res.updated > 0
+          ? `Approved ${res.updated} post${res.updated === 1 ? "" : "s"}.`
+          : "Nothing left to approve — everything here is already approved.",
+      );
       reload();
     } catch (e) {
       setActionError(e instanceof Error ? e.message : String(e));
@@ -600,7 +659,7 @@ function PostsTab({ agentId, isAdmin }: { agentId: string; isAdmin: boolean }) {
             {sending ? "Sending…" : "Send to Agent"}
           </Button>
         )}
-        {driveFolderId && (
+        {driveFolderId ? (
           <PhotoScanPanel
             agentId={agentId}
             folderId={driveFolderId}
@@ -611,9 +670,16 @@ function PostsTab({ agentId, isAdmin }: { agentId: string; isAdmin: boolean }) {
             onClose={() => setScanOpen(false)}
             onAdded={reload}
           />
+        ) : (
+          <span className="text-xs text-muted-foreground">
+            {driveError
+              ? driveError
+              : "No Google Drive folder set for this agent yet — set one on the Google Drive tab to scan for photo posts."}
+          </span>
         )}
       </div>
 
+      {approveNote && <p className="text-xs text-muted-foreground">{approveNote}</p>}
       {actionError && <p className="text-xs text-destructive">{actionError}</p>}
 
       {posts === null && (
@@ -631,24 +697,12 @@ function PostsTab({ agentId, isAdmin }: { agentId: string; isAdmin: boolean }) {
       )}
 
       {posts !== null && posts.length > 0 && (
-        <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
-          {posts.map((post) => (
-            <PostCard
-              key={post.id}
-              post={post}
-              agentId={agentId}
-              expanded={!collapsed.has(post.id)}
-              onToggle={() =>
-                setCollapsed((cur) => {
-                  const next = new Set(cur);
-                  if (next.has(post.id)) next.delete(post.id);
-                  else next.add(post.id);
-                  return next;
-                })
-              }
-              onChanged={reload}
-            />
-          ))}
+        <div className="space-y-6">
+          {CATEGORY_ORDER.map((cat) => {
+            const group = posts.filter((p) => categorizePost(p) === cat);
+            if (!group.length) return null;
+            return <BatchSection key={cat} category={cat} posts={group} agentId={agentId} onChanged={reload} />;
+          })}
         </div>
       )}
     </div>
@@ -1925,10 +1979,12 @@ function MonthWorkspace({
   const [approving, setApproving] = useState(false);
   const [sending, setSending] = useState(false);
   const [sendNote, setSendNote] = useState<string | null>(null);
+  const [approveNote, setApproveNote] = useState<string | null>(null);
   // The agent's OWN Drive photo folder (set on the separate Google Drive tab,
   // unrelated to the shared native calendar above) — still how photo
   // suggestions are sourced today; see the panel below.
   const [agentDriveFolderId, setAgentDriveFolderId] = useState<string | null>(null);
+  const [driveError, setDriveError] = useState<string | null>(null);
 
   function loadDocs() {
     setDocs(null);
@@ -1950,18 +2006,20 @@ function MonthWorkspace({
     loadDocs();
     loadPosts();
     listAgentDriveMedia({ data: { agentId } })
-      .then((r) => setAgentDriveFolderId(r.folderId))
-      .catch(() => setAgentDriveFolderId(null));
+      .then((r) => {
+        setAgentDriveFolderId(r.folderId);
+        setDriveError(null);
+      })
+      .catch((e) => {
+        setAgentDriveFolderId(null);
+        setDriveError(e instanceof Error ? e.message : String(e));
+      });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [agentId, folder.id, folder.month]);
 
   const batchPosts = (posts ?? []).filter(
     (p) => p.metadata?.source === "content_calendar" || p.metadata?.source === "drive_photo_scan",
   );
-  const socialPosts = batchPosts.filter((p) => p.content_type === "post" && !p.metadata?.canva_link);
-  const canvaPosts = batchPosts.filter((p) => p.content_type === "post" && Boolean(p.metadata?.canva_link));
-  const emails = batchPosts.filter((p) => p.content_type === "email");
-  const videos = batchPosts.filter((p) => p.content_type === "video");
   const latestFromPosts = batchPosts.length
     ? (batchPosts[batchPosts.length - 1]?.metadata?.batch_id as string | undefined)
     : undefined;
@@ -1983,14 +2041,21 @@ function MonthWorkspace({
     }
   }
 
+  // Explicit confirmation text alongside the download — added per Mike's
+  // report (2026-09-18) that Approve All seemed to do nothing until he
+  // navigated away and back. The download itself is one signal something
+  // happened, but it's easy to miss (it just lands in Downloads), so this
+  // also puts a plain-language confirmation right on the screen.
   async function approveAllAndDownload() {
     if (!batchPosts.length) return;
     setApproving(true);
     setPostsError(null);
+    setApproveNote(null);
     try {
       if (activeBatchId) {
         await approveBatch({ data: { agentId, batchId: activeBatchId } });
       }
+      const fileName = `${folder.month.replace(/\s+/g, "-")}-content.txt`;
       const text = batchPosts
         .map((p) => {
           const heading = (p.title || p.content_type).toUpperCase();
@@ -2002,9 +2067,12 @@ function MonthWorkspace({
       const url = URL.createObjectURL(blob);
       const a = document.createElement("a");
       a.href = url;
-      a.download = `${folder.month.replace(/\s+/g, "-")}-content.txt`;
+      a.download = fileName;
       a.click();
       URL.revokeObjectURL(url);
+      setApproveNote(
+        `Approved ${batchPosts.length} piece${batchPosts.length === 1 ? "" : "s"} of content and downloaded ${fileName}.`,
+      );
       loadPosts();
     } catch (e) {
       setPostsError(e instanceof Error ? e.message : String(e));
@@ -2065,7 +2133,7 @@ function MonthWorkspace({
         {genError && <p className="mt-2 text-xs text-destructive">{genError}</p>}
       </Card>
 
-      {agentDriveFolderId && (
+      {agentDriveFolderId ? (
         <PhotoScanPanel
           agentId={agentId}
           folderId={agentDriveFolderId}
@@ -2076,6 +2144,12 @@ function MonthWorkspace({
           onClose={() => setPhotosOpen(false)}
           onAdded={loadPosts}
         />
+      ) : (
+        <p className="text-xs text-muted-foreground">
+          {driveError
+            ? driveError
+            : "No Google Drive folder set for this agent yet — set one on the Google Drive tab to scan for photo posts."}
+        </p>
       )}
 
       <Card>
@@ -2092,6 +2166,7 @@ function MonthWorkspace({
             )}
           </div>
         </div>
+        {approveNote && <p className="mt-2 text-xs text-muted-foreground">{approveNote}</p>}
         {sendNote && <p className="mt-2 text-xs text-muted-foreground">{sendNote}</p>}
         {postsError && <p className="mt-2 text-xs text-destructive">{postsError}</p>}
         {posts !== null && batchPosts.length === 0 && (
@@ -2101,16 +2176,11 @@ function MonthWorkspace({
         )}
       </Card>
 
-      {socialPosts.length > 0 && (
-        <BatchSection title="Social posts" posts={socialPosts} agentId={agentId} onChanged={loadPosts} />
-      )}
-      {canvaPosts.length > 0 && (
-        <BatchSection title="Predesigned Canva templates" posts={canvaPosts} agentId={agentId} onChanged={loadPosts} />
-      )}
-      {emails.length > 0 && <BatchSection title="Emails" posts={emails} agentId={agentId} onChanged={loadPosts} />}
-      {videos.length > 0 && (
-        <BatchSection title="Video scripts" posts={videos} agentId={agentId} onChanged={loadPosts} />
-      )}
+      {CATEGORY_ORDER.map((cat) => {
+        const group = batchPosts.filter((p) => categorizePost(p) === cat);
+        if (!group.length) return null;
+        return <BatchSection key={cat} category={cat} posts={group} agentId={agentId} onChanged={loadPosts} />;
+      })}
     </div>
   );
 }
@@ -2119,22 +2189,33 @@ function MonthWorkspace({
 // photo all visible immediately) to match the old app's always-expanded
 // review grid — clicking a card's header collapses just that one, rather
 // than everything starting collapsed and needing a click to see anything.
+// Grouped and icon-labeled by content kind (Posts / Canva Templates /
+// Emails / Video Scripts, in that fixed order) per Mike's request
+// (2026-09-18) so the four different pieces of content are never visually
+// indistinguishable from each other.
 function BatchSection({
-  title,
+  category,
   posts,
   agentId,
   onChanged,
 }: {
-  title: string;
+  category: ContentCategory;
   posts: Post[];
   agentId: string;
   onChanged: () => void;
 }) {
   const [collapsed, setCollapsed] = useState<Set<string>>(new Set());
+  const meta = CATEGORY_META[category];
   return (
     <div>
-      <h4 className="mb-2 text-xs font-semibold uppercase tracking-wider text-muted-foreground">{title}</h4>
-      <div className="space-y-3">
+      <div
+        className={`mb-3 inline-flex items-center gap-2 rounded-full border px-3 py-1 text-xs font-semibold uppercase tracking-wider ${meta.accent}`}
+      >
+        <span aria-hidden="true">{meta.icon}</span>
+        <span>{meta.label}</span>
+        <span className="rounded-full bg-background/70 px-1.5 py-0.5 text-[10px] font-bold">{posts.length}</span>
+      </div>
+      <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
         {posts.map((post) => (
           <PostCard
             key={post.id}

@@ -120,35 +120,157 @@ export type PostMetadata = {
   [key: string]: string | number | boolean | null | undefined;
 };
 
+// Fixed tag vocabulary for the native Media library, ported from the old
+// app's separate "Tag Photos" screen (PHOTO_TAGS) so the team keys in the
+// same categories they already know — folded into the Media tab itself here
+// instead of a separate screen, since there's no Drive-scan step to hang a
+// separate screen off of. Exported so the Media tab's tag chips use the
+// exact same list the matching logic below understands.
+export const PHOTO_TAG_OPTIONS = [
+  "outdoor portrait",
+  "desk or work",
+  "neighborhood walk",
+  "coffee or local spot",
+  "with clients",
+  "car or on the go",
+  "family",
+  "holiday or seasonal",
+  "listing or property",
+  "community event",
+  "casual lifestyle",
+  "behind the scenes",
+] as const;
+
+// Buckets each fixed tag into one of the same four categories the old app's
+// classifyPostType()/classifyPhotoType() used. The old app derived a
+// photo's category from a freeform tags string via regex; ours has a fixed
+// fixed vocabulary instead (set from the Media tab's tag chips), so this is
+// a direct lookup rather than a regex — same four buckets, same intent:
+// never put a family/appreciation photo on a straight business post or vice
+// versa.
+const TAG_CATEGORY: Record<string, "real_estate" | "appreciation" | "community" | "neutral"> = {
+  "desk or work": "real_estate",
+  "listing or property": "real_estate",
+  "with clients": "appreciation",
+  family: "appreciation",
+  "holiday or seasonal": "appreciation",
+  "community event": "community",
+  "outdoor portrait": "community",
+  "neighborhood walk": "community",
+  "coffee or local spot": "community",
+  "casual lifestyle": "community",
+  "car or on the go": "neutral",
+  "behind the scenes": "neutral",
+};
+
+// Ported from the old app's classifyPostType() — same keyword signals, same
+// four buckets: real estate business posts, appreciation/thank-you posts,
+// community/lifestyle posts, or neutral.
+function classifyPostType(titleAndCopy: string): "real_estate" | "appreciation" | "community" | "neutral" {
+  const text = (titleAndCopy || "").toLowerCase();
+  const isRealEstate =
+    /list|sold|closing|deal|market|buyer|seller|home|house|property|showing|offer|contract|price|rate|mortgage|commission|referral.*business|database|client|agent|real estate|escrow|inspection|title|pending|equity|invest/.test(
+      text,
+    );
+  const isAppreciation =
+    /thank|referral|grateful|appreciate|honor|trust|introduce|word of mouth|client.*friend|friend.*client|mean a lot|support/.test(
+      text,
+    );
+  const isCommunity =
+    /local|town|community|neighborhood|area|restaurant|coffee|spot|weekend|summer|fall|spring|winter|beach|park|trail|family|kids|life|morning|routine|enjoy|love where|live here/.test(
+      text,
+    );
+  if (isAppreciation) return "appreciation";
+  if (isRealEstate && !isCommunity) return "real_estate";
+  if (isCommunity && !isRealEstate) return "community";
+  return "neutral";
+}
+
+// Ported from the old app's getPreferredPhotoTypes() — the ranked list of
+// photo categories acceptable for each post category, best match first.
+function getPreferredPhotoTypes(postType: "real_estate" | "appreciation" | "community" | "neutral"): string[] {
+  switch (postType) {
+    case "real_estate":
+      return ["real_estate", "neutral", "video"];
+    case "appreciation":
+      return ["appreciation", "community", "neutral"];
+    case "community":
+      return ["community", "appreciation", "neutral"];
+    default:
+      return ["neutral", "community", "real_estate", "appreciation"];
+  }
+}
+
+function classifyMediaCategory(tags: string[], mediaType: string): string {
+  if (mediaType === "video") return "video";
+  for (const tag of tags) {
+    const category = TAG_CATEGORY[tag];
+    if (category) return category;
+  }
+  return "neutral";
+}
+
 // Auto-suggests a photo/video per post from the agent's native Media library
-// (the "available" pool), cycling through in FIFO order so several posts
-// generated in the same batch don't all get the same suggestion. This is the
-// native replacement for the old app's Drive-tag matchPhoto(): since native
-// media isn't tag-categorized (no tagging UI exists for it yet), suggestion
-// here is FIFO — oldest available first — rather than keyword-matched. The
-// "Change photo" picker on each post lets the team override the suggestion,
-// same as the old app's "Change Photo" button did, and an override is logged
-// to feedback_history as a learning signal exactly like the old app's photo
-// picker did when a VA chose something different than the auto-match.
+// (the "available" pool) — one request per post, each carrying that post's
+// own image direction/title/copy so the match is per-post, not one pick
+// reused for the whole batch. This is the native replacement for the old
+// app's Drive-tag matchPhoto(): now that the Media tab has a tagging UI
+// (2026-09-17, added per Mike's request), suggestion is tag-and-category
+// matched the same way matchPhoto() worked — same post/photo category
+// buckets, same "don't put a family photo on a business post" rule — with
+// FIFO (oldest available first) as the tiebreak within a category. Anything
+// still untagged classifies as "neutral", which is never the worst option in
+// any bucket, so an agent with no tags set yet gets essentially the same
+// FIFO behavior as before — tagging makes suggestions smarter, it isn't
+// required for this to keep working. The "Change photo" picker on each post
+// still lets the team override the suggestion, logged to feedback_history as
+// a learning signal, same as always.
 async function assignSuggestedMedia(
   agentId: string,
-  count: number,
+  requests: { direction?: string | null; title?: string | null; copy?: string | null }[],
 ): Promise<({ id: string; url: string; mediaType: string } | null)[]> {
-  if (count <= 0) return [];
+  if (!requests.length) return [];
   const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
   const { data, error } = await supabaseAdmin
     .from("agent_photos")
-    .select("id, url, media_type")
+    .select("id, url, media_type, tags, created_at")
     .eq("agent_id", agentId)
     .eq("status", "available")
     .order("created_at", { ascending: true })
     .limit(50);
   if (error) throw error;
   const pool = (data ?? []).filter((m) => Boolean(m.url));
-  if (!pool.length) return Array.from({ length: count }, () => null);
-  return Array.from({ length: count }, (_, i) => {
-    const m = pool[i % pool.length]!;
-    return { id: m.id, url: m.url as string, mediaType: m.media_type };
+  if (!pool.length) return requests.map(() => null);
+
+  const assignedThisBatch = new Set<string>();
+
+  return requests.map((req) => {
+    const combinedText = `${req.direction || ""} ${req.title || ""} ${req.copy || ""}`;
+    const postType = classifyPostType(combinedText);
+    const preferredTypes = getPreferredPhotoTypes(postType);
+    const preferVideo = /clip|reel|video|b-?roll|footage|walking through|short form/i.test(req.direction || "");
+
+    // Prefer media not already handed to an earlier post in this same batch;
+    // if that empties the pool (more posts than available media), reset and
+    // allow repeats rather than leaving a post with nothing — same fallback
+    // the old app used once it ran out of unused photos.
+    let candidates = pool.filter((m) => !assignedThisBatch.has(m.id));
+    if (!candidates.length) candidates = pool;
+
+    const scored = candidates
+      .map((m) => {
+        const category = classifyMediaCategory(m.tags ?? [], m.media_type);
+        let score = preferredTypes.indexOf(category);
+        if (score === -1) score = preferredTypes.length;
+        if (preferVideo && category === "video") score -= 0.5;
+        return { m, score };
+      })
+      .sort((a, b) => a.score - b.score);
+
+    const pick = scored[0]?.m ?? null;
+    if (!pick) return null;
+    assignedThisBatch.add(pick.id);
+    return { id: pick.id, url: pick.url as string, mediaType: pick.media_type };
   });
 }
 
@@ -206,6 +328,52 @@ export const approveBatch = createServerFn({ method: "POST" })
 
     // Same auto-mark-used behavior as the single-post approve path, applied
     // to the whole batch at once.
+    const mediaIds = Array.from(
+      new Set(
+        (rows ?? [])
+          .map((r) => (r.metadata as PostMetadata | null)?.media_id)
+          .filter((id): id is string => Boolean(id)),
+      ),
+    );
+    if (mediaIds.length) {
+      await supabaseAdmin
+        .from("agent_photos")
+        .update({ status: "used", used_at: new Date().toISOString() })
+        .in("id", mediaIds)
+        .eq("status", "available");
+    }
+
+    return { ok: true, updated: ids.length };
+  });
+
+// Bulk-approves every not-yet-approved post for this agent (optionally
+// scoped to one month) — added per Mike's request (2026-09-17) for the Posts
+// tab, which had no "approve all" of its own (only a calendar batch did, via
+// approveBatch above). Same auto-mark-used-media behavior as the other two
+// approve paths.
+export const approveAllPending = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .validator((data: { agentId: string; month?: string }) => data)
+  .handler(async ({ data, context }): Promise<{ ok: true; updated: number }> => {
+    const email = (context.claims as { email?: string } | undefined)?.email;
+    await requireAgentAccess(context.userId, email, data.agentId);
+    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+    let query = supabaseAdmin
+      .from("generated_posts")
+      .select("id, metadata")
+      .eq("agent_id", data.agentId)
+      .neq("status", "approved");
+    if (data.month) query = query.eq("month", data.month);
+    const { data: rows, error: fetchErr } = await query;
+    if (fetchErr) throw fetchErr;
+    const ids = (rows ?? []).map((r) => r.id);
+    if (!ids.length) return { ok: true, updated: 0 };
+    const { error } = await supabaseAdmin
+      .from("generated_posts")
+      .update({ status: "approved", updated_at: new Date().toISOString() })
+      .in("id", ids);
+    if (error) throw error;
+
     const mediaIds = Array.from(
       new Set(
         (rows ?? [])
@@ -385,6 +553,101 @@ export const submitMarketingFeedback = createServerFn({ method: "POST" })
     return { ok: true };
   });
 
+// Regenerates a post/email/video's content in the agent's voice,
+// incorporating whatever the reviewer typed into the Flag/feedback panel —
+// added per Mike's request (2026-09-17) as the native version of the old
+// app's "Rewrite in their voice" button, same prompt shape: keep the
+// original concept, apply the feedback exactly, write it in the agent's
+// Voice DNA, output only the finished text. Sets the post back to "pending"
+// so the rewritten version goes through review again, and logs the round to
+// feedback_history as a learning signal, same as the old app did.
+export const rewritePostContent = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .validator((data: { agentId: string; postId: string; feedback: string }) => data)
+  .handler(async ({ data, context }): Promise<{ ok: true; content: string }> => {
+    const email = (context.claims as { email?: string } | undefined)?.email;
+    await requireAgentAccess(context.userId, email, data.agentId);
+    const feedback = data.feedback.trim();
+    if (!feedback) throw new Error("Tell us what to fix first.");
+
+    const apiKey = process.env["ANTHROPIC_API_KEY"];
+    if (!apiKey) {
+      throw new Error("Rewriting isn't configured yet — add ANTHROPIC_API_KEY in Lovable Cloud → Secrets.");
+    }
+
+    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+    const { data: existing, error: fetchErr } = await supabaseAdmin
+      .from("generated_posts")
+      .select("agent_id, content, content_type, title")
+      .eq("id", data.postId)
+      .maybeSingle();
+    if (fetchErr) throw fetchErr;
+    if (!existing || existing.agent_id !== data.agentId) {
+      throw new Error("Post not found for this agent.");
+    }
+
+    const { data: agent, error: agentErr } = await supabaseAdmin
+      .from("agents")
+      .select("full_name, market_area, voice_summary")
+      .eq("id", data.agentId)
+      .maybeSingle();
+    if (agentErr) throw agentErr;
+    const agentName = agent?.full_name ?? "the agent";
+    const firstName = agentName.split(" ")[0] || agentName;
+    const agentCity = agent?.market_area ?? "their market";
+    const dna =
+      agent?.voice_summary ?? "Warm, conversational, authentic real estate agent. Short posts. Real human energy.";
+
+    const kind =
+      existing.content_type === "email"
+        ? "email"
+        : existing.content_type === "video"
+          ? "video script"
+          : "social media post";
+    const formatRule =
+      existing.content_type === "post"
+        ? "4. 2 to 4 sentences max\n"
+        : existing.content_type === "video"
+          ? "4. Keep the HOOK / BODY / CLOSE format, written to be spoken, 150 words maximum\n"
+          : "4. Keep the SUBJECT OPTIONS / EMAIL BODY format\n";
+    const learnedFeedback = await fetchLearnedFeedback(data.agentId);
+    const prompt =
+      `You are rewriting a ${kind} for ${agentName} in ${agentCity}.\n\n` +
+      `VOICE DNA (this is how they actually talk):\n${dna}\n\n` +
+      (existing.title ? `ORIGINAL CONCEPT: ${existing.title}\n` : "") +
+      `CURRENT VERSION:\n${existing.content}\n\n` +
+      `FEEDBACK FROM REVIEWER: ${feedback}${learnedFeedback}\n\n` +
+      "YOUR JOB:\n" +
+      "1. Keep the same concept and emotional core as the current version\n" +
+      "2. Apply the feedback exactly as described\n" +
+      `3. Write in ${firstName}'s voice based on their Voice DNA above\n` +
+      formatRule +
+      "5. No hyphens, no corporate language, sounds like a real person, not a brand\n" +
+      "6. Standard capitalization always — never write in all lowercase\n" +
+      `7. AUTHENTICITY TEST: would ${firstName} actually say this?\n\n` +
+      "Output ONLY the rewritten text. Nothing else. No explanation.";
+
+    const maxTokens = existing.content_type === "email" ? 2000 : existing.content_type === "video" ? 600 : 400;
+    const raw = await callClaude(apiKey, prompt, maxTokens);
+    if (!raw) throw new Error("Empty response from Claude — try again.");
+    const rewritten = cleanCopy(raw);
+
+    const { error } = await supabaseAdmin
+      .from("generated_posts")
+      .update({ content: rewritten, status: "pending", updated_at: new Date().toISOString() })
+      .eq("id", data.postId);
+    if (error) throw error;
+
+    await supabaseAdmin.from("feedback_history").insert({
+      agent_id: data.agentId,
+      post_id: data.postId,
+      rating: "rewritten",
+      notes: `Feedback: "${feedback}" — rewritten in ${agentName}'s voice.`,
+    });
+
+    return { ok: true, content: rewritten };
+  });
+
 type PhotoRow = {
   id: string;
   url: string | null;
@@ -508,6 +771,38 @@ export const finalizeMediaUpload = createServerFn({ method: "POST" })
       .single();
     if (error) throw error;
     return { ok: true, id: row.id };
+  });
+
+// Sets a media item's tags from the Media tab's tag-chip editor — added per
+// Mike's request (2026-09-17) as the native equivalent of the old app's
+// separate "Tag Photos" screen, folded into the Media tab itself since
+// there's no Drive-scan step here to hang a separate screen off of. These
+// tags are exactly what assignSuggestedMedia() above reads to match photos
+// to posts by category instead of pure FIFO.
+export const setMediaTags = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .validator((data: { agentId: string; mediaId: string; tags: string[] }) => data)
+  .handler(async ({ data, context }): Promise<{ ok: true }> => {
+    const email = (context.claims as { email?: string } | undefined)?.email;
+    await requireAgentAccess(context.userId, email, data.agentId);
+    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+    const { data: existing, error: fetchErr } = await supabaseAdmin
+      .from("agent_photos")
+      .select("agent_id")
+      .eq("id", data.mediaId)
+      .maybeSingle();
+    if (fetchErr) throw fetchErr;
+    if (!existing || existing.agent_id !== data.agentId) {
+      throw new Error("Media not found for this agent.");
+    }
+    const allowed = new Set<string>(PHOTO_TAG_OPTIONS);
+    const tags = Array.from(new Set(data.tags.filter((t) => allowed.has(t))));
+    const { error } = await supabaseAdmin
+      .from("agent_photos")
+      .update({ tags, updated_at: new Date().toISOString() })
+      .eq("id", data.mediaId);
+    if (error) throw error;
+    return { ok: true };
   });
 
 // Marks one or more media items "used" — the native equivalent of Drive's
@@ -698,13 +993,44 @@ type GenerateContentInput = {
   useHashtags?: boolean | undefined;
 };
 
+// Pulls this agent's most recent reviewer feedback (flags and rewrite
+// requests — not photo-swap logging, that's not about the writing) and
+// formats it as a short block of "lessons" to fold into a generation prompt.
+// Added per Mike's explicit ask (2026-09-17): feedback was already being
+// SAVED to feedback_history (flag notes, rewrite requests), but nothing ever
+// read it back into future generations — so the "gets smarter over time"
+// part of the feedback loop wasn't actually happening yet. This is what
+// closes that loop: every new draft (native single-item generate, a
+// calendar batch, or an AI rewrite) now sees a digest of what reviewers have
+// corrected for this agent before and is told to apply those lessons too.
+async function fetchLearnedFeedback(agentId: string): Promise<string> {
+  const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+  const { data, error } = await supabaseAdmin
+    .from("feedback_history")
+    .select("rating, notes")
+    .eq("agent_id", agentId)
+    .in("rating", ["flagged", "rewritten"])
+    .not("notes", "is", null)
+    .order("created_at", { ascending: false })
+    .limit(8);
+  if (error || !data?.length) return "";
+  const lines = data.map((r) => `- ${r.notes}`).filter((l) => l.trim() !== "-");
+  if (!lines.length) return "";
+  return (
+    "\n\nLESSONS FROM PAST REVIEWER FEEDBACK FOR THIS AGENT (apply these too, don't repeat these mistakes):\n" +
+    lines.join("\n")
+  );
+}
+
 function buildContentPrompt(
   input: GenerateContentInput,
   agentName: string,
   agentCity: string,
   voiceDna: string,
+  learnedFeedback: string,
 ): string {
-  const extra = input.instructions?.trim() ? `\n\nADDITIONAL DIRECTION:\n${input.instructions.trim()}` : "";
+  const extra =
+    (input.instructions?.trim() ? `\n\nADDITIONAL DIRECTION:\n${input.instructions.trim()}` : "") + learnedFeedback;
 
   if (input.contentType === "post") {
     return (
@@ -777,9 +1103,14 @@ export const generateMarketingContent = createServerFn({ method: "POST" })
     const voiceDna =
       agent?.voice_summary ?? "Warm, conversational, authentic real estate agent. Short posts. Real human energy.";
 
-    const prompt = buildContentPrompt(data, agentName, agentCity, voiceDna);
+    const learnedFeedback = await fetchLearnedFeedback(data.agentId);
+    const prompt = buildContentPrompt(data, agentName, agentCity, voiceDna, learnedFeedback);
     const suggestedMedia =
-      data.contentType === "post" ? ((await assignSuggestedMedia(data.agentId, 1))[0] ?? null) : null;
+      data.contentType === "post"
+        ? ((
+            await assignSuggestedMedia(data.agentId, [{ direction: null, title: data.title ?? null, copy: data.goal }])
+          )[0] ?? null)
+        : null;
 
     const res = await fetch("https://api.anthropic.com/v1/messages", {
       method: "POST",
@@ -1214,6 +1545,7 @@ export const generateMonthlyBatch = createServerFn({ method: "POST" })
     const agentCity = agent?.market_area ?? "their market";
     const dna =
       agent?.voice_summary ?? "Warm, conversational, authentic real estate agent. Short posts. Real human energy.";
+    const learnedFeedback = await fetchLearnedFeedback(data.agentId);
 
     const docs = await fetchNativeCalendarDocs(data.monthId);
     const postDocs = docs.filter((d): d is Extract<CalendarDoc, { type: "post" }> => d.type === "post");
@@ -1242,6 +1574,7 @@ export const generateMonthlyBatch = createServerFn({ method: "POST" })
         `- The post should remind people ${agentName} is in real estate — not sell them on it\n` +
         "- AUTHENTICITY CHECK: Read it out loud. If it sounds like an ad, rewrite it. If a real person would never say this, rewrite it.\n" +
         (data.useHashtags ? "- Add 2-3 relevant hashtags at the very end\n" : "- NO hashtags\n") +
+        learnedFeedback +
         "\nFor each post below:\n1. Read the CONCEPT and ORIGINAL carefully\n2. Find the story or the human truth in it\n3. Write it clearly in the agent's voice\n4. Make sure the last sentence lands and the whole post makes sense\n\n" +
         "Output format for each post:\nPOST [N]: [TITLE]\nREWRITTEN: [complete caption]\n---\n\n" +
         "Posts to write:\n" +
@@ -1249,7 +1582,10 @@ export const generateMonthlyBatch = createServerFn({ method: "POST" })
 
       const raw = await callClaude(anthropicKey, postPrompt, 4000);
       const blocks = raw.split("---").filter((b) => b.trim());
-      const media = await assignSuggestedMedia(data.agentId, postDocs.length);
+      const media = await assignSuggestedMedia(
+        data.agentId,
+        postDocs.map((d) => ({ direction: d.image, title: d.title, copy: d.copy })),
+      );
       blocks.forEach((block, i) => {
         const rm = block.match(/REWRITTEN:\s*([\s\S]*?)$/);
         const rewritten = rm ? cleanCopy(rm[1]!.trim()) : "";
@@ -1303,8 +1639,9 @@ export const generateMonthlyBatch = createServerFn({ method: "POST" })
             `FULL BRIEF:\n${instructions}\n\n` +
             "CRITICAL: Write this as three to four natural observations that flow into each other. Do NOT use headers. Do NOT use bullet lists. Do NOT structure this as a newsletter with named sections. Each observation transitions naturally into the next. The real estate mention is one short paragraph near the end, treated as a casual aside — not a featured section. End with one or two lines. No call to action. No pitch. " +
             `This should read like a personal note from someone who lives in ${agentCity} and noticed a few things worth sharing. If it reads like a newsletter when done, it is wrong. Replace all [CITY], [NAME] placeholders with ${agentName} and ${agentCity}.\n` +
-            "NO hyphens. NO corporate language. NO AI tell phrases. Standard capitalization always.\n\n" +
-            "Output format:\nSUBJECT OPTIONS:\n1. [subject]\n2. [subject]\n3. [subject]\n\nEMAIL BODY:\n[full email — reads like a note, not a newsletter]";
+            "NO hyphens. NO corporate language. NO AI tell phrases. Standard capitalization always." +
+            learnedFeedback +
+            "\n\nOutput format:\nSUBJECT OPTIONS:\n1. [subject]\n2. [subject]\n3. [subject]\n\nEMAIL BODY:\n[full email — reads like a note, not a newsletter]";
         } else {
           emailPrompt =
             `You are writing a real estate email for ${agentName} in ${agentCity}.\n\n` +
@@ -1312,7 +1649,9 @@ export const generateMonthlyBatch = createServerFn({ method: "POST" })
             `EMAIL GOAL:\n${ed.goal || ""}\n\n` +
             `BRIEF TO FOLLOW:\n${instructions}\n\n` +
             `Write this email EXACTLY as ${agentName} would write it based on their Voice DNA above. Replace all [CITY], [NAME], [CITY, STATE] placeholders with ${agentName} and ${agentCity}.\n` +
-            "NO hyphens. NO corporate language. NO AI-tell phrases. Standard capitalization always.\n\n" +
+            "NO hyphens. NO corporate language. NO AI-tell phrases. Standard capitalization always." +
+            learnedFeedback +
+            "\n\n" +
             "Output format:\nSUBJECT OPTIONS:\n1. [subject]\n2. [subject]\n3. [subject]\n\nEMAIL BODY:\n[full email in plain text, no HTML tags]";
         }
       } else {
@@ -1374,7 +1713,8 @@ export const generateMonthlyBatch = createServerFn({ method: "POST" })
         `${vd.script}\n\n` +
         `Write a 60 second video script in ${agentName}'s voice. Format:\n` +
         "HOOK (first 3 seconds — grab attention):\n[hook line]\n\nBODY (main point, story, or insight):\n[15 to 45 seconds of content]\n\nCLOSE (natural ending, no hard sell):\n[closing line]\n\n" +
-        `Rules:\n- Sounds exactly like ${agentName} based on their Voice DNA\n- Written to be SPOKEN, not read — short sentences, natural pauses\n- NO hyphens, NO corporate language, NO AI phrases\n- Standard capitalization, never all lowercase\n- Real estate reminder energy — top of mind, not a pitch\n- 150 words maximum`;
+        `Rules:\n- Sounds exactly like ${agentName} based on their Voice DNA\n- Written to be SPOKEN, not read — short sentences, natural pauses\n- NO hyphens, NO corporate language, NO AI phrases\n- Standard capitalization, never all lowercase\n- Real estate reminder energy — top of mind, not a pitch\n- 150 words maximum` +
+        learnedFeedback;
 
       try {
         const vraw = cleanCopy(await callClaude(anthropicKey, videoPrompt, 600));

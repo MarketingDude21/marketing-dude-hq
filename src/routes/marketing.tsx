@@ -17,9 +17,12 @@ import {
   listAgentDriveMedia,
   setAgentDriveFolder,
   generateMarketingContent,
-  listContentFolders,
-  addContentFolder,
-  removeContentFolder,
+  listCalendarMonths,
+  addCalendarMonth,
+  removeCalendarMonth,
+  listCalendarItems,
+  addCalendarItem,
+  removeCalendarItem,
   readContentCalendar,
   generateMonthlyBatch,
   scanAgentDrivePhotos,
@@ -29,7 +32,8 @@ import {
   type MarketingAccess,
   type MediaRow,
   type DriveFile,
-  type ContentFolder,
+  type CalendarMonth,
+  type CalendarItem,
   type CalendarDoc,
   type PhotoScanSuggestion,
   type PostMetadata,
@@ -120,7 +124,7 @@ function MarketingPage() {
   const [accessError, setAccessError] = useState<string | null>(null);
   const [agents, setAgents] = useState<AgentOption[]>([]);
   const [selected, setSelected] = useState<AgentOption | null>(null);
-  const [managingAgent, setManagingAgent] = useState<AgentOption | null>(null);
+  const [showCalendarAdmin, setShowCalendarAdmin] = useState(false);
 
   useEffect(() => {
     getMarketingAccess()
@@ -171,11 +175,11 @@ function MarketingPage() {
     );
   }
 
-  if (access.role === "admin" && managingAgent) {
+  if (access.role === "admin" && showCalendarAdmin) {
     return (
       <AppShell>
         <PageHeader />
-        <ManageMonthsScreen agent={managingAgent} onBack={() => setManagingAgent(null)} />
+        <ManageCalendarScreen onBack={() => setShowCalendarAdmin(false)} />
       </AppShell>
     );
   }
@@ -185,26 +189,31 @@ function MarketingPage() {
       <AppShell>
         <PageHeader />
         <Card className="mt-5">
+          <div className="flex flex-wrap items-start justify-between gap-3">
+            <div>
+              <h2 className="font-display text-lg font-semibold">Content Calendar</h2>
+              <p className="mt-1 text-sm text-muted-foreground">
+                One calendar, shared by every agent — build out each month's posts, emails, and video briefs once here,
+                and every agent generates their own personalized version of it from their own login.
+              </p>
+            </div>
+            <Button onClick={() => setShowCalendarAdmin(true)}>Manage Content Calendar</Button>
+          </div>
+        </Card>
+        <Card className="mt-5">
           <h2 className="font-display text-lg font-semibold">Choose an agent</h2>
           <p className="mt-1 text-sm text-muted-foreground">
             Pick who you're working on behalf of. Every action you take here is logged against their account, not yours.
           </p>
           <div className="mt-4 grid gap-2 sm:grid-cols-2 lg:grid-cols-3">
             {agents.map((a) => (
-              <div
+              <button
                 key={a.id}
-                className="rounded-2xl border border-border bg-glass px-4 py-3 transition-colors hover:bg-secondary"
+                onClick={() => setSelected(a)}
+                className="rounded-2xl border border-border bg-glass px-4 py-3 text-left text-sm font-medium transition-colors hover:bg-secondary"
               >
-                <button onClick={() => setSelected(a)} className="block w-full text-left text-sm font-medium">
-                  {a.name}
-                </button>
-                <button
-                  onClick={() => setManagingAgent(a)}
-                  className="mt-1 text-xs font-semibold text-primary hover:underline"
-                >
-                  Manage months →
-                </button>
-              </div>
+                {a.name}
+              </button>
             ))}
             {agents.length === 0 && <p className="text-sm text-muted-foreground">No agents yet.</p>}
           </div>
@@ -1037,43 +1046,39 @@ function DriveTab({ agentId, isAdmin }: { agentId: string; isAdmin: boolean }) {
 // gated on isAdmin.
 // ============================================================================
 
-function ManageMonthsScreen({ agent, onBack }: { agent: AgentOption; onBack: () => void }) {
-  const [folders, setFolders] = useState<ContentFolder[] | null>(null);
+function ManageCalendarScreen({ onBack }: { onBack: () => void }) {
+  const [months, setMonths] = useState<CalendarMonth[] | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [addOpen, setAddOpen] = useState(false);
   const [newMonth, setNewMonth] = useState("");
-  const [newFolderId, setNewFolderId] = useState("");
   const [addBusy, setAddBusy] = useState(false);
   const [addError, setAddError] = useState<string | null>(null);
-  const [busyFolderId, setBusyFolderId] = useState<string | null>(null);
+  const [busyMonthId, setBusyMonthId] = useState<string | null>(null);
+  const [activeMonth, setActiveMonth] = useState<CalendarMonth | null>(null);
 
   function reload() {
-    setFolders(null);
+    setMonths(null);
     setError(null);
-    listContentFolders({ data: { agentId: agent.id } })
-      .then((f) => setFolders(f))
+    listCalendarMonths()
+      .then((m) => setMonths(m))
       .catch((e) => setError(e instanceof Error ? e.message : String(e)));
   }
 
   useEffect(() => {
     reload();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [agent.id]);
+  }, []);
 
-  async function addFolder() {
-    if (!newMonth.trim() || !newFolderId.trim()) {
-      setAddError("Give it a month label and a Drive folder ID or link.");
+  async function addMonth() {
+    if (!newMonth.trim()) {
+      setAddError("Give this month a label.");
       return;
     }
     setAddBusy(true);
     setAddError(null);
     try {
-      const res = await addContentFolder({
-        data: { agentId: agent.id, month: newMonth.trim(), driveFolderId: newFolderId.trim() },
-      });
-      setFolders(res.folders);
+      const res = await addCalendarMonth({ data: { month: newMonth.trim() } });
+      setMonths((prev) => [res.month, ...(prev ?? [])]);
       setNewMonth("");
-      setNewFolderId("");
       setAddOpen(false);
     } catch (e) {
       setAddError(e instanceof Error ? e.message : String(e));
@@ -1082,30 +1087,33 @@ function ManageMonthsScreen({ agent, onBack }: { agent: AgentOption; onBack: () 
     }
   }
 
-  async function removeFolder(folderId: string) {
-    setBusyFolderId(folderId);
+  async function removeMonth(monthId: string) {
+    setBusyMonthId(monthId);
     try {
-      const res = await removeContentFolder({ data: { agentId: agent.id, folderId } });
-      setFolders(res.folders);
+      await removeCalendarMonth({ data: { monthId } });
+      setMonths((prev) => (prev ?? []).filter((m) => m.id !== monthId));
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
-      setBusyFolderId(null);
+      setBusyMonthId(null);
     }
+  }
+
+  if (activeMonth) {
+    return <CalendarMonthItemsScreen month={activeMonth} onBack={() => setActiveMonth(null)} />;
   }
 
   return (
     <div className="mt-5 space-y-4">
       <button onClick={onBack} className="text-xs font-semibold text-muted-foreground hover:text-foreground">
-        ← All agents
+        ← Back
       </button>
 
       <Card>
-        <h2 className="font-display text-lg font-semibold">Manage months — {agent.name}</h2>
+        <h2 className="font-display text-lg font-semibold">Content Calendar</h2>
         <p className="mt-1 text-sm text-muted-foreground">
-          The same monthly folder setup we've always used — one Google Drive folder per month, full of the post, email,
-          and video briefs your team writes. Add a month below and {agent.name} will be able to pick it and generate
-          that month's content in their own voice.
+          One shared calendar for every agent. Add a month, then add the posts, emails, and video briefs that belong to
+          it — every agent generates their own personalized version of the same briefs from their own login.
         </p>
       </Card>
 
@@ -1123,15 +1131,9 @@ function ManageMonthsScreen({ agent, onBack }: { agent: AgentOption; onBack: () 
               placeholder='Month label, e.g. "June 2026"'
               className="w-full rounded-xl border border-border bg-glass px-3 py-2 text-sm outline-none"
             />
-            <input
-              value={newFolderId}
-              onChange={(e) => setNewFolderId(e.target.value)}
-              placeholder="Google Drive folder ID or link"
-              className="w-full rounded-xl border border-border bg-glass px-3 py-2 text-sm outline-none"
-            />
             {addError && <p className="text-xs text-destructive">{addError}</p>}
             <div className="flex gap-2">
-              <Button onClick={addFolder} disabled={addBusy}>
+              <Button onClick={addMonth} disabled={addBusy}>
                 {addBusy ? "Adding…" : "Add month"}
               </Button>
               <Button variant="secondary" onClick={() => setAddOpen(false)} disabled={addBusy}>
@@ -1142,24 +1144,189 @@ function ManageMonthsScreen({ agent, onBack }: { agent: AgentOption; onBack: () 
         )}
 
         {error && <p className="mt-3 text-xs text-destructive">{error}</p>}
-        {folders === null && !error && <p className="mt-3 text-sm text-muted-foreground">Loading…</p>}
-        {folders !== null && folders.length === 0 && (
-          <p className="mt-3 text-sm text-muted-foreground">No month folders yet — add one above to get started.</p>
+        {months === null && !error && <p className="mt-3 text-sm text-muted-foreground">Loading…</p>}
+        {months !== null && months.length === 0 && (
+          <p className="mt-3 text-sm text-muted-foreground">No months yet — add one above to get started.</p>
         )}
-        {folders !== null && folders.length > 0 && (
+        {months !== null && months.length > 0 && (
           <div className="mt-3 grid gap-2 sm:grid-cols-2 lg:grid-cols-3">
-            {folders.map((f) => (
+            {months.map((m) => (
               <div
-                key={f.id}
+                key={m.id}
+                className="flex items-center justify-between gap-2 rounded-2xl border border-border bg-glass px-4 py-3"
+              >
+                <button onClick={() => setActiveMonth(m)} className="text-left text-sm font-semibold">
+                  {m.month}
+                </button>
+                <button
+                  onClick={() => removeMonth(m.id)}
+                  disabled={busyMonthId === m.id}
+                  className="shrink-0 text-[11px] font-semibold text-destructive hover:underline disabled:opacity-50"
+                >
+                  Remove
+                </button>
+              </div>
+            ))}
+          </div>
+        )}
+      </Card>
+    </div>
+  );
+}
+
+const DOC_TYPE_LABEL: Record<CalendarItem["docType"], string> = {
+  post: "Social post",
+  email: "Email",
+  video: "Video",
+};
+
+const DOC_TYPE_PLACEHOLDER: Record<CalendarItem["docType"], string> = {
+  post: "Post Goal:\n...\n\nPost Image/Video Suggestions:\n...\n\nCanva Template Direction:\nTemplate Link: https://...\n\nPost Copy:\n...",
+  email: "Email Goal:\n...\n\nSubject Line Options:\n1. ...\n2. ...\n\nEmail Instructions:\n...",
+  video: "Video Goal:\n...\n\nHook:\n...\n\nVideo Script:\n...",
+};
+
+function CalendarMonthItemsScreen({ month, onBack }: { month: CalendarMonth; onBack: () => void }) {
+  const [items, setItems] = useState<CalendarItem[] | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [addOpen, setAddOpen] = useState(false);
+  const [docType, setDocType] = useState<CalendarItem["docType"]>("post");
+  const [title, setTitle] = useState("");
+  const [rawText, setRawText] = useState("");
+  const [addBusy, setAddBusy] = useState(false);
+  const [addError, setAddError] = useState<string | null>(null);
+  const [busyItemId, setBusyItemId] = useState<string | null>(null);
+
+  function reload() {
+    setItems(null);
+    setError(null);
+    listCalendarItems({ data: { monthId: month.id } })
+      .then((r) => setItems(r))
+      .catch((e) => setError(e instanceof Error ? e.message : String(e)));
+  }
+
+  useEffect(() => {
+    reload();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [month.id]);
+
+  async function addItem() {
+    if (!title.trim() || !rawText.trim()) {
+      setAddError("Give this piece a title and the brief/copy to generate from.");
+      return;
+    }
+    setAddBusy(true);
+    setAddError(null);
+    try {
+      await addCalendarItem({
+        data: { monthId: month.id, docType, title: title.trim(), rawText: rawText.trim() },
+      });
+      setTitle("");
+      setRawText("");
+      setAddOpen(false);
+      reload();
+    } catch (e) {
+      setAddError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setAddBusy(false);
+    }
+  }
+
+  async function removeItem(itemId: string) {
+    setBusyItemId(itemId);
+    try {
+      await removeCalendarItem({ data: { itemId } });
+      setItems((prev) => (prev ?? []).filter((it) => it.id !== itemId));
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusyItemId(null);
+    }
+  }
+
+  return (
+    <div className="mt-5 space-y-4">
+      <button onClick={onBack} className="text-xs font-semibold text-muted-foreground hover:text-foreground">
+        ← All months
+      </button>
+
+      <Card>
+        <h2 className="font-display text-lg font-semibold">{month.month}</h2>
+        <p className="mt-1 text-sm text-muted-foreground">
+          Add each post, email, and video brief for this month below — the same shape a Drive Doc used to have (goal,
+          image suggestions/Canva link, and copy for a post; goal, subject lines, and instructions for an email; goal,
+          hook, and script for a video). Every agent's Voice DNA turns these into their own personalized version when
+          they generate.
+        </p>
+      </Card>
+
+      <Card>
+        <div className="flex items-center justify-between">
+          <h4 className="font-display text-sm font-semibold">This month's content</h4>
+          {!addOpen && <Button onClick={() => setAddOpen(true)}>+ Add piece</Button>}
+        </div>
+
+        {addOpen && (
+          <div className="mt-3 space-y-2 rounded-2xl border border-border bg-background/40 p-4">
+            <div className="flex flex-wrap gap-1 rounded-full border border-border bg-glass p-1 w-fit">
+              {(["post", "email", "video"] as const).map((t) => (
+                <button
+                  key={t}
+                  onClick={() => setDocType(t)}
+                  className={`rounded-full px-4 py-1.5 text-sm font-medium transition-colors ${
+                    docType === t ? "bg-secondary text-foreground" : "text-muted-foreground hover:text-foreground"
+                  }`}
+                >
+                  {DOC_TYPE_LABEL[t]}
+                </button>
+              ))}
+            </div>
+            <input
+              value={title}
+              onChange={(e) => setTitle(e.target.value)}
+              placeholder="Title"
+              className="w-full rounded-xl border border-border bg-glass px-3 py-2 text-sm outline-none"
+            />
+            <textarea
+              value={rawText}
+              onChange={(e) => setRawText(e.target.value)}
+              rows={10}
+              placeholder={DOC_TYPE_PLACEHOLDER[docType]}
+              className="w-full rounded-xl border border-border bg-glass px-3 py-2 text-sm outline-none"
+            />
+            {addError && <p className="text-xs text-destructive">{addError}</p>}
+            <div className="flex gap-2">
+              <Button onClick={addItem} disabled={addBusy}>
+                {addBusy ? "Adding…" : "Add"}
+              </Button>
+              <Button variant="secondary" onClick={() => setAddOpen(false)} disabled={addBusy}>
+                Cancel
+              </Button>
+            </div>
+          </div>
+        )}
+
+        {error && <p className="mt-3 text-xs text-destructive">{error}</p>}
+        {items === null && !error && <p className="mt-3 text-sm text-muted-foreground">Loading…</p>}
+        {items !== null && items.length === 0 && (
+          <p className="mt-3 text-sm text-muted-foreground">Nothing added yet — add a post, email, or video above.</p>
+        )}
+        {items !== null && items.length > 0 && (
+          <div className="mt-3 space-y-2">
+            {items.map((it) => (
+              <div
+                key={it.id}
                 className="flex items-center justify-between gap-2 rounded-2xl border border-border bg-glass px-4 py-3"
               >
                 <div>
-                  <p className="text-sm font-semibold">{f.month}</p>
-                  <p className="text-[11px] text-muted-foreground">{f.id}</p>
+                  <span className="rounded-full bg-muted px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">
+                    {DOC_TYPE_LABEL[it.docType]}
+                  </span>
+                  <p className="mt-1 text-sm font-semibold">{it.title}</p>
                 </div>
                 <button
-                  onClick={() => removeFolder(f.id)}
-                  disabled={busyFolderId === f.id}
+                  onClick={() => removeItem(it.id)}
+                  disabled={busyItemId === it.id}
                   className="shrink-0 text-[11px] font-semibold text-destructive hover:underline disabled:opacity-50"
                 >
                   Remove
@@ -1174,22 +1341,22 @@ function ManageMonthsScreen({ agent, onBack }: { agent: AgentOption; onBack: () 
 }
 
 function ContentCalendarTab({ agentId, isAdmin }: { agentId: string; isAdmin: boolean }) {
-  const [folders, setFolders] = useState<ContentFolder[] | null>(null);
+  const [months, setMonths] = useState<CalendarMonth[] | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [activeFolder, setActiveFolder] = useState<ContentFolder | null>(null);
+  const [activeMonth, setActiveMonth] = useState<CalendarMonth | null>(null);
 
   useEffect(() => {
-    setFolders(null);
+    setMonths(null);
     setError(null);
-    setActiveFolder(null);
-    listContentFolders({ data: { agentId } })
-      .then((f) => setFolders(f))
+    setActiveMonth(null);
+    listCalendarMonths()
+      .then((m) => setMonths(m))
       .catch((e) => setError(e instanceof Error ? e.message : String(e)));
   }, [agentId]);
 
-  if (activeFolder) {
+  if (activeMonth) {
     return (
-      <MonthWorkspace agentId={agentId} isAdmin={isAdmin} folder={activeFolder} onBack={() => setActiveFolder(null)} />
+      <MonthWorkspace agentId={agentId} isAdmin={isAdmin} month={activeMonth} onBack={() => setActiveMonth(null)} />
     );
   }
 
@@ -1207,19 +1374,19 @@ function ContentCalendarTab({ agentId, isAdmin }: { agentId: string; isAdmin: bo
         <h4 className="font-display text-sm font-semibold">Months</h4>
 
         {error && <p className="mt-3 text-xs text-destructive">{error}</p>}
-        {folders === null && !error && <p className="mt-3 text-sm text-muted-foreground">Loading…</p>}
-        {folders !== null && folders.length === 0 && (
+        {months === null && !error && <p className="mt-3 text-sm text-muted-foreground">Loading…</p>}
+        {months !== null && months.length === 0 && (
           <p className="mt-3 text-sm text-muted-foreground">No months set up yet — ask your team to add one.</p>
         )}
-        {folders !== null && folders.length > 0 && (
+        {months !== null && months.length > 0 && (
           <div className="mt-3 grid gap-2 sm:grid-cols-2 lg:grid-cols-3">
-            {folders.map((f) => (
+            {months.map((m) => (
               <button
-                key={f.id}
-                onClick={() => setActiveFolder(f)}
+                key={m.id}
+                onClick={() => setActiveMonth(m)}
                 className="rounded-2xl border border-border bg-glass px-4 py-3 text-left text-sm font-semibold transition-colors hover:bg-secondary"
               >
-                {f.month}
+                {m.month}
               </button>
             ))}
           </div>
@@ -1232,12 +1399,12 @@ function ContentCalendarTab({ agentId, isAdmin }: { agentId: string; isAdmin: bo
 function MonthWorkspace({
   agentId,
   isAdmin,
-  folder,
+  month: folder,
   onBack,
 }: {
   agentId: string;
   isAdmin: boolean;
-  folder: ContentFolder;
+  month: CalendarMonth;
   onBack: () => void;
 }) {
   const [docs, setDocs] = useState<CalendarDoc[] | null>(null);
@@ -1252,11 +1419,15 @@ function MonthWorkspace({
   const [approving, setApproving] = useState(false);
   const [sending, setSending] = useState(false);
   const [sendNote, setSendNote] = useState<string | null>(null);
+  // The agent's OWN Drive photo folder (set on the separate Google Drive tab,
+  // unrelated to the shared native calendar above) — still how photo
+  // suggestions are sourced today; see the panel below.
+  const [agentDriveFolderId, setAgentDriveFolderId] = useState<string | null>(null);
 
   function loadDocs() {
     setDocs(null);
     setDocsError(null);
-    readContentCalendar({ data: { agentId, folderId: folder.id } })
+    readContentCalendar({ data: { agentId, monthId: folder.id } })
       .then((r) => setDocs(r.docs))
       .catch((e) => setDocsError(e instanceof Error ? e.message : String(e)));
   }
@@ -1272,11 +1443,14 @@ function MonthWorkspace({
   useEffect(() => {
     loadDocs();
     loadPosts();
+    listAgentDriveMedia({ data: { agentId } })
+      .then((r) => setAgentDriveFolderId(r.folderId))
+      .catch(() => setAgentDriveFolderId(null));
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [agentId, folder.id, folder.month]);
 
   const batchPosts = (posts ?? []).filter(
-    (p) => p.metadata?.source === "drive_calendar" || p.metadata?.source === "drive_photo_scan",
+    (p) => p.metadata?.source === "content_calendar" || p.metadata?.source === "drive_photo_scan",
   );
   const socialPosts = batchPosts.filter((p) => p.content_type === "post" && !p.metadata?.canva_link);
   const canvaPosts = batchPosts.filter((p) => p.content_type === "post" && Boolean(p.metadata?.canva_link));
@@ -1292,7 +1466,7 @@ function MonthWorkspace({
     setGenError(null);
     try {
       const res = await generateMonthlyBatch({
-        data: { agentId, folderId: folder.id, month: folder.month, useHashtags },
+        data: { agentId, monthId: folder.id, month: folder.month, useHashtags },
       });
       setLastBatchId(res.batchId);
       loadPosts();
@@ -1363,12 +1537,12 @@ function MonthWorkspace({
             {docsError ? (
               <p className="mt-1 text-xs text-destructive">{docsError}</p>
             ) : docs === null ? (
-              <p className="mt-1 text-xs text-muted-foreground">Reading this month's Drive folder…</p>
+              <p className="mt-1 text-xs text-muted-foreground">Reading this month's calendar…</p>
             ) : (
               <p className="mt-1 text-xs text-muted-foreground">
                 {postCount} post{postCount === 1 ? "" : "s"}, {emailCount} email
-                {emailCount === 1 ? "" : "s"}, {videoCount} video script{videoCount === 1 ? "" : "s"} found in this
-                month's folder.
+                {emailCount === 1 ? "" : "s"}, {videoCount} video script{videoCount === 1 ? "" : "s"} in this month's
+                calendar.
               </p>
             )}
           </div>
@@ -1385,16 +1559,18 @@ function MonthWorkspace({
         {genError && <p className="mt-2 text-xs text-destructive">{genError}</p>}
       </Card>
 
-      <PhotoScanPanel
-        agentId={agentId}
-        folderId={folder.id}
-        month={folder.month}
-        batchId={activeBatchId}
-        open={photosOpen}
-        onOpen={() => setPhotosOpen(true)}
-        onClose={() => setPhotosOpen(false)}
-        onAdded={loadPosts}
-      />
+      {agentDriveFolderId && (
+        <PhotoScanPanel
+          agentId={agentId}
+          folderId={agentDriveFolderId}
+          month={folder.month}
+          batchId={activeBatchId}
+          open={photosOpen}
+          onOpen={() => setPhotosOpen(true)}
+          onClose={() => setPhotosOpen(false)}
+          onAdded={loadPosts}
+        />
+      )}
 
       <Card>
         <div className="flex flex-wrap items-center justify-between gap-3">

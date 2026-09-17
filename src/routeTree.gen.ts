@@ -13,6 +13,7 @@ import { Route as IndexRouteImport } from './routes/index'
 import { Route as AccountRouteImport } from './routes/account'
 import { Route as DatabaseRouteImport } from './routes/database'
 import { Route as LoginRouteImport } from './routes/login'
+import { Route as MarketingRouteImport } from './routes/marketing'
 import { Route as VoiceRouteImport } from './routes/voice'
 
 const IndexRoute = IndexRouteImport.update({
@@ -35,6 +36,11 @@ const LoginRoute = LoginRouteImport.update({
   path: '/login',
   getParentRoute: () => rootRouteImport,
 } as any)
+const MarketingRoute = MarketingRouteImport.update({
+  id: '/marketing',
+  path: '/marketing',
+  getParentRoute: () => rootRouteImport,
+} as any)
 const VoiceRoute = VoiceRouteImport.update({
   id: '/voice',
   path: '/voice',
@@ -46,6 +52,7 @@ export interface FileRoutesByFullPath {
   '/account': typeof AccountRoute
   '/database': typeof DatabaseRoute
   '/login': typeof LoginRoute
+  '/marketing': typeof MarketingRoute
   '/voice': typeof VoiceRoute
 }
 export interface FileRoutesByTo {
@@ -53,6 +60,7 @@ export interface FileRoutesByTo {
   '/account': typeof AccountRoute
   '/database': typeof DatabaseRoute
   '/login': typeof LoginRoute
+  '/marketing': typeof MarketingRoute
   '/voice': typeof VoiceRoute
 }
 export interface FileRoutesById {
@@ -61,14 +69,22 @@ export interface FileRoutesById {
   '/account': typeof AccountRoute
   '/database': typeof DatabaseRoute
   '/login': typeof LoginRoute
+  '/marketing': typeof MarketingRoute
   '/voice': typeof VoiceRoute
 }
 export interface FileRouteTypes {
   fileRoutesByFullPath: FileRoutesByFullPath
-  fullPaths: '/' | '/account' | '/database' | '/login' | '/voice'
+  fullPaths: '/' | '/account' | '/database' | '/login' | '/marketing' | '/voice'
   fileRoutesByTo: FileRoutesByTo
-  to: '/' | '/account' | '/database' | '/login' | '/voice'
-  id: '__root__' | '/' | '/account' | '/database' | '/login' | '/voice'
+  to: '/' | '/account' | '/database' | '/login' | '/marketing' | '/voice'
+  id:
+    | '__root__'
+    | '/'
+    | '/account'
+    | '/database'
+    | '/login'
+    | '/marketing'
+    | '/voice'
   fileRoutesById: FileRoutesById
 }
 export interface RootRouteChildren {
@@ -76,6 +92,7 @@ export interface RootRouteChildren {
   AccountRoute: typeof AccountRoute
   DatabaseRoute: typeof DatabaseRoute
   LoginRoute: typeof LoginRoute
+  MarketingRoute: typeof MarketingRoute
   VoiceRoute: typeof VoiceRoute
 }
 
@@ -109,6 +126,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof LoginRouteImport
       parentRoute: typeof rootRouteImport
     }
+    '/marketing': {
+      id: '/marketing'
+      path: '/marketing'
+      fullPath: '/marketing'
+      preLoaderRoute: typeof MarketingRouteImport
+      parentRoute: typeof rootRouteImport
+    }
     '/voice': {
       id: '/voice'
       path: '/voice'
@@ -124,6 +148,7 @@ const rootRouteChildren: RootRouteChildren = {
   AccountRoute: AccountRoute,
   DatabaseRoute: DatabaseRoute,
   LoginRoute: LoginRoute,
+  MarketingRoute: MarketingRoute,
   VoiceRoute: VoiceRoute,
 }
 export const routeTree = rootRouteImport

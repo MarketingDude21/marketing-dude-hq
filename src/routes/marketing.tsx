@@ -9,6 +9,7 @@ import {
   listMarketingMonths,
   updateMarketingPost,
   submitMarketingFeedback,
+  setPostMedia,
   listMarketingMedia,
   createMediaUploadUrl,
   finalizeMediaUpload,
@@ -528,6 +529,9 @@ function PostCard({
   const [notes, setNotes] = useState("");
   const [busy, setBusy] = useState(false);
   const [saveError, setSaveError] = useState<string | null>(null);
+  const [pickerOpen, setPickerOpen] = useState(false);
+  const [mediaOptions, setMediaOptions] = useState<MediaRow[] | null>(null);
+  const [mediaBusy, setMediaBusy] = useState(false);
 
   useEffect(() => {
     setDraft(post.content);
@@ -580,7 +584,34 @@ function PostCard({
     }
   }
 
+  async function openPicker() {
+    setPickerOpen(true);
+    if (!mediaOptions) {
+      try {
+        const list = await listMarketingMedia({ data: { agentId, status: "available" } });
+        setMediaOptions(list);
+      } catch {
+        setMediaOptions([]);
+      }
+    }
+  }
+
+  async function pickMedia(mediaId: string | null) {
+    setMediaBusy(true);
+    setSaveError(null);
+    try {
+      await setPostMedia({ data: { agentId, postId: post.id, mediaId } });
+      setPickerOpen(false);
+      onChanged();
+    } catch (e) {
+      setSaveError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setMediaBusy(false);
+    }
+  }
+
   const typeLabel = post.content_type === "email" ? "Email" : post.content_type === "video" ? "Video script" : "Post";
+  const photoUrl = post.metadata?.media_url || post.metadata?.drive_thumbnail_url || null;
 
   return (
     <Card>
@@ -600,6 +631,21 @@ function PostCard({
 
       {expanded && (
         <div className="mt-4 border-t border-border pt-4">
+          {post.content_type === "post" && photoUrl && (
+            <div className="mb-3 overflow-hidden rounded-2xl border border-border bg-muted">
+              {post.metadata?.media_type === "video" ? (
+                <video src={photoUrl} controls className="max-h-64 w-full object-contain" />
+              ) : (
+                <img src={photoUrl} alt="" className="max-h-64 w-full object-contain" />
+              )}
+            </div>
+          )}
+          {post.content_type === "post" && !photoUrl && post.metadata?.image_suggestion && (
+            <p className="mb-2 text-xs text-muted-foreground">
+              📸 Suggested image direction: {post.metadata.image_suggestion} — no photo on file yet to attach
+              automatically; add one on the Media tab or pick one below.
+            </p>
+          )}
           {editing ? (
             <textarea
               value={draft}
@@ -651,9 +697,64 @@ function PostCard({
                 <Button variant="danger" onClick={() => setFeedbackOpen((v) => !v)} disabled={busy}>
                   Flag / feedback
                 </Button>
+                {post.content_type === "post" && (
+                  <Button variant="secondary" onClick={openPicker} disabled={busy}>
+                    {photoUrl ? "Change photo" : "Add photo"}
+                  </Button>
+                )}
               </>
             )}
           </div>
+
+          {pickerOpen && (
+            <div className="mt-4 rounded-2xl border border-border bg-background/40 p-4">
+              <div className="flex items-center justify-between">
+                <p className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
+                  Choose from this agent's media library
+                </p>
+                <button
+                  onClick={() => setPickerOpen(false)}
+                  className="text-xs text-muted-foreground hover:text-foreground"
+                >
+                  Close
+                </button>
+              </div>
+              {mediaOptions === null && <p className="mt-2 text-xs text-muted-foreground">Loading…</p>}
+              {mediaOptions !== null && mediaOptions.length === 0 && (
+                <p className="mt-2 text-xs text-muted-foreground">
+                  No available photos or videos uploaded for this agent yet — add some on the Media tab, then come back
+                  here.
+                </p>
+              )}
+              {mediaOptions !== null && mediaOptions.length > 0 && (
+                <div className="mt-3 grid grid-cols-3 gap-2 sm:grid-cols-4">
+                  {mediaOptions.map((m) => (
+                    <button
+                      key={m.id}
+                      onClick={() => pickMedia(m.id)}
+                      disabled={mediaBusy}
+                      className="overflow-hidden rounded-xl border border-border transition-colors hover:border-primary disabled:opacity-50"
+                    >
+                      {m.media_type === "video"
+                        ? m.url && <video src={m.url} className="aspect-square w-full object-cover" />
+                        : m.url && (
+                            <img src={m.url} alt={m.caption ?? ""} className="aspect-square w-full object-cover" />
+                          )}
+                    </button>
+                  ))}
+                </div>
+              )}
+              {photoUrl && (
+                <button
+                  onClick={() => pickMedia(null)}
+                  disabled={mediaBusy}
+                  className="mt-3 text-xs font-semibold text-destructive hover:underline disabled:opacity-50"
+                >
+                  Remove photo
+                </button>
+              )}
+            </div>
+          )}
 
           {feedbackOpen && (
             <div className="mt-4 rounded-2xl border border-border bg-background/40 p-4">
@@ -1609,6 +1710,10 @@ function MonthWorkspace({
   );
 }
 
+// Cards here default to OPEN (photo, full copy, and Approve/Edit/Flag/Change
+// photo all visible immediately) to match the old app's always-expanded
+// review grid — clicking a card's header collapses just that one, rather
+// than everything starting collapsed and needing a click to see anything.
 function BatchSection({
   title,
   posts,
@@ -1620,7 +1725,7 @@ function BatchSection({
   agentId: string;
   onChanged: () => void;
 }) {
-  const [expanded, setExpanded] = useState<string | null>(null);
+  const [collapsed, setCollapsed] = useState<Set<string>>(new Set());
   return (
     <div>
       <h4 className="mb-2 text-xs font-semibold uppercase tracking-wider text-muted-foreground">{title}</h4>
@@ -1630,8 +1735,15 @@ function BatchSection({
             key={post.id}
             post={post}
             agentId={agentId}
-            expanded={expanded === post.id}
-            onToggle={() => setExpanded((cur) => (cur === post.id ? null : post.id))}
+            expanded={!collapsed.has(post.id)}
+            onToggle={() =>
+              setCollapsed((cur) => {
+                const next = new Set(cur);
+                if (next.has(post.id)) next.delete(post.id);
+                else next.add(post.id);
+                return next;
+              })
+            }
             onChanged={onChanged}
           />
         ))}

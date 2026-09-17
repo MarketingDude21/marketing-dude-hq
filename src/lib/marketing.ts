@@ -35,10 +35,7 @@ export type MarketingAccess =
   | { role: "agent"; agentId: string; agentName: string }
   | { role: "none" };
 
-async function resolveAccess(
-  userId: string,
-  email: string | undefined,
-): Promise<MarketingAccess> {
+async function resolveAccess(userId: string, email: string | undefined): Promise<MarketingAccess> {
   const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
 
   if (email) {
@@ -50,11 +47,7 @@ async function resolveAccess(
     if (allow) return { role: "admin" };
   }
 
-  const { data: agent } = await supabaseAdmin
-    .from("agents")
-    .select("id, full_name")
-    .eq("id", userId)
-    .maybeSingle();
+  const { data: agent } = await supabaseAdmin.from("agents").select("id, full_name").eq("id", userId).maybeSingle();
   if (agent) {
     return { role: "agent", agentId: agent.id, agentName: agent.full_name ?? "Your account" };
   }
@@ -93,15 +86,24 @@ export const listMarketingAgents = createServerFn({ method: "GET" })
 // caller's access on every call (never trusts an agentId the browser sends)
 // so an agent can never read or edit someone else's content, and an admin's
 // access is always verified fresh rather than cached client-side.
-async function requireAgentAccess(
-  userId: string,
-  email: string | undefined,
-  requestedAgentId: string,
-): Promise<void> {
+async function requireAgentAccess(userId: string, email: string | undefined, requestedAgentId: string): Promise<void> {
   const access = await resolveAccess(userId, email);
   if (access.role === "admin") return;
   if (access.role === "agent" && access.agentId === requestedAgentId) return;
   throw new Error("Not authorized for this agent's content");
+}
+
+// Guards for the shared content calendar below — it isn't scoped to any one
+// agent (every agent reads the same months/items), so these check the
+// caller's role directly rather than re-deriving a specific agentId match.
+async function requireAnyMarketingAccess(userId: string, email: string | undefined): Promise<void> {
+  const access = await resolveAccess(userId, email);
+  if (access.role === "none") throw new Error("You don't have access to Monthly Marketing.");
+}
+
+async function requireAdmin(userId: string, email: string | undefined): Promise<void> {
+  const access = await resolveAccess(userId, email);
+  if (access.role !== "admin") throw new Error("Only team members can manage the content calendar.");
 }
 
 export type PostMetadata = {
@@ -136,9 +138,7 @@ export const listMarketingPosts = createServerFn({ method: "GET" })
     const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
     let query = supabaseAdmin
       .from("generated_posts")
-      .select(
-        "id, content, content_type, title, platform, status, month, scheduled_for, created_at, metadata",
-      )
+      .select("id, content, content_type, title, platform, status, month, scheduled_for, created_at, metadata")
       .eq("agent_id", data.agentId)
       .order("created_at", { ascending: true });
     if (data.month) query = query.eq("month", data.month);
@@ -182,9 +182,7 @@ export const listMarketingMonths = createServerFn({ method: "GET" })
       .select("month")
       .eq("agent_id", data.agentId);
     if (error) throw error;
-    const months = Array.from(
-      new Set((rows ?? []).map((r) => r.month).filter((m): m is string => Boolean(m))),
-    );
+    const months = Array.from(new Set((rows ?? []).map((r) => r.month).filter((m): m is string => Boolean(m))));
     months.sort();
     months.reverse();
     return months;
@@ -192,9 +190,7 @@ export const listMarketingMonths = createServerFn({ method: "GET" })
 
 export const updateMarketingPost = createServerFn({ method: "POST" })
   .middleware([requireSupabaseAuth])
-  .validator(
-    (data: { agentId: string; postId: string; content?: string; status?: string }) => data,
-  )
+  .validator((data: { agentId: string; postId: string; content?: string; status?: string }) => data)
   .handler(async ({ data, context }): Promise<{ ok: true }> => {
     const email = (context.claims as { email?: string } | undefined)?.email;
     await requireAgentAccess(context.userId, email, data.agentId);
@@ -219,19 +215,14 @@ export const updateMarketingPost = createServerFn({ method: "POST" })
     if (data.content !== undefined) update.content = data.content;
     if (data.status !== undefined) update.status = data.status;
 
-    const { error } = await supabaseAdmin
-      .from("generated_posts")
-      .update(update)
-      .eq("id", data.postId);
+    const { error } = await supabaseAdmin.from("generated_posts").update(update).eq("id", data.postId);
     if (error) throw error;
     return { ok: true };
   });
 
 export const submitMarketingFeedback = createServerFn({ method: "POST" })
   .middleware([requireSupabaseAuth])
-  .validator(
-    (data: { agentId: string; postId: string; rating?: string; notes?: string }) => data,
-  )
+  .validator((data: { agentId: string; postId: string; rating?: string; notes?: string }) => data)
   .handler(async ({ data, context }): Promise<{ ok: true }> => {
     const email = (context.claims as { email?: string } | undefined)?.email;
     await requireAgentAccess(context.userId, email, data.agentId);
@@ -344,9 +335,7 @@ export const createMediaUploadUrl = createServerFn({ method: "POST" })
     const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
     const safeName = data.fileName.replace(/[^a-zA-Z0-9._-]/g, "_").slice(-120);
     const path = `${data.agentId}/${crypto.randomUUID()}-${safeName}`;
-    const { data: signed, error } = await supabaseAdmin.storage
-      .from("media")
-      .createSignedUploadUrl(path);
+    const { data: signed, error } = await supabaseAdmin.storage.from("media").createSignedUploadUrl(path);
     if (error) throw error;
     return { path, token: signed.token };
   });
@@ -357,14 +346,7 @@ export const createMediaUploadUrl = createServerFn({ method: "POST" })
 // back about its own upload.
 export const finalizeMediaUpload = createServerFn({ method: "POST" })
   .middleware([requireSupabaseAuth])
-  .validator(
-    (data: {
-      agentId: string;
-      storagePath: string;
-      mediaType: "photo" | "video";
-      caption?: string;
-    }) => data,
-  )
+  .validator((data: { agentId: string; storagePath: string; mediaType: "photo" | "video"; caption?: string }) => data)
   .handler(async ({ data, context }): Promise<{ ok: true; id: string }> => {
     const email = (context.claims as { email?: string } | undefined)?.email;
     await requireAgentAccess(context.userId, email, data.agentId);
@@ -494,9 +476,7 @@ export const listAgentDriveMedia = createServerFn({ method: "GET" })
 
     const apiKey = process.env["GOOGLE_API_KEY"];
     if (!apiKey) {
-      throw new Error(
-        "Google Drive isn't connected yet — add GOOGLE_API_KEY in Lovable Cloud → Secrets.",
-      );
+      throw new Error("Google Drive isn't connected yet — add GOOGLE_API_KEY in Lovable Cloud → Secrets.");
     }
 
     // Find the "used" subfolder first so its contents get excluded — same
@@ -587,9 +567,7 @@ function buildContentPrompt(
   agentCity: string,
   voiceDna: string,
 ): string {
-  const extra = input.instructions?.trim()
-    ? `\n\nADDITIONAL DIRECTION:\n${input.instructions.trim()}`
-    : "";
+  const extra = input.instructions?.trim() ? `\n\nADDITIONAL DIRECTION:\n${input.instructions.trim()}` : "";
 
   if (input.contentType === "post") {
     return (
@@ -646,9 +624,7 @@ export const generateMarketingContent = createServerFn({ method: "POST" })
 
     const apiKey = process.env["ANTHROPIC_API_KEY"];
     if (!apiKey) {
-      throw new Error(
-        "Content generation isn't configured yet — add ANTHROPIC_API_KEY in Lovable Cloud → Secrets.",
-      );
+      throw new Error("Content generation isn't configured yet — add ANTHROPIC_API_KEY in Lovable Cloud → Secrets.");
     }
 
     const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
@@ -662,8 +638,7 @@ export const generateMarketingContent = createServerFn({ method: "POST" })
     const agentName = agent?.full_name ?? "the agent";
     const agentCity = agent?.market_area ?? "their market";
     const voiceDna =
-      agent?.voice_summary ??
-      "Warm, conversational, authentic real estate agent. Short posts. Real human energy.";
+      agent?.voice_summary ?? "Warm, conversational, authentic real estate agent. Short posts. Real human energy.";
 
     const prompt = buildContentPrompt(data, agentName, agentCity, voiceDna);
 
@@ -685,7 +660,10 @@ export const generateMarketingContent = createServerFn({ method: "POST" })
       error?: { message?: string };
     };
     if (!res.ok) throw new Error(json.error?.message ?? `Claude API error (${res.status})`);
-    const raw = (json.content ?? []).map((b) => b.text ?? "").join("").trim();
+    const raw = (json.content ?? [])
+      .map((b) => b.text ?? "")
+      .join("")
+      .trim();
     if (!raw) throw new Error("Empty response from Claude — try again.");
 
     const { data: row, error } = await supabaseAdmin
@@ -712,102 +690,142 @@ export const generateMarketingContent = createServerFn({ method: "POST" })
   });
 
 // ============================================================================
-// Google Drive content calendar — bringing back the exact old flow, natively.
+// Content calendar — native and SHARED across every agent (2026-09-17).
 //
-// Per Mike (2026-09-16): this ISN'T a redesign. We're not building a separate
-// admin screen and a separate agent screen the way the old app had — one
-// workspace, same as everything else here, viewed either as the agent
-// themselves or as an admin acting as them. The only thing that changes is
-// WHERE the baseline content comes from: for now, still a Google Drive
-// month folder full of Docs (existing clients keep this exactly as it was),
-// with a native way to author that baseline content planned as the next
-// step. "Send to Agent" is the one piece gated to admin-only — an agent
-// looking at their own content has no reason to email themselves.
+// Corrected twice from the original Drive-folder port: first to a per-agent
+// Drive folder (admin-only add/remove), then — per Mike, after he saw the
+// per-agent "Manage months" list and said it was backwards — to this: ONE
+// calendar, built once by admin, that every agent generates their own
+// personalized version of through their own login. There is no agentId
+// dimension on a month or an item anymore; `agentId` still appears on the
+// read/generate calls below only because those calls also need to know
+// WHICH agent's Voice DNA to write in and whose generated_posts to create.
 //
-// Everything below is a direct, faithful port of the old app's own logic
-// (content-calendar.js's doc parser, generateAll()'s per-type prompts,
-// analyze-photos.js's photo-captioning, send-review.js's notification
-// email) — not a rewrite. The one deliberate change: the notification email
-// links to this app's own secure login instead of the old public,
-// no-login review.html link, since that link was exactly the security hole
-// Phase 1 already closed with Mike.
+// Mike's explicit reasoning for going fully native here (not a Drive folder
+// shared across agents instead): the recurring operational headache with
+// Drive has always been the photo "move to used" mechanics, and native
+// content also sets up the later Meta-posting integration he's planning.
+// He pointed at a real Drive folder of his own briefs as the reference for
+// the shape a piece of content needs (goal / image suggestions / canva
+// link / copy for a post; goal / subject lines / instructions for an email;
+// goal / hook / script for a video) — confirmed by reading it directly.
+// That shape is exactly what the old Drive-doc parser below already
+// extracts, so admin authors that same shape as plain text per item, and
+// the SAME parsing functions run against it — no new prompt/logic was
+// invented, only the source changed from a Drive Doc export to a native
+// textarea.
 // ============================================================================
 
-export type ContentFolder = { id: string; month: string };
+export type CalendarMonth = { id: string; month: string };
 
-export const listContentFolders = createServerFn({ method: "GET" })
+export const listCalendarMonths = createServerFn({ method: "GET" })
   .middleware([requireSupabaseAuth])
-  .validator((data: { agentId: string }) => data)
-  .handler(async ({ data, context }): Promise<ContentFolder[]> => {
+  .handler(async ({ context }): Promise<CalendarMonth[]> => {
     const email = (context.claims as { email?: string } | undefined)?.email;
-    await requireAgentAccess(context.userId, email, data.agentId);
+    await requireAnyMarketingAccess(context.userId, email);
     const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
-    const { data: agent, error } = await supabaseAdmin
-      .from("agents")
-      .select("content_folders")
-      .eq("id", data.agentId)
-      .maybeSingle();
+    const { data, error } = await supabaseAdmin
+      .from("content_calendar_months")
+      .select("id, month")
+      .order("created_at", { ascending: false });
     if (error) throw error;
-    return ((agent?.content_folders as ContentFolder[] | null) ?? []) as ContentFolder[];
+    return (data ?? []) as CalendarMonth[];
   });
 
-export const addContentFolder = createServerFn({ method: "POST" })
+export const addCalendarMonth = createServerFn({ method: "POST" })
   .middleware([requireSupabaseAuth])
-  .validator((data: { agentId: string; month: string; driveFolderId: string }) => data)
-  .handler(async ({ data, context }): Promise<{ ok: true; folders: ContentFolder[] }> => {
+  .validator((data: { month: string }) => data)
+  .handler(async ({ data, context }): Promise<{ ok: true; month: CalendarMonth }> => {
     const email = (context.claims as { email?: string } | undefined)?.email;
-    const access = await resolveAccess(context.userId, email);
-    if (access.role !== "admin") {
-      throw new Error("Only team members can add a month folder.");
-    }
+    await requireAdmin(context.userId, email);
+    if (!data.month.trim()) throw new Error("Give this month a label.");
     const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
-    const { data: agent, error: fetchErr } = await supabaseAdmin
-      .from("agents")
-      .select("content_folders")
-      .eq("id", data.agentId)
-      .maybeSingle();
-    if (fetchErr) throw fetchErr;
-    const current = ((agent?.content_folders as ContentFolder[] | null) ?? []) as ContentFolder[];
-    const cleanId = data.driveFolderId.replace(/.*\/folders\//, "").replace(/[?&].*/, "").trim();
-    if (current.some((f) => f.id === cleanId)) {
-      throw new Error("That folder ID is already in this agent's list.");
-    }
-    const next = [{ id: cleanId, month: data.month.trim() }, ...current];
-    const { error } = await supabaseAdmin
-      .from("agents")
-      .update({ content_folders: next })
-      .eq("id", data.agentId);
+    const { data: row, error } = await supabaseAdmin
+      .from("content_calendar_months")
+      .insert({ month: data.month.trim() })
+      .select("id, month")
+      .single();
     if (error) throw error;
-    return { ok: true, folders: next };
+    return { ok: true, month: row as CalendarMonth };
   });
 
-export const removeContentFolder = createServerFn({ method: "POST" })
+export const removeCalendarMonth = createServerFn({ method: "POST" })
   .middleware([requireSupabaseAuth])
-  .validator((data: { agentId: string; folderId: string }) => data)
-  .handler(async ({ data, context }): Promise<{ ok: true; folders: ContentFolder[] }> => {
+  .validator((data: { monthId: string }) => data)
+  .handler(async ({ data, context }): Promise<{ ok: true }> => {
     const email = (context.claims as { email?: string } | undefined)?.email;
-    const access = await resolveAccess(context.userId, email);
-    if (access.role !== "admin") {
-      throw new Error("Only team members can remove a month folder.");
-    }
+    await requireAdmin(context.userId, email);
     const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
-    const { data: agent, error: fetchErr } = await supabaseAdmin
-      .from("agents")
-      .select("content_folders")
-      .eq("id", data.agentId)
-      .maybeSingle();
-    if (fetchErr) throw fetchErr;
-    const current = ((agent?.content_folders as ContentFolder[] | null) ?? []) as ContentFolder[];
-    const next = current.filter((f) => f.id !== data.folderId);
-    const { error } = await supabaseAdmin
-      .from("agents")
-      .update({ content_folders: next })
-      .eq("id", data.agentId);
+    const { error } = await supabaseAdmin.from("content_calendar_months").delete().eq("id", data.monthId);
     if (error) throw error;
-    return { ok: true, folders: next };
+    return { ok: true };
   });
 
-// ── Drive doc parsing — ported 1:1 from content-calendar.js ────────────────
+// One row per post/email/video admin authors for a month — the native
+// replacement for a Google Doc in the old Drive folder. `rawText` is typed
+// and structured exactly the way a Drive Doc for that type was (see the
+// parsing functions below); admin picks the type explicitly instead of it
+// being sniffed from a filename.
+export type CalendarItem = { id: string; docType: "post" | "email" | "video"; title: string; rawText: string };
+
+export const listCalendarItems = createServerFn({ method: "GET" })
+  .middleware([requireSupabaseAuth])
+  .validator((data: { monthId: string }) => data)
+  .handler(async ({ data, context }): Promise<CalendarItem[]> => {
+    const email = (context.claims as { email?: string } | undefined)?.email;
+    await requireAdmin(context.userId, email);
+    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+    const { data: rows, error } = await supabaseAdmin
+      .from("content_calendar_items")
+      .select("id, doc_type, title, raw_text")
+      .eq("month_id", data.monthId)
+      .order("sort_order", { ascending: true })
+      .order("created_at", { ascending: true });
+    if (error) throw error;
+    return (rows ?? []).map((r) => ({
+      id: r.id,
+      docType: r.doc_type as CalendarItem["docType"],
+      title: r.title,
+      rawText: r.raw_text,
+    }));
+  });
+
+export const addCalendarItem = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .validator((data: { monthId: string; docType: "post" | "email" | "video"; title: string; rawText: string }) => data)
+  .handler(async ({ data, context }): Promise<{ ok: true }> => {
+    const email = (context.claims as { email?: string } | undefined)?.email;
+    await requireAdmin(context.userId, email);
+    if (!data.title.trim() || !data.rawText.trim()) {
+      throw new Error("Give this piece a title and the brief/copy to generate from.");
+    }
+    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+    const row: TablesInsert<"content_calendar_items"> = {
+      month_id: data.monthId,
+      doc_type: data.docType,
+      title: data.title.trim(),
+      raw_text: data.rawText.trim(),
+    };
+    const { error } = await supabaseAdmin.from("content_calendar_items").insert(row);
+    if (error) throw error;
+    return { ok: true };
+  });
+
+export const removeCalendarItem = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .validator((data: { itemId: string }) => data)
+  .handler(async ({ data, context }): Promise<{ ok: true }> => {
+    const email = (context.claims as { email?: string } | undefined)?.email;
+    await requireAdmin(context.userId, email);
+    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+    const { error } = await supabaseAdmin.from("content_calendar_items").delete().eq("id", data.itemId);
+    if (error) throw error;
+    return { ok: true };
+  });
+
+// ── Calendar item parsing — the exact same extraction logic that was ported
+// from the old app's Drive-doc parser (content-calendar.js), just applied to
+// natively-authored text instead of a Drive Doc export ─────────────────────
 
 export type CalendarDoc =
   | { type: "post"; title: string; goal: string; image: string; canva: string; copy: string }
@@ -880,17 +898,18 @@ function parsePostDoc(text: string, title: string): CalendarDoc | null {
     text.match(/<(https?:\/\/canva\.[^\s>]+)>/i) ||
     text.match(/(https?:\/\/canva\.link\/\S+)/i) ||
     text.match(/(https?:\/\/www\.canva\.com\/\S+)/i);
-  if (canvaMatch) canva = canvaMatch[1]!.trim().replace(/[<>()[\]]/g, "").replace(/\*\*/g, "").trim();
+  if (canvaMatch)
+    canva = canvaMatch[1]!
+      .trim()
+      .replace(/[<>()[\]]/g, "")
+      .replace(/\*\*/g, "")
+      .trim();
 
   return { type: "post", title, goal, image, canva, copy };
 }
 
 function parseEmailDoc(text: string, title: string): CalendarDoc | null {
-  const goal = extractSection(text, "Email Goal", [
-    "Subject Line Options",
-    "Email Instructions",
-    "SUBJECT LINE",
-  ]);
+  const goal = extractSection(text, "Email Goal", ["Subject Line Options", "Email Instructions", "SUBJECT LINE"]);
   const subjectSection =
     extractSection(text, "SUBJECT LINE OPTIONS?(?:\\s*\\([^)]*\\))?", [
       "Email Instructions",
@@ -927,7 +946,14 @@ function parseEmailDoc(text: string, title: string): CalendarDoc | null {
 
   const subjects = (subjectSection || "")
     .split("\n")
-    .map((l) => l.replace(/^[-*•\d.)\s]+/, "").replace(/\*\*/g, "").replace(/\*/g, "").replace(/\\/g, "").trim())
+    .map((l) =>
+      l
+        .replace(/^[-*•\d.)\s]+/, "")
+        .replace(/\*\*/g, "")
+        .replace(/\*/g, "")
+        .replace(/\\/g, "")
+        .trim(),
+    )
     .filter((l) => l.length > 5 && !/^Pick\s+\d/i.test(l));
 
   return { type: "email", title, goal, subjects, instructions: instructionsText };
@@ -956,65 +982,28 @@ function parseVideoDoc(text: string, title: string): CalendarDoc | null {
   return { type: "video", title, goal, hook, script };
 }
 
-function parseContentDoc(text: string, fileName: string): CalendarDoc | null {
-  const cleaned = text
+function parseCalendarItem(item: { docType: string; title: string; rawText: string }): CalendarDoc | null {
+  const cleaned = item.rawText
     .replace(/\r\n/g, "\n")
     .replace(/\\([[\]().*+?^${}|\\])/g, "$1")
     .trim();
-  const title = fileName.replace(/\.(gdoc|docx?)$/i, "").trim();
-  const titleLower = title.toLowerCase().trim();
-
-  if (/^email[\s:\-–—|]/i.test(title) || titleLower.startsWith("email")) return parseEmailDoc(cleaned, title);
-  if (/^video[\s:\-–—|1-9]/i.test(title) || titleLower.startsWith("video")) return parseVideoDoc(cleaned, title);
-
-  const isEmailByContent =
-    /(?:\d+\.\s*)?Email Goal/i.test(cleaned) ||
-    /Subject Line Options/i.test(cleaned) ||
-    /SUBJECT LINE OPTIONS/i.test(cleaned) ||
-    /Email Instructions/i.test(cleaned) ||
-    /Pick 1.*subject/i.test(cleaned) ||
-    /EMAIL BODY/i.test(cleaned);
-  const firstLine = cleaned.split("\n")[0]!.trim();
-  const isVideoByContent =
-    /(?:\d+\.\s*)?Video Goal/i.test(cleaned) ||
-    /Video Script/i.test(cleaned) ||
-    /Script Instructions/i.test(cleaned) ||
-    /^video[\s:\-–—1-9]/i.test(firstLine);
-
-  if (isEmailByContent) return parseEmailDoc(cleaned, title);
-  if (isVideoByContent) return parseVideoDoc(cleaned, title);
-  return parsePostDoc(cleaned, title);
+  if (item.docType === "email") return parseEmailDoc(cleaned, item.title);
+  if (item.docType === "video") return parseVideoDoc(cleaned, item.title);
+  return parsePostDoc(cleaned, item.title);
 }
 
-async function fetchCalendarDocs(folderId: string, apiKey: string): Promise<CalendarDoc[]> {
-  const listUrl =
-    "https://www.googleapis.com/drive/v3/files?" +
-    "q=" +
-    encodeURIComponent(
-      `'${folderId}' in parents and mimeType='application/vnd.google-apps.document' and trashed=false`,
-    ) +
-    "&fields=files(id,name)&pageSize=100&key=" +
-    apiKey;
-  const listRes = await fetch(listUrl);
-  const listData = (await listRes.json()) as { files?: { id: string; name: string }[]; error?: { message?: string } };
-  if (!listRes.ok) throw new Error(listData.error?.message ?? "Drive list failed");
-  const files = listData.files ?? [];
-
-  const results = await Promise.all(
-    files.map(async (f) => {
-      try {
-        const exportUrl =
-          "https://www.googleapis.com/drive/v3/files/" + f.id + "/export?mimeType=text%2Fplain&key=" + apiKey;
-        const exportRes = await fetch(exportUrl);
-        if (!exportRes.ok) return null;
-        const text = await exportRes.text();
-        return parseContentDoc(text, f.name);
-      } catch {
-        return null;
-      }
-    }),
-  );
-  const docs = results.filter((d): d is CalendarDoc => Boolean(d));
+async function fetchNativeCalendarDocs(monthId: string): Promise<CalendarDoc[]> {
+  const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+  const { data, error } = await supabaseAdmin
+    .from("content_calendar_items")
+    .select("doc_type, title, raw_text")
+    .eq("month_id", monthId)
+    .order("sort_order", { ascending: true })
+    .order("created_at", { ascending: true });
+  if (error) throw error;
+  const docs = (data ?? [])
+    .map((row) => parseCalendarItem({ docType: row.doc_type, title: row.title, rawText: row.raw_text }))
+    .filter((d): d is CalendarDoc => Boolean(d));
   const typeOrder: Record<string, number> = { post: 0, video: 1, email: 2 };
   docs.sort((a, b) => (typeOrder[a.type] ?? 0) - (typeOrder[b.type] ?? 0));
   return docs;
@@ -1022,15 +1011,11 @@ async function fetchCalendarDocs(folderId: string, apiKey: string): Promise<Cale
 
 export const readContentCalendar = createServerFn({ method: "GET" })
   .middleware([requireSupabaseAuth])
-  .validator((data: { agentId: string; folderId: string }) => data)
+  .validator((data: { agentId: string; monthId: string }) => data)
   .handler(async ({ data, context }): Promise<{ docs: CalendarDoc[] }> => {
     const email = (context.claims as { email?: string } | undefined)?.email;
     await requireAgentAccess(context.userId, email, data.agentId);
-    const apiKey = process.env["GOOGLE_API_KEY"];
-    if (!apiKey) {
-      throw new Error("Google Drive isn't connected yet — add GOOGLE_API_KEY in Lovable Cloud → Secrets.");
-    }
-    const docs = await fetchCalendarDocs(data.folderId, apiKey);
+    const docs = await fetchNativeCalendarDocs(data.monthId);
     return { docs };
   });
 
@@ -1052,7 +1037,10 @@ async function callClaude(apiKey: string, prompt: string, maxTokens: number): Pr
   });
   const json = (await res.json()) as { content?: { text?: string }[]; error?: { message?: string } };
   if (!res.ok) throw new Error(json.error?.message ?? `Claude API error (${res.status})`);
-  return (json.content ?? []).map((b) => b.text ?? "").join("").trim();
+  return (json.content ?? [])
+    .map((b) => b.text ?? "")
+    .join("")
+    .trim();
 }
 
 function cleanCopy(text: string): string {
@@ -1064,15 +1052,14 @@ function cleanCopy(text: string): string {
 
 export const generateMonthlyBatch = createServerFn({ method: "POST" })
   .middleware([requireSupabaseAuth])
-  .validator((data: { agentId: string; folderId: string; month: string; useHashtags?: boolean }) => data)
+  .validator((data: { agentId: string; monthId: string; month: string; useHashtags?: boolean }) => data)
   .handler(async ({ data, context }): Promise<{ ok: true; batchId: string; created: number }> => {
     const email = (context.claims as { email?: string } | undefined)?.email;
     await requireAgentAccess(context.userId, email, data.agentId);
 
-    const googleKey = process.env["GOOGLE_API_KEY"];
     const anthropicKey = process.env["ANTHROPIC_API_KEY"];
-    if (!googleKey) throw new Error("Google Drive isn't connected yet — add GOOGLE_API_KEY in Lovable Cloud → Secrets.");
-    if (!anthropicKey) throw new Error("Content generation isn't configured yet — add ANTHROPIC_API_KEY in Lovable Cloud → Secrets.");
+    if (!anthropicKey)
+      throw new Error("Content generation isn't configured yet — add ANTHROPIC_API_KEY in Lovable Cloud → Secrets.");
 
     const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
     const { data: agent, error: agentErr } = await supabaseAdmin
@@ -1084,10 +1071,9 @@ export const generateMonthlyBatch = createServerFn({ method: "POST" })
     const agentName = agent?.full_name ?? "the agent";
     const agentCity = agent?.market_area ?? "their market";
     const dna =
-      agent?.voice_summary ??
-      "Warm, conversational, authentic real estate agent. Short posts. Real human energy.";
+      agent?.voice_summary ?? "Warm, conversational, authentic real estate agent. Short posts. Real human energy.";
 
-    const docs = await fetchCalendarDocs(data.folderId, googleKey);
+    const docs = await fetchNativeCalendarDocs(data.monthId);
     const postDocs = docs.filter((d): d is Extract<CalendarDoc, { type: "post" }> => d.type === "post");
     const emailDocs = docs.filter((d): d is Extract<CalendarDoc, { type: "email" }> => d.type === "email");
     const videoDocs = docs.filter((d): d is Extract<CalendarDoc, { type: "video" }> => d.type === "video");
@@ -1133,7 +1119,13 @@ export const generateMonthlyBatch = createServerFn({ method: "POST" })
             title: doc.title,
             status: "pending",
             month: data.month,
-            metadata: { batch_id: batchId, month: data.month, canva_link: doc.canva || null, goal: doc.goal, source: "drive_calendar" },
+            metadata: {
+              batch_id: batchId,
+              month: data.month,
+              canva_link: doc.canva || null,
+              goal: doc.goal,
+              source: "content_calendar",
+            },
           });
         }
       });
@@ -1149,8 +1141,9 @@ export const generateMonthlyBatch = createServerFn({ method: "POST" })
           instructions,
         );
       const isLocalLetter =
-        /observations|Local Letter|three to four|reads like a note|newsletter.*rewrite|sound like a note/i.test(instructions) ||
-        /CRITICAL RULES FOR THIS FORMAT|Do NOT use headers|Do NOT write bullet/i.test(instructions);
+        /observations|Local Letter|three to four|reads like a note|newsletter.*rewrite|sound like a note/i.test(
+          instructions,
+        ) || /CRITICAL RULES FOR THIS FORMAT|Do NOT use headers|Do NOT write bullet/i.test(instructions);
 
       let emailPrompt: string;
       if (isPromptBrief) {
@@ -1207,12 +1200,14 @@ export const generateMonthlyBatch = createServerFn({ method: "POST" })
           .map((s) => s.replace(/^\d+\.\s*/, "").trim());
         rows.push({
           agent_id: data.agentId,
-          content: (subjects.length ? `SUBJECT OPTIONS:\n${subjects.map((s, i) => `${i + 1}. ${s}`).join("\n")}\n\n` : "") + body,
+          content:
+            (subjects.length ? `SUBJECT OPTIONS:\n${subjects.map((s, i) => `${i + 1}. ${s}`).join("\n")}\n\n` : "") +
+            body,
           content_type: "email",
           title: ed.title.replace("Email — ", ""),
           status: "pending",
           month: data.month,
-          metadata: { batch_id: batchId, month: data.month, goal: ed.goal, source: "drive_calendar" },
+          metadata: { batch_id: batchId, month: data.month, goal: ed.goal, source: "content_calendar" },
         });
       } catch {
         // Skip this email but keep generating the rest, same as the old app.
@@ -1242,7 +1237,7 @@ export const generateMonthlyBatch = createServerFn({ method: "POST" })
           title: vd.title,
           status: "pending",
           month: data.month,
-          metadata: { batch_id: batchId, month: data.month, goal: vd.goal, source: "drive_calendar" },
+          metadata: { batch_id: batchId, month: data.month, goal: vd.goal, source: "content_calendar" },
         });
       } catch {
         // Skip, keep going.
@@ -1275,8 +1270,10 @@ export const scanAgentDrivePhotos = createServerFn({ method: "POST" })
     await requireAgentAccess(context.userId, email, data.agentId);
     const googleKey = process.env["GOOGLE_API_KEY"];
     const anthropicKey = process.env["ANTHROPIC_API_KEY"];
-    if (!googleKey) throw new Error("Google Drive isn't connected yet — add GOOGLE_API_KEY in Lovable Cloud → Secrets.");
-    if (!anthropicKey) throw new Error("Photo captioning isn't configured yet — add ANTHROPIC_API_KEY in Lovable Cloud → Secrets.");
+    if (!googleKey)
+      throw new Error("Google Drive isn't connected yet — add GOOGLE_API_KEY in Lovable Cloud → Secrets.");
+    if (!anthropicKey)
+      throw new Error("Photo captioning isn't configured yet — add ANTHROPIC_API_KEY in Lovable Cloud → Secrets.");
 
     const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
     const { data: agent } = await supabaseAdmin
@@ -1349,7 +1346,11 @@ export const scanAgentDrivePhotos = createServerFn({ method: "POST" })
 
           const res = await fetch("https://api.anthropic.com/v1/messages", {
             method: "POST",
-            headers: { "Content-Type": "application/json", "x-api-key": anthropicKey, "anthropic-version": "2023-06-01" },
+            headers: {
+              "Content-Type": "application/json",
+              "x-api-key": anthropicKey,
+              "anthropic-version": "2023-06-01",
+            },
             body: JSON.stringify({
               model: "claude-haiku-4-5-20251001",
               max_tokens: 300,
@@ -1366,7 +1367,10 @@ export const scanAgentDrivePhotos = createServerFn({ method: "POST" })
           });
           const claudeData = (await res.json()) as { content?: { text?: string }[]; error?: { message?: string } };
           if (!res.ok) throw new Error(claudeData.error?.message ?? "Claude API error");
-          const raw = (claudeData.content ?? []).map((b) => b.text ?? "").join("").trim();
+          const raw = (claudeData.content ?? [])
+            .map((b) => b.text ?? "")
+            .join("")
+            .trim();
           const descMatch = raw.match(/DESCRIPTION:\s*(.+)/i);
           const postMatch = raw.match(/POST:\s*([\s\S]+)/i);
           return {
@@ -1483,8 +1487,7 @@ export const sendContentToAgent = createServerFn({ method: "POST" })
     if (!contactId) throw new Error(`Could not find or create a GoHighLevel contact for ${agent.email}.`);
 
     const firstName = agent.full_name?.split(" ")[0] ?? "there";
-    const reviewUrl =
-      (process.env["APP_URL"] ?? "https://marketing-dude-hq.lovable.app") + "/marketing";
+    const reviewUrl = (process.env["APP_URL"] ?? "https://marketing-dude-hq.lovable.app") + "/marketing";
     const emailHtml = `
 <html><body style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;padding:20px;color:#1A1A18;">
   <h2 style="font-size:22px;font-weight:600;margin-bottom:8px;">Hey ${firstName} — your ${data.month} content is ready!</h2>

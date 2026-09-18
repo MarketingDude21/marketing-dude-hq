@@ -1,3 +1,4 @@
+```tsx
 import { useEffect, useRef, useState } from "react";
 import { createFileRoute } from "@tanstack/react-router";
 import { AppShell } from "@/components/AppShell";
@@ -103,6 +104,16 @@ type ContentCategory = "post" | "canva" | "email" | "video";
 
 const CATEGORY_ORDER: ContentCategory[] = ["post", "canva", "email", "video"];
 
+// The three metadata.source values that mean "this post belongs to a
+// month's calendar batch" — already fully reviewable on the "Generate My
+// Monthly Content Calendar" tab (MonthWorkspace's own batchPosts filter).
+// Shared by that filter and by "Create Individual Posts" (PostsTab), which
+// excludes exactly this set so the two tabs show disjoint content instead
+// of the same posts twice — see the comment on PostsTab (2026-09-18, per
+// Mike: "this post section is repetitive to the generate my monthly
+// content... we do need to remove everything that displays in it").
+const BATCH_SOURCES = new Set(["content_calendar", "drive_photo_scan", "library_photo_scan"]);
+
 const CATEGORY_META: Record<ContentCategory, { label: string; icon: string; accent: string }> = {
   post: {
     label: "Posts",
@@ -134,7 +145,9 @@ function categorizePost(post: Post): ContentCategory {
 
 function Card({ children, className = "" }: { children: React.ReactNode; className?: string }) {
   return (
-    <div className={`rounded-3xl border border-border bg-glass p-6 backdrop-blur-2xl ${className}`}>{children}</div>
+    <div className={`rounded-3xl border border-border bg-glass p-6 backdrop-blur-2xl ${className}`}>
+      {children}
+    </div>
   );
 }
 
@@ -177,7 +190,9 @@ function StatusBadge({ status }: { status: string }) {
         ? "bg-destructive/10 text-destructive"
         : "bg-muted text-muted-foreground";
   const label = status === "approved" ? "Approved" : status === "flagged" ? "Flagged" : "Pending review";
-  return <span className={`rounded-full px-3 py-1 text-xs font-semibold ${styles}`}>{label}</span>;
+  return (
+    <span className={`rounded-full px-3 py-1 text-xs font-semibold ${styles}`}>{label}</span>
+  );
 }
 
 // Minimal ambient typing for the Web Speech API — it isn't in lib.dom.d.ts.
@@ -208,7 +223,8 @@ function getSpeechRecognitionCtor(): (new () => SpeechRecognitionLike) | undefin
 function isIOSDevice(): boolean {
   if (typeof navigator === "undefined") return false;
   return (
-    /iPad|iPhone|iPod/.test(navigator.userAgent) || (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1)
+    /iPad|iPhone|iPod/.test(navigator.userAgent) ||
+    (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1)
   );
 }
 
@@ -410,7 +426,8 @@ function MarketingPage() {
         <PageHeader />
         <Card className="mt-5">
           <p className="text-sm text-muted-foreground">
-            Your account isn't set up in Monthly Marketing yet. Ask your team to add you as an agent.
+            Your account isn't set up in Monthly Marketing yet. Ask your team to add you as an
+            agent.
           </p>
         </Card>
       </AppShell>
@@ -435,8 +452,9 @@ function MarketingPage() {
             <div>
               <h2 className="font-display text-lg font-semibold">Content Calendar</h2>
               <p className="mt-1 text-sm text-muted-foreground">
-                One calendar, shared by every agent — build out each month's posts, emails, and video briefs once here,
-                and every agent generates their own personalized version of it from their own login.
+                One calendar, shared by every agent — build out each month's posts, emails, and
+                video briefs once here, and every agent generates their own personalized version
+                of it from their own login.
               </p>
             </div>
             <Button onClick={() => setShowCalendarAdmin(true)}>Manage Content Calendar</Button>
@@ -445,7 +463,8 @@ function MarketingPage() {
         <Card className="mt-5">
           <h2 className="font-display text-lg font-semibold">Choose an agent</h2>
           <p className="mt-1 text-sm text-muted-foreground">
-            Pick who you're working on behalf of. Every action you take here is logged against their account, not yours.
+            Pick who you're working on behalf of. Every action you take here is logged against
+            their account, not yours.
           </p>
           <div className="mt-4 grid gap-2 sm:grid-cols-2 lg:grid-cols-3">
             {agents.map((a) => (
@@ -457,7 +476,9 @@ function MarketingPage() {
                 {a.name}
               </button>
             ))}
-            {agents.length === 0 && <p className="text-sm text-muted-foreground">No agents yet.</p>}
+            {agents.length === 0 && (
+              <p className="text-sm text-muted-foreground">No agents yet.</p>
+            )}
           </div>
         </Card>
       </AppShell>
@@ -489,7 +510,9 @@ function PageHeader({
       <div>
         <h1 className="font-display text-2xl font-bold tracking-tight">Monthly Marketing</h1>
         <p className="mt-1 text-sm text-muted-foreground">
-          {agentName ? `Viewing as: ${agentName}` : "Posts, emails, and video scripts in your voice — every month."}
+          {agentName
+            ? `Viewing as: ${agentName}`
+            : "Posts, emails, and video scripts in your voice — every month."}
         </p>
       </div>
       {onChangeAgent && (
@@ -515,9 +538,9 @@ function Workspace({ agentId, isAdmin }: { agentId: string; isAdmin: boolean }) 
             }`}
           >
             {t === "posts"
-              ? "Posts"
+              ? "Create Individual Posts"
               : t === "calendar"
-                ? "Create My Monthly Content"
+                ? "Generate My Monthly Content Calendar"
                 : t === "media"
                   ? "Media"
                   : "Google Drive"}
@@ -534,16 +557,28 @@ function Workspace({ agentId, isAdmin }: { agentId: string; isAdmin: boolean }) 
   );
 }
 
-// Redesigned 2026-09-17 per Mike's direct feedback on this tab specifically:
-// a grid layout so photo + full copy are visible without clicking anything
-// (same always-open-card pattern BatchSection already uses for the calendar
-// review screen, applied here too), an "Approve all" for whatever's
-// currently in view, a "Send to Agent" button (admin-only — reuses the same
-// GHL notification the calendar review screen already has, scoped to the
-// selected month since the notification needs one), and the Drive photo-scan
-// panel surfaced here too (it already worked without a calendar batch —
-// `addPhotoPostsToBatch`'s batchId was always optional — it just wasn't
-// exposed outside the calendar flow before).
+// Renamed "Posts" → "Create Individual Posts" and cut down substantially
+// (2026-09-18) per Mike: "this post section is repetitive to the generate
+// my monthly content... we do need to remove everything that displays in it
+// because that already displays in create my monthly content... there's
+// nothing for you to even look at in there." He's right that it was mixed:
+// this tab's grid showed EVERY post for the agent regardless of source, so
+// a month's calendar-generated batch (already fully reviewable, with its
+// own Approve/Send/Download, on the "Generate My Monthly Content Calendar"
+// tab) was also showing up here a second time.
+//
+// Fix: this tab's grid is now filtered to exclude the three sources that
+// already have a home on the calendar tab (content_calendar,
+// drive_photo_scan, library_photo_scan — see BATCH_SOURCES below, shared
+// with MonthWorkspace's own filter so the two stay exact opposites of each
+// other) — what's left here is only content this tab itself creates
+// one-off, via "+ New content" (metadata.source "native_generate"). The
+// Drive/Media-Library photo-scan panel was removed from this tab entirely
+// for the same reason: MonthWorkspace already has its own copy, and a
+// suggestion added from either one is a content_calendar-adjacent source
+// that would only ever show on the calendar tab anyway — having two
+// separate scan buttons that both feed the same one destination was exactly
+// the kind of duplication Mike flagged, just one level deeper.
 function PostsTab({ agentId, isAdmin }: { agentId: string; isAdmin: boolean }) {
   const [months, setMonths] = useState<string[]>([]);
   const [month, setMonth] = useState<string>("");
@@ -554,9 +589,9 @@ function PostsTab({ agentId, isAdmin }: { agentId: string; isAdmin: boolean }) {
   const [sending, setSending] = useState(false);
   const [sendNote, setSendNote] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
+  // Still needed here even without the photo-scan panel — PostCard's own
+  // "Change photo" picker has a Google Drive tab gated on this being set.
   const [driveFolderId, setDriveFolderId] = useState<string | null>(null);
-  const [driveError, setDriveError] = useState<string | null>(null);
-  const [scanOpen, setScanOpen] = useState(false);
 
   // `clear` only true for a genuine month/agent switch — an action-triggered
   // reload (after Approve, Save, a photo change, etc.) keeps the current
@@ -581,14 +616,8 @@ function PostsTab({ agentId, isAdmin }: { agentId: string; isAdmin: boolean }) {
       .then((m) => setMonths(m))
       .catch(() => {});
     listAgentDriveMedia({ data: { agentId } })
-      .then((d) => {
-        setDriveFolderId(d.folderId);
-        setDriveError(null);
-      })
-      .catch((e) => {
-        setDriveFolderId(null);
-        setDriveError(e instanceof Error ? e.message : String(e));
-      });
+      .then((d) => setDriveFolderId(d.folderId))
+      .catch(() => setDriveFolderId(null));
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [agentId]);
 
@@ -660,7 +689,11 @@ function PostsTab({ agentId, isAdmin }: { agentId: string; isAdmin: boolean }) {
     );
   }
 
-  const pendingCount = (posts ?? []).filter((p) => p.status !== "approved").length;
+  // Only this tab's own one-off content (see BATCH_SOURCES/comment above) —
+  // a calendar batch's posts, or ones added via the other tab's photo scan,
+  // never show here now, only on "Generate My Monthly Content Calendar".
+  const ownPosts = (posts ?? []).filter((p) => !BATCH_SOURCES.has(p.metadata?.source ?? ""));
+  const pendingCount = ownPosts.filter((p) => p.status !== "approved").length;
 
   return (
     <div className="space-y-4">
@@ -669,7 +702,9 @@ function PostsTab({ agentId, isAdmin }: { agentId: string; isAdmin: boolean }) {
       <div className="flex flex-wrap items-center gap-2">
         {months.length > 0 && (
           <>
-            <span className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">Month</span>
+            <span className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
+              Month
+            </span>
             <select
               value={month}
               onChange={(e) => setMonth(e.target.value)}
@@ -684,7 +719,7 @@ function PostsTab({ agentId, isAdmin }: { agentId: string; isAdmin: boolean }) {
             </select>
           </>
         )}
-        {posts !== null && posts.length > 0 && (
+        {ownPosts.length > 0 && (
           <Button onClick={approveAll} disabled={approvingAll || pendingCount === 0}>
             {approvingAll ? "Approving…" : `Approve all${pendingCount ? ` (${pendingCount})` : ""}`}
           </Button>
@@ -701,18 +736,6 @@ function PostsTab({ agentId, isAdmin }: { agentId: string; isAdmin: boolean }) {
         )}
       </div>
 
-      <PhotoScanPanel
-        agentId={agentId}
-        folderId={driveFolderId}
-        month={month || new Date().toISOString().slice(0, 7)}
-        batchId={null}
-        open={scanOpen}
-        onOpen={() => setScanOpen(true)}
-        onClose={() => setScanOpen(false)}
-        onAdded={reload}
-      />
-      {!driveFolderId && driveError && <p className="text-xs text-muted-foreground">{driveError}</p>}
-
       {approveNote && <p className="text-xs text-muted-foreground">{approveNote}</p>}
       {sendNote && <p className="text-xs text-muted-foreground">{sendNote}</p>}
       {actionError && <p className="text-xs text-destructive">{actionError}</p>}
@@ -723,18 +746,20 @@ function PostsTab({ agentId, isAdmin }: { agentId: string; isAdmin: boolean }) {
         </Card>
       )}
 
-      {posts !== null && posts.length === 0 && (
+      {posts !== null && ownPosts.length === 0 && (
         <Card>
           <p className="text-sm text-muted-foreground">
-            No posts here yet. Once your team generates this month's content, it'll show up here for review.
+            Nothing created one-off yet — use "+ New content" above. Content from a month's
+            calendar (or its photo scan) lives on the "Generate My Monthly Content Calendar" tab
+            instead, not here.
           </p>
         </Card>
       )}
 
-      {posts !== null && posts.length > 0 && (
+      {ownPosts.length > 0 && (
         <div className="space-y-6">
           {CATEGORY_ORDER.map((cat) => {
-            const group = posts.filter((p) => categorizePost(p) === cat);
+            const group = ownPosts.filter((p) => categorizePost(p) === cat);
             if (!group.length) return null;
             return (
               <BatchSection
@@ -809,8 +834,8 @@ function CreateContentForm({ agentId, onCreated }: { agentId: string; onCreated:
     <Card>
       <h3 className="font-display text-sm font-semibold">Create new content</h3>
       <p className="mt-1 text-xs text-muted-foreground">
-        Tell us what you want and we'll write a full draft in your voice — it'll show up below for you to approve, edit,
-        or flag, same as anything your team generates for you.
+        Tell us what you want and we'll write a full draft in your voice — it'll show up below for
+        you to approve, edit, or flag, same as anything your team generates for you.
       </p>
 
       <div className="mt-4 flex flex-wrap gap-1 rounded-full border border-border bg-glass p-1 w-fit">
@@ -819,7 +844,9 @@ function CreateContentForm({ agentId, onCreated }: { agentId: string; onCreated:
             key={t}
             onClick={() => setContentType(t)}
             className={`rounded-full px-4 py-1.5 text-sm font-medium transition-colors ${
-              contentType === t ? "bg-secondary text-foreground" : "text-muted-foreground hover:text-foreground"
+              contentType === t
+                ? "bg-secondary text-foreground"
+                : "text-muted-foreground hover:text-foreground"
             }`}
           >
             {t === "post" ? "Social post" : t === "email" ? "Email" : "Video script"}
@@ -886,7 +913,11 @@ function CreateContentForm({ agentId, onCreated }: { agentId: string; onCreated:
         </div>
         {contentType === "post" && (
           <label className="flex items-center gap-2 text-sm text-muted-foreground">
-            <input type="checkbox" checked={useHashtags} onChange={(e) => setUseHashtags(e.target.checked)} />
+            <input
+              type="checkbox"
+              checked={useHashtags}
+              onChange={(e) => setUseHashtags(e.target.checked)}
+            />
             Add hashtags
           </label>
         )}
@@ -1119,7 +1150,8 @@ function PostCard({
     }
   }
 
-  const typeLabel = post.content_type === "email" ? "Email" : post.content_type === "video" ? "Video script" : "Post";
+  const typeLabel =
+    post.content_type === "email" ? "Email" : post.content_type === "video" ? "Video script" : "Post";
   const photoUrl = post.metadata?.media_url || post.metadata?.drive_thumbnail_url || null;
 
   return (
@@ -1142,7 +1174,7 @@ function PostCard({
       </div>
 
       <div className="mt-4 border-t border-border pt-4">
-        {/* Was gated to content_type === "post" only, so an email's chosen
+          {/* Was gated to content_type === "post" only, so an email's chosen
               photo (Unsplash, in practice — emails don't have their own Drive/
               library photos the way posts do) was saved successfully server-side
               but never actually rendered here: the picker closed and the card
@@ -1152,311 +1184,304 @@ function PostCard({
               doesn't show anything attached" — the save worked, the display
               didn't. Fixed to match the "Add/Change photo" button's own
               condition just below, which already covered both types. */}
-        {(post.content_type === "post" || post.content_type === "email") && photoUrl && (
-          <div className="mb-3 overflow-hidden rounded-2xl border border-border bg-muted">
-            {post.metadata?.media_type === "video" ? (
-              <video src={photoUrl} controls className="max-h-64 w-full object-contain" />
-            ) : (
-              <img src={photoUrl} alt="" className="max-h-64 w-full object-contain" />
-            )}
-          </div>
-        )}
-        {photoUrl && post.metadata?.unsplash_photographer && (
-          <p className="-mt-2 mb-3 text-[11px] text-muted-foreground">
-            Photo by{" "}
+          {(post.content_type === "post" || post.content_type === "email") && photoUrl && (
+            <div className="mb-3 overflow-hidden rounded-2xl border border-border bg-muted">
+              {post.metadata?.media_type === "video" ? (
+                <video src={photoUrl} controls className="max-h-64 w-full object-contain" />
+              ) : (
+                <img src={photoUrl} alt="" className="max-h-64 w-full object-contain" />
+              )}
+            </div>
+          )}
+          {photoUrl && post.metadata?.unsplash_photographer && (
+            <p className="-mt-2 mb-3 text-[11px] text-muted-foreground">
+              Photo by{" "}
+              <a
+                href={post.metadata.unsplash_credit_url ?? "https://unsplash.com"}
+                target="_blank"
+                rel="noreferrer"
+                className="underline hover:text-foreground"
+              >
+                {post.metadata.unsplash_photographer}
+              </a>{" "}
+              on Unsplash
+            </p>
+          )}
+          {post.content_type === "post" && post.metadata?.image_suggestion && (
+            <p className="mb-2 text-xs text-muted-foreground">
+              📸 Image direction from the brief: {post.metadata.image_suggestion}
+              {!photoUrl && " — no photo on file yet to attach automatically; add one on the Media tab or pick one below."}
+            </p>
+          )}
+          {editing ? (
+            <textarea
+              value={draft}
+              onChange={(e) => setDraft(e.target.value)}
+              className="min-h-[140px] w-full rounded-2xl bg-muted px-4 py-3 text-sm leading-relaxed outline-none ring-ring transition focus:ring-2"
+            />
+          ) : (
+            <p className="whitespace-pre-wrap text-sm leading-relaxed">{post.content}</p>
+          )}
+
+          {post.metadata?.canva_link && (
             <a
-              href={post.metadata.unsplash_credit_url ?? "https://unsplash.com"}
+              href={post.metadata.canva_link}
               target="_blank"
               rel="noreferrer"
-              className="underline hover:text-foreground"
+              className="mt-2 inline-block text-xs font-semibold text-primary hover:underline"
             >
-              {post.metadata.unsplash_photographer}
-            </a>{" "}
-            on Unsplash
-          </p>
-        )}
-        {post.content_type === "post" && post.metadata?.image_suggestion && (
-          <p className="mb-2 text-xs text-muted-foreground">
-            📸 Image direction from the brief: {post.metadata.image_suggestion}
-            {!photoUrl &&
-              " — no photo on file yet to attach automatically; add one on the Media tab or pick one below."}
-          </p>
-        )}
-        {editing ? (
-          <textarea
-            value={draft}
-            onChange={(e) => setDraft(e.target.value)}
-            className="min-h-[140px] w-full rounded-2xl bg-muted px-4 py-3 text-sm leading-relaxed outline-none ring-ring transition focus:ring-2"
-          />
-        ) : (
-          <p className="whitespace-pre-wrap text-sm leading-relaxed">{post.content}</p>
-        )}
-
-        {post.metadata?.canva_link && (
-          <a
-            href={post.metadata.canva_link}
-            target="_blank"
-            rel="noreferrer"
-            className="mt-2 inline-block text-xs font-semibold text-primary hover:underline"
-          >
-            Open Canva template →
-          </a>
-        )}
-
-        {saveError && <p className="mt-2 text-xs text-destructive">{saveError}</p>}
-
-        <div className="mt-4 flex flex-wrap gap-2">
-          {editing ? (
-            <>
-              <Button onClick={saveEdit} disabled={busy}>
-                Save
-              </Button>
-              <Button
-                variant="secondary"
-                onClick={() => {
-                  setDraft(post.content);
-                  setEditing(false);
-                }}
-                disabled={busy}
-              >
-                Cancel
-              </Button>
-            </>
-          ) : (
-            <>
-              <Button onClick={approve} disabled={busy || post.status === "approved"}>
-                {post.status === "approved" ? "Approved" : "Approve"}
-              </Button>
-              <Button variant="secondary" onClick={() => setEditing(true)} disabled={busy}>
-                Edit
-              </Button>
-              <Button variant="danger" onClick={() => setFeedbackOpen((v) => !v)} disabled={busy}>
-                Flag / feedback
-              </Button>
-              {(post.content_type === "post" || post.content_type === "email") && (
-                <Button variant="secondary" onClick={openPicker} disabled={busy}>
-                  {photoUrl ? "Change photo" : "Add photo"}
-                </Button>
-              )}
-            </>
+              Open Canva template →
+            </a>
           )}
-        </div>
 
-        {pickerOpen && (
-          <div className="mt-4 rounded-2xl border border-border bg-background/40 p-4">
-            <div className="flex items-center justify-between gap-3">
-              <p className="text-sm font-semibold">
-                Which image or video do you want to use dude? Click and I will make it happen.
-              </p>
-              <button
-                onClick={() => setPickerOpen(false)}
-                className="shrink-0 text-xs text-muted-foreground hover:text-foreground"
-              >
-                Close
-              </button>
-            </div>
+          {saveError && <p className="mt-2 text-xs text-destructive">{saveError}</p>}
 
-            <div className="mt-3 flex flex-wrap gap-2 border-b border-border pb-3">
-              <button
-                onClick={() => setPickerTab("library")}
-                className={`rounded-full px-3 py-1 text-xs font-semibold transition-colors ${
-                  pickerTab === "library"
-                    ? "bg-primary text-primary-foreground"
-                    : "bg-muted text-muted-foreground hover:text-foreground"
-                }`}
-              >
-                Media Library
-              </button>
-              {driveFolderId && (
+          <div className="mt-4 flex flex-wrap gap-2">
+            {editing ? (
+              <>
+                <Button onClick={saveEdit} disabled={busy}>
+                  Save
+                </Button>
+                <Button
+                  variant="secondary"
+                  onClick={() => {
+                    setDraft(post.content);
+                    setEditing(false);
+                  }}
+                  disabled={busy}
+                >
+                  Cancel
+                </Button>
+              </>
+            ) : (
+              <>
+                <Button onClick={approve} disabled={busy || post.status === "approved"}>
+                  {post.status === "approved" ? "Approved" : "Approve"}
+                </Button>
+                <Button variant="secondary" onClick={() => setEditing(true)} disabled={busy}>
+                  Edit
+                </Button>
+                <Button variant="danger" onClick={() => setFeedbackOpen((v) => !v)} disabled={busy}>
+                  Flag / feedback
+                </Button>
+                {(post.content_type === "post" || post.content_type === "email") && (
+                  <Button variant="secondary" onClick={openPicker} disabled={busy}>
+                    {photoUrl ? "Change photo" : "Add photo"}
+                  </Button>
+                )}
+              </>
+            )}
+          </div>
+
+          {pickerOpen && (
+            <div className="mt-4 rounded-2xl border border-border bg-background/40 p-4">
+              <div className="flex items-center justify-between gap-3">
+                <p className="text-sm font-semibold">
+                  Which image or video do you want to use dude? Click and I will make it happen.
+                </p>
                 <button
-                  onClick={openDriveTab}
+                  onClick={() => setPickerOpen(false)}
+                  className="shrink-0 text-xs text-muted-foreground hover:text-foreground"
+                >
+                  Close
+                </button>
+              </div>
+
+              <div className="mt-3 flex flex-wrap gap-2 border-b border-border pb-3">
+                <button
+                  onClick={() => setPickerTab("library")}
                   className={`rounded-full px-3 py-1 text-xs font-semibold transition-colors ${
-                    pickerTab === "drive"
-                      ? "bg-primary text-primary-foreground"
-                      : "bg-muted text-muted-foreground hover:text-foreground"
+                    pickerTab === "library" ? "bg-primary text-primary-foreground" : "bg-muted text-muted-foreground hover:text-foreground"
                   }`}
                 >
-                  Google Drive
+                  Media Library
+                </button>
+                {driveFolderId && (
+                  <button
+                    onClick={openDriveTab}
+                    className={`rounded-full px-3 py-1 text-xs font-semibold transition-colors ${
+                      pickerTab === "drive" ? "bg-primary text-primary-foreground" : "bg-muted text-muted-foreground hover:text-foreground"
+                    }`}
+                  >
+                    Google Drive
+                  </button>
+                )}
+                <button
+                  onClick={openUnsplashTab}
+                  className={`rounded-full px-3 py-1 text-xs font-semibold transition-colors ${
+                    pickerTab === "unsplash" ? "bg-primary text-primary-foreground" : "bg-muted text-muted-foreground hover:text-foreground"
+                  }`}
+                >
+                  Stock Photos
+                </button>
+              </div>
+
+              {pickerTab === "library" && (
+                <div className="mt-3">
+                  {mediaOptions === null && (
+                    <p className="text-xs text-muted-foreground">Loading…</p>
+                  )}
+                  {mediaOptions !== null && mediaOptions.length === 0 && (
+                    <p className="text-xs text-muted-foreground">
+                      No available photos or videos uploaded for this agent yet — add some on the
+                      Media tab, then come back here.
+                    </p>
+                  )}
+                  {mediaOptions !== null && mediaOptions.length > 0 && (
+                    <div className="grid grid-cols-3 gap-2 sm:grid-cols-4">
+                      {mediaOptions.map((m) => (
+                        <button
+                          key={m.id}
+                          onClick={() => pickMedia(m.id)}
+                          disabled={mediaBusy}
+                          className="overflow-hidden rounded-xl border border-border transition-colors hover:border-primary disabled:opacity-50"
+                        >
+                          {m.media_type === "video"
+                            ? m.url && <video src={m.url} className="aspect-square w-full object-cover" />
+                            : m.url && (
+                                <img src={m.url} alt={m.caption ?? ""} className="aspect-square w-full object-cover" />
+                              )}
+                        </button>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              )}
+
+              {pickerTab === "drive" && (
+                <div className="mt-3">
+                  {driveOptionsError && <p className="text-xs text-destructive">{driveOptionsError}</p>}
+                  {!driveOptionsError && driveOptions === null && (
+                    <p className="text-xs text-muted-foreground">Loading…</p>
+                  )}
+                  {!driveOptionsError && driveOptions !== null && driveOptions.length === 0 && (
+                    <p className="text-xs text-muted-foreground">
+                      No unused photos or videos found in this agent's Drive folder.
+                    </p>
+                  )}
+                  {driveOptions !== null && driveOptions.length > 0 && (
+                    <div className="grid grid-cols-3 gap-2 sm:grid-cols-4">
+                      {driveOptions.map((f) => (
+                        <button
+                          key={f.id}
+                          onClick={() => pickDriveFile(f)}
+                          disabled={mediaBusy}
+                          className="overflow-hidden rounded-xl border border-border transition-colors hover:border-primary disabled:opacity-50"
+                        >
+                          {f.isVideo ? (
+                            <video src={f.thumbnailUrl} className="aspect-square w-full object-cover" />
+                          ) : (
+                            <img src={f.thumbnailUrl} alt={f.name} className="aspect-square w-full object-cover" />
+                          )}
+                        </button>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              )}
+
+              {pickerTab === "unsplash" && (
+                <div className="mt-3">
+                  <div className="flex gap-2">
+                    <input
+                      value={unsplashQuery}
+                      onChange={(e) => setUnsplashQuery(e.target.value)}
+                      onKeyDown={(e) => e.key === "Enter" && runUnsplashSearch(unsplashQuery)}
+                      placeholder="Search stock photos — coffee, fall, neighborhood…"
+                      className="flex-1 rounded-xl border border-border bg-glass px-3 py-1.5 text-sm outline-none"
+                    />
+                    <Button
+                      variant="secondary"
+                      onClick={() => runUnsplashSearch(unsplashQuery)}
+                      disabled={unsplashLoading}
+                    >
+                      {unsplashLoading ? "Searching…" : "Search"}
+                    </Button>
+                  </div>
+                  {unsplashError && <p className="mt-2 text-xs text-destructive">{unsplashError}</p>}
+                  {!unsplashError && unsplashResults !== null && unsplashResults.length === 0 && !unsplashLoading && (
+                    <p className="mt-2 text-xs text-muted-foreground">No results — try a different search.</p>
+                  )}
+                  {unsplashResults !== null && unsplashResults.length > 0 && (
+                    <div className="mt-3 grid grid-cols-3 gap-2 sm:grid-cols-4">
+                      {unsplashResults.map((r) => (
+                        <button
+                          key={r.id}
+                          onClick={() => pickUnsplash(r)}
+                          disabled={mediaBusy}
+                          title={`Photo by ${r.photographerName} on Unsplash`}
+                          className="overflow-hidden rounded-xl border border-border transition-colors hover:border-primary disabled:opacity-50"
+                        >
+                          <img src={r.thumbUrl} alt="" className="aspect-square w-full object-cover" />
+                        </button>
+                      ))}
+                    </div>
+                  )}
+                  <p className="mt-2 text-[11px] text-muted-foreground">Photos via Unsplash — credit is added automatically.</p>
+                </div>
+              )}
+
+              {photoUrl && (
+                <button
+                  onClick={() => pickMedia(null)}
+                  disabled={mediaBusy}
+                  className="mt-3 text-xs font-semibold text-destructive hover:underline disabled:opacity-50"
+                >
+                  Remove photo
                 </button>
               )}
-              <button
-                onClick={openUnsplashTab}
-                className={`rounded-full px-3 py-1 text-xs font-semibold transition-colors ${
-                  pickerTab === "unsplash"
-                    ? "bg-primary text-primary-foreground"
-                    : "bg-muted text-muted-foreground hover:text-foreground"
-                }`}
-              >
-                Stock Photos
-              </button>
             </div>
+          )}
 
-            {pickerTab === "library" && (
-              <div className="mt-3">
-                {mediaOptions === null && <p className="text-xs text-muted-foreground">Loading…</p>}
-                {mediaOptions !== null && mediaOptions.length === 0 && (
-                  <p className="text-xs text-muted-foreground">
-                    No available photos or videos uploaded for this agent yet — add some on the Media tab, then come
-                    back here.
-                  </p>
-                )}
-                {mediaOptions !== null && mediaOptions.length > 0 && (
-                  <div className="grid grid-cols-3 gap-2 sm:grid-cols-4">
-                    {mediaOptions.map((m) => (
-                      <button
-                        key={m.id}
-                        onClick={() => pickMedia(m.id)}
-                        disabled={mediaBusy}
-                        className="overflow-hidden rounded-xl border border-border transition-colors hover:border-primary disabled:opacity-50"
-                      >
-                        {m.media_type === "video"
-                          ? m.url && <video src={m.url} className="aspect-square w-full object-cover" />
-                          : m.url && (
-                              <img src={m.url} alt={m.caption ?? ""} className="aspect-square w-full object-cover" />
-                            )}
-                      </button>
-                    ))}
-                  </div>
-                )}
-              </div>
-            )}
-
-            {pickerTab === "drive" && (
-              <div className="mt-3">
-                {driveOptionsError && <p className="text-xs text-destructive">{driveOptionsError}</p>}
-                {!driveOptionsError && driveOptions === null && (
-                  <p className="text-xs text-muted-foreground">Loading…</p>
-                )}
-                {!driveOptionsError && driveOptions !== null && driveOptions.length === 0 && (
-                  <p className="text-xs text-muted-foreground">
-                    No unused photos or videos found in this agent's Drive folder.
-                  </p>
-                )}
-                {driveOptions !== null && driveOptions.length > 0 && (
-                  <div className="grid grid-cols-3 gap-2 sm:grid-cols-4">
-                    {driveOptions.map((f) => (
-                      <button
-                        key={f.id}
-                        onClick={() => pickDriveFile(f)}
-                        disabled={mediaBusy}
-                        className="overflow-hidden rounded-xl border border-border transition-colors hover:border-primary disabled:opacity-50"
-                      >
-                        {f.isVideo ? (
-                          <video src={f.thumbnailUrl} className="aspect-square w-full object-cover" />
-                        ) : (
-                          <img src={f.thumbnailUrl} alt={f.name} className="aspect-square w-full object-cover" />
-                        )}
-                      </button>
-                    ))}
-                  </div>
-                )}
-              </div>
-            )}
-
-            {pickerTab === "unsplash" && (
-              <div className="mt-3">
-                <div className="flex gap-2">
-                  <input
-                    value={unsplashQuery}
-                    onChange={(e) => setUnsplashQuery(e.target.value)}
-                    onKeyDown={(e) => e.key === "Enter" && runUnsplashSearch(unsplashQuery)}
-                    placeholder="Search stock photos — coffee, fall, neighborhood…"
-                    className="flex-1 rounded-xl border border-border bg-glass px-3 py-1.5 text-sm outline-none"
-                  />
-                  <Button
-                    variant="secondary"
-                    onClick={() => runUnsplashSearch(unsplashQuery)}
-                    disabled={unsplashLoading}
-                  >
-                    {unsplashLoading ? "Searching…" : "Search"}
-                  </Button>
-                </div>
-                {unsplashError && <p className="mt-2 text-xs text-destructive">{unsplashError}</p>}
-                {!unsplashError && unsplashResults !== null && unsplashResults.length === 0 && !unsplashLoading && (
-                  <p className="mt-2 text-xs text-muted-foreground">No results — try a different search.</p>
-                )}
-                {unsplashResults !== null && unsplashResults.length > 0 && (
-                  <div className="mt-3 grid grid-cols-3 gap-2 sm:grid-cols-4">
-                    {unsplashResults.map((r) => (
-                      <button
-                        key={r.id}
-                        onClick={() => pickUnsplash(r)}
-                        disabled={mediaBusy}
-                        title={`Photo by ${r.photographerName} on Unsplash`}
-                        className="overflow-hidden rounded-xl border border-border transition-colors hover:border-primary disabled:opacity-50"
-                      >
-                        <img src={r.thumbUrl} alt="" className="aspect-square w-full object-cover" />
-                      </button>
-                    ))}
-                  </div>
-                )}
-                <p className="mt-2 text-[11px] text-muted-foreground">
-                  Photos via Unsplash — credit is added automatically.
+          {feedbackOpen && (
+            <div className="mt-4 rounded-2xl border border-border bg-background/40 p-4">
+              <div className="flex items-center justify-between">
+                <p className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
+                  What should change?
                 </p>
+                <MicButton value={notes} onChange={setNotes} />
               </div>
-            )}
-
-            {photoUrl && (
-              <button
-                onClick={() => pickMedia(null)}
-                disabled={mediaBusy}
-                className="mt-3 text-xs font-semibold text-destructive hover:underline disabled:opacity-50"
-              >
-                Remove photo
-              </button>
-            )}
-          </div>
-        )}
-
-        {feedbackOpen && (
-          <div className="mt-4 rounded-2xl border border-border bg-background/40 p-4">
-            <div className="flex items-center justify-between">
-              <p className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
-                What should change?
-              </p>
-              <MicButton value={notes} onChange={setNotes} />
-            </div>
-            {rewriteHistory.length > 0 && (
-              <div className="mt-2 space-y-2">
-                {rewriteHistory.map((h, i) => (
-                  <div key={i} className="rounded-xl bg-muted px-3 py-2 text-xs leading-relaxed">
-                    <p className="text-muted-foreground">You asked: "{h.feedback}"</p>
-                    <p className="mt-1 italic">Result: {h.result}</p>
-                  </div>
-                ))}
+              {rewriteHistory.length > 0 && (
+                <div className="mt-2 space-y-2">
+                  {rewriteHistory.map((h, i) => (
+                    <div key={i} className="rounded-xl bg-muted px-3 py-2 text-xs leading-relaxed">
+                      <p className="text-muted-foreground">You asked: "{h.feedback}"</p>
+                      <p className="mt-1 italic">Result: {h.result}</p>
+                    </div>
+                  ))}
+                </div>
+              )}
+              <textarea
+                value={notes}
+                onChange={(e) => setNotes(e.target.value)}
+                placeholder="What is off? Too formal, they never say this, make it shorter…"
+                className="mt-2 min-h-[80px] w-full rounded-2xl bg-muted px-4 py-3 text-sm outline-none ring-ring transition focus:ring-2"
+              />
+              <div className="mt-3 flex flex-wrap gap-2">
+                <Button onClick={rewrite} disabled={busy || rewriting}>
+                  {rewriting ? "Rewriting…" : "Rewrite in their voice →"}
+                </Button>
+                <Button onClick={sendFeedback} variant="secondary" disabled={busy || rewriting}>
+                  Submit feedback
+                </Button>
+                <Button
+                  variant="secondary"
+                  onClick={() => {
+                    setFeedbackOpen(false);
+                    setRewriteHistory([]);
+                  }}
+                  disabled={busy || rewriting}
+                >
+                  Done
+                </Button>
               </div>
-            )}
-            <textarea
-              value={notes}
-              onChange={(e) => setNotes(e.target.value)}
-              placeholder="What is off? Too formal, they never say this, make it shorter…"
-              className="mt-2 min-h-[80px] w-full rounded-2xl bg-muted px-4 py-3 text-sm outline-none ring-ring transition focus:ring-2"
-            />
-            <div className="mt-3 flex flex-wrap gap-2">
-              <Button onClick={rewrite} disabled={busy || rewriting}>
-                {rewriting ? "Rewriting…" : "Rewrite in their voice →"}
-              </Button>
-              <Button onClick={sendFeedback} variant="secondary" disabled={busy || rewriting}>
-                Submit feedback
-              </Button>
-              <Button
-                variant="secondary"
-                onClick={() => {
-                  setFeedbackOpen(false);
-                  setRewriteHistory([]);
-                }}
-                disabled={busy || rewriting}
-              >
-                Done
-              </Button>
+              {rewriteHistory.length > 0 && (
+                <p className="mt-2 text-xs text-muted-foreground">
+                  Not right yet? Add more feedback above and rewrite again.
+                </p>
+              )}
             </div>
-            {rewriteHistory.length > 0 && (
-              <p className="mt-2 text-xs text-muted-foreground">
-                Not right yet? Add more feedback above and rewrite again.
-              </p>
-            )}
-          </div>
-        )}
+          )}
       </div>
     </Card>
   );
@@ -1563,7 +1588,9 @@ function MediaTab({ agentId }: { agentId: string }) {
         const { path, token } = await createMediaUploadUrl({
           data: { agentId, fileName: toUpload.name },
         });
-        const { error: uploadErr } = await supabase.storage.from("media").uploadToSignedUrl(path, token, toUpload);
+        const { error: uploadErr } = await supabase.storage
+          .from("media")
+          .uploadToSignedUrl(path, token, toUpload);
         if (uploadErr) throw uploadErr;
         await finalizeMediaUpload({ data: { agentId, storagePath: path, mediaType } });
         uploaded++;
@@ -1613,7 +1640,9 @@ function MediaTab({ agentId }: { agentId: string }) {
   // in the grid, so tagging a whole library doesn't need a separate save
   // step per item.
   async function toggleTag(item: MediaRow, tag: string) {
-    const nextTags = item.tags.includes(tag) ? item.tags.filter((t) => t !== tag) : [...item.tags, tag];
+    const nextTags = item.tags.includes(tag)
+      ? item.tags.filter((t) => t !== tag)
+      : [...item.tags, tag];
     setMedia((prev) => (prev ? prev.map((m) => (m.id === item.id ? { ...m, tags: nextTags } : m)) : prev));
     try {
       await setMediaTags({ data: { agentId, mediaId: item.id, tags: nextTags } });
@@ -1628,10 +1657,11 @@ function MediaTab({ agentId }: { agentId: string }) {
       <Card>
         <h3 className="font-display text-sm font-semibold">Upload photos or short-form video</h3>
         <p className="mt-1 text-xs text-muted-foreground">
-          Uploaded here, these are used for this agent's content the same way Drive photos are — once something's used
-          in a piece of content, mark it used below and it drops out of the active pool so it doesn't get suggested
-          again. This is separate from this agent's Google Drive folder — Drive photos still work exactly as they do
-          today, they just won't show up in this grid unless they're also uploaded here.
+          Uploaded here, these are used for this agent's content the same way Drive photos are —
+          once something's used in a piece of content, mark it used below and it drops out of the
+          active pool so it doesn't get suggested again. This is separate from this agent's Google
+          Drive folder — Drive photos still work exactly as they do today, they just won't show up
+          in this grid unless they're also uploaded here.
         </p>
         <div className="mt-3 flex flex-wrap items-center gap-3">
           <input
@@ -1688,9 +1718,13 @@ function MediaTab({ agentId }: { agentId: string }) {
         <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-4">
           {media.map((m) => (
             <div key={m.id} className="overflow-hidden rounded-2xl border border-border bg-glass">
-              {m.media_type === "video"
-                ? m.url && <video src={m.url} controls className="aspect-square w-full object-cover" />
-                : m.url && <img src={m.url} alt={m.caption ?? ""} className="aspect-square w-full object-cover" />}
+              {m.media_type === "video" ? (
+                m.url && <video src={m.url} controls className="aspect-square w-full object-cover" />
+              ) : (
+                m.url && (
+                  <img src={m.url} alt={m.caption ?? ""} className="aspect-square w-full object-cover" />
+                )
+              )}
               <div className="flex items-center justify-between gap-1 px-2 pt-2">
                 <span className="rounded-full bg-muted px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">
                   {m.media_type}
@@ -1819,9 +1853,10 @@ function DriveTab({ agentId, isAdmin }: { agentId: string; isAdmin: boolean }) {
       <Card>
         <h3 className="font-display text-sm font-semibold">This agent's Google Drive folder</h3>
         <p className="mt-1 text-xs text-muted-foreground">
-          A live, read-only view of what's actually in their Drive folder right now — mainly useful for agents on our
-          video services who still send long-form footage through Drive. This never writes anything back to Drive;
-          uploading and marking things used still happens exactly as it does today, over there, untouched.
+          A live, read-only view of what's actually in their Drive folder right now — mainly useful
+          for agents on our video services who still send long-form footage through Drive. This
+          never writes anything back to Drive; uploading and marking things used still happens
+          exactly as it does today, over there, untouched.
         </p>
         {isAdmin && (
           <>
@@ -1829,7 +1864,9 @@ function DriveTab({ agentId, isAdmin }: { agentId: string; isAdmin: boolean }) {
               <input
                 value={folderInput}
                 onChange={(e) => setFolderInput(e.target.value)}
-                placeholder={data?.folderId ? `Currently: ${data.folderId}` : "Paste this agent's Drive folder ID"}
+                placeholder={
+                  data?.folderId ? `Currently: ${data.folderId}` : "Paste this agent's Drive folder ID"
+                }
                 className="min-w-[220px] flex-1 rounded-xl border border-border bg-glass px-3 py-1.5 text-sm outline-none"
               />
               <Button onClick={saveFolder} disabled={saving || !folderInput.trim()}>
@@ -1869,7 +1906,9 @@ function DriveTab({ agentId, isAdmin }: { agentId: string; isAdmin: boolean }) {
 
       {!error && data !== null && data.folderId && data.files.length === 0 && (
         <Card>
-          <p className="text-sm text-muted-foreground">Their Drive folder is connected but empty right now.</p>
+          <p className="text-sm text-muted-foreground">
+            Their Drive folder is connected but empty right now.
+          </p>
         </Card>
       )}
 
@@ -2011,8 +2050,9 @@ function ManageCalendarScreen({ onBack }: { onBack: () => void }) {
       <Card>
         <h2 className="font-display text-lg font-semibold">Content Calendar</h2>
         <p className="mt-1 text-sm text-muted-foreground">
-          One shared calendar for every agent. Add a month, then add the posts, emails, and video briefs that belong to
-          it — every agent generates their own personalized version of the same briefs from their own login.
+          One shared calendar for every agent. Add a month, then add the posts, emails, and video
+          briefs that belong to it — every agent generates their own personalized version of the
+          same briefs from their own login.
         </p>
       </Card>
 
@@ -2023,7 +2063,11 @@ function ManageCalendarScreen({ onBack }: { onBack: () => void }) {
           </h4>
           <div className="flex items-center gap-2">
             <label className="flex items-center gap-2 text-xs text-muted-foreground">
-              <input type="checkbox" checked={showArchived} onChange={(e) => setShowArchived(e.target.checked)} />
+              <input
+                type="checkbox"
+                checked={showArchived}
+                onChange={(e) => setShowArchived(e.target.checked)}
+              />
               Show archived
             </label>
             {!addOpen && <Button onClick={() => setAddOpen(true)}>+ Add month</Button>}
@@ -2053,7 +2097,9 @@ function ManageCalendarScreen({ onBack }: { onBack: () => void }) {
         {error && <p className="mt-3 text-xs text-destructive">{error}</p>}
         {months === null && !error && <p className="mt-3 text-sm text-muted-foreground">Loading…</p>}
         {months !== null && months.length === 0 && (
-          <p className="mt-3 text-sm text-muted-foreground">No months yet — add one above to get started.</p>
+          <p className="mt-3 text-sm text-muted-foreground">
+            No months yet — add one above to get started.
+          </p>
         )}
         {months !== null && months.length > 0 && (
           <div className="mt-3 grid gap-2 sm:grid-cols-2 lg:grid-cols-3">
@@ -2174,10 +2220,10 @@ function CalendarMonthItemsScreen({ month, onBack }: { month: CalendarMonth; onB
       <Card>
         <h2 className="font-display text-lg font-semibold">{month.month}</h2>
         <p className="mt-1 text-sm text-muted-foreground">
-          Add each post, email, and video brief for this month below — the same shape a Drive Doc used to have (goal,
-          image suggestions/Canva link, and copy for a post; goal, subject lines, and instructions for an email; goal,
-          hook, and script for a video). Every agent's Voice DNA turns these into their own personalized version when
-          they generate.
+          Add each post, email, and video brief for this month below — the same shape a Drive Doc
+          used to have (goal, image suggestions/Canva link, and copy for a post; goal, subject
+          lines, and instructions for an email; goal, hook, and script for a video). Every agent's
+          Voice DNA turns these into their own personalized version when they generate.
         </p>
       </Card>
 
@@ -2233,7 +2279,9 @@ function CalendarMonthItemsScreen({ month, onBack }: { month: CalendarMonth; onB
         {error && <p className="mt-3 text-xs text-destructive">{error}</p>}
         {items === null && !error && <p className="mt-3 text-sm text-muted-foreground">Loading…</p>}
         {items !== null && items.length === 0 && (
-          <p className="mt-3 text-sm text-muted-foreground">Nothing added yet — add a post, email, or video above.</p>
+          <p className="mt-3 text-sm text-muted-foreground">
+            Nothing added yet — add a post, email, or video above.
+          </p>
         )}
         {items !== null && items.length > 0 && (
           <div className="mt-3 space-y-2">
@@ -2280,7 +2328,12 @@ function ContentCalendarTab({ agentId, isAdmin }: { agentId: string; isAdmin: bo
 
   if (activeMonth) {
     return (
-      <MonthWorkspace agentId={agentId} isAdmin={isAdmin} month={activeMonth} onBack={() => setActiveMonth(null)} />
+      <MonthWorkspace
+        agentId={agentId}
+        isAdmin={isAdmin}
+        month={activeMonth}
+        onBack={() => setActiveMonth(null)}
+      />
     );
   }
 
@@ -2289,8 +2342,8 @@ function ContentCalendarTab({ agentId, isAdmin }: { agentId: string; isAdmin: bo
       <Card>
         <h3 className="font-display text-sm font-semibold">Create My Monthly Content</h3>
         <p className="mt-1 text-xs text-muted-foreground">
-          Pick a month below to generate this month's posts, emails, and video scripts in your own voice, then review
-          and approve them.
+          Pick a month below to generate this month's posts, emails, and video scripts in your
+          own voice, then review and approve them.
         </p>
       </Card>
 
@@ -2298,9 +2351,13 @@ function ContentCalendarTab({ agentId, isAdmin }: { agentId: string; isAdmin: bo
         <h4 className="font-display text-sm font-semibold">Months</h4>
 
         {error && <p className="mt-3 text-xs text-destructive">{error}</p>}
-        {months === null && !error && <p className="mt-3 text-sm text-muted-foreground">Loading…</p>}
+        {months === null && !error && (
+          <p className="mt-3 text-sm text-muted-foreground">Loading…</p>
+        )}
         {months !== null && months.length === 0 && (
-          <p className="mt-3 text-sm text-muted-foreground">No months set up yet — ask your team to add one.</p>
+          <p className="mt-3 text-sm text-muted-foreground">
+            No months set up yet — ask your team to add one.
+          </p>
         )}
         {months !== null && months.length > 0 && (
           <div className="mt-3 grid gap-2 sm:grid-cols-2 lg:grid-cols-3">
@@ -2354,13 +2411,7 @@ async function buildContentDocxBlob(batchPosts: Post[], monthLabel: string): Pro
   for (const cat of CATEGORY_ORDER) {
     const group = batchPosts.filter((p) => categorizePost(p) === cat);
     if (!group.length) continue;
-    children.push(
-      new Paragraph({
-        text: DOCX_SECTION_TITLE[cat],
-        heading: HeadingLevel.HEADING_1,
-        spacing: { before: 300, after: 150 },
-      }),
-    );
+    children.push(new Paragraph({ text: DOCX_SECTION_TITLE[cat], heading: HeadingLevel.HEADING_1, spacing: { before: 300, after: 150 } }));
 
     group.forEach((p, i) => {
       const title = p.title || `${DOCX_SECTION_TITLE[cat]} ${i + 1}`;
@@ -2416,7 +2467,9 @@ async function buildContentDocxBlob(batchPosts: Post[], monthLabel: string): Pro
         children.push(
           new Paragraph({
             spacing: { before: 100 },
-            children: [new TextRun({ text: "EMAIL PHOTOS:", bold: true })],
+            children: [
+              new TextRun({ text: "EMAIL PHOTOS:", bold: true }),
+            ],
           }),
         );
         children.push(new Paragraph({ text: `Photo 1: ${p.metadata.unsplash_photographer}` }));
@@ -2569,12 +2622,7 @@ function MonthWorkspace({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [agentId, folder.id, folder.month]);
 
-  const batchPosts = (posts ?? []).filter(
-    (p) =>
-      p.metadata?.source === "content_calendar" ||
-      p.metadata?.source === "drive_photo_scan" ||
-      p.metadata?.source === "library_photo_scan",
-  );
+  const batchPosts = (posts ?? []).filter((p) => BATCH_SOURCES.has(p.metadata?.source ?? ""));
   const latestFromPosts = batchPosts.length
     ? (batchPosts[batchPosts.length - 1]?.metadata?.batch_id as string | undefined)
     : undefined;
@@ -2649,7 +2697,10 @@ function MonthWorkspace({
 
   return (
     <div className="space-y-4">
-      <button onClick={onBack} className="text-xs font-semibold text-muted-foreground hover:text-foreground">
+      <button
+        onClick={onBack}
+        className="text-xs font-semibold text-muted-foreground hover:text-foreground"
+      >
         ← All months
       </button>
 
@@ -2664,14 +2715,18 @@ function MonthWorkspace({
             ) : (
               <p className="mt-1 text-xs text-muted-foreground">
                 {postCount} post{postCount === 1 ? "" : "s"}, {emailCount} email
-                {emailCount === 1 ? "" : "s"}, {videoCount} video script{videoCount === 1 ? "" : "s"} in this month's
-                calendar.
+                {emailCount === 1 ? "" : "s"}, {videoCount} video script{videoCount === 1 ? "" : "s"}{" "}
+                in this month's calendar.
               </p>
             )}
           </div>
           <div className="flex items-center gap-3">
             <label className="flex items-center gap-2 text-xs text-muted-foreground">
-              <input type="checkbox" checked={useHashtags} onChange={(e) => setUseHashtags(e.target.checked)} />
+              <input
+                type="checkbox"
+                checked={useHashtags}
+                onChange={(e) => setUseHashtags(e.target.checked)}
+              />
               Add hashtags to posts
             </label>
             <Button onClick={generate} disabled={generating || docs === null}>
@@ -2698,7 +2753,11 @@ function MonthWorkspace({
         <div className="flex flex-wrap items-center justify-between gap-3">
           <h4 className="font-display text-sm font-semibold">This month's generated content</h4>
           <div className="flex flex-wrap gap-2">
-            <Button variant="secondary" onClick={approveAllAndDownload} disabled={approving || !batchPosts.length}>
+            <Button
+              variant="secondary"
+              onClick={approveAllAndDownload}
+              disabled={approving || !batchPosts.length}
+            >
               {approving ? "Working…" : "Approve All & Download"}
             </Button>
             {isAdmin && (
@@ -2946,8 +3005,8 @@ function PhotoScanPanel({
       >
         <p className="font-display text-base font-semibold">{SCAN_PANEL_TITLE}</p>
         <p className="mt-1 text-xs text-muted-foreground">
-          Pulls unused photos from Drive and your Media Library, writes a caption in their voice for each, and lets you
-          pick the ones worth turning into posts. Click to get started →
+          Pulls unused photos from Drive and your Media Library, writes a caption in their voice for
+          each, and lets you pick the ones worth turning into posts. Click to get started →
         </p>
       </button>
     );
@@ -2962,8 +3021,8 @@ function PhotoScanPanel({
         </Button>
       </div>
       <p className="mt-1 text-xs text-muted-foreground">
-        Scans a handful of unused photos and writes a caption for each, in their voice. Pick the ones worth turning into
-        posts.
+        Scans a handful of unused photos and writes a caption for each, in their voice. Pick the
+        ones worth turning into posts.
       </p>
 
       <div className="mt-3 flex flex-wrap gap-2 border-b border-border pb-3">
@@ -2972,9 +3031,7 @@ function PhotoScanPanel({
           disabled={!folderId}
           title={folderId ? undefined : "No Google Drive folder set for this agent yet"}
           className={`rounded-full px-3 py-1 text-xs font-semibold transition-colors disabled:cursor-not-allowed disabled:opacity-40 ${
-            source === "drive"
-              ? "bg-primary text-primary-foreground"
-              : "bg-muted text-muted-foreground hover:text-foreground"
+            source === "drive" ? "bg-primary text-primary-foreground" : "bg-muted text-muted-foreground hover:text-foreground"
           }`}
         >
           Google Drive
@@ -2982,9 +3039,7 @@ function PhotoScanPanel({
         <button
           onClick={() => switchSource("library")}
           className={`rounded-full px-3 py-1 text-xs font-semibold transition-colors ${
-            source === "library"
-              ? "bg-primary text-primary-foreground"
-              : "bg-muted text-muted-foreground hover:text-foreground"
+            source === "library" ? "bg-primary text-primary-foreground" : "bg-muted text-muted-foreground hover:text-foreground"
           }`}
         >
           Media Library
@@ -3017,7 +3072,11 @@ function PhotoScanPanel({
                 onChange={() => toggle(s.fileId)}
                 className="mt-1 shrink-0"
               />
-              <img src={s.thumbnailUrl} alt={s.description} className="h-16 w-16 shrink-0 rounded-xl object-cover" />
+              <img
+                src={s.thumbnailUrl}
+                alt={s.description}
+                className="h-16 w-16 shrink-0 rounded-xl object-cover"
+              />
               <div className="min-w-0 flex-1">
                 <p className="text-xs text-muted-foreground">{s.description}</p>
                 {editingId === s.fileId ? (
@@ -3059,3 +3118,4 @@ function PhotoScanPanel({
     </Card>
   );
 }
+```

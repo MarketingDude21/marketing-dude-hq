@@ -77,7 +77,7 @@ export const Route = createFileRoute("/marketing")({
   component: MarketingPage,
 });
 
-type AgentOption = { id: string; name: string };
+type AgentOption = { id: string; name: string; email: string | null };
 
 type Post = {
   id: string;
@@ -384,9 +384,15 @@ function MarketingPage() {
         setAccess(a);
         if (a.role === "admin") {
           const list = await listMarketingAgents();
-          setAgents(list.map((ag) => ({ id: ag.id, name: ag.full_name ?? ag.email ?? "Unnamed agent" })));
+          setAgents(
+            list.map((ag) => ({
+              id: ag.id,
+              name: ag.full_name ?? ag.email ?? "Unnamed agent",
+              email: ag.email ?? null,
+            })),
+          );
         } else if (a.role === "agent") {
-          setSelected({ id: a.agentId, name: a.agentName });
+          setSelected({ id: a.agentId, name: a.agentName, email: null });
         }
       })
       .catch((e) => setAccessError(e instanceof Error ? e.message : String(e)));
@@ -458,15 +464,40 @@ function MarketingPage() {
             Pick who you're working on behalf of. Every action you take here is logged against their account, not yours.
           </p>
           <div className="mt-4 grid gap-2 sm:grid-cols-2 lg:grid-cols-3">
-            {agents.map((a) => (
-              <button
-                key={a.id}
-                onClick={() => setSelected(a)}
-                className="rounded-2xl border border-border bg-glass px-4 py-3 text-left text-sm font-medium transition-colors hover:bg-secondary"
-              >
-                {a.name}
-              </button>
-            ))}
+            {agents.map((a) => {
+              // Flags a duplicate display name — added 2026-09-18 while
+              // investigating Mike's report that Meghan Simons' Drive folder
+              // "still" doesn't appear client-side even after being set here.
+              // The code path that reads/writes drive_folder_id is confirmed
+              // correct (see DriveTab) — every save/read targets the exact
+              // agentId this button carries, so the leading theory left is
+              // that two separate agent rows share the same display name and
+              // admin is unknowingly saving the folder onto the wrong one.
+              // Two identical-looking buttons here would make that mistake
+              // invisible, so each one now also shows its email — and any
+              // name shared by more than one row gets a visible flag.
+              const isDuplicateName = agents.filter((o) => o.name === a.name).length > 1;
+              return (
+                <button
+                  key={a.id}
+                  onClick={() => setSelected(a)}
+                  className="rounded-2xl border border-border bg-glass px-4 py-3 text-left text-sm font-medium transition-colors hover:bg-secondary"
+                >
+                  <span className="flex items-center gap-1.5">
+                    {a.name}
+                    {isDuplicateName && (
+                      <span
+                        title="Another agent also has this exact name — double check the email below before connecting anything to this one."
+                        className="rounded-full bg-amber-500/20 px-1.5 py-0.5 text-[10px] font-semibold text-amber-600 dark:text-amber-400"
+                      >
+                        ⚠ duplicate name
+                      </span>
+                    )}
+                  </span>
+                  {a.email && <span className="mt-0.5 block text-xs font-normal text-muted-foreground">{a.email}</span>}
+                </button>
+              );
+            })}
             {agents.length === 0 && <p className="text-sm text-muted-foreground">No agents yet.</p>}
           </div>
         </Card>
@@ -482,7 +513,7 @@ function MarketingPage() {
         agentName={selected.name}
         onChangeAgent={access.role === "admin" ? () => setSelected(null) : undefined}
       />
-      <Workspace agentId={selected.id} isAdmin={access.role === "admin"} />
+      <Workspace agentId={selected.id} agentEmail={selected.email} isAdmin={access.role === "admin"} />
     </AppShell>
   );
 }
@@ -511,7 +542,7 @@ function PageHeader({
   );
 }
 
-function Workspace({ agentId, isAdmin }: { agentId: string; isAdmin: boolean }) {
+function Workspace({ agentId, agentEmail, isAdmin }: { agentId: string; agentEmail: string | null; isAdmin: boolean }) {
   const [tab, setTab] = useState<"posts" | "calendar" | "media" | "drive">("posts");
   return (
     <div className="mt-5">
@@ -538,7 +569,7 @@ function Workspace({ agentId, isAdmin }: { agentId: string; isAdmin: boolean }) 
         {tab === "posts" && <PostsTab agentId={agentId} isAdmin={isAdmin} />}
         {tab === "calendar" && <ContentCalendarTab agentId={agentId} isAdmin={isAdmin} />}
         {tab === "media" && <MediaTab agentId={agentId} />}
-        {tab === "drive" && <DriveTab agentId={agentId} isAdmin={isAdmin} />}
+        {tab === "drive" && <DriveTab agentId={agentId} agentEmail={agentEmail} isAdmin={isAdmin} />}
       </div>
     </div>
   );
@@ -1778,7 +1809,7 @@ function MediaTab({ agentId }: { agentId: string }) {
 // agents on YMD's video services who still send long-form footage through
 // Drive. Nothing here ever writes back to Drive; their existing Drive
 // workflow (upload, the "used" subfolder move) is completely untouched.
-function DriveTab({ agentId, isAdmin }: { agentId: string; isAdmin: boolean }) {
+function DriveTab({ agentId, agentEmail, isAdmin }: { agentId: string; agentEmail: string | null; isAdmin: boolean }) {
   const [data, setData] = useState<{ folderId: string | null; files: DriveFile[] } | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [folderInput, setFolderInput] = useState("");
@@ -1850,6 +1881,21 @@ function DriveTab({ agentId, isAdmin }: { agentId: string; isAdmin: boolean }) {
           video services who still send long-form footage through Drive. This never writes anything back to Drive;
           uploading and marking things used still happens exactly as it does today, over there, untouched.
         </p>
+        {/* Cross-check for admin (2026-09-18) — per Mike's report that a
+            Drive folder connection "still" isn't reaching the client-facing
+            view even after being set here. The save/read code both target
+            this exact agentId (confirmed correct), so if this still happens
+            after a Save, the most likely explanation is two agent records
+            sharing the same display name — admin saving onto one while the
+            agent's real login resolves to the other. Showing the email of
+            the record actually being edited, right here, lets that be ruled
+            in or out at a glance instead of guessing. */}
+        {isAdmin && agentEmail && (
+          <p className="mt-1 text-xs text-muted-foreground">
+            Editing the Drive connection for: <span className="font-semibold">{agentEmail}</span> — double check this is
+            the account they actually log in with if the folder still isn't showing up on their side after saving.
+          </p>
+        )}
         {isAdmin && (
           <>
             <div className="mt-3 flex flex-wrap items-center gap-2">
@@ -2605,6 +2651,18 @@ function MonthWorkspace({
     ? (batchPosts[batchPosts.length - 1]?.metadata?.batch_id as string | undefined)
     : undefined;
   const activeBatchId = lastBatchId ?? latestFromPosts ?? null;
+  // Added 2026-09-18 per Mike: "once client/user approves all button should
+  // change to 'Approved! Download Here' — just in case they want to
+  // redownload it." Previously the button always read "Approve All &
+  // Download" no matter what, even after everything was already approved —
+  // so there was no way for the agent (this screen is shared between admin
+  // and an agent's own login) to tell at a glance that they were done, or
+  // that clicking again would just redownload rather than re-do anything.
+  // The click handler itself needs no change: re-approving an already
+  // approved batch is a harmless no-op, and the download always regenerates
+  // from the current batchPosts either way, so clicking this again is a
+  // safe, genuine "redownload" exactly as asked.
+  const allApproved = batchPosts.length > 0 && batchPosts.every((p) => p.status === "approved");
 
   async function generate() {
     setGenerating(true);
@@ -2731,7 +2789,7 @@ function MonthWorkspace({
           </h4>
           <div className="flex flex-wrap gap-2">
             <Button variant="secondary" onClick={approveAllAndDownload} disabled={approving || !batchPosts.length}>
-              {approving ? "Working…" : "Approve All & Download"}
+              {approving ? "Working…" : allApproved ? "Approved! Download Here" : "Approve All & Download"}
             </Button>
             {isAdmin && (
               <Button onClick={sendToAgent} disabled={sending || !batchPosts.length}>

@@ -117,6 +117,14 @@ export type PostMetadata = {
   media_id?: string | null | undefined;
   media_url?: string | null | undefined;
   media_type?: string | null | undefined;
+  // Set when a photo was picked from Unsplash on the per-post picker (added
+  // 2026-09-18, per Mike's request for a stock-photo option — mainly meant
+  // for emails, whose photos don't come from an agent's own Drive/library).
+  // Unsplash's API terms require visible photographer credit on any hotlinked
+  // image, so these travel with the post specifically so the UI can render
+  // that credit line next to the photo.
+  unsplash_photographer?: string | null | undefined;
+  unsplash_credit_url?: string | null | undefined;
   [key: string]: string | number | boolean | null | undefined;
 };
 
@@ -503,6 +511,13 @@ export const setPostMedia = createServerFn({ method: "POST" })
       media_id: data.mediaId,
       media_url: mediaUrl,
       media_type: mediaType,
+      // Clear out any Drive/Unsplash photo that was attached before — a post
+      // only ever shows one photo, and without this a stale drive_file_id or
+      // Unsplash credit could keep hanging around after switching sources.
+      drive_file_id: null,
+      drive_thumbnail_url: null,
+      unsplash_photographer: null,
+      unsplash_credit_url: null,
     };
 
     const { error } = await supabaseAdmin
@@ -521,6 +536,166 @@ export const setPostMedia = createServerFn({ method: "POST" })
           : `Photo removed${prevMediaId ? ` (was ${prevMediaId})` : ""}.`,
       });
     }
+
+    return { ok: true };
+  });
+
+// Attaches a photo straight from the agent's connected Google Drive folder
+// to a post — the "Change photo" panel's Google Drive tab (added 2026-09-18
+// per Mike's request; previously the panel only offered the native Media
+// Library, with no way to reach the Drive folder that already existed).
+// Mirrors setPostMedia above but writes drive_file_id/drive_thumbnail_url
+// instead of a media_id, and clears the media-library + Unsplash fields so
+// only one photo source is ever active on a post at a time.
+export const setPostDrivePhoto = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .validator((data: { agentId: string; postId: string; driveFileId: string; thumbnailUrl: string }) => data)
+  .handler(async ({ data, context }): Promise<{ ok: true }> => {
+    const email = (context.claims as { email?: string } | undefined)?.email;
+    await requireAgentAccess(context.userId, email, data.agentId);
+    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+
+    const { data: existing, error: fetchErr } = await supabaseAdmin
+      .from("generated_posts")
+      .select("agent_id, metadata")
+      .eq("id", data.postId)
+      .maybeSingle();
+    if (fetchErr) throw fetchErr;
+    if (!existing || existing.agent_id !== data.agentId) {
+      throw new Error("Post not found for this agent.");
+    }
+
+    const nextMetadata = {
+      ...((existing.metadata as Record<string, unknown> | null) ?? {}),
+      drive_file_id: data.driveFileId,
+      drive_thumbnail_url: data.thumbnailUrl,
+      media_id: null,
+      media_url: null,
+      media_type: null,
+      unsplash_photographer: null,
+      unsplash_credit_url: null,
+    };
+
+    const { error } = await supabaseAdmin
+      .from("generated_posts")
+      .update({ metadata: nextMetadata, updated_at: new Date().toISOString() })
+      .eq("id", data.postId);
+    if (error) throw error;
+
+    await supabaseAdmin.from("feedback_history").insert({
+      agent_id: data.agentId,
+      post_id: data.postId,
+      rating: "photo_changed",
+      notes: `Photo changed to Drive file ${data.driveFileId}.`,
+    });
+
+    return { ok: true };
+  });
+
+// Searches Unsplash for free stock photos and attaches one to a post — added
+// 2026-09-18 per Mike's request: emails in particular never had a photo
+// option (they don't draw from an agent's own Drive/library the way posts
+// do), and the old app used Unsplash for exactly this. Requires an
+// UNSPLASH_ACCESS_KEY (a free Unsplash Developer account/app), same
+// self-explaining-when-missing pattern as GOOGLE_API_KEY/ANTHROPIC_API_KEY.
+export type UnsplashResult = {
+  id: string;
+  thumbUrl: string;
+  fullUrl: string;
+  photographerName: string;
+  photographerProfileUrl: string;
+  unsplashPageUrl: string;
+};
+
+export const searchUnsplashPhotos = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .validator((data: { agentId: string; query: string }) => data)
+  .handler(async ({ data, context }): Promise<{ results: UnsplashResult[] }> => {
+    const email = (context.claims as { email?: string } | undefined)?.email;
+    await requireAgentAccess(context.userId, email, data.agentId);
+    const key = process.env["UNSPLASH_ACCESS_KEY"];
+    if (!key) {
+      throw new Error(
+        "Stock photos aren't connected yet — add UNSPLASH_ACCESS_KEY in Lovable Cloud → Secrets (free at unsplash.com/developers).",
+      );
+    }
+    const query = data.query.trim() || "lifestyle";
+    const url =
+      "https://api.unsplash.com/search/photos?per_page=8&query=" + encodeURIComponent(query) + "&client_id=" + key;
+    const res = await fetch(url);
+    const json = (await res.json()) as {
+      results?: {
+        id: string;
+        urls?: { small?: string; regular?: string };
+        links?: { html?: string };
+        user?: { name?: string; links?: { html?: string } };
+      }[];
+      errors?: string[];
+    };
+    if (!res.ok) throw new Error(json.errors?.[0] ?? `Unsplash API error (${res.status})`);
+    const results: UnsplashResult[] = (json.results ?? [])
+      .filter((r) => r.urls?.small && r.urls?.regular)
+      .slice(0, 8)
+      .map((r) => ({
+        id: r.id,
+        thumbUrl: r.urls!.small!,
+        fullUrl: r.urls!.regular!,
+        photographerName: r.user?.name ?? "Unsplash photographer",
+        photographerProfileUrl: r.user?.links?.html ?? "https://unsplash.com",
+        unsplashPageUrl: r.links?.html ?? "https://unsplash.com",
+      }));
+    return { results };
+  });
+
+export const setPostUnsplashPhoto = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .validator(
+    (data: {
+      agentId: string;
+      postId: string;
+      photoUrl: string;
+      photographerName: string;
+      photographerProfileUrl: string;
+    }) => data,
+  )
+  .handler(async ({ data, context }): Promise<{ ok: true }> => {
+    const email = (context.claims as { email?: string } | undefined)?.email;
+    await requireAgentAccess(context.userId, email, data.agentId);
+    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+
+    const { data: existing, error: fetchErr } = await supabaseAdmin
+      .from("generated_posts")
+      .select("agent_id, metadata")
+      .eq("id", data.postId)
+      .maybeSingle();
+    if (fetchErr) throw fetchErr;
+    if (!existing || existing.agent_id !== data.agentId) {
+      throw new Error("Post not found for this agent.");
+    }
+
+    const nextMetadata = {
+      ...((existing.metadata as Record<string, unknown> | null) ?? {}),
+      media_id: null,
+      media_url: data.photoUrl,
+      media_type: "image",
+      drive_file_id: null,
+      drive_thumbnail_url: null,
+      unsplash_photographer: data.photographerName,
+      unsplash_credit_url: data.photographerProfileUrl,
+    };
+
+    const { error } = await supabaseAdmin
+      .from("generated_posts")
+      .update({ metadata: nextMetadata, updated_at: new Date().toISOString() })
+      .eq("id", data.postId);
+    if (error) throw error;
+
+    await supabaseAdmin.from("feedback_history").insert({
+      agent_id: data.agentId,
+      post_id: data.postId,
+      rating: "photo_changed",
+      notes: `Photo changed to an Unsplash photo by ${data.photographerName}.`,
+    });
 
     return { ok: true };
   });
@@ -1741,7 +1916,15 @@ export const generateMonthlyBatch = createServerFn({ method: "POST" })
 
 // ── Photo scan + caption — ported 1:1 from analyze-photos.js ───────────────
 
+// `source` distinguishes where the suggestion came from — added 2026-09-18
+// when this panel grew a second source (the native Media Library) per
+// Mike's request that the photo-scan tool "scan the media library too and
+// all photos", not just Drive. `driveUrl` is kept as the field name for the
+// original/full-size view link for BOTH sources (a Drive file's viewer link,
+// or a library photo's own URL) rather than renaming it, to avoid touching
+// every existing caller.
 export type PhotoScanSuggestion = {
+  source: "drive" | "library";
   fileId: string;
   fileName: string;
   driveUrl: string;
@@ -1749,6 +1932,57 @@ export type PhotoScanSuggestion = {
   description: string;
   suggestedPost: string;
 };
+
+// Shared with scanAgentLibraryPhotos below — one Claude vision call per
+// photo, writing a caption in the agent's voice from the raw image bytes.
+async function captionPhotoInVoice(
+  imageBytes: ArrayBuffer,
+  mediaType: string,
+  anthropicKey: string,
+  agentName: string | undefined,
+  agentCity: string | undefined,
+  voiceDna: string | undefined,
+): Promise<{ description: string; suggestedPost: string } | null> {
+  const base64 = Buffer.from(imageBytes).toString("base64");
+  const safeMediaType = ["image/jpeg", "image/png", "image/gif", "image/webp"].includes(mediaType)
+    ? mediaType
+    : "image/jpeg";
+  const prompt =
+    `You are creating a social media post for a real estate agent named ${agentName ?? "the agent"} in ${agentCity ?? "their city"}.\n\n` +
+    `VOICE DNA:\n${voiceDna ?? "Warm, authentic, conversational. Sounds like a real person, not a real estate agent."}\n\n` +
+    "Look at this photo and write a social media post that:\n1. Starts from what you actually see — the setting, the mood, the moment\n2. Sounds EXACTLY like this person based on their Voice DNA above\n3. Is 1-3 sentences max — short, human, texted-a-friend energy\n4. Does NOT mention real estate directly unless it is obviously a real estate moment\n5. Does NOT mention any specific location, city, neighborhood, or place name\n6. NO hyphens, NO corporate language, NO AI-tell phrases\n7. Standard capitalization — never write in all lowercase\n\n" +
+    "Also describe what you see in the photo in one short sentence.\n\nOutput format:\nDESCRIPTION: [one sentence of what you see]\nPOST: [the social media caption]";
+
+  const res = await fetch("https://api.anthropic.com/v1/messages", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "x-api-key": anthropicKey, "anthropic-version": "2023-06-01" },
+    body: JSON.stringify({
+      model: "claude-haiku-4-5-20251001",
+      max_tokens: 300,
+      messages: [
+        {
+          role: "user",
+          content: [
+            { type: "image", source: { type: "base64", media_type: safeMediaType, data: base64 } },
+            { type: "text", text: prompt },
+          ],
+        },
+      ],
+    }),
+  });
+  const claudeData = (await res.json()) as { content?: { text?: string }[]; error?: { message?: string } };
+  if (!res.ok) throw new Error(claudeData.error?.message ?? "Claude API error");
+  const raw = (claudeData.content ?? [])
+    .map((b) => b.text ?? "")
+    .join("")
+    .trim();
+  const descMatch = raw.match(/DESCRIPTION:\s*(.+)/i);
+  const postMatch = raw.match(/POST:\s*([\s\S]+)/i);
+  return {
+    description: descMatch ? descMatch[1]!.trim() : "Photo",
+    suggestedPost: postMatch ? postMatch[1]!.trim() : raw,
+  };
+}
 
 export const scanAgentDrivePhotos = createServerFn({ method: "POST" })
   .middleware([requireSupabaseAuth])
@@ -1820,54 +2054,28 @@ export const scanAgentDrivePhotos = createServerFn({ method: "POST" })
           const imgRes = await fetch(imgUrl);
           if (!imgRes.ok) return null;
           const arrayBuffer = await imgRes.arrayBuffer();
-          const base64 = Buffer.from(arrayBuffer).toString("base64");
 
-          let mediaType = f.mimeType || "image/jpeg";
+          const mediaType = f.mimeType || "image/jpeg";
           if (mediaType === "image/heif" || mediaType === "image/heic" || /\.heic$/i.test(f.name)) return null;
-          if (!["image/jpeg", "image/png", "image/gif", "image/webp"].includes(mediaType)) mediaType = "image/jpeg";
 
-          const prompt =
-            `You are creating a social media post for a real estate agent named ${agentName ?? "the agent"} in ${agentCity ?? "their city"}.\n\n` +
-            `VOICE DNA:\n${voiceDna ?? "Warm, authentic, conversational. Sounds like a real person, not a real estate agent."}\n\n` +
-            "Look at this photo and write a social media post that:\n1. Starts from what you actually see — the setting, the mood, the moment\n2. Sounds EXACTLY like this person based on their Voice DNA above\n3. Is 1-3 sentences max — short, human, texted-a-friend energy\n4. Does NOT mention real estate directly unless it is obviously a real estate moment\n5. Does NOT mention any specific location, city, neighborhood, or place name\n6. NO hyphens, NO corporate language, NO AI-tell phrases\n7. Standard capitalization — never write in all lowercase\n\n" +
-            "Also describe what you see in the photo in one short sentence.\n\nOutput format:\nDESCRIPTION: [one sentence of what you see]\nPOST: [the social media caption]";
-
-          const res = await fetch("https://api.anthropic.com/v1/messages", {
-            method: "POST",
-            headers: {
-              "Content-Type": "application/json",
-              "x-api-key": anthropicKey,
-              "anthropic-version": "2023-06-01",
-            },
-            body: JSON.stringify({
-              model: "claude-haiku-4-5-20251001",
-              max_tokens: 300,
-              messages: [
-                {
-                  role: "user",
-                  content: [
-                    { type: "image", source: { type: "base64", media_type: mediaType, data: base64 } },
-                    { type: "text", text: prompt },
-                  ],
-                },
-              ],
-            }),
-          });
-          const claudeData = (await res.json()) as { content?: { text?: string }[]; error?: { message?: string } };
-          if (!res.ok) throw new Error(claudeData.error?.message ?? "Claude API error");
-          const raw = (claudeData.content ?? [])
-            .map((b) => b.text ?? "")
-            .join("")
-            .trim();
-          const descMatch = raw.match(/DESCRIPTION:\s*(.+)/i);
-          const postMatch = raw.match(/POST:\s*([\s\S]+)/i);
+          const caption = await captionPhotoInVoice(
+            arrayBuffer,
+            mediaType,
+            anthropicKey,
+            agentName,
+            agentCity,
+            voiceDna,
+          );
+          if (!caption) return null;
+          const { description, suggestedPost } = caption;
           return {
+            source: "drive" as const,
             fileId: f.id,
             fileName: f.name,
             driveUrl: `https://drive.google.com/file/d/${f.id}/view`,
             thumbnailUrl: `https://drive.google.com/thumbnail?id=${f.id}&sz=w400`,
-            description: descMatch ? descMatch[1]!.trim() : "Photo from Drive",
-            suggestedPost: postMatch ? postMatch[1]!.trim() : raw,
+            description,
+            suggestedPost,
           };
         } catch {
           return null;
@@ -1878,6 +2086,83 @@ export const scanAgentDrivePhotos = createServerFn({ method: "POST" })
     return { suggestions: results.filter((r): r is PhotoScanSuggestion => Boolean(r)), totalPhotos: files.length };
   });
 
+// Same idea as scanAgentDrivePhotos, but scans the agent's own native Media
+// Library instead of their Drive folder — added 2026-09-18 per Mike's
+// request that the scan tool "needs to scan the media library too and all
+// photos," not just Drive. Library photos already have a public URL (no
+// Drive API fetch needed), so this is simpler: pull the same "available,
+// not yet attached to any post" pool assignSuggestedMedia draws from, fetch
+// each image, and run it through the same voice-captioning call.
+export const scanAgentLibraryPhotos = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .validator((data: { agentId: string; maxPhotos?: number }) => data)
+  .handler(async ({ data, context }): Promise<{ suggestions: PhotoScanSuggestion[]; totalPhotos: number }> => {
+    const email = (context.claims as { email?: string } | undefined)?.email;
+    await requireAgentAccess(context.userId, email, data.agentId);
+    const anthropicKey = process.env["ANTHROPIC_API_KEY"];
+    if (!anthropicKey)
+      throw new Error("Photo captioning isn't configured yet — add ANTHROPIC_API_KEY in Lovable Cloud → Secrets.");
+
+    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+    const { data: agent } = await supabaseAdmin
+      .from("agents")
+      .select("full_name, market_area, voice_summary")
+      .eq("id", data.agentId)
+      .maybeSingle();
+    const agentName = agent?.full_name ?? undefined;
+    const agentCity = agent?.market_area ?? undefined;
+    const voiceDna = agent?.voice_summary ?? undefined;
+
+    const { data: photos, error } = await supabaseAdmin
+      .from("agent_photos")
+      .select("id, url, media_type, created_at")
+      .eq("agent_id", data.agentId)
+      .eq("status", "available")
+      .order("created_at", { ascending: true })
+      .limit(50);
+    if (error) throw error;
+
+    const maxPhotos = data.maxPhotos ?? 5;
+    const toProcess = (photos ?? []).filter((p) => p.url && p.media_type !== "video").slice(0, maxPhotos);
+
+    const results = await Promise.all(
+      toProcess.map(async (p): Promise<PhotoScanSuggestion | null> => {
+        try {
+          const imgRes = await fetch(p.url!);
+          if (!imgRes.ok) return null;
+          const arrayBuffer = await imgRes.arrayBuffer();
+          const contentType = imgRes.headers.get("content-type") || "image/jpeg";
+
+          const caption = await captionPhotoInVoice(
+            arrayBuffer,
+            contentType,
+            anthropicKey,
+            agentName,
+            agentCity,
+            voiceDna,
+          );
+          if (!caption) return null;
+          return {
+            source: "library" as const,
+            fileId: p.id,
+            fileName: p.id,
+            driveUrl: p.url!,
+            thumbnailUrl: p.url!,
+            description: caption.description,
+            suggestedPost: caption.suggestedPost,
+          };
+        } catch {
+          return null;
+        }
+      }),
+    );
+
+    return {
+      suggestions: results.filter((r): r is PhotoScanSuggestion => Boolean(r)),
+      totalPhotos: photos?.length ?? 0,
+    };
+  });
+
 export const addPhotoPostsToBatch = createServerFn({ method: "POST" })
   .middleware([requireSupabaseAuth])
   .validator(
@@ -1885,7 +2170,13 @@ export const addPhotoPostsToBatch = createServerFn({ method: "POST" })
       agentId: string;
       month: string;
       batchId?: string | undefined;
-      items: { title: string; content: string; driveFileId: string; thumbnailUrl: string }[];
+      items: {
+        title: string;
+        content: string;
+        source: "drive" | "library";
+        sourceId: string;
+        thumbnailUrl: string;
+      }[];
     }) => data,
   )
   .handler(async ({ data, context }): Promise<{ ok: true; created: number }> => {
@@ -1900,13 +2191,23 @@ export const addPhotoPostsToBatch = createServerFn({ method: "POST" })
       title: item.title,
       status: "pending",
       month: data.month,
-      metadata: {
-        batch_id: data.batchId ?? null,
-        month: data.month,
-        source: "drive_photo_scan",
-        drive_file_id: item.driveFileId,
-        drive_thumbnail_url: item.thumbnailUrl,
-      },
+      metadata:
+        item.source === "drive"
+          ? {
+              batch_id: data.batchId ?? null,
+              month: data.month,
+              source: "drive_photo_scan",
+              drive_file_id: item.sourceId,
+              drive_thumbnail_url: item.thumbnailUrl,
+            }
+          : {
+              batch_id: data.batchId ?? null,
+              month: data.month,
+              source: "library_photo_scan",
+              media_id: item.sourceId,
+              media_url: item.thumbnailUrl,
+              media_type: "image",
+            },
     }));
     const { error } = await supabaseAdmin.from("generated_posts").insert(rows);
     if (error) throw error;
@@ -1944,10 +2245,16 @@ export const sendContentToAgent = createServerFn({ method: "POST" })
     if (error) throw error;
     if (!agent?.email) throw new Error("No email address on file for this agent.");
 
+    // NOTE (2026-09-18): this used to send Version: "2021-04-15" on every
+    // call here, which is not a version GoHighLevel's v2/LeadConnector API
+    // recognizes for either the contacts endpoints or conversations/messages
+    // — that mismatch is almost certainly why Send to Agent's email was
+    // silently failing even after GHL_API_KEY/GHL_LOCATION_ID were set
+    // correctly. 2021-07-28 is the current stable version for both.
     const headers = {
       Authorization: "Bearer " + ghlKey,
       "Content-Type": "application/json",
-      Version: "2021-04-15",
+      Version: "2021-07-28",
     };
     const searchRes = await fetch(
       "https://services.leadconnectorhq.com/contacts/search?locationId=" +

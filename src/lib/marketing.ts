@@ -1412,8 +1412,15 @@ export const generateMarketingContent = createServerFn({ method: "POST" })
 // textarea.
 // ============================================================================
 
-export type CalendarMonth = { id: string; month: string };
+export type CalendarMonth = { id: string; month: string; archived: boolean };
 
+// Excludes archived months — added 2026-09-18 per Mike: "We also need an
+// Archive so we can archive that content and we dont have a long list of
+// stuff to do." This is the one every agent's "Create My Monthly Content"
+// picker and (by default) ManageCalendarScreen use, so an archived month
+// disappears from both without any call-site changes. Archiving is purely a
+// visibility flag (see the migration comment) — it hides a finished month,
+// it doesn't delete its items or any already-generated posts.
 export const listCalendarMonths = createServerFn({ method: "GET" })
   .middleware([requireSupabaseAuth])
   .handler(async ({ context }): Promise<CalendarMonth[]> => {
@@ -1422,10 +1429,43 @@ export const listCalendarMonths = createServerFn({ method: "GET" })
     const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
     const { data, error } = await supabaseAdmin
       .from("content_calendar_months")
-      .select("id, month")
+      .select("id, month, archived")
+      .eq("archived", false)
       .order("created_at", { ascending: false });
     if (error) throw error;
     return (data ?? []) as CalendarMonth[];
+  });
+
+// Admin-only, includes archived months too — powers ManageCalendarScreen's
+// "Show archived" toggle, since that screen is the only place admin needs
+// to find an archived month again (to unarchive it, or just to look back).
+export const listAllCalendarMonthsForAdmin = createServerFn({ method: "GET" })
+  .middleware([requireSupabaseAuth])
+  .handler(async ({ context }): Promise<CalendarMonth[]> => {
+    const email = (context.claims as { email?: string } | undefined)?.email;
+    await requireAdmin(context.userId, email);
+    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+    const { data, error } = await supabaseAdmin
+      .from("content_calendar_months")
+      .select("id, month, archived")
+      .order("created_at", { ascending: false });
+    if (error) throw error;
+    return (data ?? []) as CalendarMonth[];
+  });
+
+export const setCalendarMonthArchived = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .validator((data: { monthId: string; archived: boolean }) => data)
+  .handler(async ({ data, context }): Promise<{ ok: true }> => {
+    const email = (context.claims as { email?: string } | undefined)?.email;
+    await requireAdmin(context.userId, email);
+    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+    const { error } = await supabaseAdmin
+      .from("content_calendar_months")
+      .update({ archived: data.archived })
+      .eq("id", data.monthId);
+    if (error) throw error;
+    return { ok: true };
   });
 
 export const addCalendarMonth = createServerFn({ method: "POST" })
@@ -1439,7 +1479,7 @@ export const addCalendarMonth = createServerFn({ method: "POST" })
     const { data: row, error } = await supabaseAdmin
       .from("content_calendar_months")
       .insert({ month: data.month.trim() })
-      .select("id, month")
+      .select("id, month, archived")
       .single();
     if (error) throw error;
     return { ok: true, month: row as CalendarMonth };
@@ -1960,6 +2000,42 @@ export const generateMonthlyBatch = createServerFn({ method: "POST" })
       if (error) throw error;
     }
     return { ok: true, batchId, created: rows.length };
+  });
+
+// Deletes a month's generated content for one agent so it can be
+// regenerated cleanly — added 2026-09-18 per Mike: "Put a delete in case we
+// want to re generate that months content." Without this, clicking
+// "Generate Now" a second time just adds a second batch of posts on top of
+// the first (generateMonthlyBatch only ever inserts), so a real "start
+// over" always needed this. Admin-only, same as the other actions that
+// change what an agent's data actually contains rather than just reviewing
+// it (approve/flag stay agent-doable; deleting a whole batch is a "done for
+// you" action). Scoped to exactly the sources this month's workspace shows
+// (batchPosts in MonthWorkspace) — content_calendar/drive_photo_scan/
+// library_photo_scan for this agent+month — so it never touches a
+// one-off post made through the Posts tab's "+ New content" form, which
+// isn't part of any month's batch.
+export const deleteMonthContent = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .validator((data: { agentId: string; month: string }) => data)
+  .handler(async ({ data, context }): Promise<{ ok: true; deleted: number }> => {
+    const email = (context.claims as { email?: string } | undefined)?.email;
+    await requireAdmin(context.userId, email);
+    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+    const { data: rows, error: selErr } = await supabaseAdmin
+      .from("generated_posts")
+      .select("id, metadata")
+      .eq("agent_id", data.agentId)
+      .eq("month", data.month);
+    if (selErr) throw selErr;
+    const sourcesToDelete = new Set(["content_calendar", "drive_photo_scan", "library_photo_scan"]);
+    const idsToDelete = (rows ?? [])
+      .filter((r) => sourcesToDelete.has((r.metadata as { source?: string } | null)?.source ?? ""))
+      .map((r) => r.id);
+    if (!idsToDelete.length) return { ok: true, deleted: 0 };
+    const { error: delErr } = await supabaseAdmin.from("generated_posts").delete().in("id", idsToDelete);
+    if (delErr) throw delErr;
+    return { ok: true, deleted: idsToDelete.length };
   });
 
 // ── Photo scan + caption — ported 1:1 from analyze-photos.js ───────────────

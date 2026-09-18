@@ -600,16 +600,31 @@ function PostsTab({ agentId, isAdmin }: { agentId: string; isAdmin: boolean }) {
   // card do update immediately once reload() resolves, but there was no
   // unmistakable, un-missable confirmation that the click itself worked, so
   // this adds one plainly on the screen without needing to go find it.
+  //
+  // Also downloads the txt+docx export now (2026-09-18, second pass), via
+  // the same downloadContentExport() the calendar tab's "Approve All &
+  // Download" already used — this tab's "Approve all" previously only
+  // flipped statuses with no download at all, which is exactly what Mike
+  // meant by "no download comes up when the client or user approves on
+  // their end": the client mostly lives on this tab (it's the default one),
+  // not the calendar tab, so it's the one that actually needed this. Only
+  // downloads when a specific month is picked — "All months" mixes batches
+  // together in a way that doesn't make sense as one publishing doc.
   async function approveAll() {
     setApprovingAll(true);
     setActionError(null);
     setApproveNote(null);
     try {
       const res = await approveAllPending({ data: month ? { agentId, month } : { agentId } });
+      let noteTail = "";
+      if (month) {
+        const files = await downloadContentExport(posts ?? [], month);
+        if (files) noteTail = ` Downloaded ${files.textFileName} and ${files.docxFileName}.`;
+      }
       setApproveNote(
-        res.updated > 0
+        (res.updated > 0
           ? `Approved ${res.updated} post${res.updated === 1 ? "" : "s"}.`
-          : "Nothing left to approve — everything here is already approved.",
+          : "Nothing left to approve — everything here is already approved.") + noteTail,
       );
       reload();
     } catch (e) {
@@ -1124,7 +1139,17 @@ function PostCard({
       </div>
 
       <div className="mt-4 border-t border-border pt-4">
-        {post.content_type === "post" && photoUrl && (
+        {/* Was gated to content_type === "post" only, so an email's chosen
+              photo (Unsplash, in practice — emails don't have their own Drive/
+              library photos the way posts do) was saved successfully server-side
+              but never actually rendered here: the picker closed and the card
+              looked exactly like nothing had happened. That's the bug behind
+              Mike's report (2026-09-18) "email when you choose a photo it
+              doesn't allow you to save it, you click it and it just resets and
+              doesn't show anything attached" — the save worked, the display
+              didn't. Fixed to match the "Add/Change photo" button's own
+              condition just below, which already covered both types. */}
+        {(post.content_type === "post" || post.content_type === "email") && photoUrl && (
           <div className="mb-3 overflow-hidden rounded-2xl border border-border bg-muted">
             {post.metadata?.media_type === "video" ? (
               <video src={photoUrl} controls className="max-h-64 w-full object-contain" />
@@ -2312,6 +2337,47 @@ async function buildContentDocxBlob(batchPosts: Post[], monthLabel: string): Pro
   return Packer.toBlob(doc);
 }
 
+// Shared by PostsTab's "Approve all" and MonthWorkspace's "Approve All &
+// Download" — added 2026-09-18 per Mike: "No download comes up when the
+// client or user approves on their end," plus his broader point that the
+// two review screens (the flat Posts tab and the "Create My Monthly
+// Content" calendar tab) should behave identically since they're really the
+// same app either way. Before this, only the calendar tab's approve button
+// actually built and downloaded the txt/docx export — the Posts tab's
+// "Approve all" just flipped statuses with no download at all, which is
+// exactly what "no download comes up" describes. Now both call this.
+function downloadContentExport(posts: Post[], monthLabel: string) {
+  if (!posts.length) return;
+  const baseName = monthLabel.replace(/\s+/g, "-");
+
+  const textFileName = `${baseName}-content.txt`;
+  const text = posts
+    .map((p) => {
+      const heading = (p.title || p.content_type).toUpperCase();
+      const canva = p.metadata?.canva_link ? `\nCanva template: ${p.metadata.canva_link}` : "";
+      return `${heading}\n${p.content}${canva}`;
+    })
+    .join("\n\n---\n\n");
+  const textBlob = new Blob([text], { type: "text/plain" });
+  const textUrl = URL.createObjectURL(textBlob);
+  const textLink = document.createElement("a");
+  textLink.href = textUrl;
+  textLink.download = textFileName;
+  textLink.click();
+  URL.revokeObjectURL(textUrl);
+
+  const docxFileName = `${baseName}-content.docx`;
+  return buildContentDocxBlob(posts, monthLabel).then((docxBlob) => {
+    const docxUrl = URL.createObjectURL(docxBlob);
+    const docxLink = document.createElement("a");
+    docxLink.href = docxUrl;
+    docxLink.download = docxFileName;
+    docxLink.click();
+    URL.revokeObjectURL(docxUrl);
+    return { textFileName, docxFileName };
+  });
+}
+
 function MonthWorkspace({
   agentId,
   isAdmin,
@@ -2425,34 +2491,10 @@ function MonthWorkspace({
       if (activeBatchId) {
         await approveBatch({ data: { agentId, batchId: activeBatchId } });
       }
-      const baseName = folder.month.replace(/\s+/g, "-");
-      const textFileName = `${baseName}-content.txt`;
-      const text = batchPosts
-        .map((p) => {
-          const heading = (p.title || p.content_type).toUpperCase();
-          const canva = p.metadata?.canva_link ? `\nCanva template: ${p.metadata.canva_link}` : "";
-          return `${heading}\n${p.content}${canva}`;
-        })
-        .join("\n\n---\n\n");
-      const textBlob = new Blob([text], { type: "text/plain" });
-      const textUrl = URL.createObjectURL(textBlob);
-      const textLink = document.createElement("a");
-      textLink.href = textUrl;
-      textLink.download = textFileName;
-      textLink.click();
-      URL.revokeObjectURL(textUrl);
-
-      const docxFileName = `${baseName}-content.docx`;
-      const docxBlob = await buildContentDocxBlob(batchPosts, folder.month);
-      const docxUrl = URL.createObjectURL(docxBlob);
-      const docxLink = document.createElement("a");
-      docxLink.href = docxUrl;
-      docxLink.download = docxFileName;
-      docxLink.click();
-      URL.revokeObjectURL(docxUrl);
-
+      const files = await downloadContentExport(batchPosts, folder.month);
       setApproveNote(
-        `Approved ${batchPosts.length} piece${batchPosts.length === 1 ? "" : "s"} of content and downloaded ${textFileName} and ${docxFileName}.`,
+        `Approved ${batchPosts.length} piece${batchPosts.length === 1 ? "" : "s"} of content` +
+          (files ? ` and downloaded ${files.textFileName} and ${files.docxFileName}.` : "."),
       );
       loadPosts();
     } catch (e) {
@@ -2643,30 +2685,55 @@ function PhotoScanPanel({
   const [suggestions, setSuggestions] = useState<PhotoScanSuggestion[] | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [scanning, setScanning] = useState(false);
+  const [scanningMore, setScanningMore] = useState(false);
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [adding, setAdding] = useState(false);
+  // Per-suggestion caption overrides from the inline Edit control below —
+  // keyed by fileId, only set once the user actually edits one. Added
+  // 2026-09-18 per Mike: "need ability to add edits to these types of posts
+  // too... Use the same UI as others." A suggestion isn't a real post yet
+  // (no id in generated_posts until it's added to the batch), so there's
+  // nothing to save an edit *to* until then — this just holds the edited
+  // text client-side and addSelected() uses it instead of the original
+  // suggestedPost when present.
+  const [edits, setEdits] = useState<Record<string, string>>({});
+  const [editingId, setEditingId] = useState<string | null>(null);
 
   function switchSource(next: "drive" | "library") {
     setSource(next);
     setSuggestions(null);
     setSelected(new Set());
+    setEdits({});
+    setEditingId(null);
     setError(null);
   }
 
-  async function scan() {
-    setScanning(true);
+  async function scan(more = false) {
+    if (more) setScanningMore(true);
+    else setScanning(true);
     setError(null);
     try {
+      // On "scan more," exclude every fileId already shown so far (not just
+      // the current list — skipped/removed ones stay excluded too) so the
+      // next batch is genuinely new photos, not a repeat of the same 5.
+      const excludeFileIds = more ? (suggestions ?? []).map((s) => s.fileId) : [];
       const res =
         source === "drive"
-          ? await scanAgentDrivePhotos({ data: { agentId, folderId: folderId as string, maxPhotos: 5 } })
-          : await scanAgentLibraryPhotos({ data: { agentId, maxPhotos: 5 } });
-      setSuggestions(res.suggestions);
-      setSelected(new Set(res.suggestions.map((s) => s.fileId)));
+          ? await scanAgentDrivePhotos({
+              data: { agentId, folderId: folderId as string, maxPhotos: 5, excludeFileIds },
+            })
+          : await scanAgentLibraryPhotos({ data: { agentId, maxPhotos: 5, excludeFileIds } });
+      setSuggestions((cur) => (more && cur ? [...cur, ...res.suggestions] : res.suggestions));
+      setSelected((cur) => {
+        const next = more ? new Set(cur) : new Set<string>();
+        res.suggestions.forEach((s) => next.add(s.fileId));
+        return next;
+      });
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
       setScanning(false);
+      setScanningMore(false);
     }
   }
 
@@ -2679,13 +2746,33 @@ function PhotoScanPanel({
     });
   }
 
+  // "Flag / skip" on a suggestion — matches the same button Mike asked to
+  // reuse from PostCard, but there's no real post row yet to attach
+  // feedback_history to, so this just drops it from the list instead of
+  // pretending to record feedback somewhere. If they want it gone, gone is
+  // the honest behavior.
+  function skip(id: string) {
+    setSuggestions((cur) => (cur ? cur.filter((s) => s.fileId !== id) : cur));
+    setSelected((cur) => {
+      const next = new Set(cur);
+      next.delete(id);
+      return next;
+    });
+    setEdits((cur) => {
+      if (!(id in cur)) return cur;
+      const { [id]: _drop, ...rest } = cur;
+      return rest;
+    });
+    if (editingId === id) setEditingId(null);
+  }
+
   async function addSelected() {
     if (!suggestions) return;
     const items = suggestions
       .filter((s) => selected.has(s.fileId))
       .map((s) => ({
         title: s.description,
-        content: s.suggestedPost,
+        content: edits[s.fileId] ?? s.suggestedPost,
         source: s.source,
         sourceId: s.fileId,
         thumbnailUrl: s.thumbnailUrl,
@@ -2697,6 +2784,8 @@ function PhotoScanPanel({
       await addPhotoPostsToBatch({ data: { agentId, month, batchId: batchId ?? undefined, items } });
       setSuggestions(null);
       setSelected(new Set());
+      setEdits({});
+      setEditingId(null);
       onClose();
       onAdded();
     } catch (e) {
@@ -2761,7 +2850,7 @@ function PhotoScanPanel({
 
       {!suggestions && (
         <div className="mt-3">
-          <Button onClick={scan} disabled={scanning}>
+          <Button onClick={() => scan(false)} disabled={scanning}>
             {scanning ? "Scanning…" : "Scan photos"}
           </Button>
         </div>
@@ -2778,23 +2867,50 @@ function PhotoScanPanel({
       {suggestions && suggestions.length > 0 && (
         <div className="mt-3 space-y-3">
           {suggestions.map((s) => (
-            <label key={s.fileId} className="flex gap-3 rounded-2xl border border-border bg-glass p-3 text-sm">
+            <div key={s.fileId} className="flex gap-3 rounded-2xl border border-border bg-glass p-3 text-sm">
               <input
                 type="checkbox"
                 checked={selected.has(s.fileId)}
                 onChange={() => toggle(s.fileId)}
-                className="mt-1"
+                className="mt-1 shrink-0"
               />
               <img src={s.thumbnailUrl} alt={s.description} className="h-16 w-16 shrink-0 rounded-xl object-cover" />
-              <div>
+              <div className="min-w-0 flex-1">
                 <p className="text-xs text-muted-foreground">{s.description}</p>
-                <p className="mt-1 whitespace-pre-wrap">{s.suggestedPost}</p>
+                {editingId === s.fileId ? (
+                  <textarea
+                    value={edits[s.fileId] ?? s.suggestedPost}
+                    onChange={(e) => setEdits((cur) => ({ ...cur, [s.fileId]: e.target.value }))}
+                    className="mt-1 min-h-[90px] w-full rounded-xl bg-muted px-3 py-2 text-sm leading-relaxed outline-none ring-ring transition focus:ring-2"
+                  />
+                ) : (
+                  <p className="mt-1 whitespace-pre-wrap">{edits[s.fileId] ?? s.suggestedPost}</p>
+                )}
+                <div className="mt-2 flex flex-wrap gap-2">
+                  {editingId === s.fileId ? (
+                    <Button variant="secondary" onClick={() => setEditingId(null)}>
+                      Done editing
+                    </Button>
+                  ) : (
+                    <Button variant="secondary" onClick={() => setEditingId(s.fileId)}>
+                      Edit
+                    </Button>
+                  )}
+                  <Button variant="danger" onClick={() => skip(s.fileId)}>
+                    Flag / skip
+                  </Button>
+                </div>
               </div>
-            </label>
+            </div>
           ))}
-          <Button onClick={addSelected} disabled={adding || selected.size === 0}>
-            {adding ? "Adding…" : `Add ${selected.size} selected`}
-          </Button>
+          <div className="flex flex-wrap gap-2">
+            <Button onClick={addSelected} disabled={adding || selected.size === 0}>
+              {adding ? "Adding…" : `Add ${selected.size} selected`}
+            </Button>
+            <Button variant="secondary" onClick={() => scan(true)} disabled={scanningMore}>
+              {scanningMore ? "Scanning…" : "Want to scan more? Click here"}
+            </Button>
+          </div>
         </div>
       )}
     </Card>

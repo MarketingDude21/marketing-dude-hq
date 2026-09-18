@@ -613,7 +613,19 @@ export const searchUnsplashPhotos = createServerFn({ method: "POST" })
   .handler(async ({ data, context }): Promise<{ results: UnsplashResult[] }> => {
     const email = (context.claims as { email?: string } | undefined)?.email;
     await requireAgentAccess(context.userId, email, data.agentId);
-    const key = process.env["UNSPLASH_ACCESS_KEY"];
+    // .trim() guards against a stray leading/trailing space or newline from
+    // copy-pasting the key into Lovable Cloud → Secrets — that alone is
+    // enough to make Unsplash reject it with "OAuth error: The access token
+    // is invalid" (2026-09-18: Mike hit exactly this error after adding a
+    // key). Confirmed against Unsplash's current API docs that `client_id`
+    // as a query param is the correct, supported auth method here (the
+    // alternative is an `Authorization: Client-ID <key>` header — same
+    // credential, same result), so that error means the value Unsplash
+    // received didn't match a real access key, not a request-shape bug.
+    // The most common causes: the Secret Key was pasted instead of the
+    // Access Key (an Unsplash app has both, only the Access Key works here),
+    // or whitespace around the value.
+    const key = process.env["UNSPLASH_ACCESS_KEY"]?.trim();
     if (!key) {
       throw new Error(
         "Stock photos aren't connected yet — add UNSPLASH_ACCESS_KEY in Lovable Cloud → Secrets (free at unsplash.com/developers).",
@@ -632,7 +644,14 @@ export const searchUnsplashPhotos = createServerFn({ method: "POST" })
       }[];
       errors?: string[];
     };
-    if (!res.ok) throw new Error(json.errors?.[0] ?? `Unsplash API error (${res.status})`);
+    if (!res.ok) {
+      const apiError = json.errors?.[0] ?? `Unsplash API error (${res.status})`;
+      throw new Error(
+        /access token is invalid/i.test(apiError)
+          ? `${apiError} — double check UNSPLASH_ACCESS_KEY in Lovable Cloud → Secrets is the app's "Access Key" (not the "Secret Key"), pasted with no extra spaces.`
+          : apiError,
+      );
+    }
     const results: UnsplashResult[] = (json.results ?? [])
       .filter((r) => r.urls?.small && r.urls?.regular)
       .slice(0, 8)
@@ -1065,6 +1084,34 @@ export type DriveFile = {
   viewUrl: string;
 };
 
+// This integration authenticates with a plain Drive API key, not real OAuth
+// (see the comment block above) — which means it can only ever see files
+// and folders that are shared "Anyone with the link" (or fully public).
+// A private folder ID saved to an agent's record looks fully "connected" on
+// our side (setAgentDriveFolder succeeds, drive_folder_id is set) but the
+// Drive API will just quietly act as if it doesn't exist, since the API key
+// has no viewer permission on it. Google returns 404 for this case (not
+// 403), which reads exactly like a typo'd folder ID, so this checks the
+// folder itself first and gives Mike/the agent something actionable instead
+// of a silent "no photos found." Added 2026-09-18 per Mike: "I attached a
+// google drive folder for this agent but although connected on the admin
+// end is not connected on the google drive end." A real per-agent OAuth
+// connection (each agent grants their own Drive access) would remove this
+// sharing requirement entirely, but is a separate, much bigger project —
+// this is the fix available within the current API-key architecture.
+async function verifyDriveFolderAccessible(folderId: string, apiKey: string): Promise<void> {
+  const metaUrl = `https://www.googleapis.com/drive/v3/files/${folderId}?fields=id,name,mimeType&key=${apiKey}`;
+  const res = await fetch(metaUrl);
+  if (res.ok) return;
+  if (res.status === 404) {
+    throw new Error(
+      "This Drive folder isn't visible yet — it needs to be shared as \"Anyone with the link can view\" in Google Drive (right-click the folder → Share → General access → Anyone with the link) before photos will show up here. This app only reads Drive with an API key, not a full sign-in, so a private folder looks connected on our side but the folder ID isn't enough on its own.",
+    );
+  }
+  const json = (await res.json().catch(() => ({}))) as { error?: { message?: string } };
+  throw new Error(json.error?.message ?? `Google Drive API error (${res.status}) while checking folder access.`);
+}
+
 export const listAgentDriveMedia = createServerFn({ method: "GET" })
   .middleware([requireSupabaseAuth])
   .validator((data: { agentId: string }) => data)
@@ -1085,6 +1132,7 @@ export const listAgentDriveMedia = createServerFn({ method: "GET" })
     if (!apiKey) {
       throw new Error("Google Drive isn't connected yet — add GOOGLE_API_KEY in Lovable Cloud → Secrets.");
     }
+    await verifyDriveFolderAccessible(folderId, apiKey);
 
     // Find the "used" subfolder first so its contents get excluded — same
     // rule the old app always applied.
@@ -1947,10 +1995,18 @@ async function captionPhotoInVoice(
   const safeMediaType = ["image/jpeg", "image/png", "image/gif", "image/webp"].includes(mediaType)
     ? mediaType
     : "image/jpeg";
+  // Leans deliberately playful/personality-driven rather than real-estate-y —
+  // per Mike's request (2026-09-18): "These should be more fun and playful
+  // real estate reminders and just personality driven content that makes
+  // them more human since we already have a good balance of real estate
+  // ones." The rest of the content plan already covers the real-estate side;
+  // this scan is specifically the "make them look like a human, not an
+  // agent" lever, so rule 4 below is intentionally stricter than a generic
+  // caption prompt would be.
   const prompt =
     `You are creating a social media post for a real estate agent named ${agentName ?? "the agent"} in ${agentCity ?? "their city"}.\n\n` +
     `VOICE DNA:\n${voiceDna ?? "Warm, authentic, conversational. Sounds like a real person, not a real estate agent."}\n\n` +
-    "Look at this photo and write a social media post that:\n1. Starts from what you actually see — the setting, the mood, the moment\n2. Sounds EXACTLY like this person based on their Voice DNA above\n3. Is 1-3 sentences max — short, human, texted-a-friend energy\n4. Does NOT mention real estate directly unless it is obviously a real estate moment\n5. Does NOT mention any specific location, city, neighborhood, or place name\n6. NO hyphens, NO corporate language, NO AI-tell phrases\n7. Standard capitalization — never write in all lowercase\n\n" +
+    "Look at this photo and write a social media post that:\n1. Starts from what you actually see — the setting, the mood, the moment\n2. Sounds EXACTLY like this person based on their Voice DNA above\n3. Is 1-3 sentences max — short, human, texted-a-friend energy\n4. Leans playful, funny, or personality-driven by default — treat this as a chance to make them look like a real person with a life, not an agent. Only mention real estate at all if the photo is unmistakably a real estate moment (a listing, a closing, a sign, a showing); otherwise skip it entirely\n5. Does NOT mention any specific location, city, neighborhood, or place name\n6. NO hyphens, NO corporate language, NO AI-tell phrases\n7. Standard capitalization — never write in all lowercase\n\n" +
     "Also describe what you see in the photo in one short sentence.\n\nOutput format:\nDESCRIPTION: [one sentence of what you see]\nPOST: [the social media caption]";
 
   const res = await fetch("https://api.anthropic.com/v1/messages", {
@@ -1996,6 +2052,7 @@ export const scanAgentDrivePhotos = createServerFn({ method: "POST" })
       throw new Error("Google Drive isn't connected yet — add GOOGLE_API_KEY in Lovable Cloud → Secrets.");
     if (!anthropicKey)
       throw new Error("Photo captioning isn't configured yet — add ANTHROPIC_API_KEY in Lovable Cloud → Secrets.");
+    await verifyDriveFolderAccessible(data.folderId, googleKey);
 
     const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
     const { data: agent } = await supabaseAdmin
@@ -2095,7 +2152,7 @@ export const scanAgentDrivePhotos = createServerFn({ method: "POST" })
 // each image, and run it through the same voice-captioning call.
 export const scanAgentLibraryPhotos = createServerFn({ method: "POST" })
   .middleware([requireSupabaseAuth])
-  .validator((data: { agentId: string; maxPhotos?: number }) => data)
+  .validator((data: { agentId: string; maxPhotos?: number; excludeFileIds?: string[] }) => data)
   .handler(async ({ data, context }): Promise<{ suggestions: PhotoScanSuggestion[]; totalPhotos: number }> => {
     const email = (context.claims as { email?: string } | undefined)?.email;
     await requireAgentAccess(context.userId, email, data.agentId);
@@ -2123,7 +2180,10 @@ export const scanAgentLibraryPhotos = createServerFn({ method: "POST" })
     if (error) throw error;
 
     const maxPhotos = data.maxPhotos ?? 5;
-    const toProcess = (photos ?? []).filter((p) => p.url && p.media_type !== "video").slice(0, maxPhotos);
+    const excludeIds = new Set(data.excludeFileIds ?? []);
+    const toProcess = (photos ?? [])
+      .filter((p) => p.url && p.media_type !== "video" && !excludeIds.has(p.id))
+      .slice(0, maxPhotos);
 
     const results = await Promise.all(
       toProcess.map(async (p): Promise<PhotoScanSuggestion | null> => {

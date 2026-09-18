@@ -109,6 +109,7 @@ async function requireAdmin(userId: string, email: string | undefined): Promise<
 export type PostMetadata = {
   batch_id?: string | undefined;
   canva_link?: string | undefined;
+  canva_instructions?: string | null | undefined;
   goal?: string | undefined;
   image_suggestion?: string | undefined;
   source?: string | undefined;
@@ -218,25 +219,50 @@ function classifyMediaCategory(tags: string[], mediaType: string): string {
   return "neutral";
 }
 
-// Auto-suggests a photo/video per post from the agent's native Media library
-// (the "available" pool) — one request per post, each carrying that post's
-// own image direction/title/copy so the match is per-post, not one pick
-// reused for the whole batch. This is the native replacement for the old
-// app's Drive-tag matchPhoto(): now that the Media tab has a tagging UI
-// (2026-09-17, added per Mike's request), suggestion is tag-and-category
-// matched the same way matchPhoto() worked — same post/photo category
-// buckets, same "don't put a family photo on a business post" rule — with
-// FIFO (oldest available first) as the tiebreak within a category. Anything
-// still untagged classifies as "neutral", which is never the worst option in
-// any bucket, so an agent with no tags set yet gets essentially the same
-// FIFO behavior as before — tagging makes suggestions smarter, it isn't
-// required for this to keep working. The "Change photo" picker on each post
-// still lets the team override the suggestion, logged to feedback_history as
-// a learning signal, same as always.
+// A suggestion can come from either photo source this app has — the native
+// Media Library (which we can mark "used" automatically once approved) or
+// the agent's connected Google Drive folder (read-only — see the note on
+// verifyDriveFolderAccessible above about why this integration can't write
+// back to Drive). The two need different fields written onto the post
+// (media_id/media_url vs. drive_file_id/drive_thumbnail_url), so callers
+// switch on `source` rather than assuming one shape.
+type SuggestedMediaPick =
+  | { source: "media"; id: string; url: string; mediaType: string }
+  | { source: "drive"; driveFileId: string; driveThumbnailUrl: string; mediaType: string };
+
+// Auto-suggests a photo/video per post from BOTH of the agent's photo
+// sources — the native Media library (the "available" pool) and, as of
+// 2026-09-18, their connected Google Drive folder too — one request per
+// post, each carrying that post's own image direction/title/copy so the
+// match is per-post, not one pick reused for the whole batch.
+//
+// Drive was added per Mike's report the same day that "a lot of photos
+// weren't automatically populating" when he ran the content calendar: this
+// function previously only ever looked at agent_photos, so any agent whose
+// available photos mostly still live in Drive (the common case for
+// longer-running clients — native upload is the newer path) came up with
+// nothing to suggest for most or all of a batch. Pulling in the same live
+// Drive listing the Google Drive tab already uses fixes that directly.
+//
+// This is the native replacement for the old app's Drive-tag matchPhoto():
+// now that the Media tab has a tagging UI (2026-09-17), a Media Library item
+// is matched by its tag's category the same way matchPhoto() worked — same
+// post/photo category buckets, same "don't put a family photo on a business
+// post" rule. A Drive file carries no tag data at all, so it's scored as
+// "neutral" (the same safe default an untagged Media Library item gets) —
+// this is a real, honest limitation, not a bug: matching a Drive photo by
+// what it actually shows (the way Photo Scan's AI captioning reads a photo)
+// would mean a vision call per candidate photo on every single generation,
+// which is a real latency/cost tradeoff worth deciding on deliberately
+// rather than building silently — flagged back to Mike rather than assumed.
+// FIFO (oldest-first for Media Library; Drive's own listing order otherwise)
+// is the tiebreak within a category, same as before. The "Change photo"
+// picker on each post still lets the team override the suggestion, logged to
+// feedback_history as a learning signal, same as always.
 async function assignSuggestedMedia(
   agentId: string,
   requests: { direction?: string | null; title?: string | null; copy?: string | null }[],
-): Promise<({ id: string; url: string; mediaType: string } | null)[]> {
+): Promise<(SuggestedMediaPick | null)[]> {
   if (!requests.length) return [];
   const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
   const { data, error } = await supabaseAdmin
@@ -247,8 +273,50 @@ async function assignSuggestedMedia(
     .order("created_at", { ascending: true })
     .limit(50);
   if (error) throw error;
-  const pool = (data ?? []).filter((m) => Boolean(m.url));
-  if (!pool.length) return requests.map(() => null);
+
+  type Candidate = { key: string; category: string; pick: SuggestedMediaPick };
+
+  const candidates: Candidate[] = (data ?? [])
+    .filter((m) => Boolean(m.url))
+    .map((m) => ({
+      key: `media:${m.id}`,
+      category: classifyMediaCategory(m.tags ?? [], m.media_type),
+      pick: { source: "media", id: m.id, url: m.url as string, mediaType: m.media_type },
+    }));
+
+  // Best-effort: any failure here (no GOOGLE_API_KEY, no folder set, a
+  // private/unshared folder, a transient Drive API error) just means Drive
+  // contributes zero candidates for this run — it never blocks or fails the
+  // batch. A generation should always deliver its best guess with whatever
+  // photo source actually works, not error out over an optional one.
+  try {
+    const { data: agent } = await supabaseAdmin
+      .from("agents")
+      .select("drive_folder_id")
+      .eq("id", agentId)
+      .maybeSingle();
+    const folderId = agent?.drive_folder_id ?? null;
+    const apiKey = process.env["GOOGLE_API_KEY"];
+    if (folderId && apiKey) {
+      const files = await fetchDriveMediaFiles(folderId, apiKey);
+      for (const f of files) {
+        candidates.push({
+          key: `drive:${f.id}`,
+          category: f.isVideo ? "video" : "neutral",
+          pick: {
+            source: "drive",
+            driveFileId: f.id,
+            driveThumbnailUrl: f.thumbnailUrl,
+            mediaType: f.isVideo ? "video" : "image",
+          },
+        });
+      }
+    }
+  } catch {
+    // Drive is an optional extra source here — see comment above.
+  }
+
+  if (!candidates.length) return requests.map(() => null);
 
   const assignedThisBatch = new Set<string>();
 
@@ -262,23 +330,28 @@ async function assignSuggestedMedia(
     // if that empties the pool (more posts than available media), reset and
     // allow repeats rather than leaving a post with nothing — same fallback
     // the old app used once it ran out of unused photos.
-    let candidates = pool.filter((m) => !assignedThisBatch.has(m.id));
-    if (!candidates.length) candidates = pool;
+    let pool = candidates.filter((c) => !assignedThisBatch.has(c.key));
+    if (!pool.length) pool = candidates;
 
-    const scored = candidates
-      .map((m) => {
-        const category = classifyMediaCategory(m.tags ?? [], m.media_type);
-        let score = preferredTypes.indexOf(category);
+    const scored = pool
+      .map((c) => {
+        let score = preferredTypes.indexOf(c.category);
         if (score === -1) score = preferredTypes.length;
-        if (preferVideo && category === "video") score -= 0.5;
-        return { m, score };
+        if (preferVideo && c.category === "video") score -= 0.5;
+        // Tiny tiebreak toward a Media Library pick over a Drive pick when
+        // everything else scores equal — a Media Library item is the one
+        // this app can actually mark "used" automatically once the post is
+        // approved (see approveBatch/approveAllPending); a Drive pick can't
+        // be, since this integration only ever has read access to Drive.
+        if (c.pick.source === "drive") score += 0.1;
+        return { c, score };
       })
       .sort((a, b) => a.score - b.score);
 
-    const pick = scored[0]?.m ?? null;
-    if (!pick) return null;
-    assignedThisBatch.add(pick.id);
-    return { id: pick.id, url: pick.url as string, mediaType: pick.media_type };
+    const winner = scored[0]?.c ?? null;
+    if (!winner) return null;
+    assignedThisBatch.add(winner.key);
+    return winner.pick;
   });
 }
 
@@ -306,7 +379,26 @@ export const listMarketingPosts = createServerFn({ method: "GET" })
       .from("generated_posts")
       .select("id, content, content_type, title, platform, status, month, scheduled_for, created_at, metadata")
       .eq("agent_id", data.agentId)
-      .order("created_at", { ascending: true });
+      // Secondary tiebreak on `id` — REAL BUG FIX (2026-09-18). Every post in
+      // one calendar batch is written in a single bulk insert, so posts from
+      // the same batch (e.g. two emails) can end up with the exact same
+      // `created_at` timestamp. `ORDER BY created_at` alone leaves ties in an
+      // UNDEFINED order in Postgres — in practice it's whatever the rows'
+      // current physical position happens to be, which an UPDATE can change
+      // (Postgres writes an updated row as a new row version). That's exactly
+      // what was happening here: picking a photo for one email calls
+      // setPostUnsplashPhoto/setPostMedia, which UPDATEs that one row, then
+      // the picker's onChanged() re-fetches this exact list — and a tied pair
+      // could come back in a different order than before, so the photo you
+      // just watched attach to "the email in slot 2" visually reappears on
+      // whatever email now occupies slot 2. This is Mike's report (2026-09-18):
+      // "when I select a photo to use it's placed in the other email and not
+      // the one I selected it for" — the save was always going to the right
+      // row, only the on-screen ordering was unstable. Adding `id` as a
+      // secondary sort gives every fetch of this list one single, repeatable
+      // order regardless of ties or intervening updates.
+      .order("created_at", { ascending: true })
+      .order("id", { ascending: true });
     if (data.month) query = query.eq("month", data.month);
     const { data: posts, error } = await query;
     if (error) throw error;
@@ -635,7 +727,19 @@ export const searchUnsplashPhotos = createServerFn({ method: "POST" })
     const url =
       "https://api.unsplash.com/search/photos?per_page=8&query=" + encodeURIComponent(query) + "&client_id=" + key;
     const res = await fetch(url);
-    const json = (await res.json()) as {
+    // Read as text first, then parse — added 2026-09-18 after Mike reported
+    // stock photos "still not pulling" with no error text to go on. A plain
+    // `res.json()` here throws an opaque "Unexpected token..." parse error
+    // whenever Unsplash's response body isn't JSON, which happens on at
+    // least one real, common case this app hadn't accounted for: a brand
+    // new Unsplash app starts in "Demo" mode, capped at 50 requests/hour,
+    // and once that's exceeded the response isn't always the clean JSON
+    // error body the code below expects. Reading as text first means a
+    // non-JSON response now surfaces a clear, specific message instead of a
+    // cryptic parser crash — and the rate-limit case gets its own explicit
+    // explanation rather than falling through to a generic one.
+    const bodyText = await res.text();
+    let json: {
       results?: {
         id: string;
         urls?: { small?: string; regular?: string };
@@ -644,12 +748,26 @@ export const searchUnsplashPhotos = createServerFn({ method: "POST" })
       }[];
       errors?: string[];
     };
+    try {
+      json = JSON.parse(bodyText);
+    } catch {
+      if (res.status === 403 || res.status === 429) {
+        throw new Error(
+          `Unsplash blocked this request (status ${res.status}) — likely the app's Demo-mode limit of 50 requests/hour. If stock photos have been used a lot this hour, wait a bit, or apply for production access at unsplash.com/oauth/applications to raise that limit.`,
+        );
+      }
+      throw new Error(
+        `Unsplash returned an unexpected (non-JSON) response, status ${res.status}. First part of the response: ${bodyText.slice(0, 200)}`,
+      );
+    }
     if (!res.ok) {
       const apiError = json.errors?.[0] ?? `Unsplash API error (${res.status})`;
       throw new Error(
         /access token is invalid/i.test(apiError)
           ? `${apiError} — double check UNSPLASH_ACCESS_KEY in Lovable Cloud → Secrets is the app's "Access Key" (not the "Secret Key"), pasted with no extra spaces.`
-          : apiError,
+          : /rate limit/i.test(apiError)
+            ? `${apiError} — this Unsplash app is likely still in Demo mode (50 requests/hour cap). Apply for production access at unsplash.com/oauth/applications to raise that limit.`
+            : apiError,
       );
     }
     const results: UnsplashResult[] = (json.results ?? [])
@@ -1112,6 +1230,53 @@ async function verifyDriveFolderAccessible(folderId: string, apiKey: string): Pr
   throw new Error(json.error?.message ?? `Google Drive API error (${res.status}) while checking folder access.`);
 }
 
+// Lists the images/videos actually in a Drive folder, excluding whatever's
+// already in its "used" subfolder — pulled out of listAgentDriveMedia below
+// so assignSuggestedMedia() can call the exact same live Drive listing when
+// auto-suggesting a photo for a calendar-generated post, not just when an
+// agent opens the Google Drive tab. Caller is responsible for having already
+// confirmed the folder is accessible (verifyDriveFolderAccessible) if it
+// wants a clear error on a private/unshared folder — this function itself
+// just throws whatever the Drive API returns.
+async function fetchDriveMediaFiles(folderId: string, apiKey: string): Promise<DriveFile[]> {
+  const subfolderUrl =
+    "https://www.googleapis.com/drive/v3/files?" +
+    "q=" +
+    encodeURIComponent(
+      `name='used' and '${folderId}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false`,
+    ) +
+    "&fields=files(id,name)&key=" +
+    apiKey;
+  const subfolderRes = await fetch(subfolderUrl);
+  const subfolderData = (await subfolderRes.json()) as { files?: { id: string }[] };
+  const usedFolderId = subfolderData.files?.[0]?.id ?? null;
+
+  const q = `'${folderId}' in parents and (mimeType contains 'image/' or mimeType contains 'video/') and trashed=false`;
+  const url =
+    "https://www.googleapis.com/drive/v3/files?" +
+    "q=" +
+    encodeURIComponent(q) +
+    "&fields=files(id,name,mimeType,parents)&pageSize=200&key=" +
+    apiKey;
+  const res = await fetch(url);
+  const json = (await res.json()) as {
+    files?: { id: string; name: string; mimeType: string; parents?: string[] }[];
+    error?: { message?: string };
+  };
+  if (!res.ok) throw new Error(json.error?.message ?? `Google Drive API error (${res.status})`);
+
+  return (json.files ?? [])
+    .filter((f) => !usedFolderId || !(f.parents ?? []).includes(usedFolderId))
+    .map((f) => ({
+      id: f.id,
+      name: f.name,
+      mimeType: f.mimeType,
+      isVideo: f.mimeType.startsWith("video/"),
+      thumbnailUrl: `https://drive.google.com/thumbnail?id=${f.id}&sz=w400`,
+      viewUrl: `https://drive.google.com/file/d/${f.id}/view`,
+    }));
+}
+
 export const listAgentDriveMedia = createServerFn({ method: "GET" })
   .middleware([requireSupabaseAuth])
   .validator((data: { agentId: string }) => data)
@@ -1133,46 +1298,7 @@ export const listAgentDriveMedia = createServerFn({ method: "GET" })
       throw new Error("Google Drive isn't connected yet — add GOOGLE_API_KEY in Lovable Cloud → Secrets.");
     }
     await verifyDriveFolderAccessible(folderId, apiKey);
-
-    // Find the "used" subfolder first so its contents get excluded — same
-    // rule the old app always applied.
-    const subfolderUrl =
-      "https://www.googleapis.com/drive/v3/files?" +
-      "q=" +
-      encodeURIComponent(
-        `name='used' and '${folderId}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false`,
-      ) +
-      "&fields=files(id,name)&key=" +
-      apiKey;
-    const subfolderRes = await fetch(subfolderUrl);
-    const subfolderData = (await subfolderRes.json()) as { files?: { id: string }[] };
-    const usedFolderId = subfolderData.files?.[0]?.id ?? null;
-
-    const q = `'${folderId}' in parents and (mimeType contains 'image/' or mimeType contains 'video/') and trashed=false`;
-    const url =
-      "https://www.googleapis.com/drive/v3/files?" +
-      "q=" +
-      encodeURIComponent(q) +
-      "&fields=files(id,name,mimeType,parents)&pageSize=200&key=" +
-      apiKey;
-    const res = await fetch(url);
-    const json = (await res.json()) as {
-      files?: { id: string; name: string; mimeType: string; parents?: string[] }[];
-      error?: { message?: string };
-    };
-    if (!res.ok) throw new Error(json.error?.message ?? `Google Drive API error (${res.status})`);
-
-    const files: DriveFile[] = (json.files ?? [])
-      .filter((f) => !usedFolderId || !(f.parents ?? []).includes(usedFolderId))
-      .map((f) => ({
-        id: f.id,
-        name: f.name,
-        mimeType: f.mimeType,
-        isVideo: f.mimeType.startsWith("video/"),
-        thumbnailUrl: `https://drive.google.com/thumbnail?id=${f.id}&sz=w400`,
-        viewUrl: `https://drive.google.com/file/d/${f.id}/view`,
-      }));
-
+    const files = await fetchDriveMediaFiles(folderId, apiKey);
     return { folderId, files };
   });
 
@@ -1374,9 +1500,11 @@ export const generateMarketingContent = createServerFn({ method: "POST" })
           hook: data.hook ?? null,
           use_hashtags: data.useHashtags ?? null,
           source: "native_generate",
-          media_id: suggestedMedia?.id ?? null,
-          media_url: suggestedMedia?.url ?? null,
+          media_id: suggestedMedia?.source === "media" ? suggestedMedia.id : null,
+          media_url: suggestedMedia?.source === "media" ? suggestedMedia.url : null,
           media_type: suggestedMedia?.mediaType ?? null,
+          drive_file_id: suggestedMedia?.source === "drive" ? suggestedMedia.driveFileId : null,
+          drive_thumbnail_url: suggestedMedia?.source === "drive" ? suggestedMedia.driveThumbnailUrl : null,
         },
       })
       .select("id")
@@ -1564,7 +1692,15 @@ export const removeCalendarItem = createServerFn({ method: "POST" })
 // natively-authored text instead of a Drive Doc export ─────────────────────
 
 export type CalendarDoc =
-  | { type: "post"; title: string; goal: string; image: string; canva: string; copy: string }
+  | {
+      type: "post";
+      title: string;
+      goal: string;
+      image: string;
+      canva: string;
+      canvaDirection: string;
+      copy: string;
+    }
   | { type: "email"; title: string; goal: string; subjects: string[]; instructions: string }
   | { type: "video"; title: string; goal: string; hook: string; script: string };
 
@@ -1641,7 +1777,21 @@ function parsePostDoc(text: string, title: string): CalendarDoc | null {
       .replace(/\*\*/g, "")
       .trim();
 
-  return { type: "post", title, goal, image, canva, copy };
+  // The "Canva Template Direction" section itself was previously only ever
+  // used as a boundary marker (to know where "Post Goal"/"Post Image..."
+  // end) — its actual content (what to put in the template: which photo,
+  // which headline, layout notes) was never captured anywhere, so a
+  // Canva-templated post never had any instructions shown under it, unlike
+  // a regular post's "Post Image/Video Suggestions" section. Fixed per
+  // Mike's report (2026-09-18): "the Canva images need the instructions
+  // posted beneath it, just like they are in the posts."
+  const canvaDirection = extractSection(text, "Canva Template Direction", ["Post Copy"])
+    .split("\n")
+    .filter((l) => !/Template Link:/i.test(l))
+    .join("\n")
+    .trim();
+
+  return { type: "post", title, goal, image, canva, canvaDirection, copy };
 }
 
 function parseEmailDoc(text: string, title: string): CalendarDoc | null {
@@ -1866,12 +2016,15 @@ export const generateMonthlyBatch = createServerFn({ method: "POST" })
               batch_id: batchId,
               month: data.month,
               canva_link: doc.canva || null,
+              canva_instructions: doc.canvaDirection || null,
               goal: doc.goal,
               image_suggestion: doc.image || null,
               source: "content_calendar",
-              media_id: pick?.id ?? null,
-              media_url: pick?.url ?? null,
+              media_id: pick?.source === "media" ? pick.id : null,
+              media_url: pick?.source === "media" ? pick.url : null,
               media_type: pick?.mediaType ?? null,
+              drive_file_id: pick?.source === "drive" ? pick.driveFileId : null,
+              drive_thumbnail_url: pick?.source === "drive" ? pick.driveThumbnailUrl : null,
             },
           });
         }

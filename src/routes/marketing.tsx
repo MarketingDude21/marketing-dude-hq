@@ -24,13 +24,16 @@ import {
   setAgentDriveFolder,
   generateMarketingContent,
   listCalendarMonths,
+  listAllCalendarMonthsForAdmin,
   addCalendarMonth,
   removeCalendarMonth,
+  setCalendarMonthArchived,
   listCalendarItems,
   addCalendarItem,
   removeCalendarItem,
   readContentCalendar,
   generateMonthlyBatch,
+  deleteMonthContent,
   scanAgentDrivePhotos,
   scanAgentLibraryPhotos,
   addPhotoPostsToBatch,
@@ -1753,6 +1756,14 @@ function DriveTab({ agentId, isAdmin }: { agentId: string; isAdmin: boolean }) {
   const [error, setError] = useState<string | null>(null);
   const [folderInput, setFolderInput] = useState("");
   const [saving, setSaving] = useState(false);
+  // Added 2026-09-18 per Mike's report that a folder "still does not appear
+  // for the agent" after he believed he'd already connected one — there was
+  // no confirmation at all when Save actually succeeded, so there was no way
+  // to tell "it didn't save" from "it saved, but for a different agent than
+  // I meant to." This makes success (and exactly which agent it applied to)
+  // unmissable, the same instinct as the Approve-All confirmation text.
+  const [saveNote, setSaveNote] = useState<string | null>(null);
+  const [removing, setRemoving] = useState(false);
 
   function reload() {
     setData(null);
@@ -1764,20 +1775,42 @@ function DriveTab({ agentId, isAdmin }: { agentId: string; isAdmin: boolean }) {
 
   useEffect(() => {
     reload();
+    setSaveNote(null);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [agentId]);
 
   async function saveFolder() {
     setSaving(true);
     setError(null);
+    setSaveNote(null);
     try {
       await setAgentDriveFolder({ data: { agentId, driveFolderId: folderInput } });
+      setSaveNote(`Saved — this agent's Drive folder is now ${folderInput.trim()}.`);
       setFolderInput("");
       reload();
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
       setSaving(false);
+    }
+  }
+
+  // "we need a way to remove [a connected folder]" (2026-09-18) — Save was
+  // previously the only control here and it's disabled on an empty input,
+  // so there was actually no way to clear a folder ID from this screen at
+  // all before this. Clears agents.drive_folder_id back to null.
+  async function removeFolder() {
+    setRemoving(true);
+    setError(null);
+    setSaveNote(null);
+    try {
+      await setAgentDriveFolder({ data: { agentId, driveFolderId: "" } });
+      setSaveNote("Removed — this agent's Drive connection is cleared.");
+      reload();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setRemoving(false);
     }
   }
 
@@ -1791,17 +1824,25 @@ function DriveTab({ agentId, isAdmin }: { agentId: string; isAdmin: boolean }) {
           uploading and marking things used still happens exactly as it does today, over there, untouched.
         </p>
         {isAdmin && (
-          <div className="mt-3 flex flex-wrap items-center gap-2">
-            <input
-              value={folderInput}
-              onChange={(e) => setFolderInput(e.target.value)}
-              placeholder={data?.folderId ? `Currently: ${data.folderId}` : "Paste this agent's Drive folder ID"}
-              className="min-w-[220px] flex-1 rounded-xl border border-border bg-glass px-3 py-1.5 text-sm outline-none"
-            />
-            <Button onClick={saveFolder} disabled={saving || !folderInput.trim()}>
-              Save folder ID
-            </Button>
-          </div>
+          <>
+            <div className="mt-3 flex flex-wrap items-center gap-2">
+              <input
+                value={folderInput}
+                onChange={(e) => setFolderInput(e.target.value)}
+                placeholder={data?.folderId ? `Currently: ${data.folderId}` : "Paste this agent's Drive folder ID"}
+                className="min-w-[220px] flex-1 rounded-xl border border-border bg-glass px-3 py-1.5 text-sm outline-none"
+              />
+              <Button onClick={saveFolder} disabled={saving || !folderInput.trim()}>
+                {saving ? "Saving…" : "Save folder ID"}
+              </Button>
+              {data?.folderId && (
+                <Button variant="danger" onClick={removeFolder} disabled={removing}>
+                  {removing ? "Removing…" : "Remove connection"}
+                </Button>
+              )}
+            </div>
+            {saveNote && <p className="mt-2 text-xs text-muted-foreground">{saveNote}</p>}
+          </>
         )}
       </Card>
 
@@ -1885,18 +1926,46 @@ function ManageCalendarScreen({ onBack }: { onBack: () => void }) {
   const [addError, setAddError] = useState<string | null>(null);
   const [busyMonthId, setBusyMonthId] = useState<string | null>(null);
   const [activeMonth, setActiveMonth] = useState<CalendarMonth | null>(null);
+  // Added 2026-09-18 per Mike: "We also need an Archive so we can archive
+  // that content and we dont have a long list of stuff to do." Off by
+  // default (the plain, non-archived listCalendarMonths — same one every
+  // agent's month picker uses); flipping it switches to the admin-only
+  // listAllCalendarMonthsForAdmin so a past month can still be found again
+  // to unarchive it.
+  const [showArchived, setShowArchived] = useState(false);
 
   function reload() {
     setMonths(null);
     setError(null);
-    listCalendarMonths()
+    (showArchived ? listAllCalendarMonthsForAdmin() : listCalendarMonths())
       .then((m) => setMonths(m))
       .catch((e) => setError(e instanceof Error ? e.message : String(e)));
   }
 
   useEffect(() => {
     reload();
-  }, []);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [showArchived]);
+
+  async function toggleArchived(m: CalendarMonth) {
+    setBusyMonthId(m.id);
+    setError(null);
+    try {
+      await setCalendarMonthArchived({ data: { monthId: m.id, archived: !m.archived } });
+      if (!showArchived) {
+        // Archiving one while looking at the non-archived list makes it
+        // disappear immediately; unarchiving can't happen from this list
+        // since an archived month was never shown here in the first place.
+        setMonths((prev) => (prev ?? []).filter((x) => x.id !== m.id));
+      } else {
+        setMonths((prev) => (prev ?? []).map((x) => (x.id === m.id ? { ...x, archived: !x.archived } : x)));
+      }
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusyMonthId(null);
+    }
+  }
 
   async function addMonth() {
     if (!newMonth.trim()) {
@@ -1948,9 +2017,17 @@ function ManageCalendarScreen({ onBack }: { onBack: () => void }) {
       </Card>
 
       <Card>
-        <div className="flex items-center justify-between">
-          <h4 className="font-display text-sm font-semibold">Months</h4>
-          {!addOpen && <Button onClick={() => setAddOpen(true)}>+ Add month</Button>}
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <h4 className="font-display text-sm font-semibold">
+            {showArchived ? "All months (including archived)" : "Months"}
+          </h4>
+          <div className="flex items-center gap-2">
+            <label className="flex items-center gap-2 text-xs text-muted-foreground">
+              <input type="checkbox" checked={showArchived} onChange={(e) => setShowArchived(e.target.checked)} />
+              Show archived
+            </label>
+            {!addOpen && <Button onClick={() => setAddOpen(true)}>+ Add month</Button>}
+          </div>
         </div>
 
         {addOpen && (
@@ -1987,14 +2064,28 @@ function ManageCalendarScreen({ onBack }: { onBack: () => void }) {
               >
                 <button onClick={() => setActiveMonth(m)} className="text-left text-sm font-semibold">
                   {m.month}
+                  {m.archived && (
+                    <span className="ml-2 rounded-full bg-muted px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">
+                      Archived
+                    </span>
+                  )}
                 </button>
-                <button
-                  onClick={() => removeMonth(m.id)}
-                  disabled={busyMonthId === m.id}
-                  className="shrink-0 text-[11px] font-semibold text-destructive hover:underline disabled:opacity-50"
-                >
-                  Remove
-                </button>
+                <div className="flex shrink-0 items-center gap-3">
+                  <button
+                    onClick={() => toggleArchived(m)}
+                    disabled={busyMonthId === m.id}
+                    className="text-[11px] font-semibold text-muted-foreground hover:text-foreground hover:underline disabled:opacity-50"
+                  >
+                    {m.archived ? "Unarchive" : "Archive"}
+                  </button>
+                  <button
+                    onClick={() => removeMonth(m.id)}
+                    disabled={busyMonthId === m.id}
+                    className="text-[11px] font-semibold text-destructive hover:underline disabled:opacity-50"
+                  >
+                    Remove
+                  </button>
+                </div>
               </div>
             ))}
           </div>
@@ -2407,6 +2498,41 @@ function MonthWorkspace({
   // suggestions are sourced today; see the panel below.
   const [agentDriveFolderId, setAgentDriveFolderId] = useState<string | null>(null);
   const [driveError, setDriveError] = useState<string | null>(null);
+  // Added 2026-09-18 per Mike: "Put a delete in case we want to re generate
+  // that months content." generateMonthlyBatch only ever inserts, so a
+  // second "Generate Now" click piles a second batch on top of the first —
+  // this clears this agent's generated content for this month so a fresh
+  // Generate Now actually starts clean. Admin-only (it deletes an agent's
+  // data, not just reviews it) and requires clicking twice — Delete arms a
+  // "Really delete?" confirm rather than firing immediately, since there's
+  // no undo.
+  const [deleting, setDeleting] = useState(false);
+  const [deleteArmed, setDeleteArmed] = useState(false);
+  const [deleteNote, setDeleteNote] = useState<string | null>(null);
+
+  async function deleteContent() {
+    if (!deleteArmed) {
+      setDeleteArmed(true);
+      return;
+    }
+    setDeleting(true);
+    setDeleteNote(null);
+    try {
+      const res = await deleteMonthContent({ data: { agentId, month: folder.month } });
+      setDeleteNote(
+        res.deleted > 0
+          ? `Deleted ${res.deleted} piece${res.deleted === 1 ? "" : "s"} of generated content for ${folder.month} — hit "Generate Now" above for a fresh batch.`
+          : "Nothing to delete — this month has no generated content for this agent yet.",
+      );
+      setLastBatchId(null);
+      loadPosts();
+    } catch (e) {
+      setDeleteNote(e instanceof Error ? e.message : String(e));
+    } finally {
+      setDeleting(false);
+      setDeleteArmed(false);
+    }
+  }
 
   function loadDocs() {
     setDocs(null);
@@ -2580,10 +2706,27 @@ function MonthWorkspace({
                 {sending ? "Sending…" : "Send to Agent"}
               </Button>
             )}
+            {isAdmin && batchPosts.length > 0 && (
+              <>
+                <Button variant="danger" onClick={deleteContent} disabled={deleting}>
+                  {deleting
+                    ? "Deleting…"
+                    : deleteArmed
+                      ? "Click again to confirm delete"
+                      : "Delete this month's content"}
+                </Button>
+                {deleteArmed && !deleting && (
+                  <Button variant="secondary" onClick={() => setDeleteArmed(false)}>
+                    Cancel
+                  </Button>
+                )}
+              </>
+            )}
           </div>
         </div>
         {approveNote && <p className="mt-2 text-xs text-muted-foreground">{approveNote}</p>}
         {sendNote && <p className="mt-2 text-xs text-muted-foreground">{sendNote}</p>}
+        {deleteNote && <p className="mt-2 text-xs text-muted-foreground">{deleteNote}</p>}
         {postsError && <p className="mt-2 text-xs text-destructive">{postsError}</p>}
         {posts !== null && batchPosts.length === 0 && (
           <p className="mt-3 text-sm text-muted-foreground">

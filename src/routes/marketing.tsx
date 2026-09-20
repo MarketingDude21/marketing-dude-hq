@@ -2345,6 +2345,18 @@ function ContentCalendarTab({ agentId, isAdmin }: { agentId: string; isAdmin: bo
   const [months, setMonths] = useState<CalendarMonth[] | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [activeMonth, setActiveMonth] = useState<CalendarMonth | null>(null);
+  // Added 2026-09-20 per Mike's follow-up screenshot: "On this screen for
+  // both admin and agent view there should be an archive button that can be
+  // clicked and that month can be archived." The archive/restore machinery
+  // itself (archiveMonthContent, requireAgentAccess-gated so it works for
+  // both admin-acting-as-agent and the agent's own login) already existed on
+  // MonthWorkspace's review screen — this just surfaces the same action one
+  // level up, right on the month card, so archiving doesn't require opening
+  // the month first. Archiving here only clears this agent's *generated
+  // content* for that month (same as the button inside the workspace); the
+  // month itself stays in this list, ready for a fresh "Generate Now."
+  const [archivingId, setArchivingId] = useState<string | null>(null);
+  const [archiveNote, setArchiveNote] = useState<string | null>(null);
 
   useEffect(() => {
     setMonths(null);
@@ -2354,6 +2366,23 @@ function ContentCalendarTab({ agentId, isAdmin }: { agentId: string; isAdmin: bo
       .then((m) => setMonths(m))
       .catch((e) => setError(e instanceof Error ? e.message : String(e)));
   }, [agentId]);
+
+  async function archiveFromList(m: CalendarMonth) {
+    setArchivingId(m.id);
+    setArchiveNote(null);
+    try {
+      const res = await archiveMonthContent({ data: { agentId, month: m.month } });
+      setArchiveNote(
+        res.archived > 0
+          ? `Archived ${res.archived} piece${res.archived === 1 ? "" : "s"} of content for ${m.month}. Nothing was deleted — open the month and check "Archived content" to restore it.`
+          : `Nothing to archive for ${m.month} — this agent has no generated content there yet.`,
+      );
+    } catch (e) {
+      setArchiveNote(e instanceof Error ? e.message : String(e));
+    } finally {
+      setArchivingId(null);
+    }
+  }
 
   if (activeMonth) {
     return (
@@ -2375,6 +2404,7 @@ function ContentCalendarTab({ agentId, isAdmin }: { agentId: string; isAdmin: bo
         <h4 className="font-display text-sm font-semibold">Months</h4>
 
         {error && <p className="mt-3 text-xs text-destructive">{error}</p>}
+        {archiveNote && <p className="mt-3 text-xs text-muted-foreground">{archiveNote}</p>}
         {months === null && !error && <p className="mt-3 text-sm text-muted-foreground">Loading…</p>}
         {months !== null && months.length === 0 && (
           <p className="mt-3 text-sm text-muted-foreground">No months set up yet — ask your team to add one.</p>
@@ -2382,13 +2412,25 @@ function ContentCalendarTab({ agentId, isAdmin }: { agentId: string; isAdmin: bo
         {months !== null && months.length > 0 && (
           <div className="mt-3 grid gap-2 sm:grid-cols-2 lg:grid-cols-3">
             {months.map((m) => (
-              <button
+              <div
                 key={m.id}
-                onClick={() => setActiveMonth(m)}
-                className="rounded-2xl border border-border bg-glass px-4 py-3 text-left text-sm font-semibold transition-colors hover:bg-secondary"
+                className="flex items-center justify-between gap-2 rounded-2xl border border-border bg-glass px-4 py-3 transition-colors hover:bg-secondary"
               >
-                {m.month}
-              </button>
+                <button
+                  onClick={() => setActiveMonth(m)}
+                  className="min-w-0 flex-1 truncate text-left text-sm font-semibold"
+                >
+                  {m.month}
+                </button>
+                <button
+                  onClick={() => archiveFromList(m)}
+                  disabled={archivingId === m.id}
+                  className="shrink-0 rounded-full border border-border px-2.5 py-1 text-[11px] font-semibold text-muted-foreground transition-colors hover:bg-background disabled:opacity-50"
+                  title={`Archive this agent's generated content for ${m.month}`}
+                >
+                  {archivingId === m.id ? "Archiving…" : "Archive"}
+                </button>
+              </div>
             ))}
           </div>
         )}

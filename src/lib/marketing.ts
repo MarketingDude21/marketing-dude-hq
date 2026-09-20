@@ -365,20 +365,29 @@ export type PostRow = {
   month: string | null;
   scheduled_for: string | null;
   created_at: string;
+  archived: boolean;
   metadata: PostMetadata | null;
 };
 
 export const listMarketingPosts = createServerFn({ method: "GET" })
   .middleware([requireSupabaseAuth])
-  .validator((data: { agentId: string; month?: string }) => data)
+  .validator((data: { agentId: string; month?: string; archivedOnly?: boolean }) => data)
   .handler(async ({ data, context }): Promise<PostRow[]> => {
     const email = (context.claims as { email?: string } | undefined)?.email;
     await requireAgentAccess(context.userId, email, data.agentId);
     const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
     let query = supabaseAdmin
       .from("generated_posts")
-      .select("id, content, content_type, title, platform, status, month, scheduled_for, created_at, metadata")
+      .select(
+        "id, content, content_type, title, platform, status, month, scheduled_for, created_at, archived, metadata",
+      )
       .eq("agent_id", data.agentId)
+      // Archived content (2026-09-20, see archiveMonthContent below) is
+      // hidden from the normal list by default — that's the whole point of
+      // archiving a month's test batch: get it out of the way so "Generate
+      // Now" can be run again cleanly. Pass archivedOnly to see just the
+      // archived history instead (used by the "view archived" list).
+      .eq("archived", Boolean(data.archivedOnly))
       // Secondary tiebreak on `id` — REAL BUG FIX (2026-09-18). Every post in
       // one calendar batch is written in a single bulk insert, so posts from
       // the same batch (e.g. two emails) can end up with the exact same
@@ -2155,6 +2164,18 @@ export const generateMonthlyBatch = createServerFn({ method: "POST" })
     return { ok: true, batchId, created: rows.length };
   });
 
+// The three metadata.source values that mean "this row belongs to a month's
+// generated batch" (a calendar generation, or a photo-scan suggestion added
+// to one) — as opposed to a one-off post made through "+ New content"
+// (source "native_generate"), which never belongs to any month's batch and
+// should never be touched by delete/archive/restore below. Shared by all
+// three so they stay in sync — this used to be redeclared inline just in
+// deleteMonthContent; pulled out when archiveMonthContent needed the exact
+// same set (2026-09-20). Mirrors BATCH_SOURCES in marketing.tsx (kept as a
+// separate constant there since the frontend needs it for display grouping,
+// not data mutation, but the values must always match).
+const BATCH_CONTENT_SOURCES = new Set(["content_calendar", "drive_photo_scan", "library_photo_scan"]);
+
 // Deletes a month's generated content for one agent so it can be
 // regenerated cleanly — added 2026-09-18 per Mike: "Put a delete in case we
 // want to re generate that months content." Without this, clicking
@@ -2163,11 +2184,12 @@ export const generateMonthlyBatch = createServerFn({ method: "POST" })
 // over" always needed this. Admin-only, same as the other actions that
 // change what an agent's data actually contains rather than just reviewing
 // it (approve/flag stay agent-doable; deleting a whole batch is a "done for
-// you" action). Scoped to exactly the sources this month's workspace shows
-// (batchPosts in MonthWorkspace) — content_calendar/drive_photo_scan/
-// library_photo_scan for this agent+month — so it never touches a
-// one-off post made through the Posts tab's "+ New content" form, which
-// isn't part of any month's batch.
+// you" action, and it's the one that's actually destructive — archiving,
+// added below, is the non-destructive alternative). Scoped to exactly the
+// sources this month's workspace shows (batchPosts in MonthWorkspace) —
+// content_calendar/drive_photo_scan/library_photo_scan for this agent+month
+// — so it never touches a one-off post made through the Posts tab's "+ New
+// content" form, which isn't part of any month's batch.
 export const deleteMonthContent = createServerFn({ method: "POST" })
   .middleware([requireSupabaseAuth])
   .validator((data: { agentId: string; month: string }) => data)
@@ -2181,14 +2203,123 @@ export const deleteMonthContent = createServerFn({ method: "POST" })
       .eq("agent_id", data.agentId)
       .eq("month", data.month);
     if (selErr) throw selErr;
-    const sourcesToDelete = new Set(["content_calendar", "drive_photo_scan", "library_photo_scan"]);
     const idsToDelete = (rows ?? [])
-      .filter((r) => sourcesToDelete.has((r.metadata as { source?: string } | null)?.source ?? ""))
+      .filter((r) => BATCH_CONTENT_SOURCES.has((r.metadata as { source?: string } | null)?.source ?? ""))
       .map((r) => r.id);
     if (!idsToDelete.length) return { ok: true, deleted: 0 };
     const { error: delErr } = await supabaseAdmin.from("generated_posts").delete().in("id", idsToDelete);
     if (delErr) throw delErr;
     return { ok: true, deleted: idsToDelete.length };
+  });
+
+// Archives a month's generated content for one agent — added 2026-09-20 per
+// Mike: "I'm trying to test and retest, but I can't retest without the
+// ability to archive the monthly content." deleteMonthContent above already
+// covers "clear it out to regenerate," but it's permanent and admin-only;
+// this is the safer, reversible version of the same need, and — per his
+// explicit "the admin and or the user needs the ability" — available to the
+// agent themselves too, not just admin (requireAgentAccess, same guard
+// approveAllPending/submitMarketingFeedback use, not requireAdmin).
+// Archiving just flips a flag: listMarketingPosts excludes archived rows by
+// default, so an archived batch disappears from the review screen and
+// "Generate Now" can be run again cleanly — but nothing is deleted, and
+// listArchivedBatchesForMonth/restoreArchivedBatch below can always bring a
+// past attempt back. Same BATCH_CONTENT_SOURCES scoping as delete, so a
+// one-off "+ New content" post is never swept up by accident.
+export const archiveMonthContent = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .validator((data: { agentId: string; month: string }) => data)
+  .handler(async ({ data, context }): Promise<{ ok: true; archived: number }> => {
+    const email = (context.claims as { email?: string } | undefined)?.email;
+    await requireAgentAccess(context.userId, email, data.agentId);
+    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+    const { data: rows, error: selErr } = await supabaseAdmin
+      .from("generated_posts")
+      .select("id, metadata")
+      .eq("agent_id", data.agentId)
+      .eq("month", data.month)
+      .eq("archived", false);
+    if (selErr) throw selErr;
+    const idsToArchive = (rows ?? [])
+      .filter((r) => BATCH_CONTENT_SOURCES.has((r.metadata as { source?: string } | null)?.source ?? ""))
+      .map((r) => r.id);
+    if (!idsToArchive.length) return { ok: true, archived: 0 };
+    const { error } = await supabaseAdmin
+      .from("generated_posts")
+      .update({ archived: true, updated_at: new Date().toISOString() })
+      .in("id", idsToArchive);
+    if (error) throw error;
+    return { ok: true, archived: idsToArchive.length };
+  });
+
+// Groups this agent+month's archived rows by batch_id so the UI can show a
+// short history ("14 pieces, generated Sep 18") with a Restore button per
+// past attempt, instead of one undifferentiated pile. A batch_id groups
+// everything one "Generate Now" click produced (see generateMonthlyBatch);
+// photo-scan additions carry their own batch_id from addPhotoPostsToBatch,
+// so those group separately too, which is correct — restoring one doesn't
+// have to restore the other.
+export type ArchivedBatchSummary = { batchId: string; count: number; generatedAt: string };
+
+export const listArchivedBatchesForMonth = createServerFn({ method: "GET" })
+  .middleware([requireSupabaseAuth])
+  .validator((data: { agentId: string; month: string }) => data)
+  .handler(async ({ data, context }): Promise<ArchivedBatchSummary[]> => {
+    const email = (context.claims as { email?: string } | undefined)?.email;
+    await requireAgentAccess(context.userId, email, data.agentId);
+    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+    const { data: rows, error } = await supabaseAdmin
+      .from("generated_posts")
+      .select("created_at, metadata")
+      .eq("agent_id", data.agentId)
+      .eq("month", data.month)
+      .eq("archived", true);
+    if (error) throw error;
+    const groups = new Map<string, { count: number; earliest: string }>();
+    for (const r of rows ?? []) {
+      const meta = r.metadata as { batch_id?: string; source?: string } | null;
+      if (!meta?.batch_id || !BATCH_CONTENT_SOURCES.has(meta.source ?? "")) continue;
+      const createdAt = r.created_at as string;
+      const g = groups.get(meta.batch_id);
+      if (g) {
+        g.count += 1;
+        if (createdAt < g.earliest) g.earliest = createdAt;
+      } else {
+        groups.set(meta.batch_id, { count: 1, earliest: createdAt });
+      }
+    }
+    return Array.from(groups.entries())
+      .map(([batchId, g]) => ({ batchId, count: g.count, generatedAt: g.earliest }))
+      .sort((a, b) => (a.generatedAt < b.generatedAt ? 1 : -1));
+  });
+
+// Un-archives one past batch (by batch_id) for one agent — the recovery
+// half of archiveMonthContent. Same access level as archive (agent or
+// admin). Scoped to this agent's own rows even though a batch_id is already
+// effectively unique per generation, as belt-and-suspenders consistent with
+// every other per-post/per-batch action in this file.
+export const restoreArchivedBatch = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .validator((data: { agentId: string; batchId: string }) => data)
+  .handler(async ({ data, context }): Promise<{ ok: true; restored: number }> => {
+    const email = (context.claims as { email?: string } | undefined)?.email;
+    await requireAgentAccess(context.userId, email, data.agentId);
+    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+    const { data: rows, error: selErr } = await supabaseAdmin
+      .from("generated_posts")
+      .select("id")
+      .eq("agent_id", data.agentId)
+      .eq("archived", true)
+      .eq("metadata->>batch_id", data.batchId);
+    if (selErr) throw selErr;
+    const ids = (rows ?? []).map((r) => r.id);
+    if (!ids.length) return { ok: true, restored: 0 };
+    const { error } = await supabaseAdmin
+      .from("generated_posts")
+      .update({ archived: false, updated_at: new Date().toISOString() })
+      .in("id", ids);
+    if (error) throw error;
+    return { ok: true, restored: ids.length };
   });
 
 // ── Photo scan + caption — ported 1:1 from analyze-photos.js ───────────────

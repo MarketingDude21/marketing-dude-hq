@@ -2357,24 +2357,25 @@ function ContentCalendarTab({ agentId, isAdmin }: { agentId: string; isAdmin: bo
   // month itself stays in this list, ready for a fresh "Generate Now."
   const [archivingId, setArchivingId] = useState<string | null>(null);
   const [noteByMonth, setNoteByMonth] = useState<Record<string, string>>({});
-  // Added 2026-09-20, same-day second follow-up. Mike's voice note after
-  // trying the Archive-only version above: "the file should disappear and
-  // then I should be able to regenerate content... the generate content on
-  // the monthly screen should appear after I archive a file... you should be
-  // able to run it a few times." Archiving already emptied the review screen
-  // INSIDE a month's workspace and "Generate Now" was always available there
-  // — but this list screen (where his screenshot's arrow actually pointed)
-  // only had Archive, nothing to show that content was gone, and no way to
-  // regenerate without leaving it. So this card now carries the whole
-  // archive → confirm empty → regenerate loop on its own: a live count of
-  // this agent's current (non-archived) content for that month — so
-  // archiving visibly takes it to 0 right here — plus a Generate button that
-  // calls the exact same generateMonthlyBatch the workspace's "Generate Now"
-  // uses. Nothing about the workspace's own Archive/Generate/restore
-  // controls changed; this is a second, faster place to run the same loop.
+  // Simplified 2026-09-20, third same-day pass, after Mike found the second
+  // pass (live counts + an inline Generate button on every card) over-built:
+  // "let's not think too hard about this. We're trying to accomplish a very
+  // simple task." What he actually wants: "you have months. There's a
+  // button that says archive. If you press the archive button, it'll go
+  // into the archive folder. There should be an archive folder somewhere on
+  // this screen that shows the past months that were ran. But... if it's
+  // archived, you should just be able to click on create my monthly content
+  // and click the button and it'll generate the content." So the card is
+  // back down to just a month name + Archive; counts are still fetched in
+  // the background (silently) only to decide which section a month sits in,
+  // never shown as text. A month is "archived" once this agent has archived
+  // batches for it and no active content left — it then moves out of
+  // Months and into the Archived section below. Clicking a card in either
+  // section opens MonthWorkspace, where "Generate Now" already works and
+  // was never gated on there being no existing content — that's the one
+  // place Generate lives, and it can be run as many times as needed.
   const [counts, setCounts] = useState<Record<string, number | null>>({});
   const [archivedCounts, setArchivedCounts] = useState<Record<string, number>>({});
-  const [generatingId, setGeneratingId] = useState<string | null>(null);
 
   function loadCountsFor(list: CalendarMonth[]) {
     for (const m of list) {
@@ -2422,7 +2423,7 @@ function ContentCalendarTab({ agentId, isAdmin }: { agentId: string; isAdmin: bo
       setNote(
         m.id,
         res.archived > 0
-          ? `Archived ${res.archived} piece${res.archived === 1 ? "" : "s"} — cleared for a fresh Generate.`
+          ? `Archived ${res.archived} piece${res.archived === 1 ? "" : "s"} — moved to Archived below.`
           : `Nothing to archive for ${m.month} yet.`,
       );
       loadCountsFor([m]);
@@ -2433,25 +2434,45 @@ function ContentCalendarTab({ agentId, isAdmin }: { agentId: string; isAdmin: bo
     }
   }
 
-  async function generateFromList(m: CalendarMonth) {
-    setGeneratingId(m.id);
-    setNote(m.id, "");
-    try {
-      const res = await generateMonthlyBatch({
-        data: { agentId, monthId: m.id, month: m.month, useHashtags: false },
-      });
-      setNote(m.id, `Generated ${res.created} piece${res.created === 1 ? "" : "s"} of fresh content.`);
-      loadCountsFor([m]);
-    } catch (e) {
-      setNote(m.id, e instanceof Error ? e.message : String(e));
-    } finally {
-      setGeneratingId(null);
-    }
-  }
-
   if (activeMonth) {
     return (
       <MonthWorkspace agentId={agentId} isAdmin={isAdmin} month={activeMonth} onBack={() => setActiveMonth(null)} />
+    );
+  }
+
+  const activeMonths: CalendarMonth[] = [];
+  const archivedMonths: CalendarMonth[] = [];
+  if (months) {
+    for (const m of months) {
+      const isArchived = (archivedCounts[m.id] ?? 0) > 0 && (counts[m.id] ?? 0) === 0;
+      (isArchived ? archivedMonths : activeMonths).push(m);
+    }
+  }
+
+  function renderMonthCard(m: CalendarMonth, archived: boolean) {
+    const busy = archivingId === m.id;
+    return (
+      <div
+        key={m.id}
+        className="flex flex-col gap-2 rounded-2xl border border-border bg-glass px-4 py-3 transition-colors hover:bg-secondary"
+      >
+        <button onClick={() => setActiveMonth(m)} className="min-w-0 text-left text-sm font-semibold">
+          {m.month}
+        </button>
+        {archived ? (
+          <p className="text-[11px] text-muted-foreground">Archived — click the month to create fresh content.</p>
+        ) : (
+          <button
+            onClick={() => archiveFromList(m)}
+            disabled={busy}
+            className="self-start shrink-0 rounded-full border border-border px-2.5 py-1 text-[11px] font-semibold text-muted-foreground transition-colors hover:bg-background disabled:opacity-50"
+            title={`Archive this agent's generated content for ${m.month}`}
+          >
+            {busy ? "Archiving…" : "Archive"}
+          </button>
+        )}
+        {noteByMonth[m.id] && <p className="text-[11px] text-muted-foreground">{noteByMonth[m.id]}</p>}
+      </div>
     );
   }
 
@@ -2461,8 +2482,8 @@ function ContentCalendarTab({ agentId, isAdmin }: { agentId: string; isAdmin: bo
         <h3 className="font-display text-sm font-semibold">Create My Monthly Content</h3>
         <p className="mt-1 text-xs text-muted-foreground">
           Pick a month below to generate this month's posts, emails, and video scripts in your own voice, then review
-          and approve them. Testing? Archive clears a month's content so you can Generate a clean batch again, right
-          here — as many times as you need.
+          and approve them. Archive a month to clear it out — it moves to Archived below, and clicking back into it lets
+          you generate a fresh batch.
         </p>
       </Card>
 
@@ -2474,55 +2495,30 @@ function ContentCalendarTab({ agentId, isAdmin }: { agentId: string; isAdmin: bo
         {months !== null && months.length === 0 && (
           <p className="mt-3 text-sm text-muted-foreground">No months set up yet — ask your team to add one.</p>
         )}
-        {months !== null && months.length > 0 && (
+        {months !== null && activeMonths.length > 0 && (
           <div className="mt-3 grid gap-2 sm:grid-cols-2 lg:grid-cols-3">
-            {months.map((m) => {
-              const count = counts[m.id];
-              const archivedCount = archivedCounts[m.id] ?? 0;
-              const busy = archivingId === m.id || generatingId === m.id;
-              return (
-                <div
-                  key={m.id}
-                  className="flex flex-col gap-2 rounded-2xl border border-border bg-glass px-4 py-3 transition-colors hover:bg-secondary"
-                >
-                  <button onClick={() => setActiveMonth(m)} className="min-w-0 text-left text-sm font-semibold">
-                    {m.month}
-                  </button>
-                  <p className="text-[11px] text-muted-foreground">
-                    {count === undefined
-                      ? "Checking…"
-                      : count === null
-                        ? "Couldn't load content count."
-                        : count > 0
-                          ? `${count} piece${count === 1 ? "" : "s"} generated`
-                          : "No content generated yet"}
-                    {archivedCount > 0 && ` · ${archivedCount} archived (open month to restore)`}
-                  </p>
-                  <div className="flex flex-wrap gap-2">
-                    <button
-                      onClick={() => archiveFromList(m)}
-                      disabled={busy || !count}
-                      className="shrink-0 rounded-full border border-border px-2.5 py-1 text-[11px] font-semibold text-muted-foreground transition-colors hover:bg-background disabled:opacity-50"
-                      title={`Archive this agent's generated content for ${m.month}`}
-                    >
-                      {archivingId === m.id ? "Archiving…" : "Archive"}
-                    </button>
-                    <button
-                      onClick={() => generateFromList(m)}
-                      disabled={busy}
-                      className="shrink-0 rounded-full border border-border bg-primary px-2.5 py-1 text-[11px] font-semibold text-primary-foreground transition-colors hover:opacity-90 disabled:opacity-50"
-                      title={`Generate a fresh batch for ${m.month}`}
-                    >
-                      {generatingId === m.id ? "Generating…" : "Generate"}
-                    </button>
-                  </div>
-                  {noteByMonth[m.id] && <p className="text-[11px] text-muted-foreground">{noteByMonth[m.id]}</p>}
-                </div>
-              );
-            })}
+            {activeMonths.map((m) => renderMonthCard(m, false))}
           </div>
         )}
+        {months !== null && months.length > 0 && activeMonths.length === 0 && (
+          <p className="mt-3 text-sm text-muted-foreground">
+            Every month is archived — see Archived below, or click one there to start fresh.
+          </p>
+        )}
       </Card>
+
+      {archivedMonths.length > 0 && (
+        <Card>
+          <h4 className="font-display text-sm font-semibold">Archived</h4>
+          <p className="mt-1 text-[11px] text-muted-foreground">
+            Past months that were archived. Click one to generate fresh content — it moves back up to Months once it has
+            content again.
+          </p>
+          <div className="mt-3 grid gap-2 sm:grid-cols-2 lg:grid-cols-3">
+            {archivedMonths.map((m) => renderMonthCard(m, true))}
+          </div>
+        </Card>
+      )}
     </div>
   );
 }

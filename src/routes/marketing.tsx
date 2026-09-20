@@ -34,6 +34,9 @@ import {
   readContentCalendar,
   generateMonthlyBatch,
   deleteMonthContent,
+  archiveMonthContent,
+  listArchivedBatchesForMonth,
+  restoreArchivedBatch,
   scanAgentDrivePhotos,
   scanAgentLibraryPhotos,
   addPhotoPostsToBatch,
@@ -49,6 +52,7 @@ import {
   type PhotoScanSuggestion,
   type PostMetadata,
   type UnsplashResult,
+  type ArchivedBatchSummary,
 } from "@/lib/marketing";
 // Type-only import (erased at build) — the runtime docx library is loaded
 // lazily inside buildContentDocxBlob() below instead of imported at the top
@@ -2586,6 +2590,69 @@ function MonthWorkspace({
   const [deleting, setDeleting] = useState(false);
   const [deleteArmed, setDeleteArmed] = useState(false);
   const [deleteNote, setDeleteNote] = useState<string | null>(null);
+  // Added 2026-09-20 per Mike: "the admin and or the user needs the ability
+  // to archive the month's monthly content... I can't retest without the
+  // ability to archive the monthly content." Unlike Delete above, this is
+  // reversible (a flag, not a delete) and open to the agent themselves too,
+  // so no double-click "are you sure" arming is needed — restoring a batch
+  // below undoes it just as easily.
+  const [archiving, setArchiving] = useState(false);
+  const [archiveNote, setArchiveNote] = useState<string | null>(null);
+  const [showArchived, setShowArchived] = useState(false);
+  const [archivedBatches, setArchivedBatches] = useState<ArchivedBatchSummary[] | null>(null);
+  const [archivedError, setArchivedError] = useState<string | null>(null);
+  const [restoringBatchId, setRestoringBatchId] = useState<string | null>(null);
+
+  async function archiveContent() {
+    if (!batchPosts.length) return;
+    setArchiving(true);
+    setArchiveNote(null);
+    try {
+      const res = await archiveMonthContent({ data: { agentId, month: folder.month } });
+      setArchiveNote(
+        res.archived > 0
+          ? `Archived ${res.archived} piece${res.archived === 1 ? "" : "s"} of content for ${folder.month} — the review screen is clear for a fresh "Generate Now." Nothing was deleted; open "Archived content" below to restore it.`
+          : "Nothing to archive — this month has no generated content for this agent yet.",
+      );
+      setLastBatchId(null);
+      loadPosts();
+      if (showArchived) loadArchivedBatches();
+    } catch (e) {
+      setArchiveNote(e instanceof Error ? e.message : String(e));
+    } finally {
+      setArchiving(false);
+    }
+  }
+
+  function loadArchivedBatches() {
+    setArchivedError(null);
+    listArchivedBatchesForMonth({ data: { agentId, month: folder.month } })
+      .then((b) => setArchivedBatches(b))
+      .catch((e) => setArchivedError(e instanceof Error ? e.message : String(e)));
+  }
+
+  function toggleArchivedView() {
+    const next = !showArchived;
+    setShowArchived(next);
+    if (next) {
+      setArchivedBatches(null);
+      loadArchivedBatches();
+    }
+  }
+
+  async function restoreBatch(batchId: string) {
+    setRestoringBatchId(batchId);
+    setArchivedError(null);
+    try {
+      await restoreArchivedBatch({ data: { agentId, batchId } });
+      loadArchivedBatches();
+      loadPosts();
+    } catch (e) {
+      setArchivedError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setRestoringBatchId(null);
+    }
+  }
 
   async function deleteContent() {
     if (!deleteArmed) {
@@ -2796,6 +2863,15 @@ function MonthWorkspace({
                 {sending ? "Sending…" : "Send to Agent"}
               </Button>
             )}
+            {/* Not gated on isAdmin — per Mike (2026-09-20): "the admin and or
+                the user needs the ability to archive." Reversible (a flag,
+                not a delete), so it needs no arm/confirm step the way Delete
+                below does. */}
+            {batchPosts.length > 0 && (
+              <Button variant="secondary" onClick={archiveContent} disabled={archiving}>
+                {archiving ? "Archiving…" : "Archive this month's content"}
+              </Button>
+            )}
             {isAdmin && batchPosts.length > 0 && (
               <>
                 <Button variant="danger" onClick={deleteContent} disabled={deleting}>
@@ -2816,12 +2892,47 @@ function MonthWorkspace({
         </div>
         {approveNote && <p className="mt-2 text-xs text-muted-foreground">{approveNote}</p>}
         {sendNote && <p className="mt-2 text-xs text-muted-foreground">{sendNote}</p>}
+        {archiveNote && <p className="mt-2 text-xs text-muted-foreground">{archiveNote}</p>}
         {deleteNote && <p className="mt-2 text-xs text-muted-foreground">{deleteNote}</p>}
         {postsError && <p className="mt-2 text-xs text-destructive">{postsError}</p>}
         {posts !== null && batchPosts.length === 0 && (
           <p className="mt-3 text-sm text-muted-foreground">
             Nothing generated for this month yet — hit "Generate Now" above.
           </p>
+        )}
+        <button
+          onClick={toggleArchivedView}
+          className="mt-3 text-xs font-semibold text-muted-foreground hover:text-foreground"
+        >
+          {showArchived ? "▾" : "▸"} Archived content for {folder.month}
+        </button>
+        {showArchived && (
+          <div className="mt-2 space-y-2 border-t border-border pt-2">
+            {archivedError && <p className="text-xs text-destructive">{archivedError}</p>}
+            {archivedBatches === null && !archivedError && (
+              <p className="text-xs text-muted-foreground">Loading archived content…</p>
+            )}
+            {archivedBatches !== null && archivedBatches.length === 0 && (
+              <p className="text-xs text-muted-foreground">Nothing archived for this month yet.</p>
+            )}
+            {archivedBatches?.map((b) => (
+              <div
+                key={b.batchId}
+                className="flex flex-wrap items-center justify-between gap-2 rounded-md bg-muted/40 px-3 py-2"
+              >
+                <span className="text-xs text-muted-foreground">
+                  {b.count} piece{b.count === 1 ? "" : "s"} — generated {new Date(b.generatedAt).toLocaleDateString()}
+                </span>
+                <Button
+                  variant="secondary"
+                  onClick={() => restoreBatch(b.batchId)}
+                  disabled={restoringBatchId === b.batchId}
+                >
+                  {restoringBatchId === b.batchId ? "Restoring…" : "Restore"}
+                </Button>
+              </div>
+            ))}
+          </div>
         )}
       </Card>
 

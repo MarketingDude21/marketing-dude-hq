@@ -1256,7 +1256,7 @@ async function fetchDriveMediaFiles(folderId: string, apiKey: string): Promise<D
     ) +
     "&fields=files(id,name)&key=" +
     apiKey;
-  const subfolderRes = await fetch(subfolderUrl);
+  const subfolderRes = await fetchWithTimeout(subfolderUrl, {}, 15_000);
   const subfolderData = (await subfolderRes.json()) as { files?: { id: string }[] };
   const usedFolderId = subfolderData.files?.[0]?.id ?? null;
 
@@ -1267,7 +1267,7 @@ async function fetchDriveMediaFiles(folderId: string, apiKey: string): Promise<D
     encodeURIComponent(q) +
     "&fields=files(id,name,mimeType,parents)&pageSize=200&key=" +
     apiKey;
-  const res = await fetch(url);
+  const res = await fetchWithTimeout(url, {}, 15_000);
   const json = (await res.json()) as {
     files?: { id: string; name: string; mimeType: string; parents?: string[] }[];
     error?: { message?: string };
@@ -1916,20 +1916,48 @@ export const readContentCalendar = createServerFn({ method: "GET" })
 
 // ── Batch generation — ported 1:1 from generateAll()'s per-type prompts ────
 
+// Added 2026-09-20: Mike reported a month stuck on "Generating…" with no
+// error (17 pieces landed, then it just hung). generateMonthlyBatch used to
+// run its email and video loops fully sequentially — one callClaude() at a
+// time, no request timeout anywhere — so a single slow/unresponsive call to
+// Claude or Google Drive could stall the whole batch indefinitely (and on a
+// serverless platform, risk the function just getting killed mid-request
+// with nothing written back to the UI). fetchWithTimeout gives every
+// outbound call a hard ceiling so one bad request fails fast and gets
+// skipped (existing try/catch-and-continue behavior) instead of hanging.
+async function fetchWithTimeout(url: string, options: RequestInit, timeoutMs: number): Promise<Response> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...options, signal: controller.signal });
+  } catch (e) {
+    if (e instanceof Error && e.name === "AbortError") {
+      throw new Error(`Request timed out after ${Math.round(timeoutMs / 1000)}s`);
+    }
+    throw e;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 async function callClaude(apiKey: string, prompt: string, maxTokens: number): Promise<string> {
-  const res = await fetch("https://api.anthropic.com/v1/messages", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "x-api-key": apiKey,
-      "anthropic-version": "2023-06-01",
+  const res = await fetchWithTimeout(
+    "https://api.anthropic.com/v1/messages",
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-api-key": apiKey,
+        "anthropic-version": "2023-06-01",
+      },
+      body: JSON.stringify({
+        model: "claude-haiku-4-5-20251001",
+        max_tokens: maxTokens,
+        messages: [{ role: "user", content: prompt }],
+      }),
     },
-    body: JSON.stringify({
-      model: "claude-haiku-4-5-20251001",
-      max_tokens: maxTokens,
-      messages: [{ role: "user", content: prompt }],
-    }),
-  });
+    60_000,
+  );
   const json = (await res.json()) as { content?: { text?: string }[]; error?: { message?: string } };
   if (!res.ok) throw new Error(json.error?.message ?? `Claude API error (${res.status})`);
   return (json.content ?? [])
@@ -2040,122 +2068,141 @@ export const generateMonthlyBatch = createServerFn({ method: "POST" })
       });
     }
 
-    // Emails — one prompt per doc, same brief-vs-prewritten detection as before.
-    for (const ed of emailDocs) {
-      const instructions = ed.instructions || "";
-      const hasCompleteBody = /Hey\s*\[/.test(instructions) || /Hey,\s*\n/.test(instructions);
-      const isPromptBrief =
-        !hasCompleteBody &&
-        /Opening:|Structure:|Style Rules|AFTER THE EMAIL|SUBJECT LINES|Write a complete email|Blend together:|Create a section|observations|Local Letter|BEFORE YOU WRITE/i.test(
-          instructions,
-        );
-      const isLocalLetter =
-        /observations|Local Letter|three to four|reads like a note|newsletter.*rewrite|sound like a note/i.test(
-          instructions,
-        ) || /CRITICAL RULES FOR THIS FORMAT|Do NOT use headers|Do NOT write bullet/i.test(instructions);
+    // Emails — one prompt per doc, same brief-vs-prewritten detection as
+    // before. Changed 2026-09-20 from a sequential for-loop to Promise.all:
+    // each email was one full callClaude() round trip, awaited one at a
+    // time, so a month with a dozen emails meant a dozen sequential network
+    // calls with no timeout — the likely cause of the "stuck Generating…"
+    // report. Running them concurrently (each still wrapped in its own
+    // try/catch so one bad email doesn't drop the rest) cuts total wall
+    // time roughly to the slowest single call instead of the sum of all of
+    // them, and the new fetchWithTimeout on callClaude means a stuck one
+    // fails and gets skipped instead of hanging the batch.
+    const emailResults = await Promise.all(
+      emailDocs.map(async (ed): Promise<TablesInsert<"generated_posts"> | null> => {
+        const instructions = ed.instructions || "";
+        const hasCompleteBody = /Hey\s*\[/.test(instructions) || /Hey,\s*\n/.test(instructions);
+        const isPromptBrief =
+          !hasCompleteBody &&
+          /Opening:|Structure:|Style Rules|AFTER THE EMAIL|SUBJECT LINES|Write a complete email|Blend together:|Create a section|observations|Local Letter|BEFORE YOU WRITE/i.test(
+            instructions,
+          );
+        const isLocalLetter =
+          /observations|Local Letter|three to four|reads like a note|newsletter.*rewrite|sound like a note/i.test(
+            instructions,
+          ) || /CRITICAL RULES FOR THIS FORMAT|Do NOT use headers|Do NOT write bullet/i.test(instructions);
 
-      let emailPrompt: string;
-      if (isPromptBrief) {
-        if (isLocalLetter) {
-          emailPrompt =
-            `You are writing a personal community letter for ${agentName} in ${agentCity}.\n\n` +
-            `VOICE DNA:\n${dna}\n\n` +
-            `EMAIL GOAL:\n${ed.goal || ""}\n\n` +
-            `FULL BRIEF:\n${instructions}\n\n` +
-            "CRITICAL: Write this as three to four natural observations that flow into each other. Do NOT use headers. Do NOT use bullet lists. Do NOT structure this as a newsletter with named sections. Each observation transitions naturally into the next. The real estate mention is one short paragraph near the end, treated as a casual aside — not a featured section. End with one or two lines. No call to action. No pitch. " +
-            `This should read like a personal note from someone who lives in ${agentCity} and noticed a few things worth sharing. If it reads like a newsletter when done, it is wrong. Replace all [CITY], [NAME] placeholders with ${agentName} and ${agentCity}.\n` +
-            "NO hyphens. NO corporate language. NO AI tell phrases. Standard capitalization always." +
-            learnedFeedback +
-            "\n\nOutput format:\nSUBJECT OPTIONS:\n1. [subject]\n2. [subject]\n3. [subject]\n\nEMAIL BODY:\n[full email — reads like a note, not a newsletter]";
+        let emailPrompt: string;
+        if (isPromptBrief) {
+          if (isLocalLetter) {
+            emailPrompt =
+              `You are writing a personal community letter for ${agentName} in ${agentCity}.\n\n` +
+              `VOICE DNA:\n${dna}\n\n` +
+              `EMAIL GOAL:\n${ed.goal || ""}\n\n` +
+              `FULL BRIEF:\n${instructions}\n\n` +
+              "CRITICAL: Write this as three to four natural observations that flow into each other. Do NOT use headers. Do NOT use bullet lists. Do NOT structure this as a newsletter with named sections. Each observation transitions naturally into the next. The real estate mention is one short paragraph near the end, treated as a casual aside — not a featured section. End with one or two lines. No call to action. No pitch. " +
+              `This should read like a personal note from someone who lives in ${agentCity} and noticed a few things worth sharing. If it reads like a newsletter when done, it is wrong. Replace all [CITY], [NAME] placeholders with ${agentName} and ${agentCity}.\n` +
+              "NO hyphens. NO corporate language. NO AI tell phrases. Standard capitalization always." +
+              learnedFeedback +
+              "\n\nOutput format:\nSUBJECT OPTIONS:\n1. [subject]\n2. [subject]\n3. [subject]\n\nEMAIL BODY:\n[full email — reads like a note, not a newsletter]";
+          } else {
+            emailPrompt =
+              `You are writing a real estate email for ${agentName} in ${agentCity}.\n\n` +
+              `VOICE DNA:\n${dna}\n\n` +
+              `EMAIL GOAL:\n${ed.goal || ""}\n\n` +
+              `BRIEF TO FOLLOW:\n${instructions}\n\n` +
+              `Write this email EXACTLY as ${agentName} would write it based on their Voice DNA above. Replace all [CITY], [NAME], [CITY, STATE] placeholders with ${agentName} and ${agentCity}.\n` +
+              "NO hyphens. NO corporate language. NO AI-tell phrases. Standard capitalization always." +
+              learnedFeedback +
+              "\n\n" +
+              "Output format:\nSUBJECT OPTIONS:\n1. [subject]\n2. [subject]\n3. [subject]\n\nEMAIL BODY:\n[full email in plain text, no HTML tags]";
+          }
         } else {
+          const preWrittenSubjects = ed.subjects?.length ? ed.subjects : [];
+          const subjectBlock = preWrittenSubjects.length
+            ? preWrittenSubjects.map((s, i) => `${i + 1}. ${s}`).join("\n")
+            : "1. [See email below]\n2. \n3. ";
           emailPrompt =
-            `You are writing a real estate email for ${agentName} in ${agentCity}.\n\n` +
-            `VOICE DNA:\n${dna}\n\n` +
-            `EMAIL GOAL:\n${ed.goal || ""}\n\n` +
-            `BRIEF TO FOLLOW:\n${instructions}\n\n` +
-            `Write this email EXACTLY as ${agentName} would write it based on their Voice DNA above. Replace all [CITY], [NAME], [CITY, STATE] placeholders with ${agentName} and ${agentCity}.\n` +
-            "NO hyphens. NO corporate language. NO AI-tell phrases. Standard capitalization always." +
-            learnedFeedback +
-            "\n\n" +
-            "Output format:\nSUBJECT OPTIONS:\n1. [subject]\n2. [subject]\n3. [subject]\n\nEMAIL BODY:\n[full email in plain text, no HTML tags]";
+            `You are personalizing a pre-written real estate email for ${agentName} in ${agentCity}.\n\n` +
+            `VOICE DNA (use this to lightly align tone, do NOT rewrite the email):\n${dna}\n\n` +
+            `PRE-WRITTEN EMAIL (keep this mostly intact — only replace placeholders and fix any [CITY]/[NAME] references):\n${instructions}\n\n` +
+            `Rules:\n- Do NOT rewrite or restructure this email\n- Replace [CITY], [NAME], [CITY, STATE] with ${agentName} and ${agentCity}\n- Fix any placeholder brackets that are still unfilled\n- NO hyphens. NO corporate language. Standard capitalization.\n\n` +
+            `Output format:\nSUBJECT OPTIONS:\n${subjectBlock}\n\nEMAIL BODY:\n[the personalized email]`;
         }
-      } else {
-        const preWrittenSubjects = ed.subjects?.length ? ed.subjects : [];
-        const subjectBlock = preWrittenSubjects.length
-          ? preWrittenSubjects.map((s, i) => `${i + 1}. ${s}`).join("\n")
-          : "1. [See email below]\n2. \n3. ";
-        emailPrompt =
-          `You are personalizing a pre-written real estate email for ${agentName} in ${agentCity}.\n\n` +
-          `VOICE DNA (use this to lightly align tone, do NOT rewrite the email):\n${dna}\n\n` +
-          `PRE-WRITTEN EMAIL (keep this mostly intact — only replace placeholders and fix any [CITY]/[NAME] references):\n${instructions}\n\n` +
-          `Rules:\n- Do NOT rewrite or restructure this email\n- Replace [CITY], [NAME], [CITY, STATE] with ${agentName} and ${agentCity}\n- Fix any placeholder brackets that are still unfilled\n- NO hyphens. NO corporate language. Standard capitalization.\n\n` +
-          `Output format:\nSUBJECT OPTIONS:\n${subjectBlock}\n\nEMAIL BODY:\n[the personalized email]`;
-      }
 
-      try {
-        const eraw = await callClaude(anthropicKey, emailPrompt, 2000);
-        const sm = eraw.match(/SUBJECT OPTIONS:([\s\S]*?)EMAIL BODY:/);
-        const bm = eraw.match(/EMAIL BODY:([\s\S]*)/);
-        const body = cleanCopy(
-          (bm ? bm[1]! : eraw)
-            .replace(/#+\s*VISUAL ASSETS[\s\S]*/i, "")
-            .replace(/\*\*Image Idea:\*\*[\s\S]*/i, "")
-            .replace(/# VISUAL[\s\S]*/i, "")
-            .replace(/VISUAL ASSETS[\s\S]*/i, "")
-            .replace(/\n{3,}/g, "\n\n")
-            .trim(),
-        );
-        const subjectsRaw = sm ? sm[1]!.trim() : "";
-        const subjects = subjectsRaw
-          .split("\n")
-          .filter((s) => s.trim() && /^\d/.test(s.trim()))
-          .map((s) => s.replace(/^\d+\.\s*/, "").trim());
-        rows.push({
-          agent_id: data.agentId,
-          content:
-            (subjects.length ? `SUBJECT OPTIONS:\n${subjects.map((s, i) => `${i + 1}. ${s}`).join("\n")}\n\n` : "") +
-            body,
-          content_type: "email",
-          title: ed.title.replace("Email — ", ""),
-          status: "pending",
-          month: data.month,
-          metadata: { batch_id: batchId, month: data.month, goal: ed.goal, source: "content_calendar" },
-        });
-      } catch {
-        // Skip this email but keep generating the rest, same as the old app.
-      }
-    }
+        try {
+          const eraw = await callClaude(anthropicKey, emailPrompt, 2000);
+          const sm = eraw.match(/SUBJECT OPTIONS:([\s\S]*?)EMAIL BODY:/);
+          const bm = eraw.match(/EMAIL BODY:([\s\S]*)/);
+          const body = cleanCopy(
+            (bm ? bm[1]! : eraw)
+              .replace(/#+\s*VISUAL ASSETS[\s\S]*/i, "")
+              .replace(/\*\*Image Idea:\*\*[\s\S]*/i, "")
+              .replace(/# VISUAL[\s\S]*/i, "")
+              .replace(/VISUAL ASSETS[\s\S]*/i, "")
+              .replace(/\n{3,}/g, "\n\n")
+              .trim(),
+          );
+          const subjectsRaw = sm ? sm[1]!.trim() : "";
+          const subjects = subjectsRaw
+            .split("\n")
+            .filter((s) => s.trim() && /^\d/.test(s.trim()))
+            .map((s) => s.replace(/^\d+\.\s*/, "").trim());
+          return {
+            agent_id: data.agentId,
+            content:
+              (subjects.length ? `SUBJECT OPTIONS:\n${subjects.map((s, i) => `${i + 1}. ${s}`).join("\n")}\n\n` : "") +
+              body,
+            content_type: "email",
+            title: ed.title.replace("Email — ", ""),
+            status: "pending",
+            month: data.month,
+            metadata: { batch_id: batchId, month: data.month, goal: ed.goal, source: "content_calendar" },
+          };
+        } catch {
+          // Skip this email but keep generating the rest, same as the old app.
+          return null;
+        }
+      }),
+    );
+    for (const r of emailResults) if (r) rows.push(r);
 
-    // Video scripts
-    for (const vd of videoDocs) {
-      const isVideoBrief = /Hook:|Body:|Close:|Structure:|STYLE RULES|Script Instructions/i.test(vd.script || "");
-      const videoPrompt =
-        `You are writing a short real estate video script for ${agentName} in ${agentCity}.\n\n` +
-        `VOICE DNA:\n${dna}\n\n` +
-        `VIDEO GOAL:\n${vd.goal || ""}\n\n` +
-        (vd.hook ? `HOOK DIRECTION:\n${vd.hook}\n\n` : "") +
-        (isVideoBrief ? "SCRIPT BRIEF TO FOLLOW:\n" : "SCRIPT DIRECTION:\n") +
-        `${vd.script}\n\n` +
-        `Write a 60 second video script in ${agentName}'s voice. Format:\n` +
-        "HOOK (first 3 seconds — grab attention):\n[hook line]\n\nBODY (main point, story, or insight):\n[15 to 45 seconds of content]\n\nCLOSE (natural ending, no hard sell):\n[closing line]\n\n" +
-        `Rules:\n- Sounds exactly like ${agentName} based on their Voice DNA\n- Written to be SPOKEN, not read — short sentences, natural pauses\n- NO hyphens, NO corporate language, NO AI phrases\n- Standard capitalization, never all lowercase\n- Real estate reminder energy — top of mind, not a pitch\n- 150 words maximum` +
-        learnedFeedback;
+    // Video scripts — same Promise.all treatment as emails above, for the
+    // same reason: sequential per-video callClaude() calls were another
+    // place a single slow request could stall the whole batch.
+    const videoResults = await Promise.all(
+      videoDocs.map(async (vd): Promise<TablesInsert<"generated_posts"> | null> => {
+        const isVideoBrief = /Hook:|Body:|Close:|Structure:|STYLE RULES|Script Instructions/i.test(vd.script || "");
+        const videoPrompt =
+          `You are writing a short real estate video script for ${agentName} in ${agentCity}.\n\n` +
+          `VOICE DNA:\n${dna}\n\n` +
+          `VIDEO GOAL:\n${vd.goal || ""}\n\n` +
+          (vd.hook ? `HOOK DIRECTION:\n${vd.hook}\n\n` : "") +
+          (isVideoBrief ? "SCRIPT BRIEF TO FOLLOW:\n" : "SCRIPT DIRECTION:\n") +
+          `${vd.script}\n\n` +
+          `Write a 60 second video script in ${agentName}'s voice. Format:\n` +
+          "HOOK (first 3 seconds — grab attention):\n[hook line]\n\nBODY (main point, story, or insight):\n[15 to 45 seconds of content]\n\nCLOSE (natural ending, no hard sell):\n[closing line]\n\n" +
+          `Rules:\n- Sounds exactly like ${agentName} based on their Voice DNA\n- Written to be SPOKEN, not read — short sentences, natural pauses\n- NO hyphens, NO corporate language, NO AI phrases\n- Standard capitalization, never all lowercase\n- Real estate reminder energy — top of mind, not a pitch\n- 150 words maximum` +
+          learnedFeedback;
 
-      try {
-        const vraw = cleanCopy(await callClaude(anthropicKey, videoPrompt, 600));
-        rows.push({
-          agent_id: data.agentId,
-          content: vraw,
-          content_type: "video",
-          title: vd.title,
-          status: "pending",
-          month: data.month,
-          metadata: { batch_id: batchId, month: data.month, goal: vd.goal, source: "content_calendar" },
-        });
-      } catch {
-        // Skip, keep going.
-      }
-    }
+        try {
+          const vraw = cleanCopy(await callClaude(anthropicKey, videoPrompt, 600));
+          return {
+            agent_id: data.agentId,
+            content: vraw,
+            content_type: "video",
+            title: vd.title,
+            status: "pending",
+            month: data.month,
+            metadata: { batch_id: batchId, month: data.month, goal: vd.goal, source: "content_calendar" },
+          };
+        } catch {
+          // Skip, keep going.
+          return null;
+        }
+      }),
+    );
+    for (const r of videoResults) if (r) rows.push(r);
 
     if (rows.length) {
       const { error } = await supabaseAdmin.from("generated_posts").insert(rows);

@@ -2210,6 +2210,280 @@ export const generateMarketingContent = createServerFn({ method: "POST" })
   });
 
 // ============================================================================
+// Individual Posts — "personal marketing dude" chat hub (2026-09-21).
+//
+// Per Mike's voice note: the old "+ New content" form-and-list should become
+// a real, persistent, per-agent chat thread — "your own personal marketing
+// dude," embedded in the agent's whole workflow, not a set of separate
+// tools. One continuous conversation per agent (backed by
+// agent_chat_messages, see monthly-marketing-chat-hub-migration.sql) with a
+// content-type switcher (post/email, video script, photo scan — carousel to
+// follow once Mike sends a template/brand direction) that changes how the
+// NEXT reply gets generated, not a separate siloed thread per mode — a
+// correction made while drafting an email should still be visible context
+// if the agent switches to video-script mode a minute later.
+//
+// Full scoping: individual-posts-hub-scoping.md.
+// ============================================================================
+
+export type ChatMode = "post" | "email" | "video_script" | "photo_scan";
+
+export type ChatMessageRow = {
+  id: string;
+  role: string;
+  content: string;
+  mode: string;
+  metadata: Record<string, unknown> | null;
+  created_at: string;
+};
+
+// Mike's actual video-script template (received 2026-09-21), confirmed the
+// same day as reference grounding, NOT the only format or a rigid fill-in-
+// the-blanks shape: "not the only one, just what I typically feed into AI
+// to create scripts now... There is both short form and long form, but tap
+// into AI too, these are just for reference." So this is woven into the
+// video-script prompt as an EXAMPLE of a shape that's worked before, not a
+// template to force every script into.
+const VIDEO_SCRIPT_REFERENCE_TEMPLATE =
+  "Hook:\n[Insert a strong hook that will get people to stop and watch this video]\n\n" +
+  "The Problem(s):\n[Identify a clear problem the intended viewer of this video faces or could face]\n\n" +
+  'Twist The Knife:\n[add in another pain point to twist the knife, for example, "Plus if…"]\n\n' +
+  "Promise Of Value:\nOver the next few minutes I'm going to show you how [INSERT SITUATION and get INSERT BENEFIT]\n\n" +
+  "Intro:\nMy name is [INSERT NAME] And I help people [INSERT END RESULT].\n\n" +
+  "Body\n" +
+  "Point 1 - The Problem - Clearly Identify the problem:\n" +
+  "Point 2 - What most people are doing to solve that problem:\n" +
+  "Point 3 - Why what they are doing to solve that problem won't work:\n" +
+  "Point 4 - Introduce Your Solution:\n" +
+  "Point 5 - Why Your Solution Works:\n  Step 1\n  Step 2\n  Step 3\n\n" +
+  "Outro\nIf you need additional assistance or have questions to your specific situation, schedule a consultation with our office. We will spend about 30 minutes going through your scenario and then advise what you might need to do next FREE of charge!";
+
+function buildChatSystemPrompt(
+  mode: ChatMode,
+  agentName: string,
+  agentCity: string,
+  voiceDna: string,
+  learnedFeedback: string,
+): string {
+  const base =
+    `You are ${agentName}'s own personal marketing assistant — their "Marketing Dude," embedded in their day-to-day workflow. You know their voice and you're having an ongoing conversation with them, not filling out a form. Keep replies focused on the content they're working on; don't pad with generic assistant chatter.\n\n` +
+    `You are writing for ${agentName} in ${agentCity}.\n\n` +
+    `VOICE DNA:\n${voiceDna}${learnedFeedback}\n\n` +
+    'House rules that apply no matter what you\'re writing: no hyphens used as dashes, no "As a real estate professional" or any version of that, no "Navigating the market," no corporate language, no buzzwords, no filler, standard capitalization always, never write in a way a real person wouldn\'t actually say out loud.\n\n';
+
+  if (mode === "email") {
+    return (
+      base +
+      "Right now you're helping draft an EMAIL. When you're ready to give a finished draft, format it as:\nSUBJECT OPTIONS:\n1. [subject]\n2. [subject]\n3. [subject]\n\nEMAIL BODY:\n[full email in plain text]\n\nIt's fine to ask a quick clarifying question first if you genuinely need more to go on, but don't stall on a clear, simple request — just write it."
+    );
+  }
+
+  if (mode === "video_script") {
+    return (
+      base +
+      "Right now you're helping write a VIDEO SCRIPT. Below is a real example of the kind of script this agency has fed into AI before — treat it as reference grounding for tone and shape, NOT a rigid template to fill in word-for-word every time. This agent's real script library also has a mix of short-form and long-form scripts, so match the length and structure to what THIS video actually needs rather than defaulting to this one example.\n\n" +
+      `REFERENCE EXAMPLE (education/single-topic shape):\n${VIDEO_SCRIPT_REFERENCE_TEMPLATE}\n\n` +
+      "Write scripts to be SPOKEN, not read — short sentences, natural pauses. Ask what the video is about and whether they want short-form or long-form if it isn't already clear, otherwise just write it."
+    );
+  }
+
+  // "post" and "photo_scan" — photo_scan messages are logged directly by
+  // logPhotoScanToChat below without a Claude call, but this is the
+  // sensible default system prompt if this mode is ever routed through here.
+  return (
+    base +
+    "Right now you're helping write a SOCIAL POST. Every post should tell a small story or make one clear point, be short (2-4 sentences), and feel like a text to a friend, not a broadcast. Real estate should feel like a casual aside, not the whole point, unless they're specifically asking for something transaction-focused."
+  );
+}
+
+export const listAgentChatMessages = createServerFn({ method: "GET" })
+  .middleware([requireSupabaseAuth])
+  .validator((data: { agentId: string }) => data)
+  .handler(async ({ data, context }): Promise<ChatMessageRow[]> => {
+    const email = (context.claims as { email?: string } | undefined)?.email;
+    await requireAgentAccess(context.userId, email, data.agentId);
+    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+    const { data: rows, error } = await supabaseAdmin
+      .from("agent_chat_messages")
+      .select("id, role, content, mode, metadata, created_at")
+      .eq("agent_id", data.agentId)
+      .order("created_at", { ascending: true })
+      .limit(200);
+    if (error) throw error;
+    return (rows ?? []) as unknown as ChatMessageRow[];
+  });
+
+export const sendAgentChatMessage = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .validator((data: { agentId: string; mode: ChatMode; message: string }) => data)
+  .handler(async ({ data, context }): Promise<{ ok: true; reply: ChatMessageRow }> => {
+    const email = (context.claims as { email?: string } | undefined)?.email;
+    await requireAgentAccess(context.userId, email, data.agentId);
+    const message = data.message.trim();
+    if (!message) throw new Error("Type something first.");
+
+    const apiKey = process.env["ANTHROPIC_API_KEY"];
+    if (!apiKey) {
+      throw new Error("Content generation isn't configured yet — add ANTHROPIC_API_KEY in Lovable Cloud → Secrets.");
+    }
+
+    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+    const { data: agent } = await supabaseAdmin
+      .from("agents")
+      .select("full_name, market_area, voice_summary")
+      .eq("id", data.agentId)
+      .maybeSingle();
+    const agentName = agent?.full_name ?? "the agent";
+    const agentCity = agent?.market_area ?? "their market";
+    const voiceDna =
+      agent?.voice_summary ?? "Warm, conversational, authentic real estate agent. Short posts. Real human energy.";
+
+    const learnedFeedback = await fetchLearnedFeedback(data.agentId);
+    const systemPrompt = buildChatSystemPrompt(data.mode, agentName, agentCity, voiceDna, learnedFeedback);
+
+    // Save the agent's turn first so it's never lost even if the Claude call
+    // below fails, and so it's part of the history the call below reads.
+    const { error: userInsertErr } = await supabaseAdmin.from("agent_chat_messages").insert({
+      agent_id: data.agentId,
+      role: "user",
+      mode: data.mode,
+      content: message,
+    });
+    if (userInsertErr) throw userInsertErr;
+
+    // Recent thread as conversational context — capped so a long-running
+    // relationship doesn't grow the prompt without bound.
+    const { data: history } = await supabaseAdmin
+      .from("agent_chat_messages")
+      .select("role, content")
+      .eq("agent_id", data.agentId)
+      .order("created_at", { ascending: false })
+      .limit(20);
+    const claudeMessages = (history ?? [])
+      .slice()
+      .reverse()
+      .map((m) => ({ role: m.role === "assistant" ? "assistant" : "user", content: m.content }));
+
+    const res = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-api-key": apiKey,
+        "anthropic-version": "2023-06-01",
+      },
+      body: JSON.stringify({
+        model: "claude-haiku-4-5-20251001",
+        max_tokens: 1200,
+        system: systemPrompt,
+        messages: claudeMessages,
+      }),
+    });
+    const json = (await res.json()) as {
+      content?: { text?: string }[];
+      error?: { message?: string };
+    };
+    if (!res.ok) throw new Error(json.error?.message ?? `Claude API error (${res.status})`);
+    const raw = (json.content ?? [])
+      .map((b) => b.text ?? "")
+      .join("")
+      .trim();
+    if (!raw) throw new Error("Empty response from Claude — try again.");
+
+    const { data: assistantRow, error: assistantInsertErr } = await supabaseAdmin
+      .from("agent_chat_messages")
+      .insert({ agent_id: data.agentId, role: "assistant", mode: data.mode, content: raw })
+      .select("id, role, content, mode, metadata, created_at")
+      .single();
+    if (assistantInsertErr) throw assistantInsertErr;
+
+    return { ok: true, reply: assistantRow as unknown as ChatMessageRow };
+  });
+
+// Turns one of Claude's chat replies into a real post that goes through the
+// same review/approve pipeline as everything else — the thread itself is
+// scratch space for drafting and refining, not the review surface, exactly
+// like AI-Rewrite already works elsewhere in this app.
+export const saveChatMessageAsPost = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .validator(
+    (data: { agentId: string; messageId: string; contentType: "post" | "email" | "video"; title?: string }) => data,
+  )
+  .handler(async ({ data, context }): Promise<{ ok: true; postId: string }> => {
+    const email = (context.claims as { email?: string } | undefined)?.email;
+    await requireAgentAccess(context.userId, email, data.agentId);
+    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+
+    const { data: msg, error: msgErr } = await supabaseAdmin
+      .from("agent_chat_messages")
+      .select("agent_id, role, content")
+      .eq("id", data.messageId)
+      .maybeSingle();
+    if (msgErr) throw msgErr;
+    if (!msg || msg.agent_id !== data.agentId || msg.role !== "assistant") {
+      throw new Error("That message can't be saved as a post.");
+    }
+
+    const { data: row, error } = await supabaseAdmin
+      .from("generated_posts")
+      .insert({
+        agent_id: data.agentId,
+        content: msg.content,
+        content_type: data.contentType,
+        title: data.title?.trim() || null,
+        status: "pending",
+        month: new Date().toISOString().slice(0, 7),
+        metadata: { source: "chat_hub" },
+      })
+      .select("id")
+      .single();
+    if (error) throw error;
+    return { ok: true, postId: row.id };
+  });
+
+// Drops a photo-scan suggestion straight into the agent's chat thread as an
+// assistant message, with no separate Claude call — captionPhotoInVoice
+// already wrote the caption when scanAgentDrivePhotos/scanAgentLibraryPhotos
+// ran. Keeps "Scan My Photos" inside the hub feeling like part of the same
+// conversation instead of a separate screen. "Save as post" on the resulting
+// message calls the existing addPhotoPostsToBatch directly from the client
+// using this row's metadata, same as the old PhotoScanPanel already does.
+export const logPhotoScanToChat = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .validator(
+    (data: {
+      agentId: string;
+      suggestedPost: string;
+      source: "drive" | "library";
+      sourceId: string;
+      thumbnailUrl: string;
+      fileName: string;
+    }) => data,
+  )
+  .handler(async ({ data, context }): Promise<{ ok: true; message: ChatMessageRow }> => {
+    const email = (context.claims as { email?: string } | undefined)?.email;
+    await requireAgentAccess(context.userId, email, data.agentId);
+    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+    const { data: row, error } = await supabaseAdmin
+      .from("agent_chat_messages")
+      .insert({
+        agent_id: data.agentId,
+        role: "assistant",
+        mode: "photo_scan",
+        content: data.suggestedPost,
+        metadata: {
+          source: data.source,
+          sourceId: data.sourceId,
+          thumbnailUrl: data.thumbnailUrl,
+          fileName: data.fileName,
+        },
+      })
+      .select("id, role, content, mode, metadata, created_at")
+      .single();
+    if (error) throw error;
+    return { ok: true, message: row as unknown as ChatMessageRow };
+  });
+
+// ============================================================================
 // Content calendar — native and SHARED across every agent (2026-09-17).
 //
 // Corrected twice from the original Drive-folder port: first to a per-agent

@@ -23,10 +23,13 @@ import {
   finalizeMediaUpload,
   setMediaTags,
   markMediaUsed,
+  restoreMediaToAvailable,
   deleteMarketingMedia,
   getMediaUploadLink,
   regenerateMediaUploadLink,
   listAgentDriveMedia,
+  markDriveFileUsed,
+  restoreDriveFileToActive,
   setAgentDriveFolder,
   generateMarketingContent,
   listCalendarMonths,
@@ -1301,13 +1304,23 @@ function EmailPhotosPanel({
                 className="mt-2 min-h-[50px] w-full rounded-lg border border-border bg-glass px-2 py-1.5 text-xs outline-none"
                 disabled={busy}
               />
-              <button
-                onClick={() => removePhoto(p.id)}
-                disabled={busy}
-                className="mt-1 text-[11px] font-semibold text-destructive hover:underline disabled:opacity-50"
-              >
-                Remove photo
-              </button>
+              <div className="mt-1 flex items-center justify-between gap-2">
+                {p.url && (
+                  <button
+                    onClick={() => downloadRemoteFile(p.url!, p.url!.split("/").pop() || `${p.id}`)}
+                    className="text-[11px] font-semibold text-muted-foreground hover:text-foreground hover:underline"
+                  >
+                    ⬇ Download
+                  </button>
+                )}
+                <button
+                  onClick={() => removePhoto(p.id)}
+                  disabled={busy}
+                  className="text-[11px] font-semibold text-destructive hover:underline disabled:opacity-50"
+                >
+                  Remove photo
+                </button>
+              </div>
             </div>
           ))}
         </div>
@@ -1673,6 +1686,12 @@ function PostCard({
             ) : (
               <img src={photoUrl} alt="" className="max-h-64 w-full object-contain" />
             )}
+            <button
+              onClick={() => downloadRemoteFile(photoUrl, photoUrl.split("/").pop() || "photo")}
+              className="w-full border-t border-border bg-glass py-1 text-[11px] font-semibold text-muted-foreground transition-colors hover:bg-secondary hover:text-foreground"
+            >
+              ⬇ Download
+            </button>
           </div>
         )}
         {post.content_type === "post" && photoUrl && post.metadata?.unsplash_photographer && (
@@ -1987,6 +2006,35 @@ function getVideoDuration(file: File): Promise<number> {
 
 const MAX_VIDEO_SECONDS = 120;
 
+// Added 2026-09-21 per Mike: "photos in all libraries should be
+// downloadable." A plain <a href> works for a same-origin file (Media
+// Library items, on Supabase Storage) but the browser's `download`
+// attribute is unreliable cross-origin, so this fetches the file as a blob
+// and saves it directly — the same reliable pattern regardless of source.
+// Falls back to just opening the URL in a new tab if the fetch itself fails
+// (e.g. a host that blocks cross-origin reads even though it serves the
+// file fine to a normal link click — Google Drive's own uc?export=download
+// endpoint, for one, doesn't allow that kind of fetch from a browser, but it
+// already forces a real download on a plain click, so the fallback covers
+// it correctly either way).
+async function downloadRemoteFile(url: string, filename: string) {
+  try {
+    const res = await fetch(url);
+    if (!res.ok) throw new Error(`${res.status}`);
+    const blob = await res.blob();
+    const objectUrl = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = objectUrl;
+    link.download = filename;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    URL.revokeObjectURL(objectUrl);
+  } catch {
+    window.open(url, "_blank", "noreferrer");
+  }
+}
+
 // Same fixed vocabulary marketing.ts's PHOTO_TAG_OPTIONS uses for matching —
 // kept as its own small client-side copy rather than importing the server
 // module's export, so nothing about the server bundle is a dependency of
@@ -2163,6 +2211,20 @@ function MediaTab({ agentId, isAdmin }: { agentId: string; isAdmin: boolean }) {
     }
   }
 
+  // Added 2026-09-21 per Mike: "photos and videos should be able to be moved
+  // back to active folder form used folder." Mirrors markUsed above.
+  async function restoreToAvailable(id: string) {
+    setBusyId(id);
+    try {
+      await restoreMediaToAvailable({ data: { agentId, mediaId: id } });
+      reload();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusyId(null);
+    }
+  }
+
   async function remove(id: string) {
     setBusyId(id);
     try {
@@ -2287,7 +2349,7 @@ function MediaTab({ agentId, isAdmin }: { agentId: string; isAdmin: boolean }) {
                   );
                 })}
               </div>
-              <div className="flex gap-1 p-2">
+              <div className="flex flex-wrap gap-1 p-2">
                 {status === "available" ? (
                   <button
                     onClick={() => markUsed(m.id)}
@@ -2297,9 +2359,22 @@ function MediaTab({ agentId, isAdmin }: { agentId: string; isAdmin: boolean }) {
                     Mark used
                   </button>
                 ) : (
-                  <span className="flex-1 text-center text-[11px] text-muted-foreground">
-                    {m.used_at ? `Used ${new Date(m.used_at).toLocaleDateString()}` : "Used"}
-                  </span>
+                  <button
+                    onClick={() => restoreToAvailable(m.id)}
+                    disabled={busyId === m.id}
+                    className="flex-1 rounded-full border border-border px-2 py-1 text-[11px] font-semibold transition-colors hover:bg-secondary disabled:opacity-50"
+                    title={m.used_at ? `Used ${new Date(m.used_at).toLocaleDateString()}` : "Used"}
+                  >
+                    Move to active
+                  </button>
+                )}
+                {m.url && (
+                  <button
+                    onClick={() => downloadRemoteFile(m.url!, m.url!.split("/").pop() || `${m.id}`)}
+                    className="rounded-full border border-border px-2 py-1 text-[11px] font-semibold transition-colors hover:bg-secondary"
+                  >
+                    ⬇ Download
+                  </button>
                 )}
                 <button
                   onClick={() => remove(m.id)}
@@ -2334,11 +2409,19 @@ function DriveTab({ agentId, agentEmail, isAdmin }: { agentId: string; agentEmai
   // unmissable, the same instinct as the Approve-All confirmation text.
   const [saveNote, setSaveNote] = useState<string | null>(null);
   const [removing, setRemoving] = useState(false);
+  // Added 2026-09-21 per Mike: "google drive folder Used needs to show" —
+  // mirrors MediaTab's Available/Used toggle exactly, so both photo sources
+  // work the same way. See listAgentDriveMedia in marketing.ts for what
+  // "used" means here (a real "used" subfolder's contents, plus anything
+  // this app itself has marked used — there's no real Drive write access to
+  // physically move a file, see the comment there).
+  const [status, setStatus] = useState<"available" | "used">("available");
+  const [busyId, setBusyId] = useState<string | null>(null);
 
   function reload() {
     setData(null);
     setError(null);
-    listAgentDriveMedia({ data: { agentId } })
+    listAgentDriveMedia({ data: { agentId, status } })
       .then((d) => setData(d))
       .catch((e) => setError(e instanceof Error ? e.message : String(e)));
   }
@@ -2347,7 +2430,31 @@ function DriveTab({ agentId, agentEmail, isAdmin }: { agentId: string; agentEmai
     reload();
     setSaveNote(null);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [agentId]);
+  }, [agentId, status]);
+
+  async function markUsed(fileId: string) {
+    setBusyId(fileId);
+    try {
+      await markDriveFileUsed({ data: { agentId, driveFileId: fileId } });
+      reload();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusyId(null);
+    }
+  }
+
+  async function restoreToActive(fileId: string) {
+    setBusyId(fileId);
+    try {
+      await restoreDriveFileToActive({ data: { agentId, driveFileId: fileId } });
+      reload();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusyId(null);
+    }
+  }
 
   async function saveFolder() {
     setSaving(true);
@@ -2431,6 +2538,22 @@ function DriveTab({ agentId, agentEmail, isAdmin }: { agentId: string; agentEmai
         )}
       </Card>
 
+      {data?.folderId && (
+        <div className="flex flex-wrap gap-1 rounded-full border border-border bg-glass p-1 backdrop-blur-xl w-fit">
+          {(["available", "used"] as const).map((s) => (
+            <button
+              key={s}
+              onClick={() => setStatus(s)}
+              className={`rounded-full px-4 py-1.5 text-sm font-medium transition-colors ${
+                status === s ? "bg-secondary text-foreground" : "text-muted-foreground hover:text-foreground"
+              }`}
+            >
+              {s === "available" ? "Available" : "Used"}
+            </button>
+          ))}
+        </div>
+      )}
+
       {error && (
         <Card>
           <p className="text-sm text-destructive">{error}</p>
@@ -2454,22 +2577,22 @@ function DriveTab({ agentId, agentEmail, isAdmin }: { agentId: string; agentEmai
 
       {!error && data !== null && data.folderId && data.files.length === 0 && (
         <Card>
-          <p className="text-sm text-muted-foreground">Their Drive folder is connected but empty right now.</p>
+          <p className="text-sm text-muted-foreground">
+            {status === "available"
+              ? "Their Drive folder is connected but empty right now."
+              : 'Nothing marked used yet — either a real "used" subfolder in their Drive is empty, or nothing\'s been approved with a Drive photo attached yet.'}
+          </p>
         </Card>
       )}
 
       {!error && data !== null && data.files.length > 0 && (
         <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-4">
           {data.files.map((f) => (
-            <a
-              key={f.id}
-              href={f.viewUrl}
-              target="_blank"
-              rel="noreferrer"
-              className="overflow-hidden rounded-2xl border border-border bg-glass"
-            >
-              <img src={f.thumbnailUrl} alt={f.name} className="aspect-square w-full object-cover" />
-              <div className="flex items-center justify-between gap-1 px-2 py-2">
+            <div key={f.id} className="overflow-hidden rounded-2xl border border-border bg-glass">
+              <a href={f.viewUrl} target="_blank" rel="noreferrer">
+                <img src={f.thumbnailUrl} alt={f.name} className="aspect-square w-full object-cover" />
+              </a>
+              <div className="flex items-center justify-between gap-1 px-2 pt-2">
                 <span className="truncate text-[11px] text-muted-foreground">{f.name}</span>
                 {f.isVideo && (
                   <span className="shrink-0 rounded-full bg-muted px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">
@@ -2477,7 +2600,38 @@ function DriveTab({ agentId, agentEmail, isAdmin }: { agentId: string; agentEmai
                   </span>
                 )}
               </div>
-            </a>
+              {status === "used" && (
+                <p className="px-2 pt-1 text-[11px] text-muted-foreground">
+                  {f.usedAt ? `Used ${new Date(f.usedAt).toLocaleDateString()}` : "Used"}
+                </p>
+              )}
+              <div className="flex flex-wrap gap-1 p-2">
+                {status === "available" ? (
+                  <button
+                    onClick={() => markUsed(f.id)}
+                    disabled={busyId === f.id}
+                    className="flex-1 rounded-full border border-border px-2 py-1 text-[11px] font-semibold transition-colors hover:bg-secondary disabled:opacity-50"
+                  >
+                    Mark used
+                  </button>
+                ) : (
+                  <button
+                    onClick={() => restoreToActive(f.id)}
+                    disabled={busyId === f.id}
+                    className="flex-1 rounded-full border border-border px-2 py-1 text-[11px] font-semibold transition-colors hover:bg-secondary disabled:opacity-50"
+                    title="If this file is inside a real 'used' folder in Drive itself, this only clears our own tracking — it can't move the actual file back in Drive."
+                  >
+                    Move to active
+                  </button>
+                )}
+                <button
+                  onClick={() => downloadRemoteFile(f.downloadUrl, f.name)}
+                  className="rounded-full border border-border px-2 py-1 text-[11px] font-semibold transition-colors hover:bg-secondary"
+                >
+                  ⬇ Download
+                </button>
+              </div>
+            </div>
           ))}
         </div>
       )}

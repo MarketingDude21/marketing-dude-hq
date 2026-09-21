@@ -190,6 +190,55 @@ function Button({
   );
 }
 
+// A textarea that grows to fit its content instead of staying pinned to a
+// small fixed height — added 2026-09-21 per Mike's bug report: "when you
+// click edit an email the whole edit screen shrinks." Root cause: the plain
+// <textarea> used everywhere content gets edited had only a min-height, so
+// a genuinely long piece of content (an email body is often 200+ words)
+// rendered as a small scrollable box the moment you clicked Edit, instead of
+// showing the same amount of text at once that the read-only view (an
+// uncapped <p>) already did — it wasn't actually losing anything, it just
+// LOOKED like the card had shrunk. This measures the textarea's own
+// scrollHeight on mount and on every keystroke and sets its CSS height to
+// match, so the edit view is always at least as tall as its content, same
+// as the read view. Used everywhere a piece of already-generated content
+// gets edited (a post/email/video card, a photo-scan suggestion) — not the
+// small "Publishing instructions" boxes on an email photo, which are meant
+// to hold a short note and are fine staying a fixed, manually resizable size.
+function AutoResizeTextarea({
+  value,
+  onChange,
+  className,
+  placeholder,
+  minHeightPx = 140,
+}: {
+  value: string;
+  onChange: (value: string) => void;
+  className?: string;
+  placeholder?: string;
+  minHeightPx?: number;
+}) {
+  const ref = useRef<HTMLTextAreaElement>(null);
+
+  useEffect(() => {
+    const el = ref.current;
+    if (!el) return;
+    el.style.height = "auto";
+    el.style.height = `${Math.max(minHeightPx, el.scrollHeight)}px`;
+  }, [value, minHeightPx]);
+
+  return (
+    <textarea
+      ref={ref}
+      value={value}
+      onChange={(e) => onChange(e.target.value)}
+      placeholder={placeholder}
+      className={className}
+      style={{ overflow: "hidden", resize: "vertical" }}
+    />
+  );
+}
+
 // Renders a calendar brief's image/Canva instructions as an actual bulleted
 // list instead of one run-on paragraph — added 2026-09-20 per Mike's
 // screenshot feedback ("too long," "very confusing," asked for bullet
@@ -1655,10 +1704,11 @@ function PostCard({
           </div>
         )}
         {editing ? (
-          <textarea
+          <AutoResizeTextarea
             value={draft}
-            onChange={(e) => setDraft(e.target.value)}
-            className="min-h-[140px] w-full rounded-2xl bg-muted px-4 py-3 text-sm leading-relaxed outline-none ring-ring transition focus:ring-2"
+            onChange={setDraft}
+            minHeightPx={140}
+            className="w-full rounded-2xl bg-muted px-4 py-3 text-sm leading-relaxed outline-none ring-ring transition focus:ring-2"
           />
         ) : (
           <p className="whitespace-pre-wrap text-sm leading-relaxed">{post.content}</p>
@@ -3662,6 +3712,15 @@ function PhotoScanPanel({
 }) {
   const [source, setSource] = useState<"drive" | "library">(folderId ? "drive" : "library");
   const [suggestions, setSuggestions] = useState<PhotoScanSuggestion[] | null>(null);
+  // Diagnostic counts from the last scan — added 2026-09-21 alongside the
+  // Drive subfolder-recursion fix, so an empty result can say WHY it's
+  // empty instead of a flat "no unused photos" that reads as a bug even
+  // when it's telling the truth. Only Drive scans currently return
+  // unsupportedFormatCount (HEIC/HEIF, an iPhone's default format, which
+  // Drive can list but Claude's vision API can't read) — a Library scan's
+  // uploads are always converted to JPEG at upload time, so that case
+  // doesn't apply there.
+  const [scanMeta, setScanMeta] = useState<{ totalPhotos: number; unsupportedFormatCount: number } | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [scanning, setScanning] = useState(false);
   const [scanningMore, setScanningMore] = useState(false);
@@ -3681,6 +3740,7 @@ function PhotoScanPanel({
   function switchSource(next: "drive" | "library") {
     setSource(next);
     setSuggestions(null);
+    setScanMeta(null);
     setSelected(new Set());
     setEdits({});
     setEditingId(null);
@@ -3703,6 +3763,10 @@ function PhotoScanPanel({
             })
           : await scanAgentLibraryPhotos({ data: { agentId, maxPhotos: 5, excludeFileIds } });
       setSuggestions((cur) => (more && cur ? [...cur, ...res.suggestions] : res.suggestions));
+      setScanMeta({
+        totalPhotos: res.totalPhotos,
+        unsupportedFormatCount: (res as { unsupportedFormatCount?: number }).unsupportedFormatCount ?? 0,
+      });
       setSelected((cur) => {
         const next = more ? new Set(cur) : new Set<string>();
         res.suggestions.forEach((s) => next.add(s.fileId));
@@ -3839,7 +3903,20 @@ function PhotoScanPanel({
 
       {suggestions && suggestions.length === 0 && (
         <p className="mt-3 text-sm text-muted-foreground">
-          No unused photos found in {source === "drive" ? "this Drive folder" : "the Media Library"}.
+          {/* Distinguishes "genuinely nothing there" from "found photos but
+              couldn't use any of them" — added 2026-09-21 after a report
+              that this said "no photos" for a Drive folder that visibly had
+              photos in it. A flat "no unused photos" is only ever accurate
+              for the first case; the other two have their own real, fixable
+              cause and deserve their own message instead of looking like a
+              bug. */}
+          {scanMeta && scanMeta.unsupportedFormatCount > 0 && scanMeta.totalPhotos === scanMeta.unsupportedFormatCount
+            ? `Found ${scanMeta.totalPhotos} photo${scanMeta.totalPhotos === 1 ? "" : "s"} in this Drive folder, but ${scanMeta.totalPhotos === 1 ? "it's" : "all of them are"} HEIC/HEIF (an iPhone's default photo format), which can't be scanned yet. Save them as JPEG first (Photos app → Share → "Options" → JPEG), or switch the phone's camera to the more compatible format in Settings → Camera → Formats → "Most Compatible."`
+            : scanMeta && scanMeta.unsupportedFormatCount > 0
+              ? `Found ${scanMeta.totalPhotos} photos in this Drive folder — ${scanMeta.unsupportedFormatCount} of them are HEIC/HEIF and got skipped (see above), and the rest are already used or were already shown. Try "Scan more" or add new photos.`
+              : scanMeta && scanMeta.totalPhotos > 0
+                ? `Found ${scanMeta.totalPhotos} photo${scanMeta.totalPhotos === 1 ? "" : "s"} in ${source === "drive" ? "this Drive folder" : "the Media Library"}, but they're already used or already shown here — add new ones to scan more.`
+                : `No photos found in ${source === "drive" ? "this Drive folder (checked its subfolders too)" : "the Media Library"}.`}
         </p>
       )}
 
@@ -3857,10 +3934,11 @@ function PhotoScanPanel({
               <div className="min-w-0 flex-1">
                 <p className="text-xs text-muted-foreground">{s.description}</p>
                 {editingId === s.fileId ? (
-                  <textarea
+                  <AutoResizeTextarea
                     value={edits[s.fileId] ?? s.suggestedPost}
-                    onChange={(e) => setEdits((cur) => ({ ...cur, [s.fileId]: e.target.value }))}
-                    className="mt-1 min-h-[90px] w-full rounded-xl bg-muted px-3 py-2 text-sm leading-relaxed outline-none ring-ring transition focus:ring-2"
+                    onChange={(v) => setEdits((cur) => ({ ...cur, [s.fileId]: v }))}
+                    minHeightPx={90}
+                    className="mt-1 w-full rounded-xl bg-muted px-3 py-2 text-sm leading-relaxed outline-none ring-ring transition focus:ring-2"
                   />
                 ) : (
                   <p className="mt-1 whitespace-pre-wrap">{edits[s.fileId] ?? s.suggestedPost}</p>

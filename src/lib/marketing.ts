@@ -423,6 +423,48 @@ export const listMarketingPosts = createServerFn({ method: "GET" })
     return (posts ?? []) as unknown as PostRow[];
   });
 
+// Shared by approveBatch and approveAllPending below — marks every photo/
+// video attached to a just-approved batch of posts "used," across BOTH
+// sources at once (Media Library rows via a real status flag, Drive files
+// via our own agent_drive_used_files tracking — see markDriveFileUsed's
+// comment for why Drive can't be a real folder move). Added/split out
+// 2026-09-21 after Mike reported "photos on the approve all did not move,
+// they need to move to the used folder in both media library and google
+// drive as well" — previously only the media_id half of this existed here;
+// a Drive-sourced photo on an approved post was never marked used at all.
+async function markAttachedMediaUsedForBatch(
+  supabaseAdmin: (typeof import("@/integrations/supabase/client.server"))["supabaseAdmin"],
+  agentId: string,
+  rows: { id: string; metadata: unknown }[],
+): Promise<void> {
+  const mediaIds = Array.from(
+    new Set(rows.map((r) => (r.metadata as PostMetadata | null)?.media_id).filter((id): id is string => Boolean(id))),
+  );
+  if (mediaIds.length) {
+    await supabaseAdmin
+      .from("agent_photos")
+      .update({ status: "used", used_at: new Date().toISOString() })
+      .in("id", mediaIds)
+      .eq("status", "available");
+  }
+
+  const driveFileIds = Array.from(
+    new Set(
+      rows.map((r) => (r.metadata as PostMetadata | null)?.drive_file_id).filter((id): id is string => Boolean(id)),
+    ),
+  );
+  if (driveFileIds.length) {
+    await supabaseAdmin.from("agent_drive_used_files").upsert(
+      driveFileIds.map((driveFileId) => ({
+        agent_id: agentId,
+        drive_file_id: driveFileId,
+        used_at: new Date().toISOString(),
+      })),
+      { onConflict: "agent_id,drive_file_id" },
+    );
+  }
+}
+
 export const approveBatch = createServerFn({ method: "POST" })
   .middleware([requireSupabaseAuth])
   .validator((data: { agentId: string; batchId: string }) => data)
@@ -445,21 +487,8 @@ export const approveBatch = createServerFn({ method: "POST" })
     if (error) throw error;
 
     // Same auto-mark-used behavior as the single-post approve path, applied
-    // to the whole batch at once.
-    const mediaIds = Array.from(
-      new Set(
-        (rows ?? [])
-          .map((r) => (r.metadata as PostMetadata | null)?.media_id)
-          .filter((id): id is string => Boolean(id)),
-      ),
-    );
-    if (mediaIds.length) {
-      await supabaseAdmin
-        .from("agent_photos")
-        .update({ status: "used", used_at: new Date().toISOString() })
-        .in("id", mediaIds)
-        .eq("status", "available");
-    }
+    // to the whole batch at once, across both photo sources.
+    await markAttachedMediaUsedForBatch(supabaseAdmin, data.agentId, rows ?? []);
 
     return { ok: true, updated: ids.length };
   });
@@ -492,20 +521,7 @@ export const approveAllPending = createServerFn({ method: "POST" })
       .in("id", ids);
     if (error) throw error;
 
-    const mediaIds = Array.from(
-      new Set(
-        (rows ?? [])
-          .map((r) => (r.metadata as PostMetadata | null)?.media_id)
-          .filter((id): id is string => Boolean(id)),
-      ),
-    );
-    if (mediaIds.length) {
-      await supabaseAdmin
-        .from("agent_photos")
-        .update({ status: "used", used_at: new Date().toISOString() })
-        .in("id", mediaIds)
-        .eq("status", "available");
-    }
+    await markAttachedMediaUsedForBatch(supabaseAdmin, data.agentId, rows ?? []);
 
     return { ok: true, updated: ids.length };
   });
@@ -561,15 +577,30 @@ export const updateMarketingPost = createServerFn({ method: "POST" })
     // Auto-mark the attached photo/video "used" the moment a post is
     // approved — the native equivalent of the old app's move-to-used, which
     // also only ever fired once content was actually approved, never at
-    // suggestion time.
+    // suggestion time. As of 2026-09-21, this covers a Drive-sourced photo
+    // too, not just a Media Library one — see markDriveFileUsed above for
+    // why Drive's version is a DB flag rather than an actual Drive move.
     if (data.status === "approved") {
-      const mediaId = (existing.metadata as PostMetadata | null)?.media_id;
+      const meta = existing.metadata as PostMetadata | null;
+      const mediaId = meta?.media_id;
       if (mediaId) {
         await supabaseAdmin
           .from("agent_photos")
           .update({ status: "used", used_at: new Date().toISOString(), used_in_post_id: data.postId })
           .eq("id", mediaId)
           .eq("status", "available");
+      }
+      const driveFileId = meta?.drive_file_id;
+      if (driveFileId) {
+        await supabaseAdmin.from("agent_drive_used_files").upsert(
+          {
+            agent_id: data.agentId,
+            drive_file_id: driveFileId,
+            used_at: new Date().toISOString(),
+            used_in_post_id: data.postId,
+          },
+          { onConflict: "agent_id,drive_file_id" },
+        );
       }
     }
 
@@ -1406,6 +1437,29 @@ export const markMediaUsed = createServerFn({ method: "POST" })
     return { ok: true, updated: data.mediaIds.length };
   });
 
+// Added 2026-09-21 per Mike: "photos and videos should be able to be moved
+// back to active folder form used folder." There was previously no way to
+// undo markMediaUsed (or the automatic used-marking on approve) at all —
+// once something was used, it stayed used forever. This is the Media
+// Library equivalent of restoreDriveFileToActive below; both undo the same
+// kind of mistake (marked used too early, or a piece of content got
+// deleted/rejected after all) the same way.
+export const restoreMediaToAvailable = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .validator((data: { agentId: string; mediaId: string }) => data)
+  .handler(async ({ data, context }): Promise<{ ok: true }> => {
+    const email = (context.claims as { email?: string } | undefined)?.email;
+    await requireAgentAccess(context.userId, email, data.agentId);
+    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+    const { error } = await supabaseAdmin
+      .from("agent_photos")
+      .update({ status: "available", used_at: null, used_in_post_id: null })
+      .eq("agent_id", data.agentId)
+      .eq("id", data.mediaId);
+    if (error) throw error;
+    return { ok: true };
+  });
+
 export const deleteMarketingMedia = createServerFn({ method: "POST" })
   .middleware([requireSupabaseAuth])
   .validator((data: { agentId: string; mediaId: string }) => data)
@@ -1577,6 +1631,17 @@ export type DriveFile = {
   isVideo: boolean;
   thumbnailUrl: string;
   viewUrl: string;
+  // Direct-content endpoint (added 2026-09-21 per Mike: "photos in all
+  // libraries should be downloadable") — unlike thumbnailUrl (a small
+  // preview) or viewUrl (opens Drive's own viewer), this serves the actual
+  // full-resolution file so a person can save it in one click. Works with
+  // the same "anyone with the link" sharing this whole integration already
+  // requires — no extra permission needed.
+  downloadUrl: string;
+  // Set only when this file is returned from the "used" side of
+  // listAgentDriveMedia (see below) — the moment our own app marked it used,
+  // when known. Undefined/omitted on the "available" listing.
+  usedAt?: string | null;
 };
 
 // This integration authenticates with a plain Drive API key, not real OAuth
@@ -1672,6 +1737,57 @@ function driveParentsClause(folderIds: string[]): string {
   return "(" + folderIds.map((id) => `'${id}' in parents`).join(" or ") + ")";
 }
 
+// Sibling to listDriveFolderIds above, walking the exact same tree, but
+// doing the OPPOSITE thing with a folder literally named "used": instead of
+// skipping it, this collects its id (without descending further into it,
+// matching how listDriveFolderIds treats it as a dead end either way). Added
+// 2026-09-21 per Mike: "google drive folder Used needs to show" — a legacy
+// Drive-workflow agent may already have real photos sitting in an actual
+// "used" subfolder (from the old app's move-to-used, or a manual move), and
+// until now nothing in this app ever surfaced that folder's contents
+// anywhere — it was just silently excluded, full stop.
+async function listDriveUsedFolderIds(rootFolderId: string, apiKey: string): Promise<string[]> {
+  const usedIds: string[] = [];
+  let frontier = [rootFolderId];
+  for (
+    let depth = 0;
+    depth < MAX_DRIVE_FOLDER_DEPTH && frontier.length && usedIds.length < MAX_DRIVE_FOLDERS;
+    depth++
+  ) {
+    const batches = await Promise.all(
+      frontier.map(async (parentId) => {
+        const url =
+          "https://www.googleapis.com/drive/v3/files?" +
+          "q=" +
+          encodeURIComponent(
+            `'${parentId}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false`,
+          ) +
+          "&fields=files(id,name)&pageSize=100&key=" +
+          apiKey;
+        try {
+          const res = await fetchWithTimeout(url, {}, 15_000);
+          const json = (await res.json()) as { files?: { id: string; name: string }[] };
+          return json.files ?? [];
+        } catch {
+          return [];
+        }
+      }),
+    );
+    const nextFrontier: string[] = [];
+    for (const folders of batches) {
+      for (const f of folders) {
+        if (f.name.trim().toLowerCase() === "used") {
+          usedIds.push(f.id); // found one — don't descend into it
+          continue;
+        }
+        nextFrontier.push(f.id);
+      }
+    }
+    frontier = nextFrontier;
+  }
+  return usedIds;
+}
+
 // A HEIC/HEIF photo (the default format on an iPhone camera) can be listed
 // and thumbnailed by Drive just fine, but Claude's vision API can't read
 // its bytes — captioning it just fails. Callers filter these out up front
@@ -1691,8 +1807,24 @@ function isHeicDriveFile(f: { name: string; mimeType: string }): boolean {
 // confirmed the folder is accessible (verifyDriveFolderAccessible) if it
 // wants a clear error on a private/unshared folder — this function itself
 // just throws whatever the Drive API returns.
-async function fetchDriveMediaFiles(folderId: string, apiKey: string): Promise<DriveFile[]> {
-  const folderIds = await listDriveFolderIds(folderId, apiKey);
+function mapDriveApiFile(f: { id: string; name: string; mimeType: string }): DriveFile {
+  return {
+    id: f.id,
+    name: f.name,
+    mimeType: f.mimeType,
+    isVideo: f.mimeType.startsWith("video/"),
+    thumbnailUrl: `https://drive.google.com/thumbnail?id=${f.id}&sz=w400`,
+    viewUrl: `https://drive.google.com/file/d/${f.id}/view`,
+    downloadUrl: `https://drive.google.com/uc?export=download&id=${f.id}`,
+  };
+}
+
+// Shared by fetchDriveMediaFiles and fetchDriveUsedFiles below — both just
+// query "every image/video directly inside this set of folder ids," they
+// only differ in which folder ids they pass in (the active tree vs. a
+// "used" folder found inside it).
+async function queryDriveFilesInFolders(folderIds: string[], apiKey: string): Promise<DriveFile[]> {
+  if (!folderIds.length) return [];
   const q = `${driveParentsClause(folderIds)} and (mimeType contains 'image/' or mimeType contains 'video/') and trashed=false`;
   const url =
     "https://www.googleapis.com/drive/v3/files?" +
@@ -1706,20 +1838,51 @@ async function fetchDriveMediaFiles(folderId: string, apiKey: string): Promise<D
     error?: { message?: string };
   };
   if (!res.ok) throw new Error(json.error?.message ?? `Google Drive API error (${res.status})`);
+  return (json.files ?? []).map(mapDriveApiFile);
+}
 
-  return (json.files ?? []).map((f) => ({
-    id: f.id,
-    name: f.name,
-    mimeType: f.mimeType,
-    isVideo: f.mimeType.startsWith("video/"),
-    thumbnailUrl: `https://drive.google.com/thumbnail?id=${f.id}&sz=w400`,
-    viewUrl: `https://drive.google.com/file/d/${f.id}/view`,
-  }));
+async function fetchDriveMediaFiles(folderId: string, apiKey: string): Promise<DriveFile[]> {
+  const folderIds = await listDriveFolderIds(folderId, apiKey);
+  return queryDriveFilesInFolders(folderIds, apiKey);
+}
+
+// The contents of whatever "used" subfolder(s) exist anywhere in this Drive
+// folder's tree — added 2026-09-21 alongside listDriveUsedFolderIds above,
+// so the "Used" side of the Drive tab has something real to show.
+async function fetchDriveUsedFiles(folderId: string, apiKey: string): Promise<DriveFile[]> {
+  const usedFolderIds = await listDriveUsedFolderIds(folderId, apiKey);
+  return queryDriveFilesInFolders(usedFolderIds, apiKey);
+}
+
+// Looks up a specific set of Drive file ids directly (files.get, one call
+// per id — Drive v3 has no bulk multi-get without the more involved batch/
+// multipart endpoint, and this is only ever called for a handful of ids at
+// once: files OUR app has marked "used" that don't already show up in the
+// structural "used" folder listing above). A file that's been deleted,
+// trashed, or had its sharing revoked since being marked used is silently
+// skipped rather than failing the whole listing — the used-tracking row
+// stays either way, but there's nothing to render for it.
+async function fetchDriveFilesByIds(fileIds: string[], apiKey: string): Promise<DriveFile[]> {
+  const results = await Promise.all(
+    fileIds.map(async (id) => {
+      try {
+        const url = `https://www.googleapis.com/drive/v3/files/${id}?fields=id,name,mimeType,trashed&key=${apiKey}`;
+        const res = await fetchWithTimeout(url, {}, 15_000);
+        if (!res.ok) return null;
+        const json = (await res.json()) as { id: string; name: string; mimeType: string; trashed?: boolean };
+        if (json.trashed) return null;
+        return mapDriveApiFile(json);
+      } catch {
+        return null;
+      }
+    }),
+  );
+  return results.filter((f): f is DriveFile => Boolean(f));
 }
 
 export const listAgentDriveMedia = createServerFn({ method: "GET" })
   .middleware([requireSupabaseAuth])
-  .validator((data: { agentId: string }) => data)
+  .validator((data: { agentId: string; status?: "available" | "used" }) => data)
   .handler(async ({ data, context }): Promise<{ folderId: string | null; files: DriveFile[] }> => {
     const email = (context.claims as { email?: string } | undefined)?.email;
     await requireAgentAccess(context.userId, email, data.agentId);
@@ -1738,8 +1901,101 @@ export const listAgentDriveMedia = createServerFn({ method: "GET" })
       throw new Error("Google Drive isn't connected yet — add GOOGLE_API_KEY in Lovable Cloud → Secrets.");
     }
     await verifyDriveFolderAccessible(folderId, apiKey);
-    const files = await fetchDriveMediaFiles(folderId, apiKey);
+
+    // agent_drive_used_files — our own DB-side "used" tracking for Drive
+    // photos, added 2026-09-21 (see markDriveFileUsed below for why this
+    // exists rather than a real Drive move).
+    const { data: trackedRows, error: trackedErr } = await supabaseAdmin
+      .from("agent_drive_used_files")
+      .select("drive_file_id, used_at")
+      .eq("agent_id", data.agentId);
+    if (trackedErr) throw trackedErr;
+    const trackedUsed = new Map((trackedRows ?? []).map((r) => [r.drive_file_id as string, r.used_at as string]));
+
+    if ((data.status ?? "available") === "used") {
+      // Two sources, merged: (1) whatever's structurally sitting inside a
+      // real "used" subfolder in Drive right now (a legacy client's old
+      // workflow, or a manual move) — see listDriveUsedFolderIds — and
+      // (2) anything OUR app has marked used via approve/Mark used, which
+      // may or may not also be one of those structural files. De-duped by
+      // file id so something in both places only shows once.
+      const structural = await fetchDriveUsedFiles(folderId, apiKey);
+      const structuralIds = new Set(structural.map((f) => f.id));
+      const onlyTrackedIds = Array.from(trackedUsed.keys()).filter((id) => !structuralIds.has(id));
+      const trackedOnly = onlyTrackedIds.length ? await fetchDriveFilesByIds(onlyTrackedIds, apiKey) : [];
+      const files = [...structural, ...trackedOnly].map((f) => ({
+        ...f,
+        usedAt: trackedUsed.get(f.id) ?? null,
+      }));
+      return { folderId, files };
+    }
+
+    // "available" — the normal active-tree listing, minus anything we've
+    // separately marked used ourselves (covers a file our app marked used
+    // that's still physically sitting in a normal, non-"used" folder, since
+    // we can't move the real file without Drive write access — see below).
+    const files = (await fetchDriveMediaFiles(folderId, apiKey)).filter((f) => !trackedUsed.has(f.id));
     return { folderId, files };
+  });
+
+// Added 2026-09-21 per Mike: "photos on the approve all did not move, they
+// need to move to the used folder in both media library and google drive as
+// well." For the native Media library, "moving to used" was already just a
+// status flag on our own row (agent_photos.status) — that part already
+// worked. Google Drive has no equivalent at all: this integration only ever
+// had a plain, read-only Drive API key (see the big comment block above
+// DriveFile), never the OAuth refresh token real Drive WRITES (moving a file
+// between folders) require — that's exactly why the old app's actual
+// move-to-used.js needed a different kind of credential than everything
+// else in this file. Rather than block this fix on setting up Google OAuth
+// (a real, separate infra decision), "used" for Drive is tracked the same
+// way as Media Library — as our own flag, in our own database — so approve/
+// restore work identically for both sources today. The file itself never
+// physically moves in the agent's real Drive; if Mike wants Drive-native
+// moves later, that needs OAuth credentials from Google Cloud Console,
+// which is worth flagging to him as a follow-up rather than assuming.
+export const markDriveFileUsed = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .validator((data: { agentId: string; driveFileId: string; postId?: string }) => data)
+  .handler(async ({ data, context }): Promise<{ ok: true }> => {
+    const email = (context.claims as { email?: string } | undefined)?.email;
+    await requireAgentAccess(context.userId, email, data.agentId);
+    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+    const { error } = await supabaseAdmin.from("agent_drive_used_files").upsert(
+      {
+        agent_id: data.agentId,
+        drive_file_id: data.driveFileId,
+        used_at: new Date().toISOString(),
+        used_in_post_id: data.postId ?? null,
+      },
+      { onConflict: "agent_id,drive_file_id" },
+    );
+    if (error) throw error;
+    return { ok: true };
+  });
+
+// Undoes markDriveFileUsed above — added 2026-09-21 per Mike: "photos and
+// videos should be able to be moved back to active folder from used
+// folder." Only clears OUR tracking flag. If the file is genuinely sitting
+// inside a real "used" subfolder in the agent's actual Drive (the legacy/
+// structural case — see fetchDriveUsedFiles), this can't move the real file
+// back out of it — that would need the same Drive write access noted above.
+// A file this app itself marked used (without any physical move) restores
+// fully and correctly either way.
+export const restoreDriveFileToActive = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .validator((data: { agentId: string; driveFileId: string }) => data)
+  .handler(async ({ data, context }): Promise<{ ok: true }> => {
+    const email = (context.claims as { email?: string } | undefined)?.email;
+    await requireAgentAccess(context.userId, email, data.agentId);
+    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+    const { error } = await supabaseAdmin
+      .from("agent_drive_used_files")
+      .delete()
+      .eq("agent_id", data.agentId)
+      .eq("drive_file_id", data.driveFileId);
+    if (error) throw error;
+    return { ok: true };
   });
 
 // Admin-only — sets which Drive folder a given agent's tab reads from.

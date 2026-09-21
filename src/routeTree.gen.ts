@@ -15,6 +15,7 @@ import { Route as DatabaseRouteImport } from './routes/database'
 import { Route as LoginRouteImport } from './routes/login'
 import { Route as MarketingRouteImport } from './routes/marketing'
 import { Route as VoiceRouteImport } from './routes/voice'
+import { Route as MediaUploadTokenRouteImport } from './routes/media-upload.$token'
 
 const IndexRoute = IndexRouteImport.update({
   id: '/',
@@ -46,6 +47,11 @@ const VoiceRoute = VoiceRouteImport.update({
   path: '/voice',
   getParentRoute: () => rootRouteImport,
 } as any)
+const MediaUploadTokenRoute = MediaUploadTokenRouteImport.update({
+  id: '/media-upload/$token',
+  path: '/media-upload/$token',
+  getParentRoute: () => rootRouteImport,
+} as any)
 
 export interface FileRoutesByFullPath {
   '/': typeof IndexRoute
@@ -54,6 +60,7 @@ export interface FileRoutesByFullPath {
   '/login': typeof LoginRoute
   '/marketing': typeof MarketingRoute
   '/voice': typeof VoiceRoute
+  '/media-upload/$token': typeof MediaUploadTokenRoute
 }
 export interface FileRoutesByTo {
   '/': typeof IndexRoute
@@ -62,6 +69,7 @@ export interface FileRoutesByTo {
   '/login': typeof LoginRoute
   '/marketing': typeof MarketingRoute
   '/voice': typeof VoiceRoute
+  '/media-upload/$token': typeof MediaUploadTokenRoute
 }
 export interface FileRoutesById {
   __root__: typeof rootRouteImport
@@ -71,12 +79,27 @@ export interface FileRoutesById {
   '/login': typeof LoginRoute
   '/marketing': typeof MarketingRoute
   '/voice': typeof VoiceRoute
+  '/media-upload/$token': typeof MediaUploadTokenRoute
 }
 export interface FileRouteTypes {
   fileRoutesByFullPath: FileRoutesByFullPath
-  fullPaths: '/' | '/account' | '/database' | '/login' | '/marketing' | '/voice'
+  fullPaths:
+    | '/'
+    | '/account'
+    | '/database'
+    | '/login'
+    | '/marketing'
+    | '/voice'
+    | '/media-upload/$token'
   fileRoutesByTo: FileRoutesByTo
-  to: '/' | '/account' | '/database' | '/login' | '/marketing' | '/voice'
+  to:
+    | '/'
+    | '/account'
+    | '/database'
+    | '/login'
+    | '/marketing'
+    | '/voice'
+    | '/media-upload/$token'
   id:
     | '__root__'
     | '/'
@@ -85,6 +108,7 @@ export interface FileRouteTypes {
     | '/login'
     | '/marketing'
     | '/voice'
+    | '/media-upload/$token'
   fileRoutesById: FileRoutesById
 }
 export interface RootRouteChildren {
@@ -94,6 +118,7 @@ export interface RootRouteChildren {
   LoginRoute: typeof LoginRoute
   MarketingRoute: typeof MarketingRoute
   VoiceRoute: typeof VoiceRoute
+  MediaUploadTokenRoute: typeof MediaUploadTokenRoute
 }
 
 declare module '@tanstack/react-router' {
@@ -140,6 +165,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof VoiceRouteImport
       parentRoute: typeof rootRouteImport
     }
+    '/media-upload/$token': {
+      id: '/media-upload/$token'
+      path: '/media-upload/$token'
+      fullPath: '/media-upload/$token'
+      preLoaderRoute: typeof MediaUploadTokenRouteImport
+      parentRoute: typeof rootRouteImport
+    }
   }
 }
 
@@ -150,6 +182,7 @@ const rootRouteChildren: RootRouteChildren = {
   LoginRoute: LoginRoute,
   MarketingRoute: MarketingRoute,
   VoiceRoute: VoiceRoute,
+  MediaUploadTokenRoute: MediaUploadTokenRoute,
 }
 export const routeTree = rootRouteImport
   ._addFileChildren(rootRouteChildren)

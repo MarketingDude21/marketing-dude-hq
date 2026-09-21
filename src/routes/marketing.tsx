@@ -20,6 +20,8 @@ import {
   setMediaTags,
   markMediaUsed,
   deleteMarketingMedia,
+  getMediaUploadLink,
+  regenerateMediaUploadLink,
   listAgentDriveMedia,
   setAgentDriveFolder,
   generateMarketingContent,
@@ -180,6 +182,51 @@ function Button({
     >
       {children}
     </button>
+  );
+}
+
+// Renders a calendar brief's image/Canva instructions as an actual bulleted
+// list instead of one run-on paragraph — added 2026-09-20 per Mike's
+// screenshot feedback ("too long," "very confusing," asked for bullet
+// points). New content comes from marketing.ts's parsePostDoc/toBullets
+// already newline-joined and cleaned; older, already-generated posts made
+// before this fix still have their text semicolon-joined, so this falls
+// back to splitting on "; " too, so existing pending content reads better
+// immediately rather than only after a fresh Generate. Long briefs (more
+// than 4 lines — the common case for a multi-slide carousel/video brief)
+// show only the first 3 up front with the rest tucked behind a native
+// <details> disclosure, so the card itself stays short without losing any
+// detail — this is what actually answers "this is too long."
+function SuggestionBullets({ text }: { text: string }) {
+  const lines = (text.includes("\n") ? text.split("\n") : text.split("; ")).map((l) => l.trim()).filter(Boolean);
+  if (lines.length === 0) return null;
+  if (lines.length <= 4) {
+    return (
+      <ul className="list-disc space-y-0.5 pl-4">
+        {lines.map((l, i) => (
+          <li key={i}>{l}</li>
+        ))}
+      </ul>
+    );
+  }
+  const shown = lines.slice(0, 3);
+  const rest = lines.slice(3);
+  return (
+    <>
+      <ul className="list-disc space-y-0.5 pl-4">
+        {shown.map((l, i) => (
+          <li key={i}>{l}</li>
+        ))}
+      </ul>
+      <details className="mt-1">
+        <summary className="cursor-pointer text-[11px] font-semibold text-primary">+{rest.length} more</summary>
+        <ul className="mt-1 list-disc space-y-0.5 pl-4">
+          {rest.map((l, i) => (
+            <li key={i}>{l}</li>
+          ))}
+        </ul>
+      </details>
+    </>
   );
 }
 
@@ -572,7 +619,7 @@ function Workspace({ agentId, agentEmail, isAdmin }: { agentId: string; agentEma
       <div className="mt-5">
         {tab === "posts" && <PostsTab agentId={agentId} isAdmin={isAdmin} />}
         {tab === "calendar" && <ContentCalendarTab agentId={agentId} isAdmin={isAdmin} />}
-        {tab === "media" && <MediaTab agentId={agentId} />}
+        {tab === "media" && <MediaTab agentId={agentId} isAdmin={isAdmin} />}
         {tab === "drive" && <DriveTab agentId={agentId} agentEmail={agentEmail} isAdmin={isAdmin} />}
       </div>
     </div>
@@ -1220,11 +1267,15 @@ function PostCard({
           </p>
         )}
         {post.content_type === "post" && post.metadata?.image_suggestion && (
-          <p className="mb-2 text-xs text-muted-foreground">
-            📸 Image direction from the brief: {post.metadata.image_suggestion}
-            {!photoUrl &&
-              " — no photo on file yet to attach automatically; add one on the Media tab or pick one below."}
-          </p>
+          <div className="mb-2 text-xs text-muted-foreground">
+            <p className="mb-1 font-semibold">📸 Image direction from the brief</p>
+            <SuggestionBullets text={post.metadata.image_suggestion} />
+            {!photoUrl && (
+              <p className="mt-1">
+                No photo on file yet to attach automatically — add one on the Media tab or pick one below.
+              </p>
+            )}
+          </div>
         )}
         {editing ? (
           <textarea
@@ -1258,9 +1309,10 @@ function PostCard({
                   sections ended — so nothing ever showed here before this
                   fix. See parsePostDoc's canvaDirection in marketing.ts. */}
             {post.metadata?.canva_instructions && (
-              <p className="mt-2 text-xs text-muted-foreground">
-                🎨 Instructions for this template: {post.metadata.canva_instructions}
-              </p>
+              <div className="mt-2 text-xs text-muted-foreground">
+                <p className="mb-1 font-semibold">🎨 Instructions for this template</p>
+                <SuggestionBullets text={post.metadata.canva_instructions} />
+              </div>
             )}
           </>
         )}
@@ -1580,7 +1632,87 @@ const PHOTO_TAG_OPTIONS = [
   "behind the scenes",
 ] as const;
 
-function MediaTab({ agentId }: { agentId: string }) {
+// Admin-only card on the Media tab that surfaces the public upload link for
+// this agent — added 2026-09-20 per Mike: "I want to create a simple link I
+// can send them that will open up directly into the Media folder no
+// differently than how we share a google drive link... upload photos to
+// that media library without logging in." Getting the link lazily creates a
+// token the first time (getMediaUploadLink), so nothing changes for an
+// agent whose link has never been requested. Regenerating issues a brand
+// new token and immediately breaks whatever link was shared before — the
+// equivalent of un-sharing a Drive folder.
+function PublicUploadLinkCard({ agentId }: { agentId: string }) {
+  const [token, setToken] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [copied, setCopied] = useState(false);
+
+  useEffect(() => {
+    setToken(null);
+    setError(null);
+    getMediaUploadLink({ data: { agentId } })
+      .then((r) => setToken(r.token))
+      .catch((e) => setError(e instanceof Error ? e.message : String(e)));
+  }, [agentId]);
+
+  const link = token && typeof window !== "undefined" ? `${window.location.origin}/media-upload/${token}` : null;
+
+  async function copyLink() {
+    if (!link) return;
+    try {
+      await navigator.clipboard.writeText(link);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    } catch {
+      setError("Couldn't copy automatically — select and copy the link text instead.");
+    }
+  }
+
+  async function regenerate() {
+    setBusy(true);
+    setError(null);
+    setCopied(false);
+    try {
+      const r = await regenerateMediaUploadLink({ data: { agentId } });
+      setToken(r.token);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <Card>
+      <h3 className="font-display text-sm font-semibold">Public upload link</h3>
+      <p className="mt-1 text-xs text-muted-foreground">
+        Anyone with this link can open a simple upload page for this agent and add photos or videos straight into this
+        Media library — no login needed, same idea as sharing a Google Drive upload link. They can only upload; they
+        can't see, download, or delete anything already here.
+      </p>
+      {error && <p className="mt-2 text-xs text-destructive">{error}</p>}
+      {link && (
+        <div className="mt-3 flex flex-wrap items-center gap-2">
+          <input
+            readOnly
+            value={link}
+            onFocus={(e) => e.currentTarget.select()}
+            className="min-w-0 flex-1 rounded-full border border-border bg-muted px-4 py-2 text-xs text-foreground"
+          />
+          <Button variant="secondary" onClick={copyLink}>
+            {copied ? "Copied ✓" : "Copy link"}
+          </Button>
+          <Button variant="secondary" onClick={regenerate} disabled={busy}>
+            {busy ? "Regenerating…" : "Regenerate link"}
+          </Button>
+        </div>
+      )}
+      {!link && !error && <p className="mt-2 text-xs text-muted-foreground">Loading…</p>}
+    </Card>
+  );
+}
+
+function MediaTab({ agentId, isAdmin }: { agentId: string; isAdmin: boolean }) {
   const [status, setStatus] = useState<"available" | "used">("available");
   const [media, setMedia] = useState<MediaRow[] | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -1709,6 +1841,8 @@ function MediaTab({ agentId }: { agentId: string }) {
         </div>
         {uploadNote && <p className="mt-2 text-xs text-muted-foreground">{uploadNote}</p>}
       </Card>
+
+      {isAdmin && <PublicUploadLinkCard agentId={agentId} />}
 
       <div className="flex flex-wrap gap-1 rounded-full border border-border bg-glass p-1 backdrop-blur-xl w-fit">
         {(["available", "used"] as const).map((s) => (

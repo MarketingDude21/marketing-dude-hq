@@ -380,7 +380,7 @@ export type PostRow = {
 
 export const listMarketingPosts = createServerFn({ method: "GET" })
   .middleware([requireSupabaseAuth])
-  .validator((data: { agentId: string; month?: string; archivedOnly?: boolean }) => data)
+  .inputValidator((data: { agentId: string; month?: string; archivedOnly?: boolean }) => data)
   .handler(async ({ data, context }): Promise<PostRow[]> => {
     const email = (context.claims as { email?: string } | undefined)?.email;
     await requireAgentAccess(context.userId, email, data.agentId);
@@ -425,7 +425,7 @@ export const listMarketingPosts = createServerFn({ method: "GET" })
 
 export const approveBatch = createServerFn({ method: "POST" })
   .middleware([requireSupabaseAuth])
-  .validator((data: { agentId: string; batchId: string }) => data)
+  .inputValidator((data: { agentId: string; batchId: string }) => data)
   .handler(async ({ data, context }): Promise<{ ok: true; updated: number }> => {
     const email = (context.claims as { email?: string } | undefined)?.email;
     await requireAgentAccess(context.userId, email, data.agentId);
@@ -471,7 +471,7 @@ export const approveBatch = createServerFn({ method: "POST" })
 // approve paths.
 export const approveAllPending = createServerFn({ method: "POST" })
   .middleware([requireSupabaseAuth])
-  .validator((data: { agentId: string; month?: string }) => data)
+  .inputValidator((data: { agentId: string; month?: string }) => data)
   .handler(async ({ data, context }): Promise<{ ok: true; updated: number }> => {
     const email = (context.claims as { email?: string } | undefined)?.email;
     await requireAgentAccess(context.userId, email, data.agentId);
@@ -512,7 +512,7 @@ export const approveAllPending = createServerFn({ method: "POST" })
 
 export const listMarketingMonths = createServerFn({ method: "GET" })
   .middleware([requireSupabaseAuth])
-  .validator((data: { agentId: string }) => data)
+  .inputValidator((data: { agentId: string }) => data)
   .handler(async ({ data, context }): Promise<string[]> => {
     const email = (context.claims as { email?: string } | undefined)?.email;
     await requireAgentAccess(context.userId, email, data.agentId);
@@ -530,7 +530,7 @@ export const listMarketingMonths = createServerFn({ method: "GET" })
 
 export const updateMarketingPost = createServerFn({ method: "POST" })
   .middleware([requireSupabaseAuth])
-  .validator((data: { agentId: string; postId: string; content?: string; status?: string }) => data)
+  .inputValidator((data: { agentId: string; postId: string; content?: string; status?: string }) => data)
   .handler(async ({ data, context }): Promise<{ ok: true }> => {
     const email = (context.claims as { email?: string } | undefined)?.email;
     await requireAgentAccess(context.userId, email, data.agentId);
@@ -583,7 +583,7 @@ export const updateMarketingPost = createServerFn({ method: "POST" })
 // as the old app did when a VA picked something other than the suggestion.
 export const setPostMedia = createServerFn({ method: "POST" })
   .middleware([requireSupabaseAuth])
-  .validator((data: { agentId: string; postId: string; mediaId: string | null }) => data)
+  .inputValidator((data: { agentId: string; postId: string; mediaId: string | null }) => data)
   .handler(async ({ data, context }): Promise<{ ok: true }> => {
     const email = (context.claims as { email?: string } | undefined)?.email;
     await requireAgentAccess(context.userId, email, data.agentId);
@@ -659,7 +659,7 @@ export const setPostMedia = createServerFn({ method: "POST" })
 // only one photo source is ever active on a post at a time.
 export const setPostDrivePhoto = createServerFn({ method: "POST" })
   .middleware([requireSupabaseAuth])
-  .validator((data: { agentId: string; postId: string; driveFileId: string; thumbnailUrl: string }) => data)
+  .inputValidator((data: { agentId: string; postId: string; driveFileId: string; thumbnailUrl: string }) => data)
   .handler(async ({ data, context }): Promise<{ ok: true }> => {
     const email = (context.claims as { email?: string } | undefined)?.email;
     await requireAgentAccess(context.userId, email, data.agentId);
@@ -719,7 +719,7 @@ export type UnsplashResult = {
 
 export const searchUnsplashPhotos = createServerFn({ method: "POST" })
   .middleware([requireSupabaseAuth])
-  .validator((data: { agentId: string; query: string }) => data)
+  .inputValidator((data: { agentId: string; query: string }) => data)
   .handler(async ({ data, context }): Promise<{ results: UnsplashResult[] }> => {
     const email = (context.claims as { email?: string } | undefined)?.email;
     await requireAgentAccess(context.userId, email, data.agentId);
@@ -804,7 +804,7 @@ export const searchUnsplashPhotos = createServerFn({ method: "POST" })
 
 export const setPostUnsplashPhoto = createServerFn({ method: "POST" })
   .middleware([requireSupabaseAuth])
-  .validator(
+  .inputValidator(
     (data: {
       agentId: string;
       postId: string;
@@ -943,7 +943,7 @@ async function writeEmailPhotos(postId: string, photos: EmailPhoto[]): Promise<v
 // already applies to library photos) before trusting its URL.
 export const addEmailPhotoFromLibrary = createServerFn({ method: "POST" })
   .middleware([requireSupabaseAuth])
-  .validator((data: { agentId: string; postId: string; mediaId: string }) => data)
+  .inputValidator((data: { agentId: string; postId: string; mediaId: string }) => data)
   .handler(async ({ data, context }): Promise<{ photos: EmailPhoto[] }> => {
     const email = (context.claims as { email?: string } | undefined)?.email;
     await requireAgentAccess(context.userId, email, data.agentId);
@@ -989,7 +989,7 @@ export const addEmailPhotoFromLibrary = createServerFn({ method: "POST" })
 // nothing further to re-verify against a Drive file id here).
 export const addEmailPhotoFromDrive = createServerFn({ method: "POST" })
   .middleware([requireSupabaseAuth])
-  .validator((data: { agentId: string; postId: string; driveFileId: string; thumbnailUrl: string }) => data)
+  .inputValidator((data: { agentId: string; postId: string; driveFileId: string; thumbnailUrl: string }) => data)
   .handler(async ({ data, context }): Promise<{ photos: EmailPhoto[] }> => {
     const email = (context.claims as { email?: string } | undefined)?.email;
     await requireAgentAccess(context.userId, email, data.agentId);
@@ -1025,7 +1025,7 @@ export const addEmailPhotoFromDrive = createServerFn({ method: "POST" })
 // comes from a live searchUnsplashPhotos result, never typed in by hand).
 export const addEmailPhotoFromUnsplash = createServerFn({ method: "POST" })
   .middleware([requireSupabaseAuth])
-  .validator(
+  .inputValidator(
     (data: {
       agentId: string;
       postId: string;
@@ -1070,7 +1070,7 @@ export const addEmailPhotoFromUnsplash = createServerFn({ method: "POST" })
 // in the panel saves through this on blur.
 export const updateEmailPhotoInstructions = createServerFn({ method: "POST" })
   .middleware([requireSupabaseAuth])
-  .validator((data: { agentId: string; postId: string; photoId: string; publishingInstructions: string }) => data)
+  .inputValidator((data: { agentId: string; postId: string; photoId: string; publishingInstructions: string }) => data)
   .handler(async ({ data, context }): Promise<{ photos: EmailPhoto[] }> => {
     const email = (context.claims as { email?: string } | undefined)?.email;
     await requireAgentAccess(context.userId, email, data.agentId);
@@ -1085,7 +1085,7 @@ export const updateEmailPhotoInstructions = createServerFn({ method: "POST" })
 // Removes one attached email photo, leaving the others as-is.
 export const removeEmailPhoto = createServerFn({ method: "POST" })
   .middleware([requireSupabaseAuth])
-  .validator((data: { agentId: string; postId: string; photoId: string }) => data)
+  .inputValidator((data: { agentId: string; postId: string; photoId: string }) => data)
   .handler(async ({ data, context }): Promise<{ photos: EmailPhoto[] }> => {
     const email = (context.claims as { email?: string } | undefined)?.email;
     await requireAgentAccess(context.userId, email, data.agentId);
@@ -1097,7 +1097,7 @@ export const removeEmailPhoto = createServerFn({ method: "POST" })
 
 export const submitMarketingFeedback = createServerFn({ method: "POST" })
   .middleware([requireSupabaseAuth])
-  .validator((data: { agentId: string; postId: string; rating?: string; notes?: string }) => data)
+  .inputValidator((data: { agentId: string; postId: string; rating?: string; notes?: string }) => data)
   .handler(async ({ data, context }): Promise<{ ok: true }> => {
     const email = (context.claims as { email?: string } | undefined)?.email;
     await requireAgentAccess(context.userId, email, data.agentId);
@@ -1133,7 +1133,7 @@ export const submitMarketingFeedback = createServerFn({ method: "POST" })
 // feedback_history as a learning signal, same as the old app did.
 export const rewritePostContent = createServerFn({ method: "POST" })
   .middleware([requireSupabaseAuth])
-  .validator((data: { agentId: string; postId: string; feedback: string }) => data)
+  .inputValidator((data: { agentId: string; postId: string; feedback: string }) => data)
   .handler(async ({ data, context }): Promise<{ ok: true; content: string }> => {
     const email = (context.claims as { email?: string } | undefined)?.email;
     await requireAgentAccess(context.userId, email, data.agentId);
@@ -1228,7 +1228,7 @@ type PhotoRow = {
 
 export const listMarketingPhotos = createServerFn({ method: "GET" })
   .middleware([requireSupabaseAuth])
-  .validator((data: { agentId: string }) => data)
+  .inputValidator((data: { agentId: string }) => data)
   .handler(async ({ data, context }): Promise<PhotoRow[]> => {
     const email = (context.claims as { email?: string } | undefined)?.email;
     await requireAgentAccess(context.userId, email, data.agentId);
@@ -1274,7 +1274,7 @@ export type MediaRow = {
 
 export const listMarketingMedia = createServerFn({ method: "GET" })
   .middleware([requireSupabaseAuth])
-  .validator((data: { agentId: string; status?: "available" | "used" }) => data)
+  .inputValidator((data: { agentId: string; status?: "available" | "used" }) => data)
   .handler(async ({ data, context }): Promise<MediaRow[]> => {
     const email = (context.claims as { email?: string } | undefined)?.email;
     await requireAgentAccess(context.userId, email, data.agentId);
@@ -1298,7 +1298,7 @@ export const listMarketingMedia = createServerFn({ method: "GET" })
 // video the way there would be if uploads were proxied through here.
 export const createMediaUploadUrl = createServerFn({ method: "POST" })
   .middleware([requireSupabaseAuth])
-  .validator((data: { agentId: string; fileName: string }) => data)
+  .inputValidator((data: { agentId: string; fileName: string }) => data)
   .handler(async ({ data, context }): Promise<{ path: string; token: string }> => {
     const email = (context.claims as { email?: string } | undefined)?.email;
     await requireAgentAccess(context.userId, email, data.agentId);
@@ -1316,7 +1316,7 @@ export const createMediaUploadUrl = createServerFn({ method: "POST" })
 // back about its own upload.
 export const finalizeMediaUpload = createServerFn({ method: "POST" })
   .middleware([requireSupabaseAuth])
-  .validator((data: { agentId: string; storagePath: string; mediaType: "photo" | "video"; caption?: string }) => data)
+  .inputValidator((data: { agentId: string; storagePath: string; mediaType: "photo" | "video"; caption?: string }) => data)
   .handler(async ({ data, context }): Promise<{ ok: true; id: string }> => {
     const email = (context.claims as { email?: string } | undefined)?.email;
     await requireAgentAccess(context.userId, email, data.agentId);
@@ -1351,7 +1351,7 @@ export const finalizeMediaUpload = createServerFn({ method: "POST" })
 // to posts by category instead of pure FIFO.
 export const setMediaTags = createServerFn({ method: "POST" })
   .middleware([requireSupabaseAuth])
-  .validator((data: { agentId: string; mediaId: string; tags: string[] }) => data)
+  .inputValidator((data: { agentId: string; mediaId: string; tags: string[] }) => data)
   .handler(async ({ data, context }): Promise<{ ok: true }> => {
     const email = (context.claims as { email?: string } | undefined)?.email;
     await requireAgentAccess(context.userId, email, data.agentId);
@@ -1387,7 +1387,7 @@ export const setMediaTags = createServerFn({ method: "POST" })
 // into which post.
 export const markMediaUsed = createServerFn({ method: "POST" })
   .middleware([requireSupabaseAuth])
-  .validator((data: { agentId: string; mediaIds: string[]; postId?: string }) => data)
+  .inputValidator((data: { agentId: string; mediaIds: string[]; postId?: string }) => data)
   .handler(async ({ data, context }): Promise<{ ok: true; updated: number }> => {
     const email = (context.claims as { email?: string } | undefined)?.email;
     await requireAgentAccess(context.userId, email, data.agentId);
@@ -1408,7 +1408,7 @@ export const markMediaUsed = createServerFn({ method: "POST" })
 
 export const deleteMarketingMedia = createServerFn({ method: "POST" })
   .middleware([requireSupabaseAuth])
-  .validator((data: { agentId: string; mediaId: string }) => data)
+  .inputValidator((data: { agentId: string; mediaId: string }) => data)
   .handler(async ({ data, context }): Promise<{ ok: true }> => {
     const email = (context.claims as { email?: string } | undefined)?.email;
     await requireAgentAccess(context.userId, email, data.agentId);
@@ -1455,7 +1455,7 @@ export const deleteMarketingMedia = createServerFn({ method: "POST" })
 // Admin-only: read (creating on first use) this agent's public upload token.
 export const getMediaUploadLink = createServerFn({ method: "POST" })
   .middleware([requireSupabaseAuth])
-  .validator((data: { agentId: string }) => data)
+  .inputValidator((data: { agentId: string }) => data)
   .handler(async ({ data, context }): Promise<{ token: string }> => {
     const email = (context.claims as { email?: string } | undefined)?.email;
     await requireAdmin(context.userId, email);
@@ -1478,7 +1478,7 @@ export const getMediaUploadLink = createServerFn({ method: "POST" })
 // been floating around too long, etc.).
 export const regenerateMediaUploadLink = createServerFn({ method: "POST" })
   .middleware([requireSupabaseAuth])
-  .validator((data: { agentId: string }) => data)
+  .inputValidator((data: { agentId: string }) => data)
   .handler(async ({ data, context }): Promise<{ token: string }> => {
     const email = (context.claims as { email?: string } | undefined)?.email;
     await requireAdmin(context.userId, email);
@@ -1504,7 +1504,7 @@ async function resolveAgentIdFromUploadToken(token: string): Promise<{ agentId: 
 // Public — no login required. Only ever returns a display name, never the
 // agent's real id or any other data about them.
 export const getPublicUploadAgent = createServerFn({ method: "POST" })
-  .validator((data: { token: string }) => data)
+  .inputValidator((data: { token: string }) => data)
   .handler(async ({ data }): Promise<{ agentName: string }> => {
     const { agentName } = await resolveAgentIdFromUploadToken(data.token);
     return { agentName };
@@ -1514,7 +1514,7 @@ export const getPublicUploadAgent = createServerFn({ method: "POST" })
 // above, but resolving the agent from the token instead of a logged-in
 // session. The browser still uploads the raw bytes straight to Storage.
 export const createPublicMediaUploadUrl = createServerFn({ method: "POST" })
-  .validator((data: { token: string; fileName: string }) => data)
+  .inputValidator((data: { token: string; fileName: string }) => data)
   .handler(async ({ data }): Promise<{ path: string; uploadToken: string }> => {
     const { agentId } = await resolveAgentIdFromUploadToken(data.token);
     const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
@@ -1528,7 +1528,7 @@ export const createPublicMediaUploadUrl = createServerFn({ method: "POST" })
 // Public — records the row once the browser's direct upload succeeds, same
 // shape as finalizeMediaUpload, resolved via the token instead of a session.
 export const finalizePublicMediaUpload = createServerFn({ method: "POST" })
-  .validator((data: { token: string; storagePath: string; mediaType: "photo" | "video" }) => data)
+  .inputValidator((data: { token: string; storagePath: string; mediaType: "photo" | "video" }) => data)
   .handler(async ({ data }): Promise<{ ok: true }> => {
     const { agentId } = await resolveAgentIdFromUploadToken(data.token);
     if (!data.storagePath.startsWith(`${agentId}/`)) {
@@ -1656,7 +1656,7 @@ async function fetchDriveMediaFiles(folderId: string, apiKey: string): Promise<D
 
 export const listAgentDriveMedia = createServerFn({ method: "GET" })
   .middleware([requireSupabaseAuth])
-  .validator((data: { agentId: string }) => data)
+  .inputValidator((data: { agentId: string }) => data)
   .handler(async ({ data, context }): Promise<{ folderId: string | null; files: DriveFile[] }> => {
     const email = (context.claims as { email?: string } | undefined)?.email;
     await requireAgentAccess(context.userId, email, data.agentId);
@@ -1682,7 +1682,7 @@ export const listAgentDriveMedia = createServerFn({ method: "GET" })
 // Admin-only — sets which Drive folder a given agent's tab reads from.
 export const setAgentDriveFolder = createServerFn({ method: "POST" })
   .middleware([requireSupabaseAuth])
-  .validator((data: { agentId: string; driveFolderId: string }) => data)
+  .inputValidator((data: { agentId: string; driveFolderId: string }) => data)
   .handler(async ({ data, context }): Promise<{ ok: true }> => {
     const email = (context.claims as { email?: string } | undefined)?.email;
     const access = await resolveAccess(context.userId, email);
@@ -1805,7 +1805,7 @@ function buildContentPrompt(
 
 export const generateMarketingContent = createServerFn({ method: "POST" })
   .middleware([requireSupabaseAuth])
-  .validator((data: GenerateContentInput) => data)
+  .inputValidator((data: GenerateContentInput) => data)
   .handler(async ({ data, context }): Promise<{ ok: true; postId: string }> => {
     const email = (context.claims as { email?: string } | undefined)?.email;
     await requireAgentAccess(context.userId, email, data.agentId);
@@ -1960,7 +1960,7 @@ export const listAllCalendarMonthsForAdmin = createServerFn({ method: "GET" })
 
 export const setCalendarMonthArchived = createServerFn({ method: "POST" })
   .middleware([requireSupabaseAuth])
-  .validator((data: { monthId: string; archived: boolean }) => data)
+  .inputValidator((data: { monthId: string; archived: boolean }) => data)
   .handler(async ({ data, context }): Promise<{ ok: true }> => {
     const email = (context.claims as { email?: string } | undefined)?.email;
     await requireAdmin(context.userId, email);
@@ -1975,7 +1975,7 @@ export const setCalendarMonthArchived = createServerFn({ method: "POST" })
 
 export const addCalendarMonth = createServerFn({ method: "POST" })
   .middleware([requireSupabaseAuth])
-  .validator((data: { month: string }) => data)
+  .inputValidator((data: { month: string }) => data)
   .handler(async ({ data, context }): Promise<{ ok: true; month: CalendarMonth }> => {
     const email = (context.claims as { email?: string } | undefined)?.email;
     await requireAdmin(context.userId, email);
@@ -1992,7 +1992,7 @@ export const addCalendarMonth = createServerFn({ method: "POST" })
 
 export const removeCalendarMonth = createServerFn({ method: "POST" })
   .middleware([requireSupabaseAuth])
-  .validator((data: { monthId: string }) => data)
+  .inputValidator((data: { monthId: string }) => data)
   .handler(async ({ data, context }): Promise<{ ok: true }> => {
     const email = (context.claims as { email?: string } | undefined)?.email;
     await requireAdmin(context.userId, email);
@@ -2011,7 +2011,7 @@ export type CalendarItem = { id: string; docType: "post" | "email" | "video"; ti
 
 export const listCalendarItems = createServerFn({ method: "GET" })
   .middleware([requireSupabaseAuth])
-  .validator((data: { monthId: string }) => data)
+  .inputValidator((data: { monthId: string }) => data)
   .handler(async ({ data, context }): Promise<CalendarItem[]> => {
     const email = (context.claims as { email?: string } | undefined)?.email;
     await requireAdmin(context.userId, email);
@@ -2033,7 +2033,7 @@ export const listCalendarItems = createServerFn({ method: "GET" })
 
 export const addCalendarItem = createServerFn({ method: "POST" })
   .middleware([requireSupabaseAuth])
-  .validator((data: { monthId: string; docType: "post" | "email" | "video"; title: string; rawText: string }) => data)
+  .inputValidator((data: { monthId: string; docType: "post" | "email" | "video"; title: string; rawText: string }) => data)
   .handler(async ({ data, context }): Promise<{ ok: true }> => {
     const email = (context.claims as { email?: string } | undefined)?.email;
     await requireAdmin(context.userId, email);
@@ -2054,7 +2054,7 @@ export const addCalendarItem = createServerFn({ method: "POST" })
 
 export const removeCalendarItem = createServerFn({ method: "POST" })
   .middleware([requireSupabaseAuth])
-  .validator((data: { itemId: string }) => data)
+  .inputValidator((data: { itemId: string }) => data)
   .handler(async ({ data, context }): Promise<{ ok: true }> => {
     const email = (context.claims as { email?: string } | undefined)?.email;
     await requireAdmin(context.userId, email);
@@ -2313,7 +2313,7 @@ async function fetchNativeCalendarDocs(monthId: string): Promise<CalendarDoc[]> 
 
 export const readContentCalendar = createServerFn({ method: "GET" })
   .middleware([requireSupabaseAuth])
-  .validator((data: { agentId: string; monthId: string }) => data)
+  .inputValidator((data: { agentId: string; monthId: string }) => data)
   .handler(async ({ data, context }): Promise<{ docs: CalendarDoc[] }> => {
     const email = (context.claims as { email?: string } | undefined)?.email;
     await requireAgentAccess(context.userId, email, data.agentId);
@@ -2382,7 +2382,7 @@ function cleanCopy(text: string): string {
 
 export const generateMonthlyBatch = createServerFn({ method: "POST" })
   .middleware([requireSupabaseAuth])
-  .validator((data: { agentId: string; monthId: string; month: string; useHashtags?: boolean }) => data)
+  .inputValidator((data: { agentId: string; monthId: string; month: string; useHashtags?: boolean }) => data)
   .handler(async ({ data, context }): Promise<{ ok: true; batchId: string; created: number }> => {
     const email = (context.claims as { email?: string } | undefined)?.email;
     await requireAgentAccess(context.userId, email, data.agentId);
@@ -2646,7 +2646,7 @@ const BATCH_CONTENT_SOURCES = new Set(["content_calendar", "drive_photo_scan", "
 // content" form, which isn't part of any month's batch.
 export const deleteMonthContent = createServerFn({ method: "POST" })
   .middleware([requireSupabaseAuth])
-  .validator((data: { agentId: string; month: string }) => data)
+  .inputValidator((data: { agentId: string; month: string }) => data)
   .handler(async ({ data, context }): Promise<{ ok: true; deleted: number }> => {
     const email = (context.claims as { email?: string } | undefined)?.email;
     await requireAdmin(context.userId, email);
@@ -2682,7 +2682,7 @@ export const deleteMonthContent = createServerFn({ method: "POST" })
 // one-off "+ New content" post is never swept up by accident.
 export const archiveMonthContent = createServerFn({ method: "POST" })
   .middleware([requireSupabaseAuth])
-  .validator((data: { agentId: string; month: string }) => data)
+  .inputValidator((data: { agentId: string; month: string }) => data)
   .handler(async ({ data, context }): Promise<{ ok: true; archived: number }> => {
     const email = (context.claims as { email?: string } | undefined)?.email;
     await requireAgentAccess(context.userId, email, data.agentId);
@@ -2717,7 +2717,7 @@ export type ArchivedBatchSummary = { batchId: string; count: number; generatedAt
 
 export const listArchivedBatchesForMonth = createServerFn({ method: "GET" })
   .middleware([requireSupabaseAuth])
-  .validator((data: { agentId: string; month: string }) => data)
+  .inputValidator((data: { agentId: string; month: string }) => data)
   .handler(async ({ data, context }): Promise<ArchivedBatchSummary[]> => {
     const email = (context.claims as { email?: string } | undefined)?.email;
     await requireAgentAccess(context.userId, email, data.agentId);
@@ -2754,7 +2754,7 @@ export const listArchivedBatchesForMonth = createServerFn({ method: "GET" })
 // every other per-post/per-batch action in this file.
 export const restoreArchivedBatch = createServerFn({ method: "POST" })
   .middleware([requireSupabaseAuth])
-  .validator((data: { agentId: string; batchId: string }) => data)
+  .inputValidator((data: { agentId: string; batchId: string }) => data)
   .handler(async ({ data, context }): Promise<{ ok: true; restored: number }> => {
     const email = (context.claims as { email?: string } | undefined)?.email;
     await requireAgentAccess(context.userId, email, data.agentId);
@@ -2856,7 +2856,7 @@ async function captionPhotoInVoice(
 
 export const scanAgentDrivePhotos = createServerFn({ method: "POST" })
   .middleware([requireSupabaseAuth])
-  .validator((data: { agentId: string; folderId: string; maxPhotos?: number; excludeFileIds?: string[] }) => data)
+  .inputValidator((data: { agentId: string; folderId: string; maxPhotos?: number; excludeFileIds?: string[] }) => data)
   .handler(async ({ data, context }): Promise<{ suggestions: PhotoScanSuggestion[]; totalPhotos: number }> => {
     const email = (context.claims as { email?: string } | undefined)?.email;
     await requireAgentAccess(context.userId, email, data.agentId);
@@ -2966,7 +2966,7 @@ export const scanAgentDrivePhotos = createServerFn({ method: "POST" })
 // each image, and run it through the same voice-captioning call.
 export const scanAgentLibraryPhotos = createServerFn({ method: "POST" })
   .middleware([requireSupabaseAuth])
-  .validator((data: { agentId: string; maxPhotos?: number; excludeFileIds?: string[] }) => data)
+  .inputValidator((data: { agentId: string; maxPhotos?: number; excludeFileIds?: string[] }) => data)
   .handler(async ({ data, context }): Promise<{ suggestions: PhotoScanSuggestion[]; totalPhotos: number }> => {
     const email = (context.claims as { email?: string } | undefined)?.email;
     await requireAgentAccess(context.userId, email, data.agentId);
@@ -3039,7 +3039,7 @@ export const scanAgentLibraryPhotos = createServerFn({ method: "POST" })
 
 export const addPhotoPostsToBatch = createServerFn({ method: "POST" })
   .middleware([requireSupabaseAuth])
-  .validator(
+  .inputValidator(
     (data: {
       agentId: string;
       month: string;
@@ -3096,7 +3096,7 @@ export const addPhotoPostsToBatch = createServerFn({ method: "POST" })
 
 export const sendContentToAgent = createServerFn({ method: "POST" })
   .middleware([requireSupabaseAuth])
-  .validator((data: { agentId: string; month: string }) => data)
+  .inputValidator((data: { agentId: string; month: string }) => data)
   .handler(async ({ data, context }): Promise<{ ok: true }> => {
     const email = (context.claims as { email?: string } | undefined)?.email;
     const access = await resolveAccess(context.userId, email);

@@ -1255,7 +1255,7 @@ async function resolveAgentIdFromUploadToken(token: string): Promise<{ agentId: 
 // Public — no login required. Only ever returns a display name, never the
 // agent's real id or any other data about them.
 export const getPublicUploadAgent = createServerFn({ method: "POST" })
-  .validator((data: { token: string }) => data)
+  .inputValidator((data: { token: string }) => data)
   .handler(async ({ data }): Promise<{ agentName: string }> => {
     const { agentName } = await resolveAgentIdFromUploadToken(data.token);
     return { agentName };
@@ -1265,7 +1265,7 @@ export const getPublicUploadAgent = createServerFn({ method: "POST" })
 // above, but resolving the agent from the token instead of a logged-in
 // session. The browser still uploads the raw bytes straight to Storage.
 export const createPublicMediaUploadUrl = createServerFn({ method: "POST" })
-  .validator((data: { token: string; fileName: string }) => data)
+  .inputValidator((data: { token: string; fileName: string }) => data)
   .handler(async ({ data }): Promise<{ path: string; uploadToken: string }> => {
     const { agentId } = await resolveAgentIdFromUploadToken(data.token);
     const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
@@ -1279,7 +1279,7 @@ export const createPublicMediaUploadUrl = createServerFn({ method: "POST" })
 // Public — records the row once the browser's direct upload succeeds, same
 // shape as finalizeMediaUpload, resolved via the token instead of a session.
 export const finalizePublicMediaUpload = createServerFn({ method: "POST" })
-  .validator((data: { token: string; storagePath: string; mediaType: "photo" | "video" }) => data)
+  .inputValidator((data: { token: string; storagePath: string; mediaType: "photo" | "video" }) => data)
   .handler(async ({ data }): Promise<{ ok: true }> => {
     const { agentId } = await resolveAgentIdFromUploadToken(data.token);
     if (!data.storagePath.startsWith(`${agentId}/`)) {

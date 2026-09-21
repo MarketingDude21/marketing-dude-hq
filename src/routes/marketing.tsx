@@ -12,7 +12,11 @@ import {
   setPostMedia,
   setPostDrivePhoto,
   searchUnsplashPhotos,
-  setPostUnsplashPhoto,
+  addEmailPhotoFromLibrary,
+  addEmailPhotoFromDrive,
+  addEmailPhotoFromUnsplash,
+  updateEmailPhotoInstructions,
+  removeEmailPhoto,
   rewritePostContent,
   listMarketingMedia,
   createMediaUploadUrl,
@@ -54,6 +58,7 @@ import {
   type PhotoScanSuggestion,
   type PostMetadata,
   type UnsplashResult,
+  type EmailPhoto,
   type ArchivedBatchSummary,
 } from "@/lib/marketing";
 // Type-only import (erased at build) — the runtime docx library is loaded
@@ -997,6 +1002,426 @@ function CreateContentForm({ agentId, onCreated }: { agentId: string; onCreated:
   );
 }
 
+// Multi-photo attachments for EMAILS — added 2026-09-21 per Mike: "Emails
+// should have the ability to include up to 3 photos from any combination.
+// Those images would come with publishing instructions." Posts keep the
+// single-photo picker in PostCard just below (openPicker/pickMedia/etc.),
+// since a post only ever needs one photo — this is a separate flow just for
+// emails, which can hold up to three at once, from any mix of sources, each
+// with its own note for whoever actually publishes the email. Every add/
+// edit/remove below calls one of the addEmailPhotoFrom.../
+// updateEmailPhotoInstructions/removeEmailPhoto functions in marketing.ts,
+// which re-save the post's metadata.email_photos array server-side.
+//
+// An email generated before this feature existed only has the old
+// single-photo fields (media_url/drive_thumbnail_url/unsplash_photographer)
+// — those still display read-only below as a "legacy" photo until removed,
+// rather than being silently dropped or auto-migrated into the new array.
+function EmailPhotosPanel({
+  post,
+  agentId,
+  driveFolderId,
+  onChanged,
+}: {
+  post: Post;
+  agentId: string;
+  driveFolderId: string | null;
+  onChanged: () => void;
+}) {
+  // Kept in sync with MAX_EMAIL_PHOTOS in marketing.ts.
+  const MAX_PHOTOS = 3;
+  const photos = post.metadata?.email_photos ?? [];
+  const legacyUrl = photos.length === 0 ? post.metadata?.media_url || post.metadata?.drive_thumbnail_url || null : null;
+
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [drafts, setDrafts] = useState<Record<string, string>>({});
+  const [pickerOpen, setPickerOpen] = useState(false);
+  const [pickerTab, setPickerTab] = useState<"library" | "drive" | "unsplash">("library");
+  const [mediaOptions, setMediaOptions] = useState<MediaRow[] | null>(null);
+  const [driveOptions, setDriveOptions] = useState<DriveFile[] | null>(null);
+  const [driveOptionsError, setDriveOptionsError] = useState<string | null>(null);
+  const [unsplashQuery, setUnsplashQuery] = useState(post.title || "lifestyle real estate");
+  const [unsplashResults, setUnsplashResults] = useState<UnsplashResult[] | null>(null);
+  const [unsplashLoading, setUnsplashLoading] = useState(false);
+  const [unsplashError, setUnsplashError] = useState<string | null>(null);
+
+  async function openPicker() {
+    setPickerOpen(true);
+    setPickerTab("library");
+    setError(null);
+    if (!mediaOptions) {
+      try {
+        setMediaOptions(await listMarketingMedia({ data: { agentId, status: "available" } }));
+      } catch {
+        setMediaOptions([]);
+      }
+    }
+  }
+
+  async function openDriveTab() {
+    setPickerTab("drive");
+    if (!driveOptions && driveFolderId) {
+      try {
+        const res = await listAgentDriveMedia({ data: { agentId } });
+        setDriveOptions(res.files);
+        setDriveOptionsError(null);
+      } catch (e) {
+        setDriveOptions([]);
+        setDriveOptionsError(e instanceof Error ? e.message : String(e));
+      }
+    }
+  }
+
+  async function runUnsplashSearch(query: string) {
+    setUnsplashLoading(true);
+    setUnsplashError(null);
+    try {
+      const res = await searchUnsplashPhotos({ data: { agentId, query } });
+      setUnsplashResults(res.results);
+    } catch (e) {
+      setUnsplashResults([]);
+      setUnsplashError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setUnsplashLoading(false);
+    }
+  }
+
+  function openUnsplashTab() {
+    setPickerTab("unsplash");
+    if (!unsplashResults) runUnsplashSearch(unsplashQuery);
+  }
+
+  async function addFromLibrary(mediaId: string) {
+    setBusy(true);
+    setError(null);
+    try {
+      await addEmailPhotoFromLibrary({ data: { agentId, postId: post.id, mediaId } });
+      setPickerOpen(false);
+      onChanged();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function addFromDrive(file: DriveFile) {
+    setBusy(true);
+    setError(null);
+    try {
+      await addEmailPhotoFromDrive({
+        data: { agentId, postId: post.id, driveFileId: file.id, thumbnailUrl: file.thumbnailUrl },
+      });
+      setPickerOpen(false);
+      onChanged();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function addFromUnsplash(r: UnsplashResult) {
+    setBusy(true);
+    setError(null);
+    try {
+      await addEmailPhotoFromUnsplash({
+        data: {
+          agentId,
+          postId: post.id,
+          photoUrl: r.fullUrl,
+          photographerName: r.photographerName,
+          photographerProfileUrl: r.photographerProfileUrl,
+        },
+      });
+      setPickerOpen(false);
+      onChanged();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function removePhoto(photoId: string) {
+    setBusy(true);
+    setError(null);
+    try {
+      await removeEmailPhoto({ data: { agentId, postId: post.id, photoId } });
+      onChanged();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function saveInstructions(photoId: string) {
+    const value = drafts[photoId];
+    if (value === undefined) return;
+    setBusy(true);
+    setError(null);
+    try {
+      await updateEmailPhotoInstructions({
+        data: { agentId, postId: post.id, photoId, publishingInstructions: value },
+      });
+      onChanged();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function removeLegacyPhoto() {
+    setBusy(true);
+    setError(null);
+    try {
+      await setPostMedia({ data: { agentId, postId: post.id, mediaId: null } });
+      onChanged();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className="mb-3">
+      {legacyUrl && (
+        <div className="mb-3 rounded-2xl border border-border bg-muted p-3">
+          <p className="mb-2 text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
+            Photo (added before multi-photo support)
+          </p>
+          <div className="overflow-hidden rounded-xl border border-border">
+            {post.metadata?.media_type === "video" ? (
+              <video src={legacyUrl} controls className="max-h-56 w-full object-contain" />
+            ) : (
+              <img src={legacyUrl} alt="" className="max-h-56 w-full object-contain" />
+            )}
+          </div>
+          {post.metadata?.unsplash_photographer && (
+            <p className="mt-1 text-[11px] text-muted-foreground">
+              Photo by {post.metadata.unsplash_photographer} on Unsplash
+            </p>
+          )}
+          <button
+            onClick={removeLegacyPhoto}
+            disabled={busy}
+            className="mt-2 text-xs font-semibold text-destructive hover:underline disabled:opacity-50"
+          >
+            Remove — I'll add new photos below instead
+          </button>
+        </div>
+      )}
+
+      {photos.length > 0 && (
+        <div className="mb-3 grid gap-3 sm:grid-cols-3">
+          {photos.map((p) => (
+            <div key={p.id} className="rounded-2xl border border-border bg-muted p-2">
+              <div className="overflow-hidden rounded-xl border border-border">
+                {p.mediaType === "video" ? (
+                  <video src={p.url} controls className="aspect-square w-full object-cover" />
+                ) : (
+                  <img src={p.url} alt="" className="aspect-square w-full object-cover" />
+                )}
+              </div>
+              <p className="mt-1 text-[10px] uppercase tracking-wide text-muted-foreground">
+                {p.source === "library" ? "Media Library" : p.source === "drive" ? "Google Drive" : "Stock photo"}
+              </p>
+              {p.source === "unsplash" && p.unsplashPhotographer && (
+                <p className="text-[10px] text-muted-foreground">
+                  Photo by{" "}
+                  <a
+                    href={p.unsplashCreditUrl ?? "https://unsplash.com"}
+                    target="_blank"
+                    rel="noreferrer"
+                    className="underline hover:text-foreground"
+                  >
+                    {p.unsplashPhotographer}
+                  </a>{" "}
+                  on Unsplash
+                </p>
+              )}
+              <textarea
+                value={drafts[p.id] ?? p.publishingInstructions}
+                onChange={(e) => setDrafts((d) => ({ ...d, [p.id]: e.target.value }))}
+                onBlur={() => saveInstructions(p.id)}
+                placeholder="Publishing instructions (optional) — e.g. use as header image"
+                className="mt-2 min-h-[50px] w-full rounded-lg border border-border bg-glass px-2 py-1.5 text-xs outline-none"
+                disabled={busy}
+              />
+              <button
+                onClick={() => removePhoto(p.id)}
+                disabled={busy}
+                className="mt-1 text-[11px] font-semibold text-destructive hover:underline disabled:opacity-50"
+              >
+                Remove photo
+              </button>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {error && <p className="mb-2 text-xs text-destructive">{error}</p>}
+
+      {photos.length < MAX_PHOTOS && (
+        <Button variant="secondary" onClick={openPicker} disabled={busy}>
+          {photos.length === 0 && !legacyUrl ? "Add photo" : "Add another photo"} ({photos.length}/{MAX_PHOTOS})
+        </Button>
+      )}
+
+      {pickerOpen && (
+        <div className="mt-3 rounded-2xl border border-border bg-background/40 p-4">
+          <div className="flex items-center justify-between gap-3">
+            <p className="text-sm font-semibold">Add a photo to this email</p>
+            <button
+              onClick={() => setPickerOpen(false)}
+              className="shrink-0 text-xs text-muted-foreground hover:text-foreground"
+            >
+              Close
+            </button>
+          </div>
+
+          <div className="mt-3 flex flex-wrap gap-2 border-b border-border pb-3">
+            <button
+              onClick={() => setPickerTab("library")}
+              className={`rounded-full px-3 py-1 text-xs font-semibold transition-colors ${
+                pickerTab === "library"
+                  ? "bg-primary text-primary-foreground"
+                  : "bg-muted text-muted-foreground hover:text-foreground"
+              }`}
+            >
+              Media Library
+            </button>
+            {driveFolderId && (
+              <button
+                onClick={openDriveTab}
+                className={`rounded-full px-3 py-1 text-xs font-semibold transition-colors ${
+                  pickerTab === "drive"
+                    ? "bg-primary text-primary-foreground"
+                    : "bg-muted text-muted-foreground hover:text-foreground"
+                }`}
+              >
+                Google Drive
+              </button>
+            )}
+            <button
+              onClick={openUnsplashTab}
+              className={`rounded-full px-3 py-1 text-xs font-semibold transition-colors ${
+                pickerTab === "unsplash"
+                  ? "bg-primary text-primary-foreground"
+                  : "bg-muted text-muted-foreground hover:text-foreground"
+              }`}
+            >
+              Stock Photos
+            </button>
+          </div>
+
+          {pickerTab === "library" && (
+            <div className="mt-3">
+              {mediaOptions === null && <p className="text-xs text-muted-foreground">Loading…</p>}
+              {mediaOptions !== null && mediaOptions.length === 0 && (
+                <p className="text-xs text-muted-foreground">
+                  No available photos or videos uploaded for this agent yet — add some on the Media tab.
+                </p>
+              )}
+              {mediaOptions !== null && mediaOptions.length > 0 && (
+                <div className="grid grid-cols-3 gap-2 sm:grid-cols-4">
+                  {mediaOptions.map((m) => (
+                    <button
+                      key={m.id}
+                      onClick={() => addFromLibrary(m.id)}
+                      disabled={busy}
+                      className="overflow-hidden rounded-xl border border-border transition-colors hover:border-primary disabled:opacity-50"
+                    >
+                      {m.media_type === "video"
+                        ? m.url && <video src={m.url} className="aspect-square w-full object-cover" />
+                        : m.url && (
+                            <img src={m.url} alt={m.caption ?? ""} className="aspect-square w-full object-cover" />
+                          )}
+                    </button>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
+
+          {pickerTab === "drive" && (
+            <div className="mt-3">
+              {driveOptionsError && <p className="text-xs text-destructive">{driveOptionsError}</p>}
+              {!driveOptionsError && driveOptions === null && <p className="text-xs text-muted-foreground">Loading…</p>}
+              {!driveOptionsError && driveOptions !== null && driveOptions.length === 0 && (
+                <p className="text-xs text-muted-foreground">
+                  No unused photos or videos found in this agent's Drive folder.
+                </p>
+              )}
+              {driveOptions !== null && driveOptions.length > 0 && (
+                <div className="grid grid-cols-3 gap-2 sm:grid-cols-4">
+                  {driveOptions.map((f) => (
+                    <button
+                      key={f.id}
+                      onClick={() => addFromDrive(f)}
+                      disabled={busy}
+                      className="overflow-hidden rounded-xl border border-border transition-colors hover:border-primary disabled:opacity-50"
+                    >
+                      {f.isVideo ? (
+                        <video src={f.thumbnailUrl} className="aspect-square w-full object-cover" />
+                      ) : (
+                        <img src={f.thumbnailUrl} alt={f.name} className="aspect-square w-full object-cover" />
+                      )}
+                    </button>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
+
+          {pickerTab === "unsplash" && (
+            <div className="mt-3">
+              <div className="flex gap-2">
+                <input
+                  value={unsplashQuery}
+                  onChange={(e) => setUnsplashQuery(e.target.value)}
+                  onKeyDown={(e) => e.key === "Enter" && runUnsplashSearch(unsplashQuery)}
+                  placeholder="Search stock photos — coffee, fall, neighborhood…"
+                  className="flex-1 rounded-xl border border-border bg-glass px-3 py-1.5 text-sm outline-none"
+                />
+                <Button variant="secondary" onClick={() => runUnsplashSearch(unsplashQuery)} disabled={unsplashLoading}>
+                  {unsplashLoading ? "Searching…" : "Search"}
+                </Button>
+              </div>
+              {unsplashError && <p className="mt-2 text-xs text-destructive">{unsplashError}</p>}
+              {!unsplashError && unsplashResults !== null && unsplashResults.length === 0 && !unsplashLoading && (
+                <p className="mt-2 text-xs text-muted-foreground">No results — try a different search.</p>
+              )}
+              {unsplashResults !== null && unsplashResults.length > 0 && (
+                <div className="mt-3 grid grid-cols-3 gap-2 sm:grid-cols-4">
+                  {unsplashResults.map((r) => (
+                    <button
+                      key={r.id}
+                      onClick={() => addFromUnsplash(r)}
+                      disabled={busy}
+                      title={`Photo by ${r.photographerName} on Unsplash`}
+                      className="overflow-hidden rounded-xl border border-border transition-colors hover:border-primary disabled:opacity-50"
+                    >
+                      <img src={r.thumbUrl} alt="" className="aspect-square w-full object-cover" />
+                    </button>
+                  ))}
+                </div>
+              )}
+              <p className="mt-2 text-[11px] text-muted-foreground">
+                Photos via Unsplash — credit is added automatically.
+              </p>
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function PostCard({
   post,
   agentId,
@@ -1014,16 +1439,20 @@ function PostCard({
   const [notes, setNotes] = useState("");
   const [busy, setBusy] = useState(false);
   const [saveError, setSaveError] = useState<string | null>(null);
+  // Post's own single-photo picker — Media Library + Google Drive (if
+  // enabled) only. Stock Photos (Unsplash) was dropped from here 2026-09-21
+  // per Mike ("No need for stock photos here. But they do need ability to
+  // choose for google drive if enabled.") — posts always have their own
+  // Drive/library photos to draw from, so there was never really a need for
+  // stock photos on a post the way there was for an email. Emails now have
+  // their own separate multi-photo flow — see EmailPhotosPanel below, which
+  // still offers Stock Photos since that's genuinely useful there.
   const [pickerOpen, setPickerOpen] = useState(false);
-  const [pickerTab, setPickerTab] = useState<"library" | "drive" | "unsplash">("library");
+  const [pickerTab, setPickerTab] = useState<"library" | "drive">("library");
   const [mediaOptions, setMediaOptions] = useState<MediaRow[] | null>(null);
   const [mediaBusy, setMediaBusy] = useState(false);
   const [driveOptions, setDriveOptions] = useState<DriveFile[] | null>(null);
   const [driveOptionsError, setDriveOptionsError] = useState<string | null>(null);
-  const [unsplashQuery, setUnsplashQuery] = useState("");
-  const [unsplashResults, setUnsplashResults] = useState<UnsplashResult[] | null>(null);
-  const [unsplashLoading, setUnsplashLoading] = useState(false);
-  const [unsplashError, setUnsplashError] = useState<string | null>(null);
   const [rewriting, setRewriting] = useState(false);
   const [rewriteHistory, setRewriteHistory] = useState<{ feedback: string; result: string }[]>([]);
 
@@ -1160,56 +1589,6 @@ function PostCard({
     }
   }
 
-  // Stock-photo tab (Unsplash) — added 2026-09-18. Mike specifically flagged
-  // emails as missing a photo option entirely (they don't have an agent's
-  // own Drive/library photos to draw from the way posts do), and said the
-  // old app used Unsplash for this. Defaults the search to the post's own
-  // title/topic so there's usually already something useful on first open.
-  async function runUnsplashSearch(query: string) {
-    setUnsplashLoading(true);
-    setUnsplashError(null);
-    try {
-      const res = await searchUnsplashPhotos({ data: { agentId, query } });
-      setUnsplashResults(res.results);
-    } catch (e) {
-      setUnsplashResults([]);
-      setUnsplashError(e instanceof Error ? e.message : String(e));
-    } finally {
-      setUnsplashLoading(false);
-    }
-  }
-
-  function openUnsplashTab() {
-    setPickerTab("unsplash");
-    if (!unsplashResults) {
-      const defaultQuery = unsplashQuery.trim() || post.title || "lifestyle real estate";
-      setUnsplashQuery(defaultQuery);
-      runUnsplashSearch(defaultQuery);
-    }
-  }
-
-  async function pickUnsplash(r: UnsplashResult) {
-    setMediaBusy(true);
-    setSaveError(null);
-    try {
-      await setPostUnsplashPhoto({
-        data: {
-          agentId,
-          postId: post.id,
-          photoUrl: r.fullUrl,
-          photographerName: r.photographerName,
-          photographerProfileUrl: r.photographerProfileUrl,
-        },
-      });
-      setPickerOpen(false);
-      onChanged();
-    } catch (e) {
-      setSaveError(e instanceof Error ? e.message : String(e));
-    } finally {
-      setMediaBusy(false);
-    }
-  }
-
   const typeLabel = post.content_type === "email" ? "Email" : post.content_type === "video" ? "Video script" : "Post";
   const photoUrl = post.metadata?.media_url || post.metadata?.drive_thumbnail_url || null;
 
@@ -1233,17 +1612,12 @@ function PostCard({
       </div>
 
       <div className="mt-4 border-t border-border pt-4">
-        {/* Was gated to content_type === "post" only, so an email's chosen
-              photo (Unsplash, in practice — emails don't have their own Drive/
-              library photos the way posts do) was saved successfully server-side
-              but never actually rendered here: the picker closed and the card
-              looked exactly like nothing had happened. That's the bug behind
-              Mike's report (2026-09-18) "email when you choose a photo it
-              doesn't allow you to save it, you click it and it just resets and
-              doesn't show anything attached" — the save worked, the display
-              didn't. Fixed to match the "Add/Change photo" button's own
-              condition just below, which already covered both types. */}
-        {(post.content_type === "post" || post.content_type === "email") && photoUrl && (
+        {/* Single-photo display — posts only now. Emails moved to their
+              own multi-photo flow (EmailPhotosPanel, just below) 2026-09-21
+              per Mike's request for up to 3 photos per email, each with its
+              own publishing instructions — a single photoUrl can no longer
+              represent an email's attached photos. */}
+        {post.content_type === "post" && photoUrl && (
           <div className="mb-3 overflow-hidden rounded-2xl border border-border bg-muted">
             {post.metadata?.media_type === "video" ? (
               <video src={photoUrl} controls className="max-h-64 w-full object-contain" />
@@ -1252,7 +1626,7 @@ function PostCard({
             )}
           </div>
         )}
-        {photoUrl && post.metadata?.unsplash_photographer && (
+        {post.content_type === "post" && photoUrl && post.metadata?.unsplash_photographer && (
           <p className="-mt-2 mb-3 text-[11px] text-muted-foreground">
             Photo by{" "}
             <a
@@ -1265,6 +1639,9 @@ function PostCard({
             </a>{" "}
             on Unsplash
           </p>
+        )}
+        {post.content_type === "email" && (
+          <EmailPhotosPanel post={post} agentId={agentId} driveFolderId={driveFolderId} onChanged={onChanged} />
         )}
         {post.content_type === "post" && post.metadata?.image_suggestion && (
           <div className="mb-2 text-xs text-muted-foreground">
@@ -1347,7 +1724,7 @@ function PostCard({
               <Button variant="danger" onClick={() => setFeedbackOpen((v) => !v)} disabled={busy}>
                 Flag / feedback
               </Button>
-              {(post.content_type === "post" || post.content_type === "email") && (
+              {post.content_type === "post" && (
                 <Button variant="secondary" onClick={openPicker} disabled={busy}>
                   {photoUrl ? "Change photo" : "Add photo"}
                 </Button>
@@ -1356,7 +1733,7 @@ function PostCard({
           )}
         </div>
 
-        {pickerOpen && (
+        {post.content_type === "post" && pickerOpen && (
           <div className="mt-4 rounded-2xl border border-border bg-background/40 p-4">
             <div className="flex items-center justify-between gap-3">
               <p className="text-sm font-semibold">
@@ -1393,16 +1770,6 @@ function PostCard({
                   Google Drive
                 </button>
               )}
-              <button
-                onClick={openUnsplashTab}
-                className={`rounded-full px-3 py-1 text-xs font-semibold transition-colors ${
-                  pickerTab === "unsplash"
-                    ? "bg-primary text-primary-foreground"
-                    : "bg-muted text-muted-foreground hover:text-foreground"
-                }`}
-              >
-                Stock Photos
-              </button>
             </div>
 
             {pickerTab === "library" && (
@@ -1464,49 +1831,6 @@ function PostCard({
                     ))}
                   </div>
                 )}
-              </div>
-            )}
-
-            {pickerTab === "unsplash" && (
-              <div className="mt-3">
-                <div className="flex gap-2">
-                  <input
-                    value={unsplashQuery}
-                    onChange={(e) => setUnsplashQuery(e.target.value)}
-                    onKeyDown={(e) => e.key === "Enter" && runUnsplashSearch(unsplashQuery)}
-                    placeholder="Search stock photos — coffee, fall, neighborhood…"
-                    className="flex-1 rounded-xl border border-border bg-glass px-3 py-1.5 text-sm outline-none"
-                  />
-                  <Button
-                    variant="secondary"
-                    onClick={() => runUnsplashSearch(unsplashQuery)}
-                    disabled={unsplashLoading}
-                  >
-                    {unsplashLoading ? "Searching…" : "Search"}
-                  </Button>
-                </div>
-                {unsplashError && <p className="mt-2 text-xs text-destructive">{unsplashError}</p>}
-                {!unsplashError && unsplashResults !== null && unsplashResults.length === 0 && !unsplashLoading && (
-                  <p className="mt-2 text-xs text-muted-foreground">No results — try a different search.</p>
-                )}
-                {unsplashResults !== null && unsplashResults.length > 0 && (
-                  <div className="mt-3 grid grid-cols-3 gap-2 sm:grid-cols-4">
-                    {unsplashResults.map((r) => (
-                      <button
-                        key={r.id}
-                        onClick={() => pickUnsplash(r)}
-                        disabled={mediaBusy}
-                        title={`Photo by ${r.photographerName} on Unsplash`}
-                        className="overflow-hidden rounded-xl border border-border transition-colors hover:border-primary disabled:opacity-50"
-                      >
-                        <img src={r.thumbUrl} alt="" className="aspect-square w-full object-cover" />
-                      </button>
-                    ))}
-                  </div>
-                )}
-                <p className="mt-2 text-[11px] text-muted-foreground">
-                  Photos via Unsplash — credit is added automatically.
-                </p>
               </div>
             )}
 
@@ -2749,14 +3073,65 @@ async function buildContentDocxBlob(batchPosts: Post[], monthLabel: string): Pro
         }
       }
 
-      if (cat === "email" && p.metadata?.unsplash_photographer) {
-        children.push(
-          new Paragraph({
-            spacing: { before: 100 },
-            children: [new TextRun({ text: "EMAIL PHOTOS:", bold: true })],
-          }),
-        );
-        children.push(new Paragraph({ text: `Photo 1: ${p.metadata.unsplash_photographer}` }));
+      // Up to 3 photos per email, each with its own publishing instructions
+      // — added 2026-09-21 per Mike's multi-photo request. Falls back to the
+      // old single-credit-line format for an email generated before this
+      // feature existed (metadata.email_photos absent, but the legacy
+      // unsplash_photographer field still set), so re-exporting an
+      // already-approved older email doesn't lose its one credit line.
+      if (cat === "email") {
+        const emailPhotos = p.metadata?.email_photos ?? [];
+        if (emailPhotos.length > 0) {
+          children.push(
+            new Paragraph({
+              spacing: { before: 100 },
+              children: [new TextRun({ text: "EMAIL PHOTOS:", bold: true })],
+            }),
+          );
+          emailPhotos.forEach((photo, idx) => {
+            const runs: (TextRun | ExternalHyperlink)[] = [
+              new TextRun({ text: `Photo ${idx + 1}:  `, bold: true }),
+              new ExternalHyperlink({
+                link: photo.url,
+                children: [new TextRun({ text: "⬇ View/Download", style: "Hyperlink" })],
+              }),
+            ];
+            if (photo.source === "drive" && photo.driveFileId) {
+              runs.push(new TextRun({ text: "   " }));
+              runs.push(
+                new ExternalHyperlink({
+                  link: `https://drive.google.com/file/d/${photo.driveFileId}/view`,
+                  children: [new TextRun({ text: "📁 View in Drive", style: "Hyperlink" })],
+                }),
+              );
+            }
+            if (photo.source === "unsplash" && photo.unsplashPhotographer) {
+              runs.push(new TextRun({ text: `   (Photo by ${photo.unsplashPhotographer} on Unsplash)` }));
+            }
+            children.push(new Paragraph({ spacing: { before: 60 }, children: runs }));
+            if (photo.publishingInstructions.trim()) {
+              children.push(
+                new Paragraph({
+                  spacing: { before: 20 },
+                  children: [
+                    new TextRun({
+                      text: `   Instructions: ${photo.publishingInstructions.trim()}`,
+                      italics: true,
+                    }),
+                  ],
+                }),
+              );
+            }
+          });
+        } else if (p.metadata?.unsplash_photographer) {
+          children.push(
+            new Paragraph({
+              spacing: { before: 100 },
+              children: [new TextRun({ text: "EMAIL PHOTOS:", bold: true })],
+            }),
+          );
+          children.push(new Paragraph({ text: `Photo 1: ${p.metadata.unsplash_photographer}` }));
+        }
       }
     });
   }

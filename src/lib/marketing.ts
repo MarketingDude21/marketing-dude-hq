@@ -126,7 +126,16 @@ export type PostMetadata = {
   // that credit line next to the photo.
   unsplash_photographer?: string | null | undefined;
   unsplash_credit_url?: string | null | undefined;
-  [key: string]: string | number | boolean | null | undefined;
+  // Up to 3 photos attached to an EMAIL specifically — added 2026-09-21 per
+  // Mike: "Emails should have the ability to include up to 3 photos from
+  // any combination. Those images would come with publishing instructions."
+  // A post still only ever has one photo (the media_id/drive_file_id/
+  // unsplash_* fields above), so this is deliberately separate rather than
+  // turning those into arrays. See the EmailPhoto type and the
+  // addEmailPhotoFrom.../updateEmailPhotoInstructions/removeEmailPhoto
+  // functions below.
+  email_photos?: EmailPhoto[] | undefined;
+  [key: string]: string | number | boolean | null | undefined | EmailPhoto[];
 };
 
 // Fixed tag vocabulary for the native Media library, ported from the old
@@ -846,6 +855,246 @@ export const setPostUnsplashPhoto = createServerFn({ method: "POST" })
     return { ok: true };
   });
 
+// ============================================================================
+// Email multi-photo attachments — added 2026-09-21 per Mike: "Emails should
+// have the ability to include up to 3 photos from any combination. Those
+// images would come with publishing instructions." A post only ever needs
+// one photo (setPostMedia/setPostDrivePhoto/setPostUnsplashPhoto above,
+// which all write directly onto PostMetadata's media_id/drive_file_id/
+// unsplash_* fields), but an email can hold several at once, from different
+// sources, each with its own note for whoever ends up actually publishing
+// it — so these live in their own metadata.email_photos array instead of
+// turning those single-photo fields into arrays (which would also change
+// what every post everywhere reads).
+//
+// One small function per source (mirrors setPostMedia/setPostDrivePhoto/
+// setPostUnsplashPhoto's own split above) plus one to edit an existing
+// photo's instructions and one to remove a photo — each does its own
+// read-modify-write of metadata.email_photos rather than sharing a
+// mid-request cache, which costs an extra round trip per call but keeps
+// every one of these obviously correct on its own, which matters more than
+// the round trip on a feature nobody calls at any real volume.
+// ============================================================================
+
+const MAX_EMAIL_PHOTOS = 3;
+
+// A single photo attached to an email. `id` is a small server-generated key
+// used purely so the UI can edit or remove one photo without touching the
+// others — it has no meaning beyond that (it is NOT the Media Library
+// media_id, the Drive file id, or anything else that identifies the photo
+// at its source; those are captured separately below when relevant).
+export type EmailPhoto = {
+  id: string;
+  source: "library" | "drive" | "unsplash";
+  url: string;
+  mediaType: "photo" | "video";
+  publishingInstructions: string;
+  driveFileId?: string | null | undefined;
+  unsplashPhotographer?: string | null | undefined;
+  unsplashCreditUrl?: string | null | undefined;
+};
+
+// Fetches a post, confirms it belongs to this agent AND is actually an
+// email (multi-photo is email-only — a post keeps the single-photo fields
+// above), and returns its current email_photos array (empty if none yet).
+// Every function below calls this first.
+async function requireEmailPost(agentId: string, postId: string): Promise<EmailPhoto[]> {
+  const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+  const { data: existing, error } = await supabaseAdmin
+    .from("generated_posts")
+    .select("agent_id, content_type, metadata")
+    .eq("id", postId)
+    .maybeSingle();
+  if (error) throw error;
+  if (!existing || existing.agent_id !== agentId) {
+    throw new Error("Post not found for this agent.");
+  }
+  if (existing.content_type !== "email") {
+    throw new Error("Multi-photo attachments are only available for emails.");
+  }
+  const metadata = (existing.metadata as Record<string, unknown> | null) ?? {};
+  return Array.isArray(metadata["email_photos"]) ? (metadata["email_photos"] as EmailPhoto[]) : [];
+}
+
+// Writes a full replacement email_photos array — every add/edit/remove below
+// ends with this, same "spread the existing metadata, overwrite one field"
+// shape setPostMedia/setPostDrivePhoto/setPostUnsplashPhoto already use.
+async function writeEmailPhotos(postId: string, photos: EmailPhoto[]): Promise<void> {
+  const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+  const { data: existing, error: fetchErr } = await supabaseAdmin
+    .from("generated_posts")
+    .select("metadata")
+    .eq("id", postId)
+    .maybeSingle();
+  if (fetchErr) throw fetchErr;
+  const nextMetadata = {
+    ...((existing?.metadata as Record<string, unknown> | null) ?? {}),
+    email_photos: photos,
+  };
+  const { error } = await supabaseAdmin
+    .from("generated_posts")
+    .update({ metadata: nextMetadata, updated_at: new Date().toISOString() })
+    .eq("id", postId);
+  if (error) throw error;
+}
+
+// Adds a photo from the agent's own native Media Library — re-verifies the
+// media item actually belongs to this agent (same trust level setPostMedia
+// already applies to library photos) before trusting its URL.
+export const addEmailPhotoFromLibrary = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .validator((data: { agentId: string; postId: string; mediaId: string }) => data)
+  .handler(async ({ data, context }): Promise<{ photos: EmailPhoto[] }> => {
+    const email = (context.claims as { email?: string } | undefined)?.email;
+    await requireAgentAccess(context.userId, email, data.agentId);
+    const photos = await requireEmailPost(data.agentId, data.postId);
+    if (photos.length >= MAX_EMAIL_PHOTOS) {
+      throw new Error(`Emails can only carry up to ${MAX_EMAIL_PHOTOS} photos — remove one first.`);
+    }
+
+    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+    const { data: media, error: mediaErr } = await supabaseAdmin
+      .from("agent_photos")
+      .select("id, url, media_type, agent_id")
+      .eq("id", data.mediaId)
+      .maybeSingle();
+    if (mediaErr) throw mediaErr;
+    if (!media || media.agent_id !== data.agentId || !media.url) {
+      throw new Error("That media item doesn't belong to this agent.");
+    }
+
+    const next: EmailPhoto[] = [
+      ...photos,
+      {
+        id: crypto.randomUUID(),
+        source: "library",
+        url: media.url,
+        mediaType: media.media_type as "photo" | "video",
+        publishingInstructions: "",
+      },
+    ];
+    await writeEmailPhotos(data.postId, next);
+    await supabaseAdmin.from("feedback_history").insert({
+      agent_id: data.agentId,
+      post_id: data.postId,
+      rating: "photo_changed",
+      notes: `Email photo added from Media Library (${next.length}/${MAX_EMAIL_PHOTOS}).`,
+    });
+    return { photos: next };
+  });
+
+// Adds a photo from the agent's connected Google Drive folder — trusts the
+// client-supplied thumbnailUrl as-is, same trust level setPostDrivePhoto
+// already applies (the Drive listing itself is what's scoped to this agent;
+// nothing further to re-verify against a Drive file id here).
+export const addEmailPhotoFromDrive = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .validator((data: { agentId: string; postId: string; driveFileId: string; thumbnailUrl: string }) => data)
+  .handler(async ({ data, context }): Promise<{ photos: EmailPhoto[] }> => {
+    const email = (context.claims as { email?: string } | undefined)?.email;
+    await requireAgentAccess(context.userId, email, data.agentId);
+    const photos = await requireEmailPost(data.agentId, data.postId);
+    if (photos.length >= MAX_EMAIL_PHOTOS) {
+      throw new Error(`Emails can only carry up to ${MAX_EMAIL_PHOTOS} photos — remove one first.`);
+    }
+
+    const next: EmailPhoto[] = [
+      ...photos,
+      {
+        id: crypto.randomUUID(),
+        source: "drive",
+        url: data.thumbnailUrl,
+        mediaType: "photo",
+        driveFileId: data.driveFileId,
+        publishingInstructions: "",
+      },
+    ];
+    await writeEmailPhotos(data.postId, next);
+    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+    await supabaseAdmin.from("feedback_history").insert({
+      agent_id: data.agentId,
+      post_id: data.postId,
+      rating: "photo_changed",
+      notes: `Email photo added from Google Drive (${next.length}/${MAX_EMAIL_PHOTOS}).`,
+    });
+    return { photos: next };
+  });
+
+// Adds a photo from Unsplash — trusts the client-supplied photo URL as-is,
+// same trust level setPostUnsplashPhoto already applies (the URL only ever
+// comes from a live searchUnsplashPhotos result, never typed in by hand).
+export const addEmailPhotoFromUnsplash = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .validator(
+    (data: {
+      agentId: string;
+      postId: string;
+      photoUrl: string;
+      photographerName: string;
+      photographerProfileUrl: string;
+    }) => data,
+  )
+  .handler(async ({ data, context }): Promise<{ photos: EmailPhoto[] }> => {
+    const email = (context.claims as { email?: string } | undefined)?.email;
+    await requireAgentAccess(context.userId, email, data.agentId);
+    const photos = await requireEmailPost(data.agentId, data.postId);
+    if (photos.length >= MAX_EMAIL_PHOTOS) {
+      throw new Error(`Emails can only carry up to ${MAX_EMAIL_PHOTOS} photos — remove one first.`);
+    }
+
+    const next: EmailPhoto[] = [
+      ...photos,
+      {
+        id: crypto.randomUUID(),
+        source: "unsplash",
+        url: data.photoUrl,
+        mediaType: "photo",
+        unsplashPhotographer: data.photographerName,
+        unsplashCreditUrl: data.photographerProfileUrl,
+        publishingInstructions: "",
+      },
+    ];
+    await writeEmailPhotos(data.postId, next);
+    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+    await supabaseAdmin.from("feedback_history").insert({
+      agent_id: data.agentId,
+      post_id: data.postId,
+      rating: "photo_changed",
+      notes: `Email photo added from Unsplash (${next.length}/${MAX_EMAIL_PHOTOS}).`,
+    });
+    return { photos: next };
+  });
+
+// Edits one already-attached email photo's publishing instructions without
+// touching the others — the "Publishing instructions" box under each photo
+// in the panel saves through this on blur.
+export const updateEmailPhotoInstructions = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .validator((data: { agentId: string; postId: string; photoId: string; publishingInstructions: string }) => data)
+  .handler(async ({ data, context }): Promise<{ photos: EmailPhoto[] }> => {
+    const email = (context.claims as { email?: string } | undefined)?.email;
+    await requireAgentAccess(context.userId, email, data.agentId);
+    const photos = await requireEmailPost(data.agentId, data.postId);
+    const next = photos.map((p) =>
+      p.id === data.photoId ? { ...p, publishingInstructions: data.publishingInstructions } : p,
+    );
+    await writeEmailPhotos(data.postId, next);
+    return { photos: next };
+  });
+
+// Removes one attached email photo, leaving the others as-is.
+export const removeEmailPhoto = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .validator((data: { agentId: string; postId: string; photoId: string }) => data)
+  .handler(async ({ data, context }): Promise<{ photos: EmailPhoto[] }> => {
+    const email = (context.claims as { email?: string } | undefined)?.email;
+    await requireAgentAccess(context.userId, email, data.agentId);
+    const photos = await requireEmailPost(data.agentId, data.postId);
+    const next = photos.filter((p) => p.id !== data.photoId);
+    await writeEmailPhotos(data.postId, next);
+    return { photos: next };
+  });
+
 export const submitMarketingFeedback = createServerFn({ method: "POST" })
   .middleware([requireSupabaseAuth])
   .validator((data: { agentId: string; postId: string; rating?: string; notes?: string }) => data)
@@ -1255,7 +1504,7 @@ async function resolveAgentIdFromUploadToken(token: string): Promise<{ agentId: 
 // Public — no login required. Only ever returns a display name, never the
 // agent's real id or any other data about them.
 export const getPublicUploadAgent = createServerFn({ method: "POST" })
-  .inputValidator((data: { token: string }) => data)
+  .validator((data: { token: string }) => data)
   .handler(async ({ data }): Promise<{ agentName: string }> => {
     const { agentName } = await resolveAgentIdFromUploadToken(data.token);
     return { agentName };
@@ -1265,7 +1514,7 @@ export const getPublicUploadAgent = createServerFn({ method: "POST" })
 // above, but resolving the agent from the token instead of a logged-in
 // session. The browser still uploads the raw bytes straight to Storage.
 export const createPublicMediaUploadUrl = createServerFn({ method: "POST" })
-  .inputValidator((data: { token: string; fileName: string }) => data)
+  .validator((data: { token: string; fileName: string }) => data)
   .handler(async ({ data }): Promise<{ path: string; uploadToken: string }> => {
     const { agentId } = await resolveAgentIdFromUploadToken(data.token);
     const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
@@ -1279,7 +1528,7 @@ export const createPublicMediaUploadUrl = createServerFn({ method: "POST" })
 // Public — records the row once the browser's direct upload succeeds, same
 // shape as finalizeMediaUpload, resolved via the token instead of a session.
 export const finalizePublicMediaUpload = createServerFn({ method: "POST" })
-  .inputValidator((data: { token: string; storagePath: string; mediaType: "photo" | "video" }) => data)
+  .validator((data: { token: string; storagePath: string; mediaType: "photo" | "video" }) => data)
   .handler(async ({ data }): Promise<{ ok: true }> => {
     const { agentId } = await resolveAgentIdFromUploadToken(data.token);
     if (!data.storagePath.startsWith(`${agentId}/`)) {

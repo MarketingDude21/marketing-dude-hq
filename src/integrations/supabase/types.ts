@@ -23,6 +23,44 @@ export type Database = {
         };
         Relationships: [];
       };
+      agent_chat_messages: {
+        Row: {
+          agent_id: string;
+          content: string;
+          created_at: string;
+          id: string;
+          metadata: Json;
+          mode: string;
+          role: string;
+        };
+        Insert: {
+          agent_id: string;
+          content: string;
+          created_at?: string;
+          id?: string;
+          metadata?: Json;
+          mode?: string;
+          role: string;
+        };
+        Update: {
+          agent_id?: string;
+          content?: string;
+          created_at?: string;
+          id?: string;
+          metadata?: Json;
+          mode?: string;
+          role?: string;
+        };
+        Relationships: [
+          {
+            foreignKeyName: "agent_chat_messages_agent_id_fkey";
+            columns: ["agent_id"];
+            isOneToOne: false;
+            referencedRelation: "agents";
+            referencedColumns: ["id"];
+          },
+        ];
+      };
       agent_drive_used_files: {
         Row: {
           agent_id: string;

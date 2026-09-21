@@ -238,7 +238,7 @@ async function requireClientAccess(
 
 export const listSoiUploads = createServerFn({ method: "GET" })
   .middleware([requireSupabaseAuth])
-  .validator((data: { clientId: string }) => data)
+  .inputValidator((data: { clientId: string }) => data)
   .handler(async ({ data, context }) => {
     const admin = getSoiAdminClient();
     const email = (context.claims as { email?: string } | undefined)?.email;
@@ -254,7 +254,7 @@ export const listSoiUploads = createServerFn({ method: "GET" })
 
 export const uploadSoiFile = createServerFn({ method: "POST" })
   .middleware([requireSupabaseAuth])
-  .validator(
+  .inputValidator(
     (data: { clientId: string; fileName: string; sourceLabel: string; kind: "vcf" | "mapped_csv"; content: string }) =>
       data,
   )
@@ -289,7 +289,7 @@ export const uploadSoiFile = createServerFn({ method: "POST" })
 
 export const deleteSoiUpload = createServerFn({ method: "POST" })
   .middleware([requireSupabaseAuth])
-  .validator((data: { clientId: string; uploadId: string }) => data)
+  .inputValidator((data: { clientId: string; uploadId: string }) => data)
   .handler(async ({ data, context }) => {
     const admin = getSoiAdminClient();
     const email = (context.claims as { email?: string } | undefined)?.email;
@@ -317,7 +317,7 @@ export const deleteSoiUpload = createServerFn({ method: "POST" })
 
 export const processSoiUploads = createServerFn({ method: "POST" })
   .middleware([requireSupabaseAuth])
-  .validator((data: { clientId: string }) => data)
+  .inputValidator((data: { clientId: string }) => data)
   .handler(async ({ data, context }) => {
     const admin = getSoiAdminClient();
     const email = (context.claims as { email?: string } | undefined)?.email;
@@ -367,7 +367,7 @@ const CHECKED_COUNT_LISTS = ["direct_mail", "email_phone", "email_list", "incomp
 
 export const getSoiHubCounts = createServerFn({ method: "GET" })
   .middleware([requireSupabaseAuth])
-  .validator((data: { clientId: string }) => data)
+  .inputValidator((data: { clientId: string }) => data)
   .handler(async ({ data, context }) => {
     const admin = getSoiAdminClient();
     const email = (context.claims as { email?: string } | undefined)?.email;
@@ -491,7 +491,7 @@ async function fetchContactsWithFlags(
 // safe - it doesn't change how any contact is classified.
 export const getSoiReviewCandidates = createServerFn({ method: "GET" })
   .middleware([requireSupabaseAuth])
-  .validator(
+  .inputValidator(
     (data: { clientId: string; listAssignment: "direct_mail" | "email_phone" | "email_list" | "incomplete" }) => data,
   )
   .handler(async ({ data, context }) => {
@@ -510,7 +510,7 @@ export const getSoiReviewCandidates = createServerFn({ method: "GET" })
 // mirror here since these are read-only, nothing is reclassified.
 export const getSoiListView = createServerFn({ method: "GET" })
   .middleware([requireSupabaseAuth])
-  .validator(
+  .inputValidator(
     (data: {
       clientId: string;
       view: "nonqualified" | "realtor_excluded" | "business_excluded" | "facebook_audience" | "final_full_contact";
@@ -558,7 +558,7 @@ export const getSoiListView = createServerFn({ method: "GET" })
 
 export const setSoiReviewFlag = createServerFn({ method: "POST" })
   .middleware([requireSupabaseAuth])
-  .validator((data: { clientId: string; contactId: string; reviewType: string; flagged: boolean }) => data)
+  .inputValidator((data: { clientId: string; contactId: string; reviewType: string; flagged: boolean }) => data)
   .handler(async ({ data, context }) => {
     const admin = getSoiAdminClient();
     const email = (context.claims as { email?: string } | undefined)?.email;
@@ -594,7 +594,7 @@ export const setSoiReviewFlag = createServerFn({ method: "POST" })
 
 export const exportSoiList = createServerFn({ method: "POST" })
   .middleware([requireSupabaseAuth])
-  .validator((data: { clientId: string; scope: string }) => data)
+  .inputValidator((data: { clientId: string; scope: string }) => data)
   .handler(async ({ data, context }) => {
     const admin = getSoiAdminClient();
     const email = (context.claims as { email?: string } | undefined)?.email;

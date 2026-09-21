@@ -1182,6 +1182,125 @@ export const deleteMarketingMedia = createServerFn({ method: "POST" })
   });
 
 // ============================================================================
+// Public media-upload link (2026-09-20) — Mike's request: "I want to create
+// a simple link I can send them that will open up directly into the Media
+// folder no differently than how we share a google drive link. You would
+// click to copy and we can send it to anyone who can click on it and then
+// upload photos to that media library without logging in." This is the same
+// pattern as a Drive "anyone with the link can upload" folder, deliberately
+// scoped to upload-only: the public page below can never list, view, or
+// delete anything already in an agent's library, and it never exposes
+// agentId, email, or any other agent data — only a display name, so admin
+// can confirm they're sending the right person the right link.
+//
+// Access model: instead of the usual session-based requireAgentAccess, these
+// three functions carry NO auth middleware at all (they need to work for
+// someone who never logs in) and are gated purely by knowing a long random
+// per-agent token — never the agent's real id, which could otherwise be
+// guessed/enumerated. Getting or regenerating the token itself IS admin-only
+// (mirrors setAgentDriveFolder's pattern) and issuing a fresh token
+// invalidates whatever link was shared before, the same way Mike could stop
+// sharing a Drive folder by moving it or changing its share setting.
+// ============================================================================
+
+// Admin-only: read (creating on first use) this agent's public upload token.
+export const getMediaUploadLink = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .validator((data: { agentId: string }) => data)
+  .handler(async ({ data, context }): Promise<{ token: string }> => {
+    const email = (context.claims as { email?: string } | undefined)?.email;
+    await requireAdmin(context.userId, email);
+    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+    const { data: agent, error: fetchErr } = await supabaseAdmin
+      .from("agents")
+      .select("media_upload_token")
+      .eq("id", data.agentId)
+      .maybeSingle();
+    if (fetchErr) throw fetchErr;
+    if (agent?.media_upload_token) return { token: agent.media_upload_token };
+    const token = crypto.randomUUID();
+    const { error } = await supabaseAdmin.from("agents").update({ media_upload_token: token }).eq("id", data.agentId);
+    if (error) throw error;
+    return { token };
+  });
+
+// Admin-only: issue a brand-new token, permanently breaking any link already
+// shared — for when a link needs to be revoked (sent to the wrong person,
+// been floating around too long, etc.).
+export const regenerateMediaUploadLink = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .validator((data: { agentId: string }) => data)
+  .handler(async ({ data, context }): Promise<{ token: string }> => {
+    const email = (context.claims as { email?: string } | undefined)?.email;
+    await requireAdmin(context.userId, email);
+    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+    const token = crypto.randomUUID();
+    const { error } = await supabaseAdmin.from("agents").update({ media_upload_token: token }).eq("id", data.agentId);
+    if (error) throw error;
+    return { token };
+  });
+
+async function resolveAgentIdFromUploadToken(token: string): Promise<{ agentId: string; agentName: string }> {
+  const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+  const { data: agent, error } = await supabaseAdmin
+    .from("agents")
+    .select("id, full_name")
+    .eq("media_upload_token", token)
+    .maybeSingle();
+  if (error) throw error;
+  if (!agent) throw new Error("This upload link isn't valid — ask your team for a new one.");
+  return { agentId: agent.id, agentName: agent.full_name ?? "this agent" };
+}
+
+// Public — no login required. Only ever returns a display name, never the
+// agent's real id or any other data about them.
+export const getPublicUploadAgent = createServerFn({ method: "POST" })
+  .validator((data: { token: string }) => data)
+  .handler(async ({ data }): Promise<{ agentName: string }> => {
+    const { agentName } = await resolveAgentIdFromUploadToken(data.token);
+    return { agentName };
+  });
+
+// Public — mints a signed Storage upload URL, exactly like createMediaUploadUrl
+// above, but resolving the agent from the token instead of a logged-in
+// session. The browser still uploads the raw bytes straight to Storage.
+export const createPublicMediaUploadUrl = createServerFn({ method: "POST" })
+  .validator((data: { token: string; fileName: string }) => data)
+  .handler(async ({ data }): Promise<{ path: string; uploadToken: string }> => {
+    const { agentId } = await resolveAgentIdFromUploadToken(data.token);
+    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+    const safeName = data.fileName.replace(/[^a-zA-Z0-9._-]/g, "_").slice(-120);
+    const path = `${agentId}/${crypto.randomUUID()}-${safeName}`;
+    const { data: signed, error } = await supabaseAdmin.storage.from("media").createSignedUploadUrl(path);
+    if (error) throw error;
+    return { path, uploadToken: signed.token };
+  });
+
+// Public — records the row once the browser's direct upload succeeds, same
+// shape as finalizeMediaUpload, resolved via the token instead of a session.
+export const finalizePublicMediaUpload = createServerFn({ method: "POST" })
+  .validator((data: { token: string; storagePath: string; mediaType: "photo" | "video" }) => data)
+  .handler(async ({ data }): Promise<{ ok: true }> => {
+    const { agentId } = await resolveAgentIdFromUploadToken(data.token);
+    if (!data.storagePath.startsWith(`${agentId}/`)) {
+      throw new Error("Upload path does not belong to this agent.");
+    }
+    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+    const { data: pub } = supabaseAdmin.storage.from("media").getPublicUrl(data.storagePath);
+    const { error } = await supabaseAdmin.from("agent_photos").insert({
+      agent_id: agentId,
+      url: pub.publicUrl,
+      storage_path: data.storagePath,
+      media_type: data.mediaType,
+      source: "upload",
+      status: "available",
+      tags: [],
+    });
+    if (error) throw error;
+    return { ok: true };
+  });
+
+// ============================================================================
 // Google Drive tab — Phase 2, requested by Mike (2026-09-16) on top of the
 // native media library above. This is a LIVE, read-only view straight from
 // the Drive API of what's actually in an agent's existing Drive folder —
@@ -1732,6 +1851,59 @@ function extractSection(text: string, startLabel: string, endLabels: string[]): 
   return text.slice(startIdx, endIdx).trim();
 }
 
+// Turns a raw, multi-line calendar-doc section into clean bullet lines —
+// added 2026-09-20 per Mike's screenshot feedback: a multi-slide/multi-clip
+// brief (several "Image:"/"Text:" pairs, one per slide) was previously
+// flattened into a single "; "-joined run-on paragraph, which is exactly
+// what he called "too long" and "very confusing." Two real problems in the
+// old flattening: (1) a doc that puts a label on its own line and the value
+// on the NEXT line (e.g. "Text:\nYou know exactly how to open the broken
+// drawer.") produced an orphaned, empty-looking "Text:;" fragment once
+// joined — this merges a bare label with whatever line follows it instead;
+// (2) a trailing "Template Link:" line (the calendar author's own record of
+// the Canva link, inside the very section this reads) was being included as
+// a bullet even though the exact same link is already captured separately
+// into canva/canva_link — filtered out here so it doesn't show twice.
+// Returns an array of clean lines; the frontend (marketing.tsx) renders
+// these newline-joined lines as an actual bulleted list instead of a
+// paragraph, and — for the handful of already-generated posts made before
+// this fix, whose stored image_suggestion/canva_instructions are still
+// semicolon-joined — falls back to splitting on "; " there too, so existing
+// pending content reads better immediately, not just future generations.
+function toBullets(sectionText: string): string[] {
+  const rawLines = sectionText
+    .split("\n")
+    .map((l) =>
+      l
+        .replace(/^[-*•]\s*/, "")
+        .replace(/^Clip\s*\d+:\s*/i, "")
+        .replace(/^Option\s*\d+:\s*/i, "")
+        .trim(),
+    )
+    .filter((l) => l.length > 0 && !/^Template Link:/i.test(l));
+
+  const bullets: string[] = [];
+  let pendingLabel: string | null = null;
+  const bareLabelRe = /^(Image|Text|Caption|Hook|Body|Close)\s*:\s*$/i;
+  for (const line of rawLines) {
+    if (bareLabelRe.test(line)) {
+      // Two bare labels in a row (rare) — the first never got a value, so
+      // keep it as its own bullet rather than silently dropping it.
+      if (pendingLabel) bullets.push(pendingLabel);
+      pendingLabel = line.replace(/\s*:\s*$/, ":");
+      continue;
+    }
+    if (pendingLabel) {
+      bullets.push(`${pendingLabel} ${line}`);
+      pendingLabel = null;
+    } else {
+      bullets.push(line);
+    }
+  }
+  if (pendingLabel) bullets.push(pendingLabel);
+  return bullets;
+}
+
 function parsePostDoc(text: string, title: string): CalendarDoc | null {
   const goal = extractSection(text, "Post Goal", [
     "Post Image",
@@ -1759,17 +1931,7 @@ function parsePostDoc(text: string, title: string): CalendarDoc | null {
   }
   if (!copy) return null;
 
-  const image = imageSection
-    .split("\n")
-    .map((l) =>
-      l
-        .replace(/^[-*•]\s*/, "")
-        .replace(/^Clip\s*\d+:\s*/i, "")
-        .replace(/^Option\s*\d+:\s*/i, "")
-        .trim(),
-    )
-    .filter(Boolean)
-    .join("; ");
+  const image = toBullets(imageSection).join("\n");
 
   let canva = "";
   const canvaMatch =
@@ -1794,11 +1956,7 @@ function parsePostDoc(text: string, title: string): CalendarDoc | null {
   // a regular post's "Post Image/Video Suggestions" section. Fixed per
   // Mike's report (2026-09-18): "the Canva images need the instructions
   // posted beneath it, just like they are in the posts."
-  const canvaDirection = extractSection(text, "Canva Template Direction", ["Post Copy"])
-    .split("\n")
-    .filter((l) => !/Template Link:/i.test(l))
-    .join("\n")
-    .trim();
+  const canvaDirection = toBullets(extractSection(text, "Canva Template Direction", ["Post Copy"])).join("\n");
 
   return { type: "post", title, goal, image, canva, canvaDirection, copy };
 }

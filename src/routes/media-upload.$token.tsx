@@ -48,7 +48,7 @@ async function resizeImage(file: File, maxEdge = 2000, quality = 0.85): Promise<
   const ctx = canvas.getContext("2d");
   if (!ctx) return file;
   ctx.drawImage(bitmap, 0, 0, canvas.width, canvas.height);
-  const blob = await new Promise((resolve) => canvas.toBlob(resolve, "image/jpeg", quality));
+  const blob = await new Promise<Blob | null>((resolve) => canvas.toBlob(resolve, "image/jpeg", quality));
   if (!blob) return file;
   return new File([blob], file.name.replace(/\.\w+$/, ".jpg"), { type: "image/jpeg" });
 }

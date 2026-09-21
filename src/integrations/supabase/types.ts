@@ -97,6 +97,7 @@ export type Database = {
           headshot_url: string | null;
           id: string;
           market_area: string | null;
+          media_upload_token: string | null;
           phone: string | null;
           photo_source: string;
           subscription_status: string;
@@ -115,6 +116,7 @@ export type Database = {
           headshot_url?: string | null;
           id: string;
           market_area?: string | null;
+          media_upload_token?: string | null;
           phone?: string | null;
           photo_source?: string;
           subscription_status?: string;
@@ -133,6 +135,7 @@ export type Database = {
           headshot_url?: string | null;
           id?: string;
           market_area?: string | null;
+          media_upload_token?: string | null;
           phone?: string | null;
           photo_source?: string;
           subscription_status?: string;

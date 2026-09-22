@@ -4,17 +4,17 @@ import { AppShell } from "@/components/AppShell";
 export const Route = createFileRoute("/")({
   head: () => ({
     meta: [
-      { title: "Your Marketing Dude — Your marketing, on autopilot" },
+      { title: "Your Marketing Dude — AI that runs your marketing for you" },
       {
         name: "description",
         content:
-          "One dashboard for real estate agents: Voice DNA, database building, and monthly marketing content — one brain that gets smarter every month.",
+          "A real estate marketing OS: mine your sphere, learn your voice, and turn your database into consistent content and follow-up — without adding to your to-do list.",
       },
       { property: "og:title", content: "Your Marketing Dude" },
       {
         property: "og:description",
         content:
-          "Log in once. Voice DNA, your database, and monthly content all draw from the same agent profile.",
+          "AI that runs your database and marketing — not AI that gives you more to do.",
       },
       { property: "og:type", content: "website" },
       { name: "twitter:card", content: "summary_large_image" },
@@ -26,12 +26,12 @@ export const Route = createFileRoute("/")({
 const MODULES = [
   {
     to: "/database",
-    tag: "SOI Builder",
+    tag: "Sphere mining",
     tagClass: "bg-primary/15 text-primary",
     dotClass: "bg-primary",
     title: "Build My Database",
-    desc: "Clean your contacts into sharp marketing lists.",
-    meta: "Pick up where you left off",
+    desc: "Import your contacts. We find your real sphere, clean it, tag it, and turn it into marketing lists worth mailing.",
+    meta: "Who you should actually market to",
     action: "Open",
   },
   {
@@ -40,21 +40,31 @@ const MODULES = [
     tagClass: "bg-accent/15 text-accent",
     dotClass: "bg-accent",
     title: "My Voice DNA",
-    desc: "15-question interview captures how you talk.",
-    meta: "Complete the interview",
+    desc: "A short interview teaches the system how you actually talk, so nothing it writes sounds like AI wrote it.",
+    meta: "Train it once, use it forever",
     action: "Review",
   },
   {
     to: "/marketing",
-    tag: "Content Generator",
+    tag: "Content engine",
     tagClass: "bg-secondary text-foreground",
     dotClass: "bg-foreground",
     title: "Monthly Marketing",
-    desc: "Drafted posts, emails & video scripts in your voice.",
-    meta: "This month's set",
+    desc: "Your month, written: emails, posts, video scripts and past-client touches — drafted in your voice, ready to approve.",
+    meta: "This month is already drafted",
     action: "View",
   },
 ] as const;
+
+const DOES = [
+  ["Mines your sphere", "Finds the people actually worth marketing to"],
+  ["Learns your voice", "Writes like you, not like a chatbot"],
+  ["Nurtures your database", "Campaigns by relationship, type and timing"],
+  ["Finds local stories", "Turns market and neighborhood news into content"],
+  ["Feeds your videos", "Topics, hooks, scripts and captions"],
+  ["Keeps past clients warm", "Anniversaries, check-ins, referral asks"],
+] as const;
+
 
 function HomePage() {
   return (

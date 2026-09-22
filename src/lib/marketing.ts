@@ -1604,6 +1604,175 @@ export const finalizePublicMediaUpload = createServerFn({ method: "POST" })
   });
 
 // ============================================================================
+// Public, no-login review link (2026-09-22) — per Mike: "it is not sending
+// the file for the agent to review... this must be a public facing link
+// that does not require login." Same trust model as the media-upload token
+// just above (an unguessable per-agent token, resolved server-side,
+// revocable any time), NOT the old app's guessable review.html?agent=...
+// &batch=... link — that was the actual security hole this whole native
+// rewrite closed, so this deliberately doesn't reopen it. Scoped narrowly:
+// the public page this backs can only view and Approve/Flag one agent's own
+// content (mirroring exactly what that agent could already do here after
+// logging in), never edit content, swap photos, or see anything about any
+// other agent. Full editing stays behind login.
+// ============================================================================
+
+async function resolveAgentIdFromReviewToken(token: string): Promise<{ agentId: string; agentName: string }> {
+  const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+  const { data: agent, error } = await supabaseAdmin
+    .from("agents")
+    .select("id, full_name")
+    .eq("review_token", token)
+    .maybeSingle();
+  if (error) throw error;
+  if (!agent) throw new Error("This review link isn't valid — ask your team for a new one.");
+  return { agentId: agent.id, agentName: agent.full_name ?? "there" };
+}
+
+// Admin-only: read (creating on first use) this agent's public review token.
+// Shares the same crypto.randomUUID()-as-token approach as
+// getMediaUploadLink above — a v4 UUID has 122 bits of randomness, not
+// practically guessable, and the whole point of this design is that
+// possessing the link IS the credential, same as a Drive share link.
+export const getReviewLink = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .validator((data: { agentId: string }) => data)
+  .handler(async ({ data, context }): Promise<{ token: string }> => {
+    const email = (context.claims as { email?: string } | undefined)?.email;
+    await requireAdmin(context.userId, email);
+    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+    const { data: agent, error: fetchErr } = await supabaseAdmin
+      .from("agents")
+      .select("review_token")
+      .eq("id", data.agentId)
+      .maybeSingle();
+    if (fetchErr) throw fetchErr;
+    if (agent?.review_token) return { token: agent.review_token };
+    const token = crypto.randomUUID();
+    const { error } = await supabaseAdmin.from("agents").update({ review_token: token }).eq("id", data.agentId);
+    if (error) throw error;
+    return { token };
+  });
+
+// Admin-only: issue a brand-new token, permanently breaking any link already
+// shared — for revoking a link sent to the wrong person or that's been
+// floating around too long.
+export const regenerateReviewLink = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .validator((data: { agentId: string }) => data)
+  .handler(async ({ data, context }): Promise<{ token: string }> => {
+    const email = (context.claims as { email?: string } | undefined)?.email;
+    await requireAdmin(context.userId, email);
+    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+    const token = crypto.randomUUID();
+    const { error } = await supabaseAdmin.from("agents").update({ review_token: token }).eq("id", data.agentId);
+    if (error) throw error;
+    return { token };
+  });
+
+// Public — no login required. Only ever returns a display name, never the
+// agent's real id or any other data about them, same as getPublicUploadAgent.
+export const getPublicReviewAgent = createServerFn({ method: "POST" })
+  .validator((data: { token: string }) => data)
+  .handler(async ({ data }): Promise<{ agentName: string }> => {
+    const { agentName } = await resolveAgentIdFromReviewToken(data.token);
+    return { agentName };
+  });
+
+// Public — which months this agent has non-archived content in, most recent
+// first, so the review page can default to the newest one instead of
+// showing an empty screen.
+export const listPublicReviewMonths = createServerFn({ method: "POST" })
+  .validator((data: { token: string }) => data)
+  .handler(async ({ data }): Promise<{ months: string[] }> => {
+    const { agentId } = await resolveAgentIdFromReviewToken(data.token);
+    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+    const { data: rows, error } = await supabaseAdmin
+      .from("generated_posts")
+      .select("month")
+      .eq("agent_id", agentId)
+      .eq("archived", false)
+      .not("month", "is", null);
+    if (error) throw error;
+    const months = Array.from(new Set((rows ?? []).map((r) => r.month as string)))
+      .sort()
+      .reverse();
+    return { months };
+  });
+
+// Public — same shape as listMarketingPosts, resolved via token instead of a
+// session. Only non-archived content for the ONE agent the token belongs to.
+export const listPublicReviewPosts = createServerFn({ method: "POST" })
+  .validator((data: { token: string; month: string }) => data)
+  .handler(async ({ data }): Promise<PostRow[]> => {
+    const { agentId } = await resolveAgentIdFromReviewToken(data.token);
+    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+    const { data: posts, error } = await supabaseAdmin
+      .from("generated_posts")
+      .select(
+        "id, content, content_type, title, platform, status, month, scheduled_for, created_at, archived, metadata",
+      )
+      .eq("agent_id", agentId)
+      .eq("month", data.month)
+      .eq("archived", false)
+      .order("created_at", { ascending: true })
+      .order("id", { ascending: true });
+    if (error) throw error;
+    return (posts ?? []) as unknown as PostRow[];
+  });
+
+// Public — approve one post. Re-verifies the post belongs to the token's
+// agent before writing, same defense-in-depth every other write here uses.
+export const approvePublicReviewPost = createServerFn({ method: "POST" })
+  .validator((data: { token: string; postId: string }) => data)
+  .handler(async ({ data }): Promise<{ ok: true }> => {
+    const { agentId } = await resolveAgentIdFromReviewToken(data.token);
+    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+    const { data: existing, error: fetchErr } = await supabaseAdmin
+      .from("generated_posts")
+      .select("agent_id")
+      .eq("id", data.postId)
+      .maybeSingle();
+    if (fetchErr) throw fetchErr;
+    if (!existing || existing.agent_id !== agentId) throw new Error("Post not found for this agent.");
+    const { error } = await supabaseAdmin.from("generated_posts").update({ status: "approved" }).eq("id", data.postId);
+    if (error) throw error;
+    return { ok: true };
+  });
+
+// Public — flag a post with a note, same as submitMarketingFeedback but
+// token-resolved. Also flips status to "flagged" so it's visually distinct
+// from a plain pending post on the admin side too.
+export const submitPublicReviewFeedback = createServerFn({ method: "POST" })
+  .validator((data: { token: string; postId: string; notes?: string }) => data)
+  .handler(async ({ data }): Promise<{ ok: true }> => {
+    const { agentId } = await resolveAgentIdFromReviewToken(data.token);
+    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+    const { data: existing, error: fetchErr } = await supabaseAdmin
+      .from("generated_posts")
+      .select("agent_id")
+      .eq("id", data.postId)
+      .maybeSingle();
+    if (fetchErr) throw fetchErr;
+    if (!existing || existing.agent_id !== agentId) throw new Error("Post not found for this agent.");
+
+    const { error: updateErr } = await supabaseAdmin
+      .from("generated_posts")
+      .update({ status: "flagged" })
+      .eq("id", data.postId);
+    if (updateErr) throw updateErr;
+
+    const { error } = await supabaseAdmin.from("feedback_history").insert({
+      agent_id: agentId,
+      post_id: data.postId,
+      rating: "flagged",
+      notes: data.notes ?? null,
+    });
+    if (error) throw error;
+    return { ok: true };
+  });
+
+// ============================================================================
 // Google Drive tab — Phase 2, requested by Mike (2026-09-16) on top of the
 // native media library above. This is a LIVE, read-only view straight from
 // the Drive API of what's actually in an agent's existing Drive folder —
@@ -2233,10 +2402,7 @@ export type ChatMessageRow = {
   role: string;
   content: string;
   mode: string;
-  // Server-fn return values must be serializable: Record<string, unknown> is
-  // rejected by the framework's serializer, and every value actually written
-  // here (source, sourceId, thumbnailUrl, fileName) is a string anyway.
-  metadata: Record<string, string> | null;
+  metadata: Record<string, unknown> | null;
   created_at: string;
 };
 
@@ -3689,10 +3855,15 @@ export const addPhotoPostsToBatch = createServerFn({ method: "POST" })
   });
 
 // ── Send to Agent — admin-only, ported from send-review.js (GoHighLevel) ───
-// One deliberate change from the old app: the notification email links to
-// this app's own secure login (/marketing) instead of the old public,
-// no-auth review.html?agent=...&batch=... link — that link was exactly the
-// hole Phase 1 closed, so recreating it would reopen it.
+// UPDATED 2026-09-22: the notification email now links to the public,
+// token-based review page (/review/$token, see the "Public, no-login review
+// link" section above) instead of this app's login screen — per Mike:
+// "it is not sending the file for the agent to review... this must be a
+// public facing link that does not require login." This is NOT a return to
+// the old app's guessable review.html?agent=...&batch=... link (the actual
+// security hole this whole native rewrite closed) — the token is an
+// unguessable per-agent UUID, and the page it unlocks only ever shows and
+// lets someone approve/flag THAT one agent's own content, nothing else.
 
 export const sendContentToAgent = createServerFn({ method: "POST" })
   .middleware([requireSupabaseAuth])
@@ -3713,11 +3884,24 @@ export const sendContentToAgent = createServerFn({ method: "POST" })
     const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
     const { data: agent, error } = await supabaseAdmin
       .from("agents")
-      .select("full_name, email")
+      .select("full_name, email, review_token")
       .eq("id", data.agentId)
       .maybeSingle();
     if (error) throw error;
     if (!agent?.email) throw new Error("No email address on file for this agent.");
+
+    // Read-or-create the review token inline (same logic as getReviewLink
+    // above) so "Send to Agent" always has a working link even if no admin
+    // ever visited that agent's link-management UI first.
+    let reviewToken = agent.review_token;
+    if (!reviewToken) {
+      reviewToken = crypto.randomUUID();
+      const { error: tokenErr } = await supabaseAdmin
+        .from("agents")
+        .update({ review_token: reviewToken })
+        .eq("id", data.agentId);
+      if (tokenErr) throw tokenErr;
+    }
 
     // NOTE (2026-09-18): this used to send Version: "2021-04-15" on every
     // call here, which is not a version GoHighLevel's v2/LeadConnector API
@@ -3730,6 +3914,14 @@ export const sendContentToAgent = createServerFn({ method: "POST" })
       "Content-Type": "application/json",
       Version: "2021-07-28",
     };
+    // FIXED (2026-09-22): this used to silently swallow whatever GoHighLevel
+    // actually said on a failed search or create call — a 401 from a bad
+    // key, a validation error, a locationId mismatch, all collapsed into
+    // the same generic "could not find or create a contact" message, which
+    // is exactly what Mike hit and reported (no way to tell from that
+    // message what was actually wrong). Both calls below now check
+    // response.ok and surface GHL's own error text when either one fails,
+    // instead of only checking "did we end up with a contactId."
     const searchRes = await fetch(
       "https://services.leadconnectorhq.com/contacts/search?locationId=" +
         ghlLocation +
@@ -3737,7 +3929,15 @@ export const sendContentToAgent = createServerFn({ method: "POST" })
         encodeURIComponent(agent.email),
       { headers },
     );
-    const searchData = (await searchRes.json()) as { contacts?: { id: string }[] };
+    const searchData = (await searchRes.json()) as {
+      contacts?: { id: string }[];
+      message?: string;
+    };
+    if (!searchRes.ok) {
+      throw new Error(
+        `GoHighLevel contact search failed (${searchRes.status}): ${searchData.message ?? "unknown error"}. Check that GHL_API_KEY has contacts access and GHL_LOCATION_ID matches the key's sub-account.`,
+      );
+    }
     let contactId = searchData.contacts?.[0]?.id ?? null;
     if (!contactId) {
       const createRes = await fetch("https://services.leadconnectorhq.com/contacts/", {
@@ -3750,17 +3950,36 @@ export const sendContentToAgent = createServerFn({ method: "POST" })
           lastName: agent.full_name?.split(" ").slice(1).join(" ") ?? "",
         }),
       });
-      const createData = (await createRes.json()) as { contact?: { id?: string }; id?: string };
-      contactId = createData.contact?.id ?? createData.id ?? null;
+      const createData = (await createRes.json()) as {
+        contact?: { id?: string };
+        id?: string;
+        message?: string;
+      };
+      if (!createRes.ok) {
+        // GHL returns 400 "duplicated contact" when a contact with this
+        // email already exists but the search above (e.g. a stale index)
+        // didn't surface it — that response includes the existing
+        // contact's id, so recover it instead of failing outright.
+        const dupeId = (createData as { meta?: { contactId?: string } }).meta?.contactId;
+        if (dupeId) {
+          contactId = dupeId;
+        } else {
+          throw new Error(
+            `GoHighLevel contact create failed (${createRes.status}): ${createData.message ?? "unknown error"}.`,
+          );
+        }
+      } else {
+        contactId = createData.contact?.id ?? createData.id ?? null;
+      }
     }
     if (!contactId) throw new Error(`Could not find or create a GoHighLevel contact for ${agent.email}.`);
 
     const firstName = agent.full_name?.split(" ")[0] ?? "there";
-    const reviewUrl = (process.env["APP_URL"] ?? "https://marketing-dude-hq.lovable.app") + "/marketing";
+    const reviewUrl = (process.env["APP_URL"] ?? "https://marketing-dude-hq.lovable.app") + "/review/" + reviewToken;
     const emailHtml = `
 <html><body style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;padding:20px;color:#1A1A18;">
   <h2 style="font-size:22px;font-weight:600;margin-bottom:8px;">Hey ${firstName} — your ${data.month} content is ready!</h2>
-  <p style="font-size:15px;color:#5A5A52;line-height:1.6;margin-bottom:24px;">Your social media posts and emails for ${data.month} are ready for your review. Log in and check the Monthly Marketing tab to see everything and let us know if it all sounds like you.</p>
+  <p style="font-size:15px;color:#5A5A52;line-height:1.6;margin-bottom:24px;">Your social media posts and emails for ${data.month} are ready for your review. Click below to see everything and approve it (or flag anything that doesn't sound like you) — no login needed.</p>
   <a href="${reviewUrl}" style="display:inline-block;background:#1A1A18;color:#fff;text-decoration:none;padding:14px 28px;border-radius:8px;font-size:15px;font-weight:600;margin-bottom:24px;">Review My Content →</a>
   <p style="font-size:13px;color:#9A9A90;line-height:1.6;">Takes about 5 minutes. The more feedback you give us, the better your content gets every month.<br/><br/>Talk soon,<br/><strong>Your Marketing Dude Team</strong></p>
 </body></html>`.trim();

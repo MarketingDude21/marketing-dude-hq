@@ -2233,7 +2233,10 @@ export type ChatMessageRow = {
   role: string;
   content: string;
   mode: string;
-  metadata: Record<string, unknown> | null;
+  // Server-fn return values must be serializable: Record<string, unknown> is
+  // rejected by the framework's serializer, and every value actually written
+  // here (source, sourceId, thumbnailUrl, fileName) is a string anyway.
+  metadata: Record<string, string> | null;
   created_at: string;
 };
 

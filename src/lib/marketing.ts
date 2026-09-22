@@ -2402,7 +2402,7 @@ export type ChatMessageRow = {
   role: string;
   content: string;
   mode: string;
-  metadata: Record<string, unknown> | null;
+  metadata: Record<string, string> | null;
   created_at: string;
 };
 

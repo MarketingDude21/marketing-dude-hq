@@ -72,7 +72,7 @@ function ReviewCard({
     setBusy(true);
     setError(null);
     try {
-      await submitPublicReviewFeedback({ data: { token, postId: post.id, notes: notes.trim() || undefined } });
+      await submitPublicReviewFeedback({ data: { token, postId: post.id, ...(notes.trim() ? { notes: notes.trim() } : {}) } });
       setFlagging(false);
       setNotes("");
       onChanged(post.id, "flagged");

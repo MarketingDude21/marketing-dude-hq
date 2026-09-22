@@ -16,6 +16,7 @@ import { Route as LoginRouteImport } from './routes/login'
 import { Route as MarketingRouteImport } from './routes/marketing'
 import { Route as VoiceRouteImport } from './routes/voice'
 import { Route as MediaUploadTokenRouteImport } from './routes/media-upload.$token'
+import { Route as ReviewTokenRouteImport } from './routes/review.$token'
 
 const IndexRoute = IndexRouteImport.update({
   id: '/',
@@ -52,6 +53,11 @@ const MediaUploadTokenRoute = MediaUploadTokenRouteImport.update({
   path: '/media-upload/$token',
   getParentRoute: () => rootRouteImport,
 } as any)
+const ReviewTokenRoute = ReviewTokenRouteImport.update({
+  id: '/review/$token',
+  path: '/review/$token',
+  getParentRoute: () => rootRouteImport,
+} as any)
 
 export interface FileRoutesByFullPath {
   '/': typeof IndexRoute
@@ -61,6 +67,7 @@ export interface FileRoutesByFullPath {
   '/marketing': typeof MarketingRoute
   '/voice': typeof VoiceRoute
   '/media-upload/$token': typeof MediaUploadTokenRoute
+  '/review/$token': typeof ReviewTokenRoute
 }
 export interface FileRoutesByTo {
   '/': typeof IndexRoute
@@ -70,6 +77,7 @@ export interface FileRoutesByTo {
   '/marketing': typeof MarketingRoute
   '/voice': typeof VoiceRoute
   '/media-upload/$token': typeof MediaUploadTokenRoute
+  '/review/$token': typeof ReviewTokenRoute
 }
 export interface FileRoutesById {
   __root__: typeof rootRouteImport
@@ -80,6 +88,7 @@ export interface FileRoutesById {
   '/marketing': typeof MarketingRoute
   '/voice': typeof VoiceRoute
   '/media-upload/$token': typeof MediaUploadTokenRoute
+  '/review/$token': typeof ReviewTokenRoute
 }
 export interface FileRouteTypes {
   fileRoutesByFullPath: FileRoutesByFullPath
@@ -91,6 +100,7 @@ export interface FileRouteTypes {
     | '/marketing'
     | '/voice'
     | '/media-upload/$token'
+    | '/review/$token'
   fileRoutesByTo: FileRoutesByTo
   to:
     | '/'
@@ -100,6 +110,7 @@ export interface FileRouteTypes {
     | '/marketing'
     | '/voice'
     | '/media-upload/$token'
+    | '/review/$token'
   id:
     | '__root__'
     | '/'
@@ -109,6 +120,7 @@ export interface FileRouteTypes {
     | '/marketing'
     | '/voice'
     | '/media-upload/$token'
+    | '/review/$token'
   fileRoutesById: FileRoutesById
 }
 export interface RootRouteChildren {
@@ -119,6 +131,7 @@ export interface RootRouteChildren {
   MarketingRoute: typeof MarketingRoute
   VoiceRoute: typeof VoiceRoute
   MediaUploadTokenRoute: typeof MediaUploadTokenRoute
+  ReviewTokenRoute: typeof ReviewTokenRoute
 }
 
 declare module '@tanstack/react-router' {
@@ -172,6 +185,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof MediaUploadTokenRouteImport
       parentRoute: typeof rootRouteImport
     }
+    '/review/$token': {
+      id: '/review/$token'
+      path: '/review/$token'
+      fullPath: '/review/$token'
+      preLoaderRoute: typeof ReviewTokenRouteImport
+      parentRoute: typeof rootRouteImport
+    }
   }
 }
 
@@ -183,6 +203,7 @@ const rootRouteChildren: RootRouteChildren = {
   MarketingRoute: MarketingRoute,
   VoiceRoute: VoiceRoute,
   MediaUploadTokenRoute: MediaUploadTokenRoute,
+  ReviewTokenRoute: ReviewTokenRoute,
 }
 export const routeTree = rootRouteImport
   ._addFileChildren(rootRouteChildren)

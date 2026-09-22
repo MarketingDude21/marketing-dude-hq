@@ -4,17 +4,17 @@ import { AppShell } from "@/components/AppShell";
 export const Route = createFileRoute("/")({
   head: () => ({
     meta: [
-      { title: "Your Marketing Dude — Your marketing, on autopilot" },
+      { title: "Your Marketing Dude — AI that runs your marketing for you" },
       {
         name: "description",
         content:
-          "One dashboard for real estate agents: Voice DNA, database building, and monthly marketing content — one brain that gets smarter every month.",
+          "A real estate marketing OS: mine your sphere, learn your voice, and turn your database into consistent content and follow-up — without adding to your to-do list.",
       },
       { property: "og:title", content: "Your Marketing Dude" },
       {
         property: "og:description",
         content:
-          "Log in once. Voice DNA, your database, and monthly content all draw from the same agent profile.",
+          "AI that runs your database and marketing — not AI that gives you more to do.",
       },
       { property: "og:type", content: "website" },
       { name: "twitter:card", content: "summary_large_image" },
@@ -26,12 +26,12 @@ export const Route = createFileRoute("/")({
 const MODULES = [
   {
     to: "/database",
-    tag: "SOI Builder",
+    tag: "Sphere mining",
     tagClass: "bg-primary/15 text-primary",
     dotClass: "bg-primary",
     title: "Build My Database",
-    desc: "Clean your contacts into sharp marketing lists.",
-    meta: "Pick up where you left off",
+    desc: "Import your contacts. We find your real sphere, clean it, tag it, and turn it into marketing lists worth mailing.",
+    meta: "Who you should actually market to",
     action: "Open",
   },
   {
@@ -40,21 +40,31 @@ const MODULES = [
     tagClass: "bg-accent/15 text-accent",
     dotClass: "bg-accent",
     title: "My Voice DNA",
-    desc: "15-question interview captures how you talk.",
-    meta: "Complete the interview",
+    desc: "A short interview teaches the system how you actually talk, so nothing it writes sounds like AI wrote it.",
+    meta: "Train it once, use it forever",
     action: "Review",
   },
   {
     to: "/marketing",
-    tag: "Content Generator",
+    tag: "Content engine",
     tagClass: "bg-secondary text-foreground",
     dotClass: "bg-foreground",
     title: "Monthly Marketing",
-    desc: "Drafted posts, emails & video scripts in your voice.",
-    meta: "This month's set",
+    desc: "Your month, written: emails, posts, video scripts and past-client touches — drafted in your voice, ready to approve.",
+    meta: "This month is already drafted",
     action: "View",
   },
 ] as const;
+
+const DOES = [
+  ["Mines your sphere", "Finds the people actually worth marketing to"],
+  ["Learns your voice", "Writes like you, not like a chatbot"],
+  ["Nurtures your database", "Campaigns by relationship, type and timing"],
+  ["Finds local stories", "Turns market and neighborhood news into content"],
+  ["Feeds your videos", "Topics, hooks, scripts and captions"],
+  ["Keeps past clients warm", "Anniversaries, check-ins, referral asks"],
+] as const;
+
 
 function HomePage() {
   return (
@@ -63,54 +73,57 @@ function HomePage() {
         {/* hero */}
         <section className="col-span-12 lg:col-span-7">
           <div className="mb-5 inline-flex items-center gap-2 rounded-full border border-border bg-glass px-3 py-1 text-xs font-medium text-muted-foreground backdrop-blur-xl">
-            <span className="size-1.5 rounded-full bg-accent" /> 3 tools · one
-            connected brain · smarter every month
+            <span className="size-1.5 rounded-full bg-accent" /> Your database ·
+            your voice · your marketing, handled
           </div>
           <h1 className="font-display text-5xl font-bold leading-[0.98] tracking-tight md:text-6xl">
-            Your marketing,
+            AI that runs your marketing.
             <br />
             <span className="bg-gradient-to-r from-primary to-accent bg-clip-text text-transparent">
-              on autopilot.
+              Not more stuff to do.
             </span>
           </h1>
-          <p className="mt-5 max-w-md text-lg text-muted-foreground">
-            Log in once. Voice DNA, your database, and monthly content all draw
-            from the same agent profile.
+          <p className="mt-5 max-w-lg text-lg text-muted-foreground">
+            Most AI hands you a blank box and a caption. Your Marketing Dude
+            already knows your sphere, your market and how you talk — so it
+            decides who to reach, writes it in your voice, and hands it to you
+            ready to send.
           </p>
           <div className="mt-8 flex flex-wrap items-center gap-3">
             <Link
               to="/voice"
               className="rounded-full bg-foreground px-6 py-3 text-sm font-semibold text-ink"
             >
-              Start my Voice DNA
+              Teach it my voice
             </Link>
             <Link
               to="/database"
               className="rounded-full border border-input px-6 py-3 text-sm font-semibold text-foreground/80 transition-colors hover:text-foreground"
             >
-              Build my database
+              Clean up my database
             </Link>
           </div>
           <div className="mt-9 grid max-w-md grid-cols-3 gap-6">
             <div>
-              <div className="font-display text-2xl font-bold">3</div>
-              <div className="text-xs text-muted-foreground">
-                tools, one login
-              </div>
-            </div>
-            <div>
-              <div className="font-display text-2xl font-bold">15</div>
-              <div className="text-xs text-muted-foreground">
-                questions to your voice
-              </div>
-            </div>
-            <div>
               <div className="font-display text-2xl font-bold">1</div>
               <div className="text-xs text-muted-foreground">
-                shared agent brain
+                system, not five tools
+              </div>
+            </div>
+            <div>
+              <div className="font-display text-2xl font-bold">0</div>
+              <div className="text-xs text-muted-foreground">
+                blank pages to stare at
+              </div>
+            </div>
+            <div>
+              <div className="font-display text-2xl font-bold">30</div>
+              <div className="text-xs text-muted-foreground">
+                days of marketing, drafted
               </div>
             </div>
           </div>
+
         </section>
 
         {/* brain card */}
@@ -119,23 +132,25 @@ function HomePage() {
             <div className="absolute -right-16 -top-16 h-40 w-40 rounded-full bg-accent/20 blur-2xl" />
             <div className="relative">
               <div className="font-display text-base font-semibold">
-                One profile, everywhere
+                It already knows your business
               </div>
               <p className="mt-1 text-xs text-muted-foreground">
-                Voice DNA, photos, and feedback feed every tool you use.
+                One profile behind every module — so nothing starts from
+                scratch.
               </p>
               <div className="mt-5 space-y-3">
                 {[
-                  ["Voice DNA", "Captures how you write & speak"],
-                  ["Agent photos", "Pulled into posts automatically"],
-                  ["Feedback learned", "Each edit sharpens the next draft"],
+                  ["Your sphere", "Who's worth a call, a mailer, an email"],
+                  ["Your voice", "How you actually write and speak"],
+                  ["Your market", "Local news, listings, neighborhood stories"],
+                  ["Your history", "Every edit sharpens the next draft"],
                 ].map(([label, detail]) => (
                   <div
                     key={label}
-                    className="flex items-center justify-between rounded-xl bg-secondary px-4 py-3"
+                    className="flex items-center justify-between gap-3 rounded-xl bg-secondary px-4 py-3"
                   >
                     <span className="text-sm text-foreground/70">{label}</span>
-                    <span className="text-xs font-medium text-foreground">
+                    <span className="text-right text-xs font-medium text-foreground">
                       {detail}
                     </span>
                   </div>
@@ -143,18 +158,45 @@ function HomePage() {
               </div>
               <div className="mt-5 rounded-xl bg-gradient-to-r from-primary/20 to-accent/20 p-4">
                 <div className="text-xs uppercase tracking-widest text-muted-foreground">
-                  Agent brain
+                  The idea
                 </div>
                 <div className="mt-1 font-display text-2xl font-bold">
-                  Smarter every month
+                  Stop figuring out marketing
                 </div>
                 <div className="mt-1 text-xs text-muted-foreground">
-                  The more you use it, the more it sounds like you.
+                  Your relationships and your listings become consistent
+                  marketing — without you managing it.
                 </div>
               </div>
+
             </div>
           </div>
         </aside>
+
+        {/* what it does */}
+        <section className="col-span-12 mt-4">
+          <div className="mb-4 flex items-end justify-between">
+            <h2 className="font-display text-xl font-semibold">
+              What it handles for you
+            </h2>
+            <span className="hidden text-sm text-muted-foreground sm:inline">
+              Database → voice → content → follow-up
+            </span>
+          </div>
+          <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3">
+            {DOES.map(([label, detail]) => (
+              <div
+                key={label}
+                className="rounded-2xl border border-border bg-glass p-5 backdrop-blur-xl"
+              >
+                <div className="font-display text-sm font-semibold">
+                  {label}
+                </div>
+                <p className="mt-1.5 text-sm text-muted-foreground">{detail}</p>
+              </div>
+            ))}
+          </div>
+        </section>
 
         {/* modules */}
         <section className="col-span-12 mt-4">
@@ -166,6 +208,7 @@ function HomePage() {
               Pick up where you left off
             </span>
           </div>
+
           <div className="grid grid-cols-1 gap-5 md:grid-cols-3">
             {MODULES.map((m) => (
               <Link

@@ -31,7 +31,6 @@ import {
   markDriveFileUsed,
   restoreDriveFileToActive,
   setAgentDriveFolder,
-  generateMarketingContent,
   listCalendarMonths,
   listAllCalendarMonthsForAdmin,
   addCalendarMonth,
@@ -52,6 +51,12 @@ import {
   approveBatch,
   approveAllPending,
   sendContentToAgent,
+  listAgentChatMessages,
+  sendAgentChatMessage,
+  saveChatMessageAsPost,
+  logPhotoScanToChat,
+  getReviewLink,
+  regenerateReviewLink,
   type MarketingAccess,
   type MediaRow,
   type DriveFile,
@@ -63,6 +68,8 @@ import {
   type UnsplashResult,
   type EmailPhoto,
   type ArchivedBatchSummary,
+  type ChatMode,
+  type ChatMessageRow,
 } from "@/lib/marketing";
 // Type-only import (erased at build) — the runtime docx library is loaded
 // lazily inside buildContentDocxBlob() below instead of imported at the top
@@ -823,7 +830,7 @@ function PostsTab({ agentId, isAdmin }: { agentId: string; isAdmin: boolean }) {
 
   return (
     <div className="space-y-4">
-      <CreateContentForm agentId={agentId} onCreated={reload} />
+      <ChatHub agentId={agentId} driveFolderId={driveFolderId} onSavedPost={reload} />
 
       <div className="flex flex-wrap items-center gap-2">
         {months.length > 0 && (
@@ -864,6 +871,8 @@ function PostsTab({ agentId, isAdmin }: { agentId: string; isAdmin: boolean }) {
       {sendNote && <p className="text-xs text-muted-foreground">{sendNote}</p>}
       {actionError && <p className="text-xs text-destructive">{actionError}</p>}
 
+      {isAdmin && <PublicReviewLinkCard agentId={agentId} />}
+
       {posts === null && (
         <Card>
           <p className="text-sm text-muted-foreground">Loading…</p>
@@ -901,155 +910,266 @@ function PostsTab({ agentId, isAdmin }: { agentId: string; isAdmin: boolean }) {
   );
 }
 
-// Lets an agent (or an admin acting as them) write a quick idea and get a
-// full draft back in their own voice — no Drive content calendar involved.
-// Works identically whether a normal agent is self-serving or an admin is
-// doing it on their behalf via the "act as" picker above, since both cases
-// resolve to the same agentId this component already receives.
-function CreateContentForm({ agentId, onCreated }: { agentId: string; onCreated: () => void }) {
-  const [open, setOpen] = useState(false);
-  const [contentType, setContentType] = useState<"post" | "email" | "video">("post");
-  const [title, setTitle] = useState("");
-  const [goal, setGoal] = useState("");
-  const [instructions, setInstructions] = useState("");
-  const [hook, setHook] = useState("");
-  const [useHashtags, setUseHashtags] = useState(false);
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+// ============================================================================
+// Individual Posts — "personal marketing dude" chat hub (2026-09-21).
+//
+// Replaces the old CreateContentForm (a form that submitted into the list
+// below) with a real persistent thread per agent, per Mike's voice note:
+// "this should basically be their individualized chat, personalized chat
+// GPT... every post has to go through their voice DNA, the data needs to be
+// saved, it needs to get smarter as they post." Backed by
+// agent_chat_messages (see listAgentChatMessages/sendAgentChatMessage in
+// marketing.ts) — one continuous conversation with a mode switcher, not a
+// separate siloed thread per content type. Scan My Photos reuses the exact
+// same scanAgentDrivePhotos/scanAgentLibraryPhotos/addPhotoPostsToBatch this
+// app's calendar-tab PhotoScanPanel already uses, just logged into the
+// thread via logPhotoScanToChat instead of a separate panel. Carousel mode
+// is shown but disabled — blocked on Mike sending a brand/template
+// direction, see individual-posts-hub-scoping.md.
+// ============================================================================
 
-  async function generate() {
-    if (!goal.trim()) {
-      setError("Tell us what this should be about first.");
-      return;
-    }
-    setBusy(true);
+const CHAT_MODE_LABELS: Record<ChatMode, string> = {
+  post: "Social post",
+  email: "Email",
+  video_script: "Video script",
+  photo_scan: "Scan my photos",
+};
+
+function ChatMessageBubble({ msg, agentId, onSaved }: { msg: ChatMessageRow; agentId: string; onSaved: () => void }) {
+  const [saving, setSaving] = useState(false);
+  const [saved, setSaved] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const isAssistant = msg.role === "assistant";
+  const isPhotoScan = msg.mode === "photo_scan";
+  const meta = (msg.metadata ?? {}) as {
+    thumbnailUrl?: string;
+    source?: "drive" | "library";
+    sourceId?: string;
+  };
+
+  async function saveAsPost() {
+    setSaving(true);
     setError(null);
     try {
-      await generateMarketingContent({
-        data: {
-          agentId,
-          contentType,
-          title,
-          goal,
-          instructions: instructions.trim() || undefined,
-          hook: contentType === "video" ? hook.trim() || undefined : undefined,
-          useHashtags: contentType === "post" ? useHashtags : undefined,
-        },
-      });
-      setTitle("");
-      setGoal("");
-      setInstructions("");
-      setHook("");
-      setOpen(false);
-      onCreated();
+      if (isPhotoScan && meta.source && meta.sourceId) {
+        await addPhotoPostsToBatch({
+          data: {
+            agentId,
+            month: new Date().toISOString().slice(0, 7),
+            items: [
+              {
+                title: msg.content.slice(0, 60),
+                content: msg.content,
+                source: meta.source,
+                sourceId: meta.sourceId,
+                thumbnailUrl: meta.thumbnailUrl ?? "",
+              },
+            ],
+          },
+        });
+      } else {
+        await saveChatMessageAsPost({
+          data: {
+            agentId,
+            messageId: msg.id,
+            contentType: msg.mode === "email" ? "email" : msg.mode === "video_script" ? "video" : "post",
+          },
+        });
+      }
+      setSaved(true);
+      onSaved();
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
-      setBusy(false);
+      setSaving(false);
     }
   }
 
-  if (!open) {
-    return <Button onClick={() => setOpen(true)}>+ New content</Button>;
+  return (
+    <div className={`flex ${isAssistant ? "justify-start" : "justify-end"}`}>
+      <div
+        className={`max-w-[85%] rounded-2xl px-4 py-3 text-sm ${
+          isAssistant ? "border border-border bg-glass" : "bg-primary text-primary-foreground"
+        }`}
+      >
+        {meta.thumbnailUrl && (
+          <img src={meta.thumbnailUrl} alt="" className="mb-2 h-32 w-full rounded-xl object-cover" />
+        )}
+        <p className="whitespace-pre-wrap">{msg.content}</p>
+        {isAssistant && (
+          <div className="mt-2 flex flex-wrap items-center gap-2">
+            {!saved ? (
+              <Button variant="secondary" onClick={saveAsPost} disabled={saving}>
+                {saving ? "Saving…" : "Save as draft post"}
+              </Button>
+            ) : (
+              <span className="text-xs font-semibold text-primary">Saved — review it below</span>
+            )}
+          </div>
+        )}
+        {error && <p className="mt-1 text-xs text-destructive">{error}</p>}
+      </div>
+    </div>
+  );
+}
+
+function ChatHub({
+  agentId,
+  driveFolderId,
+  onSavedPost,
+}: {
+  agentId: string;
+  driveFolderId: string | null;
+  onSavedPost: () => void;
+}) {
+  const [mode, setMode] = useState<ChatMode>("post");
+  const [messages, setMessages] = useState<ChatMessageRow[] | null>(null);
+  const [draft, setDraft] = useState("");
+  const [sending, setSending] = useState(false);
+  const [scanning, setScanning] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const bottomRef = useRef<HTMLDivElement>(null);
+
+  function loadMessages() {
+    listAgentChatMessages({ data: { agentId } })
+      .then((m) => setMessages(m))
+      .catch((e) => setError(e instanceof Error ? e.message : String(e)));
+  }
+
+  useEffect(() => {
+    setMessages(null);
+    loadMessages();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [agentId]);
+
+  useEffect(() => {
+    bottomRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [messages]);
+
+  async function send() {
+    const text = draft.trim();
+    if (!text) return;
+    setSending(true);
+    setError(null);
+    setDraft("");
+    try {
+      await sendAgentChatMessage({ data: { agentId, mode, message: text } });
+      loadMessages();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setSending(false);
+    }
+  }
+
+  // Scans a few unused photos (Drive if this agent has a folder connected,
+  // their native Media Library otherwise — same source choice the old
+  // PhotoScanPanel offered) and drops each caption straight into the thread.
+  async function scanPhotos() {
+    setScanning(true);
+    setError(null);
+    try {
+      const res = driveFolderId
+        ? await scanAgentDrivePhotos({ data: { agentId, folderId: driveFolderId, maxPhotos: 3 } })
+        : await scanAgentLibraryPhotos({ data: { agentId, maxPhotos: 3 } });
+      if (!res.suggestions.length) {
+        setError("No new unused photos found right now.");
+      } else {
+        for (const s of res.suggestions) {
+          await logPhotoScanToChat({
+            data: {
+              agentId,
+              suggestedPost: s.suggestedPost,
+              source: s.source,
+              sourceId: s.fileId,
+              thumbnailUrl: s.thumbnailUrl,
+              fileName: s.fileName,
+            },
+          });
+        }
+        loadMessages();
+      }
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setScanning(false);
+    }
   }
 
   return (
     <Card>
-      <h3 className="font-display text-sm font-semibold">Create new content</h3>
+      <h3 className="font-display text-sm font-semibold">Your Marketing Dude</h3>
       <p className="mt-1 text-xs text-muted-foreground">
-        Tell us what you want and we'll write a full draft in your voice — it'll show up below for you to approve, edit,
-        or flag, same as anything your team generates for you.
+        One ongoing thread, grounded in your Voice DNA — ask for a post, a video script, or scan your photos for ideas.
+        Everything here is a draft until you save it as a post.
       </p>
 
       <div className="mt-4 flex flex-wrap gap-1 rounded-full border border-border bg-glass p-1 w-fit">
-        {(["post", "email", "video"] as const).map((t) => (
+        {(["post", "email", "video_script", "photo_scan"] as ChatMode[]).map((m) => (
           <button
-            key={t}
-            onClick={() => setContentType(t)}
+            key={m}
+            onClick={() => setMode(m)}
             className={`rounded-full px-4 py-1.5 text-sm font-medium transition-colors ${
-              contentType === t ? "bg-secondary text-foreground" : "text-muted-foreground hover:text-foreground"
+              mode === m ? "bg-secondary text-foreground" : "text-muted-foreground hover:text-foreground"
             }`}
           >
-            {t === "post" ? "Social post" : t === "email" ? "Email" : "Video script"}
+            {CHAT_MODE_LABELS[m]}
           </button>
         ))}
+        <button
+          disabled
+          title="Coming soon — unlocks once a carousel brand/template direction is set"
+          className="cursor-not-allowed rounded-full px-4 py-1.5 text-sm font-medium text-muted-foreground/50"
+        >
+          Carousel (coming soon)
+        </button>
       </div>
 
-      <div className="mt-4 space-y-3">
-        <input
-          value={title}
-          onChange={(e) => setTitle(e.target.value)}
-          placeholder="Title (just for your own reference)"
-          className="w-full rounded-xl border border-border bg-glass px-3 py-2 text-sm outline-none"
-        />
-        <div>
-          <div className="mb-1 flex items-center justify-between">
-            <span className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
-              What it's about
-            </span>
-            <MicButton value={goal} onChange={setGoal} />
-          </div>
-          <textarea
-            value={goal}
-            onChange={(e) => setGoal(e.target.value)}
-            placeholder={
-              contentType === "post"
-                ? `What's this post about? e.g. "Just closed a first-time buyer in 12 days, wanted to share the excitement"`
-                : contentType === "email"
-                  ? `What's the goal of this email? e.g. "Monthly check-in for past clients, mention rates dropped"`
-                  : "What's this video about?"
-            }
-            className="min-h-[90px] w-full rounded-xl border border-border bg-glass px-3 py-2 text-sm outline-none"
-          />
-        </div>
-        {contentType === "video" && (
-          <div>
-            <div className="mb-1 flex items-center justify-between">
-              <span className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
-                Hook direction
-              </span>
-              <MicButton value={hook} onChange={setHook} />
-            </div>
-            <input
-              value={hook}
-              onChange={(e) => setHook(e.target.value)}
-              placeholder="Any specific hook/opening line direction? (optional)"
-              className="w-full rounded-xl border border-border bg-glass px-3 py-2 text-sm outline-none"
-            />
-          </div>
+      <div className="mt-4 max-h-[420px] min-h-[160px] space-y-3 overflow-y-auto rounded-2xl border border-border bg-background/40 p-4">
+        {messages === null && <p className="text-sm text-muted-foreground">Loading your thread…</p>}
+        {messages !== null && messages.length === 0 && (
+          <p className="text-sm text-muted-foreground">
+            Nothing here yet — say what you want made, or switch to "Scan my photos" below.
+          </p>
         )}
-        <div>
-          <div className="mb-1 flex items-center justify-between">
+        {(messages ?? []).map((m) => (
+          <ChatMessageBubble key={m.id} msg={m} agentId={agentId} onSaved={onSavedPost} />
+        ))}
+        <div ref={bottomRef} />
+      </div>
+
+      {error && <p className="mt-2 text-xs text-destructive">{error}</p>}
+
+      {mode === "photo_scan" ? (
+        <div className="mt-3">
+          <Button onClick={scanPhotos} disabled={scanning}>
+            {scanning ? "Scanning…" : "Scan my photos"}
+          </Button>
+        </div>
+      ) : (
+        <div className="mt-3 space-y-2">
+          <div className="flex items-center justify-between">
             <span className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
-              Anything else
+              {mode === "email"
+                ? "What's the email about"
+                : mode === "video_script"
+                  ? "What's the video about"
+                  : "What's on your mind"}
             </span>
-            <MicButton value={instructions} onChange={setInstructions} />
+            <MicButton value={draft} onChange={setDraft} />
           </div>
-          <textarea
-            value={instructions}
-            onChange={(e) => setInstructions(e.target.value)}
-            placeholder="Anything else it should include? (optional)"
+          <AutoResizeTextarea
+            value={draft}
+            onChange={setDraft}
+            minHeightPx={60}
+            placeholder="Talk to your Marketing Dude…"
             className="min-h-[60px] w-full rounded-xl border border-border bg-glass px-3 py-2 text-sm outline-none"
           />
+          <Button onClick={send} disabled={sending || !draft.trim()}>
+            {sending ? "Writing…" : "Send"}
+          </Button>
         </div>
-        {contentType === "post" && (
-          <label className="flex items-center gap-2 text-sm text-muted-foreground">
-            <input type="checkbox" checked={useHashtags} onChange={(e) => setUseHashtags(e.target.checked)} />
-            Add hashtags
-          </label>
-        )}
-      </div>
-
-      {error && <p className="mt-3 text-xs text-destructive">{error}</p>}
-
-      <div className="mt-4 flex gap-2">
-        <Button onClick={generate} disabled={busy}>
-          {busy ? "Writing…" : "Generate"}
-        </Button>
-        <Button variant="secondary" onClick={() => setOpen(false)} disabled={busy}>
-          Cancel
-        </Button>
-      </div>
+      )}
     </Card>
   );
 }
@@ -2111,6 +2231,83 @@ function PublicUploadLinkCard({ agentId }: { agentId: string }) {
         Anyone with this link can open a simple upload page for this agent and add photos or videos straight into this
         Media library — no login needed, same idea as sharing a Google Drive upload link. They can only upload; they
         can't see, download, or delete anything already here.
+      </p>
+      {error && <p className="mt-2 text-xs text-destructive">{error}</p>}
+      {link && (
+        <div className="mt-3 flex flex-wrap items-center gap-2">
+          <input
+            readOnly
+            value={link}
+            onFocus={(e) => e.currentTarget.select()}
+            className="min-w-0 flex-1 rounded-full border border-border bg-muted px-4 py-2 text-xs text-foreground"
+          />
+          <Button variant="secondary" onClick={copyLink}>
+            {copied ? "Copied ✓" : "Copy link"}
+          </Button>
+          <Button variant="secondary" onClick={regenerate} disabled={busy}>
+            {busy ? "Regenerating…" : "Regenerate link"}
+          </Button>
+        </div>
+      )}
+      {!link && !error && <p className="mt-2 text-xs text-muted-foreground">Loading…</p>}
+    </Card>
+  );
+}
+
+// Admin-only card on the Posts tab, same pattern as PublicUploadLinkCard
+// just above — added 2026-09-22 per Mike: "it is not sending the file for
+// the agent to review... this must be a public facing link that does not
+// require login." "Send to Agent" now emails this same link automatically,
+// but this card lets an admin copy/regenerate it directly (e.g. to text it
+// instead, or revoke one that leaked) without waiting on GoHighLevel.
+function PublicReviewLinkCard({ agentId }: { agentId: string }) {
+  const [token, setToken] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [copied, setCopied] = useState(false);
+
+  useEffect(() => {
+    setToken(null);
+    setError(null);
+    getReviewLink({ data: { agentId } })
+      .then((r) => setToken(r.token))
+      .catch((e) => setError(e instanceof Error ? e.message : String(e)));
+  }, [agentId]);
+
+  const link = token && typeof window !== "undefined" ? `${window.location.origin}/review/${token}` : null;
+
+  async function copyLink() {
+    if (!link) return;
+    try {
+      await navigator.clipboard.writeText(link);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    } catch {
+      setError("Couldn't copy automatically — select and copy the link text instead.");
+    }
+  }
+
+  async function regenerate() {
+    setBusy(true);
+    setError(null);
+    setCopied(false);
+    try {
+      const r = await regenerateReviewLink({ data: { agentId } });
+      setToken(r.token);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <Card>
+      <h3 className="font-display text-sm font-semibold">Public review link</h3>
+      <p className="mt-1 text-xs text-muted-foreground">
+        Anyone with this link can review and Approve/Flag this agent's own content — no login needed. "Send to Agent"
+        emails this same link automatically; use this to copy it directly (e.g. to text it) or regenerate it if it's
+        been shared somewhere it shouldn't have been.
       </p>
       {error && <p className="mt-2 text-xs text-destructive">{error}</p>}
       {link && (

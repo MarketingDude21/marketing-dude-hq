@@ -1,6 +1,13 @@
 import { Link, Outlet, useNavigate } from "@tanstack/react-router";
 import type { ReactNode } from "react";
 import { useAuth } from "@/hooks/useAuth";
+// Real logo asset (2026-09-23) — restores Mike's actual white "Your
+// Marketing Dude" clapperboard logo after an earlier pass accidentally
+// reverted the header to a placeholder "YM" box (see the note on BrandMark
+// below). This import needs the file to actually exist at
+// src/assets/logo-white.png in the Lovable project — see the delivery notes
+// for how to add it.
+import logoWhite from "@/assets/logo-white.png";
 
 // "Home" removed from this list 2026-09-23 per Mike: "once logged in the
 // Home page does not need to show in the menu on desktop or in the app" —
@@ -14,14 +21,13 @@ const NAV = [
   { to: "/account", label: "Account", exact: false },
 ] as const;
 
+// FIXED (2026-09-23) — this used to render a generic "YM" placeholder box.
+// Mike pointed out "that removed my all white logo need it back" after an
+// earlier same-day pass (removing "Home" from NAV) was built from a stale
+// copy of this file that predated his actual logo. Now renders the real
+// asset — see the import above.
 export function BrandMark({ size = "size-9" }: { size?: string }) {
-  return (
-    <div
-      className={`grid ${size} place-items-center rounded-xl bg-gradient-to-br from-primary to-accent font-display text-sm font-bold text-primary-foreground`}
-    >
-      YM
-    </div>
-  );
+  return <img src={logoWhite} alt="Your Marketing Dude" className={`${size} object-contain`} />;
 }
 
 export function AmbientBackground() {

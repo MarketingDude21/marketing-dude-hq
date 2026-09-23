@@ -1,23 +1,26 @@
 import { Link, Outlet, useNavigate } from "@tanstack/react-router";
 import type { ReactNode } from "react";
 import { useAuth } from "@/hooks/useAuth";
-import logoAsset from "@/assets/dude-logo.png.asset.json";
 
+// "Home" removed from this list 2026-09-23 per Mike: "once logged in the
+// Home page does not need to show in the menu on desktop or in the app" —
+// the marketing landing page at "/" still exists and the header logo still
+// links there, this just drops it from the nav itself so a signed-in user
+// isn't routed back to the public marketing page from the app's own menu.
 const NAV = [
-  { to: "/", label: "Home", exact: true },
   { to: "/database", label: "Build My Database", exact: false },
-  { to: "/voice", label: "My Voice DNA", exact: false },
+  { to: "/voice", label: "Build My Brand", exact: false },
   { to: "/marketing", label: "Monthly Marketing", exact: false },
   { to: "/account", label: "Account", exact: false },
 ] as const;
 
-export function BrandMark({ size = "h-14 w-auto" }: { size?: string }) {
+export function BrandMark({ size = "size-9" }: { size?: string }) {
   return (
-    <img
-      src={logoAsset.url}
-      alt="Your Marketing Dude"
-      className={`${size} object-contain`}
-    />
+    <div
+      className={`grid ${size} place-items-center rounded-xl bg-gradient-to-br from-primary to-accent font-display text-sm font-bold text-primary-foreground`}
+    >
+      YM
+    </div>
   );
 }
 
@@ -39,8 +42,9 @@ export function AppShell({ children }: { children?: ReactNode }) {
     <div className="relative min-h-screen w-full overflow-hidden bg-background text-foreground">
       <AmbientBackground />
       <header className="relative z-10 mx-auto flex max-w-7xl items-center justify-between gap-4 px-6 py-5">
-        <Link to="/" aria-label="Your Marketing Dude home" className="shrink-0">
+        <Link to="/" className="flex items-center gap-2.5">
           <BrandMark />
+          <span className="font-display text-lg font-semibold tracking-tight">Your Marketing Dude</span>
         </Link>
         <nav className="hidden items-center gap-1 rounded-full border border-border bg-glass px-1 py-1 backdrop-blur-xl md:flex">
           {NAV.map((item) => (
@@ -49,8 +53,7 @@ export function AppShell({ children }: { children?: ReactNode }) {
               to={item.to}
               activeOptions={{ exact: item.exact }}
               activeProps={{
-                className:
-                  "rounded-full bg-secondary px-4 py-1.5 text-sm font-medium text-foreground",
+                className: "rounded-full bg-secondary px-4 py-1.5 text-sm font-medium text-foreground",
               }}
               inactiveProps={{
                 className:
@@ -64,9 +67,7 @@ export function AppShell({ children }: { children?: ReactNode }) {
         <div className="flex items-center gap-3">
           {user ? (
             <>
-              <span className="hidden text-sm text-muted-foreground sm:inline">
-                {user.email}
-              </span>
+              <span className="hidden text-sm text-muted-foreground sm:inline">{user.email}</span>
               <button
                 onClick={async () => {
                   await signOut();
@@ -87,9 +88,7 @@ export function AppShell({ children }: { children?: ReactNode }) {
           )}
         </div>
       </header>
-      <main className="relative z-10 mx-auto max-w-7xl px-6 pb-20">
-        {children ?? <Outlet />}
-      </main>
+      <main className="relative z-10 mx-auto max-w-7xl px-6 pb-20">{children ?? <Outlet />}</main>
     </div>
   );
 }

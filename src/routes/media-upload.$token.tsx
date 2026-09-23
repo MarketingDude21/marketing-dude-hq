@@ -127,7 +127,8 @@ function PublicMediaUploadPage() {
   const [uploading, setUploading] = useState(false);
   const [progress, setProgress] = useState<{ done: number; total: number } | null>(null);
   const [note, setNote] = useState<string | null>(null);
-  const fileInputRef = useRef<HTMLInputElement>(null);
+  const photoInputRef = useRef<HTMLInputElement>(null);
+  const videoInputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
     getPublicUploadAgent({ data: { token } })
@@ -143,6 +144,24 @@ function PublicMediaUploadPage() {
   // bad file silently block everything queued behind it. Progress now
   // updates live ("3 of 9 done") instead of a single unmoving "Uploading…"
   // for the whole batch.
+  //
+  // SECOND FIX (2026-09-23, same day) — separate Photo/Video pickers.
+  // Mike's next report showed a DIFFERENT stall than the one above: the
+  // native iOS picker itself (Apple's own "Photos / Collections" sheet, not
+  // our page) never responded when he tapped its checkmark to confirm a
+  // 15-item batch that mixed photos and one video. That happens before any
+  // of our JS runs — the file input's change event hadn't even fired yet —
+  // so it can't be fixed by code on our page directly; this sandbox also
+  // has no real iPhone to reproduce an iOS-Safari-specific picker bug on.
+  // What IS a known, documented iOS behavior: before handing files back to
+  // a web page, iOS has to export/transcode every selected item (HEIC
+  // photos, and especially video) in that one picker session, and a large
+  // mixed batch can make that export take a long time or appear to hang,
+  // worse on a weak connection or low free storage. Splitting into two
+  // separate pickers — Photos only, Video only — means iOS never has to
+  // export a big mixed batch in a single operation, which directly reduces
+  // the most likely trigger even though it isn't a confirmed fix. Genuinely
+  // needs Mike to re-test on the actual phone that stalled.
   async function handleFiles(fileList: FileList | null) {
     if (!fileList || !fileList.length) return;
     const files = Array.from(fileList);
@@ -192,7 +211,8 @@ function PublicMediaUploadPage() {
 
     setUploading(false);
     setProgress(null);
-    if (fileInputRef.current) fileInputRef.current.value = "";
+    if (photoInputRef.current) photoInputRef.current.value = "";
+    if (videoInputRef.current) videoInputRef.current.value = "";
     setNote(
       skipped > 0
         ? `Uploaded ${uploaded}, skipped ${skipped} (a video over ${MAX_VIDEO_SECONDS}s, a slow connection, or a file that failed).`
@@ -221,17 +241,32 @@ function PublicMediaUploadPage() {
               Upload Your Social Media Graphics Here So Your Marketing Dude Can Get To Work. No account needed — just
               pick your files below.
             </p>
-            <div className="mt-4">
+            {/* Split into two separate pickers (2026-09-23) — see the note
+                above handleFiles. Photos first since that's the page's main
+                purpose; Video as its own smaller, separate action. */}
+            <div className="mt-4 space-y-2">
               <input
-                ref={fileInputRef}
+                ref={photoInputRef}
                 type="file"
-                accept="image/*,video/*"
+                accept="image/*"
                 multiple
                 onChange={(e) => handleFiles(e.target.files)}
                 disabled={uploading}
-                className="text-sm text-muted-foreground file:mr-3 file:rounded-full file:border-0 file:bg-primary file:px-4 file:py-2 file:text-sm file:font-semibold file:text-primary-foreground"
+                className="block text-sm text-muted-foreground file:mr-3 file:rounded-full file:border-0 file:bg-primary file:px-4 file:py-2 file:text-sm file:font-semibold file:text-primary-foreground"
+              />
+              <input
+                ref={videoInputRef}
+                type="file"
+                accept="video/*"
+                multiple
+                onChange={(e) => handleFiles(e.target.files)}
+                disabled={uploading}
+                className="block text-sm text-muted-foreground file:mr-3 file:rounded-full file:border-0 file:bg-secondary file:px-4 file:py-2 file:text-sm file:font-semibold file:text-foreground"
               />
             </div>
+            <p className="mt-2 text-xs text-muted-foreground">
+              If a big batch ever seems stuck picking photos, try again with fewer at a time.
+            </p>
             {uploading && (
               <p className="mt-3 text-xs text-muted-foreground">
                 {progress ? `Uploading… ${progress.done} of ${progress.total} done` : "Uploading…"}

@@ -661,24 +661,34 @@ function Workspace({ agentId, agentEmail, isAdmin }: { agentId: string; agentEma
   const [tab, setTab] = useState<"posts" | "calendar" | "media" | "drive">("posts");
   return (
     <div className="mt-5">
-      <div className="flex flex-wrap gap-1 rounded-full border border-border bg-glass p-1 backdrop-blur-xl w-fit">
-        {(["posts", "calendar", "media", "drive"] as const).map((t) => (
-          <button
-            key={t}
-            onClick={() => setTab(t)}
-            className={`rounded-full px-4 py-1.5 text-sm font-medium transition-colors ${
-              tab === t ? "bg-secondary text-foreground" : "text-muted-foreground hover:text-foreground"
-            }`}
-          >
-            {t === "posts"
-              ? "Create Individual Posts"
-              : t === "calendar"
-                ? "Generate My Monthly Content Calendar"
-                : t === "media"
-                  ? "Media"
-                  : "Google Drive"}
-          </button>
-        ))}
+      {/* Heading + mobile-centered nav, added 2026-09-23 per Mike: "it needs
+          to say above the first set of buttons What Do You Want To Do? on
+          both desktop and mobile. Then on mobile center the buttons." The
+          pill row itself is unchanged (still `w-fit` so it hugs its own
+          content) — it's wrapped in a flex container that centers it on
+          small screens and reverts to left-aligned from `sm:` up, matching
+          the desktop layout Mike didn't ask to change. */}
+      <h2 className="text-center text-sm font-semibold text-foreground sm:text-left">What Do You Want To Do?</h2>
+      <div className="mt-2 flex justify-center sm:justify-start">
+        <div className="flex flex-wrap justify-center gap-1 rounded-full border border-border bg-glass p-1 backdrop-blur-xl w-fit">
+          {(["posts", "calendar", "media", "drive"] as const).map((t) => (
+            <button
+              key={t}
+              onClick={() => setTab(t)}
+              className={`rounded-full px-4 py-1.5 text-sm font-medium transition-colors ${
+                tab === t ? "bg-secondary text-foreground" : "text-muted-foreground hover:text-foreground"
+              }`}
+            >
+              {t === "posts"
+                ? "Create Individual Posts"
+                : t === "calendar"
+                  ? "Generate My Monthly Content Calendar"
+                  : t === "media"
+                    ? "Media"
+                    : "Google Drive"}
+            </button>
+          ))}
+        </div>
       </div>
       <div className="mt-5">
         {tab === "posts" && <PostsTab agentId={agentId} isAdmin={isAdmin} />}
@@ -1098,7 +1108,9 @@ function ChatHub({
 
   return (
     <Card>
-      <h3 className="font-display text-sm font-semibold">Your Marketing Dude</h3>
+      {/* Renamed 2026-09-23 per Mike: "instead of Your Marketing Dude should
+          say What Kind Of Content Do You Want To Create?" */}
+      <h3 className="font-display text-sm font-semibold">What Kind Of Content Do You Want To Create?</h3>
       <p className="mt-1 text-xs text-muted-foreground">
         One ongoing thread, grounded in your Voice DNA — ask for a post, a video script, or scan your photos for ideas.
         Everything here is a draft until you save it as a post.

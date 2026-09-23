@@ -271,38 +271,64 @@ function PublicMediaUploadPage() {
 
           {!linkError && agentName && (
             <>
-              {/* Personalized header, per Mike (2026-09-23): agent's name, then
-                  a section label, then the actual instruction/CTA line. */}
+              {/* Personalized header, per Mike (2026-09-23), copy tightened
+                  same day: agent's name, then a section label, then the
+                  instruction line — no filler sentence underneath it. */}
               <h1 className="font-display text-xl font-semibold">{agentName}</h1>
               <p className="mt-1 text-sm font-semibold uppercase tracking-wider text-muted-foreground">
-                Social Media Images
+                Social Media Image Library
               </p>
               <p className="mt-3 text-sm text-muted-foreground">
-                Upload Your Social Media Graphics Here So Your Marketing Dude Can Get To Work. No account needed — just
-                pick your files below.
+                Upload Your Social Media Graphics Here So Your Marketing Dude Can Get To Work.
               </p>
               {/* Split into two separate pickers (2026-09-23) — see the note
                   above handleFiles. Photos first since that's the page's main
-                  purpose; Video as its own smaller, separate action. */}
-              <div className="mt-4 space-y-2">
+                  purpose; Video as its own smaller, separate action.
+                  REWORKED same day: the two plain <input type=file> elements
+                  both rendered as an identical, unlabeled browser-default
+                  "Choose Files / No file chosen" — Mike flagged that as
+                  confusing (two buttons, no way to tell them apart). Each
+                  input is now visually hidden and driven by its own <label>
+                  styled as a real button with actual text ("Add Photos" /
+                  "Add a Video"), so the two are unmistakable at a glance
+                  instead of looking like duplicates. */}
+              <div className="mt-4 flex flex-wrap items-center gap-3">
                 <input
                   ref={photoInputRef}
+                  id="public-media-photo-input"
                   type="file"
                   accept="image/*"
                   multiple
                   onChange={(e) => handleFiles(e.target.files)}
                   disabled={uploading}
-                  className="block text-sm text-muted-foreground file:mr-3 file:rounded-full file:border-0 file:bg-primary file:px-4 file:py-2 file:text-sm file:font-semibold file:text-primary-foreground"
+                  className="hidden"
                 />
+                <label
+                  htmlFor="public-media-photo-input"
+                  className={`inline-flex cursor-pointer items-center rounded-full bg-primary px-4 py-2 text-sm font-semibold text-primary-foreground ${
+                    uploading ? "pointer-events-none opacity-50" : ""
+                  }`}
+                >
+                  Add Photos
+                </label>
                 <input
                   ref={videoInputRef}
+                  id="public-media-video-input"
                   type="file"
                   accept="video/*"
                   multiple
                   onChange={(e) => handleFiles(e.target.files)}
                   disabled={uploading}
-                  className="block text-sm text-muted-foreground file:mr-3 file:rounded-full file:border-0 file:bg-secondary file:px-4 file:py-2 file:text-sm file:font-semibold file:text-foreground"
+                  className="hidden"
                 />
+                <label
+                  htmlFor="public-media-video-input"
+                  className={`inline-flex cursor-pointer items-center rounded-full border border-border bg-secondary px-4 py-2 text-sm font-semibold text-foreground ${
+                    uploading ? "pointer-events-none opacity-50" : ""
+                  }`}
+                >
+                  Add a Video
+                </label>
               </div>
               <p className="mt-2 text-xs text-muted-foreground">
                 If a big batch ever seems stuck picking photos, try again with fewer at a time.

@@ -2,7 +2,6 @@ import { useEffect, useRef, useState } from "react";
 import { createFileRoute } from "@tanstack/react-router";
 import { supabase } from "@/integrations/supabase/client";
 import { getPublicUploadAgent, createPublicMediaUploadUrl, finalizePublicMediaUpload } from "@/lib/marketing";
-import { Card } from "@/components/ui/card";
 
 // Public, unauthenticated media-upload page — added 2026-09-20 per Mike:
 // "I want to create a simple link I can send them that will open up
@@ -25,10 +24,7 @@ import { Card } from "@/components/ui/card";
 
 export const Route = createFileRoute("/media-upload/$token")({
   head: () => ({
-    meta: [
-      { title: "Upload photos — Your Marketing Dude" },
-      { name: "robots", content: "noindex, nofollow" },
-    ],
+    meta: [{ title: "Social Media Images — Your Marketing Dude" }, { name: "robots", content: "noindex, nofollow" }],
   }),
   component: PublicMediaUploadPage,
 });
@@ -53,28 +49,85 @@ async function resizeImage(file: File, maxEdge = 2000, quality = 0.85): Promise<
   return new File([blob], file.name.replace(/\.\w+$/, ".jpg"), { type: "image/jpeg" });
 }
 
+// FIXED (2026-09-23) — this is the actual root cause of Mike's "it just
+// froze" report. iPhone videos are commonly HEVC-encoded .MOV files, and
+// Safari's `loadedmetadata` event for that format doesn't reliably fire in
+// every context — when it doesn't, this promise NEVER resolved (no timeout,
+// and `onerror` doesn't fire either since nothing actually errored, it just
+// never loads). Since uploads ran one-at-a-time in a single for-loop below,
+// one stuck video silently blocked every file queued after it too — exactly
+// "selected 9 files, it said Uploading… and never finished." Now races
+// against an 8-second timeout; if metadata never arrives, this treats
+// duration as unknown (0) rather than hanging forever, and the upload
+// proceeds instead of silently stalling everything behind it.
 function getVideoDuration(file: File): Promise<number> {
   return new Promise((resolve) => {
     const video = document.createElement("video");
     video.preload = "metadata";
-    video.onloadedmetadata = () => {
+    let settled = false;
+    const finish = (value: number) => {
+      if (settled) return;
+      settled = true;
       URL.revokeObjectURL(video.src);
-      resolve(video.duration);
+      resolve(value);
     };
-    video.onerror = () => resolve(0);
+    video.onloadedmetadata = () => finish(video.duration);
+    video.onerror = () => finish(0);
     video.src = URL.createObjectURL(file);
+    setTimeout(() => finish(0), 8_000);
   });
 }
 
+// Generic timeout wrapper for the three network calls in the upload
+// pipeline below (mint a signed URL, upload bytes, finalize the row) — same
+// fix in spirit as getVideoDuration above: one call hanging on a flaky
+// mobile connection used to stall this file (and, in the old sequential
+// loop, every file after it) forever with zero feedback. Now it fails that
+// one step after 30s so the batch keeps moving and the person sees an
+// honest "skipped" count instead of a frozen screen.
+function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`${label} timed out`)), ms);
+    promise.then(
+      (v) => {
+        clearTimeout(timer);
+        resolve(v);
+      },
+      (e) => {
+        clearTimeout(timer);
+        reject(e);
+      },
+    );
+  });
+}
+
+// Runs `worker` over `items` with at most `limit` in flight at once, instead
+// of one giant Promise.all (which would fire every upload simultaneously —
+// rough on a mobile connection and on Supabase Storage) or the old fully
+// sequential for-loop (one slow/stuck file blocks every file behind it).
+async function runWithConcurrency<T>(items: T[], limit: number, worker: (item: T, index: number) => Promise<void>) {
+  let next = 0;
+  async function runOne() {
+    while (next < items.length) {
+      const index = next++;
+      await worker(items[index]!, index);
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, runOne));
+}
+
 const MAX_VIDEO_SECONDS = 120;
+const UPLOAD_CONCURRENCY = 3;
+const STEP_TIMEOUT_MS = 30_000;
 
 function PublicMediaUploadPage() {
   const token = Route.useParams().token;
   const [agentName, setAgentName] = useState<string | null>(null);
   const [linkError, setLinkError] = useState<string | null>(null);
   const [uploading, setUploading] = useState(false);
+  const [progress, setProgress] = useState<{ done: number; total: number } | null>(null);
   const [note, setNote] = useState<string | null>(null);
-  const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
     getPublicUploadAgent({ data: { token } })
@@ -82,13 +135,24 @@ function PublicMediaUploadPage() {
       .catch((e) => setLinkError(e instanceof Error ? e.message : String(e)));
   }, [token]);
 
+  // REWRITTEN (2026-09-23) per Mike: "very buggy... never uploaded, just
+  // frozen." Two independent fixes, both above: getVideoDuration and every
+  // network step now time out instead of hanging forever, and files upload
+  // with limited concurrency (UPLOAD_CONCURRENCY at once) instead of one at
+  // a time — both faster on a phone connection and no longer able to let one
+  // bad file silently block everything queued behind it. Progress now
+  // updates live ("3 of 9 done") instead of a single unmoving "Uploading…"
+  // for the whole batch.
   async function handleFiles(fileList: FileList | null) {
     if (!fileList || !fileList.length) return;
+    const files = Array.from(fileList);
     setUploading(true);
     setNote(null);
+    setProgress({ done: 0, total: files.length });
     let uploaded = 0;
     let skipped = 0;
-    for (const file of Array.from(fileList)) {
+
+    await runWithConcurrency(files, UPLOAD_CONCURRENCY, async (file) => {
       try {
         const isVideo = file.type.startsWith("video/");
         const mediaType: "photo" | "video" = isVideo ? "video" : "photo";
@@ -96,30 +160,42 @@ function PublicMediaUploadPage() {
           const duration = await getVideoDuration(file);
           if (duration > MAX_VIDEO_SECONDS) {
             skipped++;
-            continue;
+            return;
           }
         }
         const toUpload = isVideo ? file : await resizeImage(file);
-        const { path, uploadToken } = await createPublicMediaUploadUrl({
-          data: { token, fileName: toUpload.name },
-        });
-        const { error: uploadErr } = await supabase.storage
-          .from("media")
-          .uploadToSignedUrl(path, uploadToken, toUpload);
+        const { path, uploadToken } = await withTimeout(
+          createPublicMediaUploadUrl({ data: { token, fileName: toUpload.name } }),
+          STEP_TIMEOUT_MS,
+          "Getting an upload slot",
+        );
+        const { error: uploadErr } = await withTimeout(
+          supabase.storage.from("media").uploadToSignedUrl(path, uploadToken, toUpload),
+          STEP_TIMEOUT_MS,
+          "Uploading the file",
+        );
         if (uploadErr) throw uploadErr;
-        await finalizePublicMediaUpload({ data: { token, storagePath: path, mediaType } });
+        await withTimeout(
+          finalizePublicMediaUpload({ data: { token, storagePath: path, mediaType } }),
+          STEP_TIMEOUT_MS,
+          "Saving the upload",
+        );
         uploaded++;
       } catch (e) {
         skipped++;
         // eslint-disable-next-line no-console
         console.error("Public media upload failed:", e);
+      } finally {
+        setProgress((cur) => (cur ? { done: cur.done + 1, total: cur.total } : cur));
       }
-    }
+    });
+
     setUploading(false);
+    setProgress(null);
     if (fileInputRef.current) fileInputRef.current.value = "";
     setNote(
       skipped > 0
-        ? `Uploaded ${uploaded}, skipped ${skipped} (a video over ${MAX_VIDEO_SECONDS}s, or a file that failed to upload).`
+        ? `Uploaded ${uploaded}, skipped ${skipped} (a video over ${MAX_VIDEO_SECONDS}s, a slow connection, or a file that failed).`
         : uploaded > 0
           ? `Uploaded ${uploaded} file${uploaded === 1 ? "" : "s"}. Thanks!`
           : "Nothing uploaded.",
@@ -127,38 +203,43 @@ function PublicMediaUploadPage() {
   }
 
   return (
-    <div className="flex min-h-screen items-center justify-center bg-background p-6">
-      <div className="w-full max-w-xl">
-        <Card className="p-6">
-          <h1 className="font-display text-lg font-semibold">Upload photos or video</h1>
+    <div className="flex min-h-screen items-center justify-center bg-background px-4 py-10">
+      <div className="w-full max-w-md rounded-3xl border border-border bg-glass p-6 backdrop-blur-2xl">
+        {linkError && <p className="text-sm text-destructive">{linkError}</p>}
 
-          {linkError && <p className="mt-3 text-sm text-destructive">{linkError}</p>}
+        {!linkError && !agentName && <p className="text-sm text-muted-foreground">Loading…</p>}
 
-          {!linkError && !agentName && <p className="mt-3 text-sm text-muted-foreground">Loading…</p>}
-
-          {!linkError && agentName && (
-            <>
-              <p className="mt-2 text-sm text-muted-foreground">
-                Add photos or short videos for {agentName}. No account needed — just pick your files below.
+        {!linkError && agentName && (
+          <>
+            {/* Personalized header, per Mike (2026-09-23): agent's name, then
+                a section label, then the actual instruction/CTA line. */}
+            <h1 className="font-display text-xl font-semibold">{agentName}</h1>
+            <p className="mt-1 text-sm font-semibold uppercase tracking-wider text-muted-foreground">
+              Social Media Images
+            </p>
+            <p className="mt-3 text-sm text-muted-foreground">
+              Upload Your Social Media Graphics Here So Your Marketing Dude Can Get To Work. No account needed — just
+              pick your files below.
+            </p>
+            <div className="mt-4">
+              <input
+                ref={fileInputRef}
+                type="file"
+                accept="image/*,video/*"
+                multiple
+                onChange={(e) => handleFiles(e.target.files)}
+                disabled={uploading}
+                className="text-sm text-muted-foreground file:mr-3 file:rounded-full file:border-0 file:bg-primary file:px-4 file:py-2 file:text-sm file:font-semibold file:text-primary-foreground"
+              />
+            </div>
+            {uploading && (
+              <p className="mt-3 text-xs text-muted-foreground">
+                {progress ? `Uploading… ${progress.done} of ${progress.total} done` : "Uploading…"}
               </p>
-
-              <div className="mt-4 flex flex-wrap items-center gap-3">
-                <input
-                  ref={fileInputRef}
-                  type="file"
-                  accept="image/*,video/*"
-                  multiple
-                  onChange={(e) => handleFiles(e.target.files)}
-                  disabled={uploading}
-                  className="text-sm text-muted-foreground file:mr-3 file:rounded-full file:border-0 file:bg-primary file:px-4 file:py-2 file:text-sm file:font-semibold file:text-primary-foreground"
-                />
-              </div>
-
-              {uploading && <p className="mt-2 text-xs text-muted-foreground">Uploading…</p>}
-              {note && <p className="mt-2 text-xs text-muted-foreground">{note}</p>}
-            </>
-          )}
-        </Card>
+            )}
+            {note && <p className="mt-3 text-sm text-foreground">{note}</p>}
+          </>
+        )}
       </div>
     </div>
   );

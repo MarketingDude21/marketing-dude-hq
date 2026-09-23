@@ -1,25 +1,37 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { createFileRoute } from "@tanstack/react-router";
 import { supabase } from "@/integrations/supabase/client";
-import { getPublicUploadAgent, createPublicMediaUploadUrl, finalizePublicMediaUpload } from "@/lib/marketing";
+import {
+  getPublicUploadAgent,
+  createPublicMediaUploadUrl,
+  finalizePublicMediaUpload,
+  listPublicMedia,
+  type MediaRow,
+} from "@/lib/marketing";
 
 // Public, unauthenticated media-upload page — added 2026-09-20 per Mike:
 // "I want to create a simple link I can send them that will open up
 // directly into the Media folder no differently than how we share a google
 // drive link. You would click to copy and we can send it to anyone who can
 // click on it and then upload photos to that media library without logging
-// in." Deliberately upload-only: this page never lists, shows, or deletes
-// anything already in the agent's library, and it has no login, no nav, and
-// no other app functionality — just a name, a file picker, and a confirm
-// message, so it's safe to hand to a client or a photographer with no
-// context on the rest of the app. It is NOT wrapped in AppShell, since
-// AppShell assumes a signed-in user with access to every module.
+// in." No login, no nav, and no other app functionality beyond what's below,
+// so it's safe to hand to a client or a photographer with no context on the
+// rest of the app. It is NOT wrapped in AppShell, since AppShell assumes a
+// signed-in user with access to every module.
+//
+// UPDATED (2026-09-23) — originally strictly upload-only (never listed,
+// showed, or deleted anything already in the library) but Mike asked for it
+// to also show what's already there, matching the authenticated Media tab's
+// layout: "It should follow the exact layout as the app does. This way they
+// can see what's inside there." Still narrowly scoped though — this page
+// can VIEW and ADD, but still has no Delete, no Mark used, no tag editing,
+// and no access to any other agent's content or their Google Drive folder.
 //
 // The token in the URL is the only thing that identifies which agent's
-// library this uploads into — see marketing.ts's getPublicUploadAgent /
-// createPublicMediaUploadUrl / finalizePublicMediaUpload, none of which
-// require a session; access here is "knows the link," exactly like a Drive
-// upload-only share link, not "is logged in." An admin can invalidate a
+// library this reads/uploads into — see marketing.ts's getPublicUploadAgent
+// / createPublicMediaUploadUrl / finalizePublicMediaUpload / listPublicMedia,
+// none of which require a session; access here is "knows the link," exactly
+// like a Drive share link, not "is logged in." An admin can invalidate a
 // link at any time (Media tab → Regenerate link).
 
 export const Route = createFileRoute("/media-upload/$token")({
@@ -116,6 +128,10 @@ async function runWithConcurrency<T>(items: T[], limit: number, worker: (item: T
   await Promise.all(Array.from({ length: Math.min(limit, items.length) }, runOne));
 }
 
+// Same fixed vocabulary marketing.ts's PHOTO_TAG_OPTIONS uses — this page
+// only ever displays tags an admin/agent already set from the authenticated
+// Media tab, never edits them, so this is just for a consistent label list;
+// an untagged photo simply shows no chips.
 const MAX_VIDEO_SECONDS = 120;
 const UPLOAD_CONCURRENCY = 3;
 const STEP_TIMEOUT_MS = 30_000;
@@ -127,6 +143,8 @@ function PublicMediaUploadPage() {
   const [uploading, setUploading] = useState(false);
   const [progress, setProgress] = useState<{ done: number; total: number } | null>(null);
   const [note, setNote] = useState<string | null>(null);
+  const [media, setMedia] = useState<MediaRow[] | null>(null);
+  const [mediaError, setMediaError] = useState<string | null>(null);
   const photoInputRef = useRef<HTMLInputElement>(null);
   const videoInputRef = useRef<HTMLInputElement>(null);
 
@@ -136,14 +154,26 @@ function PublicMediaUploadPage() {
       .catch((e) => setLinkError(e instanceof Error ? e.message : String(e)));
   }, [token]);
 
+  // NEW (2026-09-23) — loads/reloads the "what's already in there" grid,
+  // per Mike: "It should follow the exact layout as the app does. This way
+  // they can see what's inside there." Called on first load and again after
+  // any successful upload, so a newly-added photo shows up right away.
+  const loadMedia = useCallback(() => {
+    listPublicMedia({ data: { token } })
+      .then((rows) => setMedia(rows))
+      .catch((e) => setMediaError(e instanceof Error ? e.message : String(e)));
+  }, [token]);
+
+  useEffect(() => {
+    loadMedia();
+  }, [loadMedia]);
+
   // REWRITTEN (2026-09-23) per Mike: "very buggy... never uploaded, just
   // frozen." Two independent fixes, both above: getVideoDuration and every
   // network step now time out instead of hanging forever, and files upload
   // with limited concurrency (UPLOAD_CONCURRENCY at once) instead of one at
   // a time — both faster on a phone connection and no longer able to let one
-  // bad file silently block everything queued behind it. Progress now
-  // updates live ("3 of 9 done") instead of a single unmoving "Uploading…"
-  // for the whole batch.
+  // bad file silently block everything queued behind it.
   //
   // SECOND FIX (2026-09-23, same day) — separate Photo/Video pickers.
   // Mike's next report showed a DIFFERENT stall than the one above: the
@@ -160,8 +190,16 @@ function PublicMediaUploadPage() {
   // worse on a weak connection or low free storage. Splitting into two
   // separate pickers — Photos only, Video only — means iOS never has to
   // export a big mixed batch in a single operation, which directly reduces
-  // the most likely trigger even though it isn't a confirmed fix. Genuinely
-  // needs Mike to re-test on the actual phone that stalled.
+  // the most likely trigger even though it isn't a confirmed fix.
+  //
+  // THIRD FIX (2026-09-23, same day) — Mike, after it actually worked:
+  // "I couldn't tell when it was uploading... thought it was bugging out
+  // then suddenly uploaded." The old status line was one small line of
+  // text below the buttons — easy to miss, especially once the buttons
+  // themselves went gray/disabled, which reads as "broken" rather than
+  // "working." Now shows a large, impossible-to-miss progress banner with
+  // an actual moving bar the instant a selection is made, and reloads the
+  // "already uploaded" grid below once done so the new files visibly appear.
   async function handleFiles(fileList: FileList | null) {
     if (!fileList || !fileList.length) return;
     const files = Array.from(fileList);
@@ -220,61 +258,128 @@ function PublicMediaUploadPage() {
           ? `Uploaded ${uploaded} file${uploaded === 1 ? "" : "s"}. Thanks!`
           : "Nothing uploaded.",
     );
+    if (uploaded > 0) loadMedia();
   }
 
   return (
-    <div className="flex min-h-screen items-center justify-center bg-background px-4 py-10">
-      <div className="w-full max-w-md rounded-3xl border border-border bg-glass p-6 backdrop-blur-2xl">
-        {linkError && <p className="text-sm text-destructive">{linkError}</p>}
+    <div className="min-h-screen bg-background px-4 py-10">
+      <div className="mx-auto w-full max-w-3xl">
+        <div className="rounded-3xl border border-border bg-glass p-6 backdrop-blur-2xl">
+          {linkError && <p className="text-sm text-destructive">{linkError}</p>}
 
-        {!linkError && !agentName && <p className="text-sm text-muted-foreground">Loading…</p>}
+          {!linkError && !agentName && <p className="text-sm text-muted-foreground">Loading…</p>}
 
-        {!linkError && agentName && (
-          <>
-            {/* Personalized header, per Mike (2026-09-23): agent's name, then
-                a section label, then the actual instruction/CTA line. */}
-            <h1 className="font-display text-xl font-semibold">{agentName}</h1>
-            <p className="mt-1 text-sm font-semibold uppercase tracking-wider text-muted-foreground">
-              Social Media Images
-            </p>
-            <p className="mt-3 text-sm text-muted-foreground">
-              Upload Your Social Media Graphics Here So Your Marketing Dude Can Get To Work. No account needed — just
-              pick your files below.
-            </p>
-            {/* Split into two separate pickers (2026-09-23) — see the note
-                above handleFiles. Photos first since that's the page's main
-                purpose; Video as its own smaller, separate action. */}
-            <div className="mt-4 space-y-2">
-              <input
-                ref={photoInputRef}
-                type="file"
-                accept="image/*"
-                multiple
-                onChange={(e) => handleFiles(e.target.files)}
-                disabled={uploading}
-                className="block text-sm text-muted-foreground file:mr-3 file:rounded-full file:border-0 file:bg-primary file:px-4 file:py-2 file:text-sm file:font-semibold file:text-primary-foreground"
-              />
-              <input
-                ref={videoInputRef}
-                type="file"
-                accept="video/*"
-                multiple
-                onChange={(e) => handleFiles(e.target.files)}
-                disabled={uploading}
-                className="block text-sm text-muted-foreground file:mr-3 file:rounded-full file:border-0 file:bg-secondary file:px-4 file:py-2 file:text-sm file:font-semibold file:text-foreground"
-              />
-            </div>
-            <p className="mt-2 text-xs text-muted-foreground">
-              If a big batch ever seems stuck picking photos, try again with fewer at a time.
-            </p>
-            {uploading && (
-              <p className="mt-3 text-xs text-muted-foreground">
-                {progress ? `Uploading… ${progress.done} of ${progress.total} done` : "Uploading…"}
+          {!linkError && agentName && (
+            <>
+              {/* Personalized header, per Mike (2026-09-23): agent's name, then
+                  a section label, then the actual instruction/CTA line. */}
+              <h1 className="font-display text-xl font-semibold">{agentName}</h1>
+              <p className="mt-1 text-sm font-semibold uppercase tracking-wider text-muted-foreground">
+                Social Media Images
               </p>
-            )}
-            {note && <p className="mt-3 text-sm text-foreground">{note}</p>}
-          </>
-        )}
+              <p className="mt-3 text-sm text-muted-foreground">
+                Upload Your Social Media Graphics Here So Your Marketing Dude Can Get To Work. No account needed — just
+                pick your files below.
+              </p>
+              {/* Split into two separate pickers (2026-09-23) — see the note
+                  above handleFiles. Photos first since that's the page's main
+                  purpose; Video as its own smaller, separate action. */}
+              <div className="mt-4 space-y-2">
+                <input
+                  ref={photoInputRef}
+                  type="file"
+                  accept="image/*"
+                  multiple
+                  onChange={(e) => handleFiles(e.target.files)}
+                  disabled={uploading}
+                  className="block text-sm text-muted-foreground file:mr-3 file:rounded-full file:border-0 file:bg-primary file:px-4 file:py-2 file:text-sm file:font-semibold file:text-primary-foreground"
+                />
+                <input
+                  ref={videoInputRef}
+                  type="file"
+                  accept="video/*"
+                  multiple
+                  onChange={(e) => handleFiles(e.target.files)}
+                  disabled={uploading}
+                  className="block text-sm text-muted-foreground file:mr-3 file:rounded-full file:border-0 file:bg-secondary file:px-4 file:py-2 file:text-sm file:font-semibold file:text-foreground"
+                />
+              </div>
+              <p className="mt-2 text-xs text-muted-foreground">
+                If a big batch ever seems stuck picking photos, try again with fewer at a time.
+              </p>
+
+              {/* Large, hard-to-miss progress banner (2026-09-23) — replaces
+                  the old small status line per Mike's "couldn't tell when it
+                  was uploading" report. */}
+              {uploading && progress && (
+                <div className="mt-4 rounded-2xl border border-primary/40 bg-primary/10 p-4">
+                  <p className="text-sm font-semibold text-foreground">
+                    Uploading… {progress.done} of {progress.total} done
+                  </p>
+                  <div className="mt-2 h-2 w-full overflow-hidden rounded-full bg-muted">
+                    <div
+                      className="h-full rounded-full bg-primary transition-all"
+                      style={{
+                        width: `${progress.total ? Math.round((progress.done / progress.total) * 100) : 0}%`,
+                      }}
+                    />
+                  </div>
+                  <p className="mt-2 text-xs text-muted-foreground">
+                    Keep this page open — it'll say "Thanks!" below when everything's uploaded.
+                  </p>
+                </div>
+              )}
+              {note && <p className="mt-3 text-sm font-semibold text-foreground">{note}</p>}
+
+              {/* "What's already in there" grid (2026-09-23), per Mike: "It
+                  should follow the exact layout as the app does. This way
+                  they can see what's inside there." Mirrors the authenticated
+                  Media tab's card layout exactly, view-only — no Delete, no
+                  Mark used, no tag editing. */}
+              <div className="mt-8 border-t border-border pt-6">
+                <h2 className="text-sm font-semibold text-foreground">Already uploaded</h2>
+                {mediaError && <p className="mt-2 text-sm text-destructive">{mediaError}</p>}
+                {!mediaError && media === null && <p className="mt-2 text-sm text-muted-foreground">Loading…</p>}
+                {!mediaError && media !== null && media.length === 0 && (
+                  <p className="mt-2 text-sm text-muted-foreground">Nothing uploaded yet.</p>
+                )}
+                {!mediaError && media !== null && media.length > 0 && (
+                  <div className="mt-3 grid grid-cols-2 gap-3 sm:grid-cols-3">
+                    {media.map((m) => (
+                      <div key={m.id} className="overflow-hidden rounded-2xl border border-border bg-glass">
+                        {m.media_type === "video"
+                          ? m.url && <video src={m.url} controls className="aspect-square w-full object-cover" />
+                          : m.url && (
+                              <img src={m.url} alt={m.caption ?? ""} className="aspect-square w-full object-cover" />
+                            )}
+                        <div className="flex items-center justify-between gap-1 px-2 pt-2">
+                          <span className="rounded-full bg-muted px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">
+                            {m.media_type}
+                          </span>
+                          <span className="rounded-full bg-muted px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">
+                            Uploaded
+                          </span>
+                        </div>
+                        {m.tags.length > 0 && (
+                          <div className="flex flex-wrap gap-1 p-2">
+                            {m.tags.map((tag) => (
+                              <span
+                                key={tag}
+                                className="rounded-full border border-border px-2 py-0.5 text-[10px] font-medium text-muted-foreground"
+                              >
+                                {tag}
+                              </span>
+                            ))}
+                          </div>
+                        )}
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            </>
+          )}
+        </div>
       </div>
     </div>
   );

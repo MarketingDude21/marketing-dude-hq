@@ -50,7 +50,6 @@ export function AppShell({ children }: { children?: ReactNode }) {
       <header className="relative z-10 mx-auto flex max-w-7xl items-center justify-between gap-4 px-6 py-5">
         <Link to="/" className="flex items-center gap-2.5">
           <BrandMark />
-          <span className="font-display text-lg font-semibold tracking-tight">Your Marketing Dude</span>
         </Link>
         <nav className="hidden items-center gap-1 rounded-full border border-border bg-glass px-1 py-1 backdrop-blur-xl md:flex">
           {NAV.map((item) => (

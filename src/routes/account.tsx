@@ -10,8 +10,7 @@ export const Route = createFileRoute("/account")({
       { title: "Account — Your Marketing Dude" },
       {
         name: "description",
-        content:
-          "Manage your profile, photos, and subscription for Your Marketing Dude.",
+        content: "Manage your profile, photos, and subscription for Your Marketing Dude.",
       },
       { property: "og:title", content: "Account — Your Marketing Dude" },
       {
@@ -57,14 +56,22 @@ function AccountPage() {
   const [saving, setSaving] = useState(false);
   const [plan, setPlan] = useState<string>("trial");
 
+  // NEW (2026-09-24) — change-password state, per Mike: "User needs ability
+  // to change password etc..." Separate from the profile form above so
+  // saving your profile and changing your password are two independent
+  // actions with their own status messages.
+  const [newPassword, setNewPassword] = useState("");
+  const [confirmPassword, setConfirmPassword] = useState("");
+  const [passwordBusy, setPasswordBusy] = useState(false);
+  const [passwordStatus, setPasswordStatus] = useState<string | null>(null);
+  const [passwordError, setPasswordError] = useState<string | null>(null);
+
   useEffect(() => {
     if (!user) return;
     let cancelled = false;
     supabase
       .from("agents")
-      .select(
-        "full_name, brokerage, market_area, phone, website, subscription_status",
-      )
+      .select("full_name, brokerage, market_area, phone, website, subscription_status")
       .eq("id", user.id)
       .maybeSingle()
       .then(({ data }) => {
@@ -87,23 +94,46 @@ function AccountPage() {
     if (!user) return;
     setSaving(true);
     setStatus(null);
-    const { error } = await supabase
-      .from("agents")
-      .upsert({ id: user.id, email: user.email ?? null, ...profile });
+    const { error } = await supabase.from("agents").upsert({ id: user.id, email: user.email ?? null, ...profile });
     setSaving(false);
     setStatus(error ? error.message : "Profile saved.");
+  };
+
+  // NEW (2026-09-24) — updates the signed-in user's own Supabase Auth
+  // password. Uses the same `supabase.auth.updateUser` call the
+  // reset-password page uses; the difference is this one runs from an
+  // ordinary logged-in session (no recovery token needed) since the person
+  // is already authenticated here and re-typing their current password
+  // isn't required by Supabase for this call.
+  const changePassword = async () => {
+    setPasswordError(null);
+    setPasswordStatus(null);
+    if (newPassword.length < 6) {
+      setPasswordError("New password needs to be at least 6 characters.");
+      return;
+    }
+    if (newPassword !== confirmPassword) {
+      setPasswordError("Those passwords don't match.");
+      return;
+    }
+    setPasswordBusy(true);
+    const { error } = await supabase.auth.updateUser({ password: newPassword });
+    setPasswordBusy(false);
+    if (error) {
+      setPasswordError(error.message);
+      return;
+    }
+    setNewPassword("");
+    setConfirmPassword("");
+    setPasswordStatus("Password updated.");
   };
 
   if (!loading && !user) {
     return (
       <AppShell>
         <div className="mt-16 rounded-3xl border border-border bg-glass p-8 text-center backdrop-blur-2xl">
-          <h1 className="font-display text-2xl font-bold">
-            Sign in to manage your account
-          </h1>
-          <p className="mt-2 text-sm text-muted-foreground">
-            Your profile powers every tool in the platform.
-          </p>
+          <h1 className="font-display text-2xl font-bold">Sign in to manage your account</h1>
+          <p className="mt-2 text-sm text-muted-foreground">Your profile powers every tool in the platform.</p>
           <Link
             to="/login"
             className="mt-6 inline-block rounded-2xl bg-primary px-6 py-3 text-sm font-semibold text-primary-foreground shadow-lg shadow-primary/30"
@@ -117,12 +147,8 @@ function AccountPage() {
 
   return (
     <AppShell>
-      <h1 className="pt-2 font-display text-2xl font-bold tracking-tight">
-        Account
-      </h1>
-      <p className="mt-1 text-sm text-muted-foreground">
-        Your profile feeds every tool — keep it fresh.
-      </p>
+      <h1 className="pt-2 font-display text-2xl font-bold tracking-tight">Account</h1>
+      <p className="mt-1 text-sm text-muted-foreground">Your profile feeds every tool — keep it fresh.</p>
 
       <div className="mt-6 grid grid-cols-1 gap-5 lg:grid-cols-2">
         <div className="rounded-3xl border border-border bg-glass p-6 backdrop-blur-2xl">
@@ -130,14 +156,10 @@ function AccountPage() {
           <div className="mt-5 space-y-4">
             {FIELDS.map(([key, label, placeholder]) => (
               <label key={key} className="block">
-                <span className="text-sm font-medium text-muted-foreground">
-                  {label}
-                </span>
+                <span className="text-sm font-medium text-muted-foreground">{label}</span>
                 <input
                   value={profile[key]}
-                  onChange={(e) =>
-                    setProfile((p) => ({ ...p, [key]: e.target.value }))
-                  }
+                  onChange={(e) => setProfile((p) => ({ ...p, [key]: e.target.value }))}
                   placeholder={placeholder}
                   className="mt-1.5 w-full rounded-2xl bg-muted px-4 py-3 text-sm outline-none ring-ring transition focus:ring-2"
                 />
@@ -150,9 +172,7 @@ function AccountPage() {
             >
               {saving ? "Saving…" : "Save profile"}
             </button>
-            {status && (
-              <p className="text-xs text-muted-foreground">{status}</p>
-            )}
+            {status && <p className="text-xs text-muted-foreground">{status}</p>}
           </div>
         </div>
 
@@ -165,15 +185,52 @@ function AccountPage() {
               </span>
               <span className="font-display text-sm font-bold">$149/mo</span>
             </div>
-            <p className="mt-3 text-xs text-muted-foreground">
-              Billing management arrives with payments setup.
-            </p>
+            <p className="mt-3 text-xs text-muted-foreground">Billing management arrives with payments setup.</p>
           </div>
+
+          {/* NEW (2026-09-24) — "Password" card, per Mike: "User needs
+              ability to change password etc..." Same two-field pattern as
+              the reset-password page's form. */}
+          <div className="rounded-3xl border border-border bg-glass p-6 backdrop-blur-2xl">
+            <h2 className="font-display text-lg font-semibold">Password</h2>
+            <div className="mt-4 space-y-3">
+              <label className="block">
+                <span className="text-sm font-medium text-muted-foreground">New password</span>
+                <input
+                  type="password"
+                  minLength={6}
+                  value={newPassword}
+                  onChange={(e) => setNewPassword(e.target.value)}
+                  placeholder="••••••••"
+                  className="mt-1.5 w-full rounded-2xl bg-muted px-4 py-3 text-sm outline-none ring-ring transition focus:ring-2"
+                />
+              </label>
+              <label className="block">
+                <span className="text-sm font-medium text-muted-foreground">Confirm new password</span>
+                <input
+                  type="password"
+                  minLength={6}
+                  value={confirmPassword}
+                  onChange={(e) => setConfirmPassword(e.target.value)}
+                  placeholder="••••••••"
+                  className="mt-1.5 w-full rounded-2xl bg-muted px-4 py-3 text-sm outline-none ring-ring transition focus:ring-2"
+                />
+              </label>
+              <button
+                onClick={changePassword}
+                disabled={passwordBusy}
+                className="rounded-2xl bg-primary px-5 py-2.5 text-sm font-semibold text-primary-foreground shadow-lg shadow-primary/30 transition-transform hover:-translate-y-0.5 disabled:opacity-60"
+              >
+                {passwordBusy ? "Updating…" : "Update password"}
+              </button>
+              {passwordError && <p className="text-xs text-destructive">{passwordError}</p>}
+              {passwordStatus && <p className="text-xs text-muted-foreground">{passwordStatus}</p>}
+            </div>
+          </div>
+
           <div className="rounded-3xl border border-border bg-glass p-6 backdrop-blur-2xl">
             <h2 className="font-display text-lg font-semibold">Session</h2>
-            <p className="mt-2 text-sm text-muted-foreground">
-              Signed in as {user?.email ?? "…"}
-            </p>
+            <p className="mt-2 text-sm text-muted-foreground">Signed in as {user?.email ?? "…"}</p>
             <button
               onClick={async () => {
                 await supabase.auth.signOut();

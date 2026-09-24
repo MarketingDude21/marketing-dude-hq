@@ -14,6 +14,7 @@ import { Route as AccountRouteImport } from './routes/account'
 import { Route as DatabaseRouteImport } from './routes/database'
 import { Route as LoginRouteImport } from './routes/login'
 import { Route as MarketingRouteImport } from './routes/marketing'
+import { Route as ResetPasswordRouteImport } from './routes/reset-password'
 import { Route as VoiceRouteImport } from './routes/voice'
 import { Route as MediaUploadTokenRouteImport } from './routes/media-upload.$token'
 import { Route as ReviewTokenRouteImport } from './routes/review.$token'
@@ -43,6 +44,11 @@ const MarketingRoute = MarketingRouteImport.update({
   path: '/marketing',
   getParentRoute: () => rootRouteImport,
 } as any)
+const ResetPasswordRoute = ResetPasswordRouteImport.update({
+  id: '/reset-password',
+  path: '/reset-password',
+  getParentRoute: () => rootRouteImport,
+} as any)
 const VoiceRoute = VoiceRouteImport.update({
   id: '/voice',
   path: '/voice',
@@ -65,6 +71,7 @@ export interface FileRoutesByFullPath {
   '/database': typeof DatabaseRoute
   '/login': typeof LoginRoute
   '/marketing': typeof MarketingRoute
+  '/reset-password': typeof ResetPasswordRoute
   '/voice': typeof VoiceRoute
   '/media-upload/$token': typeof MediaUploadTokenRoute
   '/review/$token': typeof ReviewTokenRoute
@@ -75,6 +82,7 @@ export interface FileRoutesByTo {
   '/database': typeof DatabaseRoute
   '/login': typeof LoginRoute
   '/marketing': typeof MarketingRoute
+  '/reset-password': typeof ResetPasswordRoute
   '/voice': typeof VoiceRoute
   '/media-upload/$token': typeof MediaUploadTokenRoute
   '/review/$token': typeof ReviewTokenRoute
@@ -86,6 +94,7 @@ export interface FileRoutesById {
   '/database': typeof DatabaseRoute
   '/login': typeof LoginRoute
   '/marketing': typeof MarketingRoute
+  '/reset-password': typeof ResetPasswordRoute
   '/voice': typeof VoiceRoute
   '/media-upload/$token': typeof MediaUploadTokenRoute
   '/review/$token': typeof ReviewTokenRoute
@@ -98,6 +107,7 @@ export interface FileRouteTypes {
     | '/database'
     | '/login'
     | '/marketing'
+    | '/reset-password'
     | '/voice'
     | '/media-upload/$token'
     | '/review/$token'
@@ -108,6 +118,7 @@ export interface FileRouteTypes {
     | '/database'
     | '/login'
     | '/marketing'
+    | '/reset-password'
     | '/voice'
     | '/media-upload/$token'
     | '/review/$token'
@@ -118,6 +129,7 @@ export interface FileRouteTypes {
     | '/database'
     | '/login'
     | '/marketing'
+    | '/reset-password'
     | '/voice'
     | '/media-upload/$token'
     | '/review/$token'
@@ -129,6 +141,7 @@ export interface RootRouteChildren {
   DatabaseRoute: typeof DatabaseRoute
   LoginRoute: typeof LoginRoute
   MarketingRoute: typeof MarketingRoute
+  ResetPasswordRoute: typeof ResetPasswordRoute
   VoiceRoute: typeof VoiceRoute
   MediaUploadTokenRoute: typeof MediaUploadTokenRoute
   ReviewTokenRoute: typeof ReviewTokenRoute
@@ -171,6 +184,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof MarketingRouteImport
       parentRoute: typeof rootRouteImport
     }
+    '/reset-password': {
+      id: '/reset-password'
+      path: '/reset-password'
+      fullPath: '/reset-password'
+      preLoaderRoute: typeof ResetPasswordRouteImport
+      parentRoute: typeof rootRouteImport
+    }
     '/voice': {
       id: '/voice'
       path: '/voice'
@@ -201,6 +221,7 @@ const rootRouteChildren: RootRouteChildren = {
   DatabaseRoute: DatabaseRoute,
   LoginRoute: LoginRoute,
   MarketingRoute: MarketingRoute,
+  ResetPasswordRoute: ResetPasswordRoute,
   VoiceRoute: VoiceRoute,
   MediaUploadTokenRoute: MediaUploadTokenRoute,
   ReviewTokenRoute: ReviewTokenRoute,

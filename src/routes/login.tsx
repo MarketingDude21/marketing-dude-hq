@@ -33,6 +33,11 @@ function LoginPage() {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
+  // NEW (2026-09-24) — "Lost password" flow per Mike: "Also need a lost
+  // password button on the login screen." `resetBusy` is separate from
+  // `busy` so clicking "Forgot password?" doesn't visually disable/spin the
+  // main Sign in button, and vice versa.
+  const [resetBusy, setResetBusy] = useState(false);
   const navigate = useNavigate();
   const { session } = useAuth();
 
@@ -64,9 +69,7 @@ function LoginPage() {
         });
         if (error) throw error;
         if (!data.session) {
-          setNotice(
-            "Check your inbox and click the confirmation link to finish setting up your account.",
-          );
+          setNotice("Check your inbox and click the confirmation link to finish setting up your account.");
         } else {
           navigate({ to: "/" });
         }
@@ -75,6 +78,35 @@ function LoginPage() {
       setError(err instanceof Error ? err.message : "Something went wrong.");
     } finally {
       setBusy(false);
+    }
+  };
+
+  // NEW (2026-09-24) — sends a Supabase password-recovery email to whatever
+  // is currently typed in the Email field above (no separate email input,
+  // to keep this a single click rather than a whole extra screen). Lands
+  // the person on /reset-password (new route, see reset-password.tsx) via
+  // the link in that email, where they actually set a new password.
+  // requires "https://<your-domain>/reset-password" to be added to
+  // Supabase's Auth → URL Configuration → Redirect URLs allow-list, or
+  // Supabase will refuse to honor this redirect — flagged in delivery notes.
+  const onForgotPassword = async () => {
+    setError(null);
+    setNotice(null);
+    if (!email.trim()) {
+      setError("Enter your email above first, then click “Forgot password?”");
+      return;
+    }
+    setResetBusy(true);
+    try {
+      const { error } = await supabase.auth.resetPasswordForEmail(email.trim(), {
+        redirectTo: `${window.location.origin}/reset-password`,
+      });
+      if (error) throw error;
+      setNotice("Check your inbox for a link to reset your password.");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Couldn't send that reset email.");
+    } finally {
+      setResetBusy(false);
     }
   };
 
@@ -89,13 +121,10 @@ function LoginPage() {
           <h1 className="mt-8 font-display text-5xl font-bold leading-[0.98] tracking-tight md:text-6xl">
             Your marketing,
             <br />
-            <span className="bg-gradient-to-r from-primary to-accent bg-clip-text text-transparent">
-              on autopilot.
-            </span>
+            <span className="bg-gradient-to-r from-primary to-accent bg-clip-text text-transparent">on autopilot.</span>
           </h1>
           <p className="mt-5 max-w-md text-lg text-muted-foreground">
-            One brain that writes your posts, builds your list, and learns your
-            voice every month.
+            One brain that writes your posts, builds your list, and learns your voice every month.
           </p>
           <div className="mt-8 flex flex-wrap gap-2">
             {["Voice DNA", "SOI Database", "Content Engine"].map((t) => (
@@ -121,9 +150,7 @@ function LoginPage() {
                   setNotice(null);
                 }}
                 className={`flex-1 rounded-xl py-2.5 text-center transition-colors ${
-                  mode === m
-                    ? "bg-foreground text-ink"
-                    : "text-muted-foreground hover:text-foreground"
+                  mode === m ? "bg-foreground text-ink" : "text-muted-foreground hover:text-foreground"
                 }`}
               >
                 {m === "signin" ? "Sign in" : "Sign up"}
@@ -134,9 +161,7 @@ function LoginPage() {
           <form onSubmit={onSubmit} className="mt-6 space-y-4">
             {mode === "signup" && (
               <label className="block">
-                <span className="text-sm font-medium text-muted-foreground">
-                  Full name
-                </span>
+                <span className="text-sm font-medium text-muted-foreground">Full name</span>
                 <input
                   value={fullName}
                   onChange={(e) => setFullName(e.target.value)}
@@ -146,9 +171,7 @@ function LoginPage() {
               </label>
             )}
             <label className="block">
-              <span className="text-sm font-medium text-muted-foreground">
-                Email
-              </span>
+              <span className="text-sm font-medium text-muted-foreground">Email</span>
               <input
                 type="email"
                 required
@@ -159,9 +182,22 @@ function LoginPage() {
               />
             </label>
             <label className="block">
-              <span className="text-sm font-medium text-muted-foreground">
-                Password
-              </span>
+              <div className="flex items-center justify-between">
+                <span className="text-sm font-medium text-muted-foreground">Password</span>
+                {/* "Lost password" button, per Mike (2026-09-24) — only shown
+                    on Sign in (a brand-new signup has no password to lose
+                    yet). */}
+                {mode === "signin" && (
+                  <button
+                    type="button"
+                    onClick={onForgotPassword}
+                    disabled={resetBusy}
+                    className="text-xs font-medium text-muted-foreground underline-offset-2 transition-colors hover:text-foreground hover:underline disabled:opacity-60"
+                  >
+                    {resetBusy ? "Sending…" : "Forgot password?"}
+                  </button>
+                )}
+              </div>
               <input
                 type="password"
                 required
@@ -177,11 +213,7 @@ function LoginPage() {
               disabled={busy}
               className="w-full rounded-2xl bg-primary py-3.5 text-base font-semibold text-primary-foreground shadow-lg shadow-primary/30 transition-transform hover:-translate-y-0.5 disabled:opacity-60"
             >
-              {busy
-                ? "One moment…"
-                : mode === "signin"
-                  ? "Sign in"
-                  : "Create my account"}
+              {busy ? "One moment…" : mode === "signin" ? "Sign in" : "Create my account"}
             </button>
           </form>
 
@@ -196,9 +228,7 @@ function LoginPage() {
             </p>
           )}
 
-          <p className="mt-5 text-center text-sm text-muted-foreground">
-            $149/month · cancel anytime
-          </p>
+          <p className="mt-5 text-center text-sm text-muted-foreground">$149/month · cancel anytime</p>
         </div>
       </div>
     </div>

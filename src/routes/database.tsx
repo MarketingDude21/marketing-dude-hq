@@ -1079,24 +1079,47 @@ function ReviewTab({ clientId, lastProcessReport }: { clientId: string; lastProc
               <p className="text-sm text-destructive">Couldn't load this list: {loadError}</p>
             ) : (
               <div className="overflow-x-auto">
+                {/* FIXED (2026-09-25) — per Mike: "we can't see the keep all
+                    section from when you look at the name... the user needs
+                    to now scroll left to see what the name is and scroll
+                    right... the entire view needs to be shifted over or
+                    expanded so that you can see every column." Root cause:
+                    with 8-9 columns of real address data this table is wider
+                    than the page, so the overflow-x-auto div has to scroll —
+                    unavoidable on most screens without dropping columns
+                    Mike didn't ask to drop. Instead of removing columns,
+                    First name / Last name are now frozen (sticky) on the
+                    left and the checkbox column is frozen on the right, so
+                    whichever way you scroll to read Email/Address/Zip/etc.,
+                    the name AND the checkbox stay on screen the whole time
+                    — you never lose track of who you're looking at. Padding
+                    also tightened slightly (pr-6 → pr-4) so more columns
+                    fit before scrolling is even needed. Same fix applied to
+                    the "Needs Data" table below in FinalCombinedListStep,
+                    which had the identical layout and would hit the same
+                    complaint. */}
                 <table className="w-full text-sm">
                   <thead>
                     <tr className="text-left text-muted-foreground">
-                      <th className="whitespace-nowrap pb-2 pr-6">First name</th>
-                      <th className="whitespace-nowrap pb-2 pr-6">Last name</th>
-                      <th className="pb-2 pr-6">Email</th>
-                      <th className="whitespace-nowrap pb-2 pr-6">Phone</th>
-                      {showAddressColumns && <th className="pb-2 pr-6">Address</th>}
-                      <th className="whitespace-nowrap pb-2 pr-6">City</th>
+                      <th className="sticky left-0 z-10 w-24 min-w-24 max-w-24 truncate bg-background pb-2 pr-4">
+                        First name
+                      </th>
+                      <th className="sticky left-24 z-10 w-28 min-w-28 max-w-28 truncate border-r border-border bg-background pb-2 pr-4">
+                        Last name
+                      </th>
+                      <th className="pb-2 pr-4">Email</th>
+                      <th className="whitespace-nowrap pb-2 pr-4">Phone</th>
+                      {showAddressColumns && <th className="pb-2 pr-4">Address</th>}
+                      <th className="whitespace-nowrap pb-2 pr-4">City</th>
                       {showAddressColumns && (
                         <>
-                          <th className="whitespace-nowrap pb-2 pr-6">State</th>
-                          <th className="whitespace-nowrap pb-2 pr-6">Zip</th>
+                          <th className="whitespace-nowrap pb-2 pr-4">State</th>
+                          <th className="whitespace-nowrap pb-2 pr-4">Zip</th>
                         </>
                       )}
-                      {showListColumn && <th className="whitespace-nowrap pb-2 pr-6">List</th>}
+                      {showListColumn && <th className="whitespace-nowrap pb-2 pr-4">List</th>}
                       {editable && (
-                        <th className="whitespace-nowrap pb-2">
+                        <th className="sticky right-0 z-10 whitespace-nowrap border-l border-border bg-background pb-2 pl-3">
                           <label className="flex items-center gap-1.5">
                             <input type="checkbox" checked={allChecked} onChange={(e) => toggleAll(e.target.checked)} />
                             {step.optOut ? "Remove all" : "Keep all"}
@@ -1115,27 +1138,41 @@ function ReviewTab({ clientId, lastProcessReport }: { clientId: string; lastProc
                         }}
                         className={`border-t border-border ${c.id === leftOffId ? "bg-secondary/40" : ""}`}
                       >
-                        <td className="whitespace-nowrap py-2 pr-6">{c.first_name}</td>
-                        <td className="whitespace-nowrap py-2 pr-6">{c.last_name}</td>
-                        <td className="py-2 pr-6">{c.email}</td>
-                        <td className="whitespace-nowrap py-2 pr-6">{c.phone}</td>
-                        {showAddressColumns && <td className="py-2 pr-6">{c.address}</td>}
-                        <td className="whitespace-nowrap py-2 pr-6">{c.city}</td>
+                        {/* Sticky cells stay fully opaque (not the row's
+                            bg-secondary/40 "left off" tint) on purpose —
+                            they need a solid backing so the columns
+                            scrolling underneath them don't show through. */}
+                        <td
+                          title={c.first_name}
+                          className="sticky left-0 z-10 w-24 min-w-24 max-w-24 truncate bg-background py-2 pr-4"
+                        >
+                          {c.first_name}
+                        </td>
+                        <td
+                          title={c.last_name}
+                          className="sticky left-24 z-10 w-28 min-w-28 max-w-28 truncate border-r border-border bg-background py-2 pr-4"
+                        >
+                          {c.last_name}
+                        </td>
+                        <td className="py-2 pr-4">{c.email}</td>
+                        <td className="whitespace-nowrap py-2 pr-4">{c.phone}</td>
+                        {showAddressColumns && <td className="py-2 pr-4">{c.address}</td>}
+                        <td className="whitespace-nowrap py-2 pr-4">{c.city}</td>
                         {showAddressColumns && (
                           <>
-                            <td className="whitespace-nowrap py-2 pr-6">{c.state}</td>
-                            <td className="whitespace-nowrap py-2 pr-6">{c.zip}</td>
+                            <td className="whitespace-nowrap py-2 pr-4">{c.state}</td>
+                            <td className="whitespace-nowrap py-2 pr-4">{c.zip}</td>
                           </>
                         )}
                         {showListColumn && (
-                          <td className="whitespace-nowrap py-2 pr-6">
+                          <td className="whitespace-nowrap py-2 pr-4">
                             <span className="rounded-full bg-muted px-2.5 py-1 text-xs font-semibold uppercase tracking-wide text-muted-foreground">
                               {LIST_LABELS[c.list_assignment ?? ""] ?? c.list_assignment}
                             </span>
                           </td>
                         )}
                         {editable && (
-                          <td className="py-2 pl-2">
+                          <td className="sticky right-0 z-10 border-l border-border bg-background py-2 pl-3">
                             <input
                               type="checkbox"
                               checked={c.flagged}
@@ -1269,38 +1306,56 @@ function FinalCombinedListStep({ clientId }: { clientId: string }) {
         />
         <Card className="mt-4">
           <div className="overflow-x-auto">
+            {/* Same frozen-columns fix as the review table above (2026-09-25) —
+                identical column layout, same scrolling complaint would apply. */}
             <table className="w-full text-sm">
               <thead>
                 <tr className="text-left text-muted-foreground">
-                  <th className="whitespace-nowrap pb-2 pr-6">First name</th>
-                  <th className="whitespace-nowrap pb-2 pr-6">Last name</th>
-                  <th className="pb-2 pr-6">Email</th>
-                  <th className="whitespace-nowrap pb-2 pr-6">Phone</th>
-                  <th className="pb-2 pr-6">Address</th>
-                  <th className="whitespace-nowrap pb-2 pr-6">City</th>
-                  <th className="whitespace-nowrap pb-2 pr-6">State</th>
-                  <th className="whitespace-nowrap pb-2 pr-6">Zip</th>
-                  <th className="whitespace-nowrap pb-2 pr-6">Missing</th>
-                  <th className="whitespace-nowrap pb-2">Select</th>
+                  <th className="sticky left-0 z-10 w-24 min-w-24 max-w-24 truncate bg-background pb-2 pr-4">
+                    First name
+                  </th>
+                  <th className="sticky left-24 z-10 w-28 min-w-28 max-w-28 truncate border-r border-border bg-background pb-2 pr-4">
+                    Last name
+                  </th>
+                  <th className="pb-2 pr-4">Email</th>
+                  <th className="whitespace-nowrap pb-2 pr-4">Phone</th>
+                  <th className="pb-2 pr-4">Address</th>
+                  <th className="whitespace-nowrap pb-2 pr-4">City</th>
+                  <th className="whitespace-nowrap pb-2 pr-4">State</th>
+                  <th className="whitespace-nowrap pb-2 pr-4">Zip</th>
+                  <th className="whitespace-nowrap pb-2 pr-4">Missing</th>
+                  <th className="sticky right-0 z-10 whitespace-nowrap border-l border-border bg-background pb-2 pl-3">
+                    Select
+                  </th>
                 </tr>
               </thead>
               <tbody>
                 {filtered.map((c) => (
                   <tr key={c.id} className="border-t border-border">
-                    <td className="whitespace-nowrap py-2 pr-6">{c.first_name}</td>
-                    <td className="whitespace-nowrap py-2 pr-6">{c.last_name}</td>
-                    <td className="py-2 pr-6">{c.email}</td>
-                    <td className="whitespace-nowrap py-2 pr-6">{c.phone}</td>
-                    <td className="py-2 pr-6">{c.address}</td>
-                    <td className="whitespace-nowrap py-2 pr-6">{c.city}</td>
-                    <td className="whitespace-nowrap py-2 pr-6">{c.state}</td>
-                    <td className="whitespace-nowrap py-2 pr-6">{c.zip}</td>
-                    <td className="py-2 pr-6">
+                    <td
+                      title={c.first_name}
+                      className="sticky left-0 z-10 w-24 min-w-24 max-w-24 truncate bg-background py-2 pr-4"
+                    >
+                      {c.first_name}
+                    </td>
+                    <td
+                      title={c.last_name}
+                      className="sticky left-24 z-10 w-28 min-w-28 max-w-28 truncate border-r border-border bg-background py-2 pr-4"
+                    >
+                      {c.last_name}
+                    </td>
+                    <td className="py-2 pr-4">{c.email}</td>
+                    <td className="whitespace-nowrap py-2 pr-4">{c.phone}</td>
+                    <td className="py-2 pr-4">{c.address}</td>
+                    <td className="whitespace-nowrap py-2 pr-4">{c.city}</td>
+                    <td className="whitespace-nowrap py-2 pr-4">{c.state}</td>
+                    <td className="whitespace-nowrap py-2 pr-4">{c.zip}</td>
+                    <td className="py-2 pr-4">
                       <span className="rounded-full bg-muted px-2.5 py-1 text-xs font-semibold uppercase tracking-wide text-muted-foreground">
                         {c.missing.join(", ") || "—"}
                       </span>
                     </td>
-                    <td className="py-2 pl-2">
+                    <td className="sticky right-0 z-10 border-l border-border bg-background py-2 pl-3">
                       <input
                         type="checkbox"
                         checked={c.already_selected}

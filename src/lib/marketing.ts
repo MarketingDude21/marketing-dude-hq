@@ -302,11 +302,12 @@ async function assignSuggestedMedia(
       pick: { source: "media", id: m.id, url: m.url as string, mediaType: m.media_type },
     }));
 
-  // Best-effort: any failure here (no GOOGLE_API_KEY, no folder set, a
-  // private/unshared folder, a transient Drive API error) just means Drive
-  // contributes zero candidates for this run — it never blocks or fails the
-  // batch. A generation should always deliver its best guess with whatever
-  // photo source actually works, not error out over an optional one.
+  // Best-effort: any failure here (Drive not connected, no folder set, a
+  // folder the connected account can't see, a transient Drive API error)
+  // just means Drive contributes zero candidates for this run — it never
+  // blocks or fails the batch. A generation should always deliver its best
+  // guess with whatever photo source actually works, not error out over an
+  // optional one.
   try {
     const { data: agent } = await supabaseAdmin
       .from("agents")
@@ -314,9 +315,9 @@ async function assignSuggestedMedia(
       .eq("id", agentId)
       .maybeSingle();
     const folderId = agent?.drive_folder_id ?? null;
-    const apiKey = process.env["GOOGLE_API_KEY"];
-    if (folderId && apiKey) {
-      const files = await fetchDriveMediaFiles(folderId, apiKey);
+    if (folderId) {
+      const accessToken = await getDriveAccessToken();
+      const files = await fetchDriveMediaFiles(folderId, accessToken);
       for (const f of files) {
         candidates.push({
           key: `drive:${f.id}`,
@@ -1817,9 +1818,26 @@ export const submitPublicReviewFeedback = createServerFn({ method: "POST" })
 // the "used" subfolder, for parity with however that client's Drive-side
 // used-tracking already works.
 //
-// Needs two things this project didn't have before:
-//   1. GOOGLE_API_KEY in Lovable Cloud → Secrets (a Drive-API-enabled key —
-//      read-only is enough, the old app only ever used it for listing).
+// AUTH, rewritten 2026-09-28 — was a plain GOOGLE_API_KEY, now real OAuth:
+// Regina Flores's folder kept failing with Google's raw "The user does not
+// have sufficient permissions for this file" even after confirming (directly
+// against Drive's own permissions API, not just the sharing dialog) that the
+// folder genuinely was shared "Anyone with the link can edit." A bare API
+// key — no signed-in identity behind it at all — is just unreliable for
+// real user-owned Drive content, sharing settings aside; this was previously
+// documented in this file as a known limitation ("a real per-agent OAuth
+// connection ... is a separate, much bigger project"), but that undersold
+// it: full OAuth credentials for this exact integration already existed,
+// sitting unused in the ORIGINAL Netlify+Supabase app's environment
+// variables from before this was ported here (found by Mike 2026-09-28) —
+// GOOGLE_OAUTH_CLIENT_ID / GOOGLE_OAUTH_CLIENT_SECRET / GOOGLE_REFRESH_TOKEN.
+// They just never made it into this project's secrets during the port.
+// Needs, in Lovable Cloud → Secrets:
+//   1. GOOGLE_OAUTH_CLIENT_ID / GOOGLE_OAUTH_CLIENT_SECRET / GOOGLE_REFRESH_TOKEN
+//      — see getDriveAccessToken() below for how these turn into a real
+//      access token. Whatever real Google account did the original consent
+//      grant is who this now reads Drive as — no "Anyone with the link"
+//      requirement anymore, just normal folder sharing with that account.
 //   2. Each agent's own agents.drive_folder_id set once — there's no bulk
 //      migration for this (the old admin UI's folder-ID field was never
 //      backed by a table we inherited), so it's set per-agent via
@@ -1836,9 +1854,11 @@ export type DriveFile = {
   // Direct-content endpoint (added 2026-09-21 per Mike: "photos in all
   // libraries should be downloadable") — unlike thumbnailUrl (a small
   // preview) or viewUrl (opens Drive's own viewer), this serves the actual
-  // full-resolution file so a person can save it in one click. Works with
-  // the same "anyone with the link" sharing this whole integration already
-  // requires — no extra permission needed.
+  // full-resolution file so a person can save it in one click. These three
+  // URLs are plain drive.google.com links rendered in the viewer's own
+  // browser (not routed through our backend's Drive auth at all), so they
+  // still rely on the file being visible to whoever clicks them — same as
+  // before, unaffected by the OAuth rewrite below.
   downloadUrl: string;
   // Set only when this file is returned from the "used" side of
   // listAgentDriveMedia (see below) — the moment our own app marked it used,
@@ -1846,50 +1866,115 @@ export type DriveFile = {
   usedAt?: string | null;
 };
 
-// This integration authenticates with a plain Drive API key, not real OAuth
-// (see the comment block above) — which means it can only ever see files
-// and folders that are shared "Anyone with the link" (or fully public).
+// Mints a real Drive API access token from the long-lived refresh token
+// (see the big comment block above for why this replaced GOOGLE_API_KEY).
+// Access tokens are short-lived (~1hr per Google); cached in module scope so
+// a warm server instance handling several Drive calls back-to-back (listing
+// a folder tree is many calls) doesn't re-hit Google's token endpoint every
+// time — refreshed automatically once it's within 30s of expiring.
+let cachedDriveToken: { token: string; expiresAt: number } | null = null;
+
+async function getDriveAccessToken(): Promise<string> {
+  if (cachedDriveToken && cachedDriveToken.expiresAt > Date.now() + 30_000) {
+    return cachedDriveToken.token;
+  }
+  const clientId = process.env["GOOGLE_OAUTH_CLIENT_ID"];
+  const clientSecret = process.env["GOOGLE_OAUTH_CLIENT_SECRET"];
+  const refreshToken = process.env["GOOGLE_REFRESH_TOKEN"];
+  if (!clientId || !clientSecret || !refreshToken) {
+    throw new Error(
+      "Google Drive isn't connected yet — add GOOGLE_OAUTH_CLIENT_ID, GOOGLE_OAUTH_CLIENT_SECRET, and GOOGLE_REFRESH_TOKEN in Lovable Cloud → Secrets.",
+    );
+  }
+  const res = await fetchWithTimeout(
+    "https://oauth2.googleapis.com/token",
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        client_id: clientId,
+        client_secret: clientSecret,
+        refresh_token: refreshToken,
+        grant_type: "refresh_token",
+      }).toString(),
+    },
+    15_000,
+  );
+  const json = (await res.json().catch(() => ({}))) as {
+    access_token?: string;
+    expires_in?: number;
+    error?: string;
+    error_description?: string;
+  };
+  if (!res.ok || !json.access_token) {
+    // "invalid_grant" specifically means the refresh token itself has been
+    // revoked or expired (the connected Google account's password changed,
+    // or access was revoked in that account's security settings) — worth
+    // saying plainly, since the fix there is "reconnect the Google sign-in
+    // and save a new refresh token," not a code change.
+    const reason =
+      json.error === "invalid_grant"
+        ? "the saved Google sign-in (GOOGLE_REFRESH_TOKEN) has been revoked or expired — it needs to be reconnected."
+        : (json.error_description ?? json.error ?? `HTTP ${res.status}`);
+    throw new Error(`Google Drive sign-in failed: ${reason}`);
+  }
+  cachedDriveToken = { token: json.access_token, expiresAt: Date.now() + (json.expires_in ?? 3600) * 1000 };
+  return cachedDriveToken.token;
+}
+
+function driveAuthHeaders(accessToken: string): Record<string, string> {
+  return { Authorization: `Bearer ${accessToken}` };
+}
+
+// Which real Google account the refresh token above signs in as — fetched
+// lazily (only when something's already gone wrong) purely so a folder-
+// access error can tell Mike/the agent exactly which account to share the
+// folder with, instead of a vague "the connected account." Cached the same
+// way the token is.
+let cachedDriveEmail: string | null = null;
+
+async function getDriveAccountEmail(accessToken: string): Promise<string | null> {
+  if (cachedDriveEmail) return cachedDriveEmail;
+  try {
+    const res = await fetchWithTimeout(
+      "https://www.googleapis.com/drive/v3/about?fields=user(emailAddress)",
+      { headers: driveAuthHeaders(accessToken) },
+      10_000,
+    );
+    if (!res.ok) return null;
+    const json = (await res.json()) as { user?: { emailAddress?: string } };
+    cachedDriveEmail = json.user?.emailAddress ?? null;
+    return cachedDriveEmail;
+  } catch {
+    return null;
+  }
+}
+
 // A private folder ID saved to an agent's record looks fully "connected" on
-// our side (setAgentDriveFolder succeeds, drive_folder_id is set) but the
-// Drive API will just quietly act as if it doesn't exist, since the API key
-// has no viewer permission on it. Google returns 404 for this case (not
-// 403), which reads exactly like a typo'd folder ID, so this checks the
-// folder itself first and gives Mike/the agent something actionable instead
-// of a silent "no photos found." Added 2026-09-18 per Mike: "I attached a
-// google drive folder for this agent but although connected on the admin
-// end is not connected on the google drive end." A real per-agent OAuth
-// connection (each agent grants their own Drive access) would remove this
-// sharing requirement entirely, but is a separate, much bigger project —
-// this is the fix available within the current API-key architecture.
-async function verifyDriveFolderAccessible(folderId: string, apiKey: string): Promise<void> {
-  const metaUrl = `https://www.googleapis.com/drive/v3/files/${folderId}?fields=id,name,mimeType&supportsAllDrives=true&key=${apiKey}`;
-  const res = await fetch(metaUrl);
+// our side (setAgentDriveFolder succeeds, drive_folder_id is set) but Drive
+// will just quietly act as if it doesn't exist if the signed-in account
+// above doesn't actually have access — this checks the folder itself first
+// and gives Mike/the agent something actionable instead of a silent "no
+// photos found." Added 2026-09-18 per Mike: "I attached a google drive
+// folder for this agent but although connected on the admin end is not
+// connected on the google drive end."
+async function verifyDriveFolderAccessible(folderId: string, accessToken: string): Promise<void> {
+  const metaUrl = `https://www.googleapis.com/drive/v3/files/${folderId}?fields=id,name,mimeType&supportsAllDrives=true`;
+  const res = await fetch(metaUrl, { headers: driveAuthHeaders(accessToken) });
   if (res.ok) return;
+  const email = await getDriveAccountEmail(accessToken);
+  const whoText = email ? `the "${email}" Google account` : "the account this app signs in as";
   if (res.status === 404) {
     throw new Error(
-      "This Drive folder isn't visible yet — it needs to be shared as \"Anyone with the link can view\" in Google Drive (right-click the folder → Share → General access → Anyone with the link) before photos will show up here. This app only reads Drive with an API key, not a full sign-in, so a private folder looks connected on our side but the folder ID isn't enough on its own.",
+      `This Drive folder isn't visible to ${whoText} — double-check the folder ID is correct, and share the folder with ${email ?? "that account"} directly (Share → add them by email, Viewer is enough) the same way you'd share it with any person.`,
     );
   }
   const json = (await res.json().catch(() => ({}))) as { error?: { message?: string } };
   const raw = json.error?.message;
-  if (res.status === 403) {
-    // Added 2026-09-28 per Mike: "Regina flores google drive is not
-    // working" — the raw Google error was just "The user does not have
-    // sufficient permissions for this file," which reads like our bug even
-    // though the folder ID was saved correctly. The #1 real-world cause of
-    // that exact message on a folder that LOOKS properly link-shared is
-    // that it actually lives inside a Shared Drive (Team Drive): the Shared
-    // Drive's own access settings can still block a bare API-key request
-    // even when the folder inside it shows "Anyone with the link." Give
-    // Mike/the agent something concrete to go check instead of Google's raw
-    // string (also added supportsAllDrives=true above and on every other
-    // Drive call in this file, the actual fix when that's the cause).
-    throw new Error(
-      (raw ? `Google Drive says: "${raw}". ` : "") +
-        'This usually means the sharing is still too narrow for a link-only (API key) connection: double-check General access on the folder is set to "Anyone with the link can view" (not shared with specific people only), and if this folder lives inside a Shared Drive / Team Drive, check that the Shared Drive itself also allows this — a folder can show as shared while the Shared Drive around it is still locked down.',
-    );
-  }
-  throw new Error(raw ?? `Google Drive API error (${res.status}) while checking folder access.`);
+  throw new Error(
+    (raw ? `Google Drive says: "${raw}". ` : "") +
+      `${whoText} doesn't have access to this folder — share it with ${email ?? "that account"} and try again.`,
+  );
 }
 
 // Real Drive folders are often organized into subfolders (by month, by
@@ -1913,7 +1998,7 @@ async function verifyDriveFolderAccessible(folderId: string, apiKey: string): Pr
 const MAX_DRIVE_FOLDER_DEPTH = 4;
 const MAX_DRIVE_FOLDERS = 40;
 
-async function listDriveFolderIds(rootFolderId: string, apiKey: string): Promise<string[]> {
+async function listDriveFolderIds(rootFolderId: string, accessToken: string): Promise<string[]> {
   const ids = [rootFolderId];
   let frontier = [rootFolderId];
   for (let depth = 0; depth < MAX_DRIVE_FOLDER_DEPTH && frontier.length && ids.length < MAX_DRIVE_FOLDERS; depth++) {
@@ -1925,10 +2010,9 @@ async function listDriveFolderIds(rootFolderId: string, apiKey: string): Promise
           encodeURIComponent(
             `'${parentId}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false`,
           ) +
-          "&fields=files(id,name)&pageSize=100&supportsAllDrives=true&includeItemsFromAllDrives=true&key=" +
-          apiKey;
+          "&fields=files(id,name)&pageSize=100&supportsAllDrives=true&includeItemsFromAllDrives=true";
         try {
-          const res = await fetchWithTimeout(url, {}, 15_000);
+          const res = await fetchWithTimeout(url, { headers: driveAuthHeaders(accessToken) }, 15_000);
           const json = (await res.json()) as { files?: { id: string; name: string }[] };
           return json.files ?? [];
         } catch {
@@ -1966,7 +2050,7 @@ function driveParentsClause(folderIds: string[]): string {
 // "used" subfolder (from the old app's move-to-used, or a manual move), and
 // until now nothing in this app ever surfaced that folder's contents
 // anywhere — it was just silently excluded, full stop.
-async function listDriveUsedFolderIds(rootFolderId: string, apiKey: string): Promise<string[]> {
+async function listDriveUsedFolderIds(rootFolderId: string, accessToken: string): Promise<string[]> {
   const usedIds: string[] = [];
   let frontier = [rootFolderId];
   for (
@@ -1982,10 +2066,9 @@ async function listDriveUsedFolderIds(rootFolderId: string, apiKey: string): Pro
           encodeURIComponent(
             `'${parentId}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false`,
           ) +
-          "&fields=files(id,name)&pageSize=100&supportsAllDrives=true&includeItemsFromAllDrives=true&key=" +
-          apiKey;
+          "&fields=files(id,name)&pageSize=100&supportsAllDrives=true&includeItemsFromAllDrives=true";
         try {
-          const res = await fetchWithTimeout(url, {}, 15_000);
+          const res = await fetchWithTimeout(url, { headers: driveAuthHeaders(accessToken) }, 15_000);
           const json = (await res.json()) as { files?: { id: string; name: string }[] };
           return json.files ?? [];
         } catch {
@@ -2043,16 +2126,15 @@ function mapDriveApiFile(f: { id: string; name: string; mimeType: string }): Dri
 // query "every image/video directly inside this set of folder ids," they
 // only differ in which folder ids they pass in (the active tree vs. a
 // "used" folder found inside it).
-async function queryDriveFilesInFolders(folderIds: string[], apiKey: string): Promise<DriveFile[]> {
+async function queryDriveFilesInFolders(folderIds: string[], accessToken: string): Promise<DriveFile[]> {
   if (!folderIds.length) return [];
   const q = `${driveParentsClause(folderIds)} and (mimeType contains 'image/' or mimeType contains 'video/') and trashed=false`;
   const url =
     "https://www.googleapis.com/drive/v3/files?" +
     "q=" +
     encodeURIComponent(q) +
-    "&fields=files(id,name,mimeType)&pageSize=200&supportsAllDrives=true&includeItemsFromAllDrives=true&key=" +
-    apiKey;
-  const res = await fetchWithTimeout(url, {}, 15_000);
+    "&fields=files(id,name,mimeType)&pageSize=200&supportsAllDrives=true&includeItemsFromAllDrives=true";
+  const res = await fetchWithTimeout(url, { headers: driveAuthHeaders(accessToken) }, 15_000);
   const json = (await res.json()) as {
     files?: { id: string; name: string; mimeType: string }[];
     error?: { message?: string };
@@ -2061,17 +2143,17 @@ async function queryDriveFilesInFolders(folderIds: string[], apiKey: string): Pr
   return (json.files ?? []).map(mapDriveApiFile);
 }
 
-async function fetchDriveMediaFiles(folderId: string, apiKey: string): Promise<DriveFile[]> {
-  const folderIds = await listDriveFolderIds(folderId, apiKey);
-  return queryDriveFilesInFolders(folderIds, apiKey);
+async function fetchDriveMediaFiles(folderId: string, accessToken: string): Promise<DriveFile[]> {
+  const folderIds = await listDriveFolderIds(folderId, accessToken);
+  return queryDriveFilesInFolders(folderIds, accessToken);
 }
 
 // The contents of whatever "used" subfolder(s) exist anywhere in this Drive
 // folder's tree — added 2026-09-21 alongside listDriveUsedFolderIds above,
 // so the "Used" side of the Drive tab has something real to show.
-async function fetchDriveUsedFiles(folderId: string, apiKey: string): Promise<DriveFile[]> {
-  const usedFolderIds = await listDriveUsedFolderIds(folderId, apiKey);
-  return queryDriveFilesInFolders(usedFolderIds, apiKey);
+async function fetchDriveUsedFiles(folderId: string, accessToken: string): Promise<DriveFile[]> {
+  const usedFolderIds = await listDriveUsedFolderIds(folderId, accessToken);
+  return queryDriveFilesInFolders(usedFolderIds, accessToken);
 }
 
 // Looks up a specific set of Drive file ids directly (files.get, one call
@@ -2082,12 +2164,12 @@ async function fetchDriveUsedFiles(folderId: string, apiKey: string): Promise<Dr
 // trashed, or had its sharing revoked since being marked used is silently
 // skipped rather than failing the whole listing — the used-tracking row
 // stays either way, but there's nothing to render for it.
-async function fetchDriveFilesByIds(fileIds: string[], apiKey: string): Promise<DriveFile[]> {
+async function fetchDriveFilesByIds(fileIds: string[], accessToken: string): Promise<DriveFile[]> {
   const results = await Promise.all(
     fileIds.map(async (id) => {
       try {
-        const url = `https://www.googleapis.com/drive/v3/files/${id}?fields=id,name,mimeType,trashed&supportsAllDrives=true&key=${apiKey}`;
-        const res = await fetchWithTimeout(url, {}, 15_000);
+        const url = `https://www.googleapis.com/drive/v3/files/${id}?fields=id,name,mimeType,trashed&supportsAllDrives=true`;
+        const res = await fetchWithTimeout(url, { headers: driveAuthHeaders(accessToken) }, 15_000);
         if (!res.ok) return null;
         const json = (await res.json()) as { id: string; name: string; mimeType: string; trashed?: boolean };
         if (json.trashed) return null;
@@ -2116,11 +2198,8 @@ export const listAgentDriveMedia = createServerFn({ method: "GET" })
     const folderId = agent?.drive_folder_id ?? null;
     if (!folderId) return { folderId: null, files: [] };
 
-    const apiKey = process.env["GOOGLE_API_KEY"];
-    if (!apiKey) {
-      throw new Error("Google Drive isn't connected yet — add GOOGLE_API_KEY in Lovable Cloud → Secrets.");
-    }
-    await verifyDriveFolderAccessible(folderId, apiKey);
+    const accessToken = await getDriveAccessToken();
+    await verifyDriveFolderAccessible(folderId, accessToken);
 
     // agent_drive_used_files — our own DB-side "used" tracking for Drive
     // photos, added 2026-09-21 (see markDriveFileUsed below for why this
@@ -2139,10 +2218,10 @@ export const listAgentDriveMedia = createServerFn({ method: "GET" })
       // (2) anything OUR app has marked used via approve/Mark used, which
       // may or may not also be one of those structural files. De-duped by
       // file id so something in both places only shows once.
-      const structural = await fetchDriveUsedFiles(folderId, apiKey);
+      const structural = await fetchDriveUsedFiles(folderId, accessToken);
       const structuralIds = new Set(structural.map((f) => f.id));
       const onlyTrackedIds = Array.from(trackedUsed.keys()).filter((id) => !structuralIds.has(id));
-      const trackedOnly = onlyTrackedIds.length ? await fetchDriveFilesByIds(onlyTrackedIds, apiKey) : [];
+      const trackedOnly = onlyTrackedIds.length ? await fetchDriveFilesByIds(onlyTrackedIds, accessToken) : [];
       const files = [...structural, ...trackedOnly].map((f) => ({
         ...f,
         usedAt: trackedUsed.get(f.id) ?? null,
@@ -2154,7 +2233,7 @@ export const listAgentDriveMedia = createServerFn({ method: "GET" })
     // separately marked used ourselves (covers a file our app marked used
     // that's still physically sitting in a normal, non-"used" folder, since
     // we can't move the real file without Drive write access — see below).
-    const files = (await fetchDriveMediaFiles(folderId, apiKey)).filter((f) => !trackedUsed.has(f.id));
+    const files = (await fetchDriveMediaFiles(folderId, accessToken)).filter((f) => !trackedUsed.has(f.id));
     return { folderId, files };
   });
 
@@ -2162,18 +2241,17 @@ export const listAgentDriveMedia = createServerFn({ method: "GET" })
 // need to move to the used folder in both media library and google drive as
 // well." For the native Media library, "moving to used" was already just a
 // status flag on our own row (agent_photos.status) — that part already
-// worked. Google Drive has no equivalent at all: this integration only ever
-// had a plain, read-only Drive API key (see the big comment block above
-// DriveFile), never the OAuth refresh token real Drive WRITES (moving a file
-// between folders) require — that's exactly why the old app's actual
-// move-to-used.js needed a different kind of credential than everything
-// else in this file. Rather than block this fix on setting up Google OAuth
-// (a real, separate infra decision), "used" for Drive is tracked the same
-// way as Media Library — as our own flag, in our own database — so approve/
-// restore work identically for both sources today. The file itself never
-// physically moves in the agent's real Drive; if Mike wants Drive-native
-// moves later, that needs OAuth credentials from Google Cloud Console,
-// which is worth flagging to him as a follow-up rather than assuming.
+// worked. Google Drive has no equivalent at all — "used" for Drive is
+// tracked the same way as Media Library instead — as our own flag, in our
+// own database — so approve/restore work identically for both sources. The
+// file itself never physically moves in the agent's real Drive.
+// UPDATE 2026-09-28: this comment previously said a real move was blocked on
+// not having Drive OAuth/write credentials — that's no longer true, this
+// file now signs in with real OAuth (see the big comment block above
+// DriveFile) via GOOGLE_REFRESH_TOKEN, which may well carry write access.
+// Left as DB-only tracking for now since actually moving a file is a bigger,
+// riskier change (real file mutation vs. our own bookkeeping) worth its own
+// explicit go-ahead from Mike rather than bundling into this auth fix.
 export const markDriveFileUsed = createServerFn({ method: "POST" })
   .middleware([requireSupabaseAuth])
   .validator((data: { agentId: string; driveFileId: string; postId?: string }) => data)
@@ -3677,13 +3755,11 @@ export const scanAgentDrivePhotos = createServerFn({ method: "POST" })
     }): Promise<{ suggestions: PhotoScanSuggestion[]; totalPhotos: number; unsupportedFormatCount: number }> => {
       const email = (context.claims as { email?: string } | undefined)?.email;
       await requireAgentAccess(context.userId, email, data.agentId);
-      const googleKey = process.env["GOOGLE_API_KEY"];
       const anthropicKey = process.env["ANTHROPIC_API_KEY"];
-      if (!googleKey)
-        throw new Error("Google Drive isn't connected yet — add GOOGLE_API_KEY in Lovable Cloud → Secrets.");
       if (!anthropicKey)
         throw new Error("Photo captioning isn't configured yet — add ANTHROPIC_API_KEY in Lovable Cloud → Secrets.");
-      await verifyDriveFolderAccessible(data.folderId, googleKey);
+      const accessToken = await getDriveAccessToken();
+      await verifyDriveFolderAccessible(data.folderId, accessToken);
 
       const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
       const { data: agent } = await supabaseAdmin
@@ -3702,14 +3778,13 @@ export const scanAgentDrivePhotos = createServerFn({ method: "POST" })
       // agent's Drive). listDriveFolderIds already skips any "used" subfolder
       // and everything inside it, so there's no separate used-folder lookup
       // needed here the way there used to be.
-      const folderIds = await listDriveFolderIds(data.folderId, googleKey);
+      const folderIds = await listDriveFolderIds(data.folderId, accessToken);
       const listUrl =
         "https://www.googleapis.com/drive/v3/files?" +
         "q=" +
         encodeURIComponent(`${driveParentsClause(folderIds)} and mimeType contains 'image/' and trashed=false`) +
-        "&fields=files(id,name,mimeType)&pageSize=200&supportsAllDrives=true&includeItemsFromAllDrives=true&key=" +
-        googleKey;
-      const listRes = await fetchWithTimeout(listUrl, {}, 15_000);
+        "&fields=files(id,name,mimeType)&pageSize=200&supportsAllDrives=true&includeItemsFromAllDrives=true";
+      const listRes = await fetchWithTimeout(listUrl, { headers: driveAuthHeaders(accessToken) }, 15_000);
       const listData = (await listRes.json()) as {
         files?: { id: string; name: string; mimeType: string }[];
         error?: { message?: string };
@@ -3735,12 +3810,8 @@ export const scanAgentDrivePhotos = createServerFn({ method: "POST" })
       const results = await Promise.all(
         toProcess.map(async (f): Promise<PhotoScanSuggestion | null> => {
           try {
-            const imgUrl =
-              "https://www.googleapis.com/drive/v3/files/" +
-              f.id +
-              "?alt=media&supportsAllDrives=true&key=" +
-              googleKey;
-            const imgRes = await fetchWithTimeout(imgUrl, {}, 15_000);
+            const imgUrl = "https://www.googleapis.com/drive/v3/files/" + f.id + "?alt=media&supportsAllDrives=true";
+            const imgRes = await fetchWithTimeout(imgUrl, { headers: driveAuthHeaders(accessToken) }, 15_000);
             if (!imgRes.ok) return null;
             const arrayBuffer = await imgRes.arrayBuffer();
 

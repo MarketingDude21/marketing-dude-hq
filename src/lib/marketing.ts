@@ -31,9 +31,7 @@ import type { TablesInsert } from "@/integrations/supabase/types";
 // ============================================================================
 
 export type MarketingAccess =
-  | { role: "admin" }
-  | { role: "agent"; agentId: string; agentName: string }
-  | { role: "none" };
+  { role: "admin" } | { role: "agent"; agentId: string; agentName: string } | { role: "none" };
 
 async function resolveAccess(userId: string, email: string | undefined): Promise<MarketingAccess> {
   const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
@@ -86,7 +84,18 @@ export const listMarketingAgents = createServerFn({ method: "GET" })
 // caller's access on every call (never trusts an agentId the browser sends)
 // so an agent can never read or edit someone else's content, and an admin's
 // access is always verified fresh rather than cached client-side.
-async function requireAgentAccess(userId: string, email: string | undefined, requestedAgentId: string): Promise<void> {
+//
+// Exported (2026-09-28) so Build My Brand (voice-dna.ts) can reuse this
+// exact same admin/agent boundary instead of re-deriving its own copy —
+// Voice DNA and Monthly Marketing already share one identity model
+// (admin_allowlist + agents.id = auth user id, see the file header above),
+// so the access check itself should live in exactly one place, not two
+// copies that could quietly drift apart from each other over time.
+export async function requireAgentAccess(
+  userId: string,
+  email: string | undefined,
+  requestedAgentId: string,
+): Promise<void> {
   const access = await resolveAccess(userId, email);
   if (access.role === "admin") return;
   if (access.role === "agent" && access.agentId === requestedAgentId) return;

@@ -1,5 +1,6 @@
 import { createServerFn } from "@tanstack/react-start";
 import { requireSupabaseAuth } from "@/integrations/supabase/auth-middleware";
+import { requireAgentAccess } from "@/lib/marketing";
 
 // The 16-question Voice DNA interview. Ported verbatim from the standalone
 // voice-dna Netlify app (marketing-dude-platform/voice-dna/index.html) so
@@ -13,14 +14,12 @@ export type VoiceDnaQuestion = {
 export const VOICE_DNA_QUESTIONS: VoiceDnaQuestion[] = [
   {
     section: "Who you are",
-    question:
-      "Describe yourself in a few words — not professionally, just as a person.",
+    question: "Describe yourself in a few words — not professionally, just as a person.",
     nudge: "How would your closest friends describe you at dinner?",
   },
   {
     section: "Who you are",
-    question:
-      "What kind of humor do you have? Sarcastic? Dry? Self-deprecating? Dad jokes?",
+    question: "What kind of humor do you have? Sarcastic? Dry? Self-deprecating? Dad jokes?",
     nudge: "This shows up in your content more than anything else.",
   },
   {
@@ -31,8 +30,7 @@ export const VOICE_DNA_QUESTIONS: VoiceDnaQuestion[] = [
   },
   {
     section: "How you communicate",
-    question:
-      "What do you say all the time — phrases that just come out automatically?",
+    question: "What do you say all the time — phrases that just come out automatically?",
     nudge: "The stuff your family would tease you about.",
   },
   {
@@ -48,8 +46,7 @@ export const VOICE_DNA_QUESTIONS: VoiceDnaQuestion[] = [
   },
   {
     section: "Real estate you",
-    question:
-      "Why did you get into real estate — and be honest, was it always the plan?",
+    question: "Why did you get into real estate — and be honest, was it always the plan?",
     nudge: "The real story is always better than the polished one.",
   },
   {
@@ -77,24 +74,20 @@ export const VOICE_DNA_QUESTIONS: VoiceDnaQuestion[] = [
   },
   {
     section: "How you show up on camera",
-    question:
-      "Walk me through a normal day on the job — what are you actually doing between appointments?",
+    question: "Walk me through a normal day on the job — what are you actually doing between appointments?",
     nudge:
       "Previewing homes, doing paperwork at a specific coffee shop, calling clients from your car — the everyday moments worth filming, not the highlight reel.",
   },
   {
     section: "Real estate you",
-    question:
-      "Tell me about another client moment — a different one from before. The messier the better.",
+    question: "Tell me about another client moment — a different one from before. The messier the better.",
     nudge:
       "One story runs out fast. Give me a second one — a deal that almost fell apart, a client who became a friend, anything real.",
   },
   {
     section: "Your local area",
-    question:
-      "What's your actual favorite spot in town — the place you'd take a friend without being asked?",
-    nudge:
-      "Coffee shop, trail, restaurant, anything. Not the touristy answer, the real one.",
+    question: "What's your actual favorite spot in town — the place you'd take a friend without being asked?",
+    nudge: "Coffee shop, trail, restaurant, anything. Not the touristy answer, the real one.",
   },
   {
     section: "Who you are not",
@@ -119,11 +112,7 @@ export type VoiceDnaAnswers = {
   serviceAreas: string;
 };
 
-function buildVoiceDnaPrompt(
-  name: string,
-  city: string,
-  answers: VoiceDnaAnswer[],
-): string {
+function buildVoiceDnaPrompt(name: string, city: string, answers: VoiceDnaAnswer[]): string {
   const qa = answers
     .map((a, i) => `Q: ${VOICE_DNA_QUESTIONS[i]?.question ?? a.question}\nA: ${a.answer || "(no answer)"}`)
     .join("\n\n");
@@ -216,9 +205,7 @@ export const generateVoiceDnaProfile = createServerFn({ method: "POST" })
   .handler(async ({ data }): Promise<{ profile: string }> => {
     const apiKey = process.env["ANTHROPIC_API_KEY"];
     if (!apiKey) {
-      throw new Error(
-        "Voice DNA generation isn't configured yet — add ANTHROPIC_API_KEY in Lovable Cloud → Secrets.",
-      );
+      throw new Error("Voice DNA generation isn't configured yet — add ANTHROPIC_API_KEY in Lovable Cloud → Secrets.");
     }
 
     const prompt = buildVoiceDnaPrompt(data.name, data.city, data.answers);
@@ -254,10 +241,174 @@ export const generateVoiceDnaProfile = createServerFn({ method: "POST" })
     const match = raw.match(/---\n([\s\S]+?)\n---/);
     const profile = match
       ? (match[1] ?? "").trim()
-      : raw.replace(/^---\n?/, "").replace(/\n?---$/, "").trim();
+      : raw
+          .replace(/^---\n?/, "")
+          .replace(/\n?---$/, "")
+          .trim();
     if (!profile) {
       throw new Error("Could not parse the generated profile — try again.");
     }
 
     return { profile };
+  });
+
+// ============================================================================
+// Build My Brand — admin "act as agent" support + brand assets (2026-09-28)
+//
+// Mike, after switching to a client in Build My Database and then clicking
+// Build My Brand: "it only takes me to my personal account under build my
+// brand... it should be for whoever's account I'm logged into... whoever the
+// admin is logged in at, that's what should appear under the build my brand
+// section, unless they're logged in as themselves."
+//
+// Root cause: voice.tsx always read/wrote the SIGNED-IN user's own `agents`
+// row directly from the browser (`supabase.from("agents")...eq("id",
+// user.id)`), relying on that table's own RLS (auth.uid() = id). That RLS
+// is exactly why an admin could never see or edit another agent's Voice DNA
+// from the browser client no matter what UI you put in front of it — the
+// database itself refuses the read/write. Monthly Marketing solved the
+// identical problem months ago with its own "Change agent" picker backed by
+// server functions that check access explicitly and then read/write with
+// the service-role client — that's the same fix applied here, reusing
+// Monthly Marketing's own access model (requireAgentAccess, imported above)
+// rather than inventing a second one, since both pages already share one
+// admin_allowlist + agents identity system.
+//
+// NOTE on scope: Build My Database's "Change client" picker is a SEPARATE
+// concept from this one — it's picking a client in the entirely separate
+// SOI Builder Supabase project (see soi-builder.ts's file header), which has
+// no shared id with this dashboard's own `agents` table. So this is its own
+// "Change agent" picker, matching the one Monthly Marketing already has —
+// not a single global switch shared across every tool. Each tool remembers
+// its own pick while you're in it, same as Monthly Marketing already works.
+// ============================================================================
+
+export type AgentVoiceProfile = {
+  full_name: string | null;
+  market_area: string | null;
+  phone: string | null;
+  voice_answers: VoiceDnaAnswers | null;
+  voice_summary: string | null;
+  headshot_url: string | null;
+  logo_url: string | null;
+};
+
+// Reads the target agent's Voice DNA + brand-asset fields with the
+// service-role client, after confirming the caller is either that agent
+// themselves or an admin — the same boundary every Monthly Marketing action
+// already enforces, just applied to the `agents` row directly instead of
+// agent_photos/generated_posts.
+export const getAgentVoiceProfile = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .validator((data: { agentId: string }) => data)
+  .handler(async ({ data, context }): Promise<AgentVoiceProfile | null> => {
+    const email = (context.claims as { email?: string } | undefined)?.email;
+    await requireAgentAccess(context.userId, email, data.agentId);
+    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+    const { data: row, error } = await supabaseAdmin
+      .from("agents")
+      .select("full_name, market_area, phone, voice_answers, voice_summary, headshot_url, logo_url")
+      .eq("id", data.agentId)
+      .maybeSingle();
+    if (error) throw error;
+    if (!row) return null;
+    return {
+      full_name: row.full_name,
+      market_area: row.market_area,
+      phone: row.phone,
+      voice_answers: (row.voice_answers as VoiceDnaAnswers | null) ?? null,
+      voice_summary: row.voice_summary,
+      headshot_url: row.headshot_url ?? null,
+      logo_url: row.logo_url ?? null,
+    };
+  });
+
+// Saves the target agent's basics + interview answers + generated profile.
+// Same guard as the read above, re-checked fresh (never trusts a prior
+// check from earlier in the session).
+export const saveAgentVoiceProfile = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .validator(
+    (data: {
+      agentId: string;
+      fullName: string;
+      marketArea: string;
+      phone: string;
+      voiceAnswers: VoiceDnaAnswers;
+      voiceSummary: string;
+    }) => data,
+  )
+  .handler(async ({ data, context }): Promise<{ ok: true } | { ok: false; error: string }> => {
+    const email = (context.claims as { email?: string } | undefined)?.email;
+    await requireAgentAccess(context.userId, email, data.agentId);
+    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+    const { error } = await supabaseAdmin
+      .from("agents")
+      .update({
+        full_name: data.fullName.trim() || null,
+        market_area: data.marketArea.trim() || null,
+        phone: data.phone.trim() || null,
+        voice_answers: data.voiceAnswers,
+        voice_summary: data.voiceSummary,
+        updated_at: new Date().toISOString(),
+      })
+      .eq("id", data.agentId);
+    if (error) return { ok: false, error: error.message };
+    return { ok: true };
+  });
+
+// Brand assets — headshot + logo (2026-09-28). Mike: "they should also be
+// able to upload their headshots and logos to this section... their
+// headshot and logos would give us like their brand colors and everything
+// else we need for anything marketing going forward." Built now: upload +
+// storage + display. NOT built yet (no spec/assets from Mike to build
+// against): automatic brand-color extraction from the uploaded images, a
+// bio builder, and Facebook/YouTube header generation — Mike flagged these
+// as "eventually" additions to this same section, tracked as roadmap items
+// in build-status.md, not part of this pass.
+//
+// Same two-step signed-upload-URL pattern Monthly Marketing's Media tab
+// already uses (createMediaUploadUrl/finalizeMediaUpload in marketing.ts) —
+// the browser uploads bytes straight to Storage, this never proxies the
+// file itself. The only difference: a headshot/logo is a single replaceable
+// slot per agent (stored directly on the agents row), not a gallery item
+// (agent_photos), so "finalize" here updates agents.headshot_url/logo_url
+// instead of inserting a new agent_photos row — uploading a new one simply
+// overwrites the old URL, matching "replace my headshot" being the only
+// thing that makes sense for a single profile photo/logo slot.
+export const createBrandAssetUploadUrl = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .validator((data: { agentId: string; fileName: string; kind: "headshot" | "logo" }) => data)
+  .handler(async ({ data, context }): Promise<{ path: string; token: string }> => {
+    const email = (context.claims as { email?: string } | undefined)?.email;
+    await requireAgentAccess(context.userId, email, data.agentId);
+    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+    const safeName = data.fileName.replace(/[^a-zA-Z0-9._-]/g, "_").slice(-120);
+    const path = `${data.agentId}/brand/${data.kind}-${crypto.randomUUID()}-${safeName}`;
+    const { data: signed, error } = await supabaseAdmin.storage.from("media").createSignedUploadUrl(path);
+    if (error) throw error;
+    return { path, token: signed.token };
+  });
+
+export const finalizeBrandAssetUpload = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .validator((data: { agentId: string; storagePath: string; kind: "headshot" | "logo" }) => data)
+  .handler(async ({ data, context }): Promise<{ ok: true; url: string }> => {
+    const email = (context.claims as { email?: string } | undefined)?.email;
+    await requireAgentAccess(context.userId, email, data.agentId);
+    if (!data.storagePath.startsWith(`${data.agentId}/brand/`)) {
+      throw new Error("Upload path does not belong to this agent.");
+    }
+    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+    const { data: pub } = supabaseAdmin.storage.from("media").getPublicUrl(data.storagePath);
+    // Explicit branches rather than a computed { [column]: ... } key — the
+    // computed form widens to a generic string index signature and doesn't
+    // type-check against the generated Update type.
+    const updatePayload =
+      data.kind === "headshot"
+        ? { headshot_url: pub.publicUrl, updated_at: new Date().toISOString() }
+        : { logo_url: pub.publicUrl, updated_at: new Date().toISOString() };
+    const { error } = await supabaseAdmin.from("agents").update(updatePayload).eq("id", data.agentId);
+    if (error) throw error;
+    return { ok: true, url: pub.publicUrl };
   });

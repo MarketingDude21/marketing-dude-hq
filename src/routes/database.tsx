@@ -1143,13 +1143,13 @@ function ReviewTab({ clientId, lastProcessReport }: { clientId: string; lastProc
                             they need a solid backing so the columns
                             scrolling underneath them don't show through. */}
                         <td
-                          title={c.first_name}
+                          title={c.first_name || undefined}
                           className="sticky left-0 z-10 w-24 min-w-24 max-w-24 truncate bg-background py-2 pr-4"
                         >
                           {c.first_name}
                         </td>
                         <td
-                          title={c.last_name}
+                          title={c.last_name || undefined}
                           className="sticky left-24 z-10 w-28 min-w-28 max-w-28 truncate border-r border-border bg-background py-2 pr-4"
                         >
                           {c.last_name}
@@ -1333,13 +1333,13 @@ function FinalCombinedListStep({ clientId }: { clientId: string }) {
                 {filtered.map((c) => (
                   <tr key={c.id} className="border-t border-border">
                     <td
-                      title={c.first_name}
+                      title={c.first_name || undefined}
                       className="sticky left-0 z-10 w-24 min-w-24 max-w-24 truncate bg-background py-2 pr-4"
                     >
                       {c.first_name}
                     </td>
                     <td
-                      title={c.last_name}
+                      title={c.last_name || undefined}
                       className="sticky left-24 z-10 w-28 min-w-28 max-w-28 truncate border-r border-border bg-background py-2 pr-4"
                     >
                       {c.last_name}

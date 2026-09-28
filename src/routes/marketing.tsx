@@ -2187,6 +2187,40 @@ const PHOTO_TAG_OPTIONS = [
 ] as const;
 
 // Admin-only card on the Media tab that surfaces the public upload link for
+// FIXED (2026-09-28) — per Mike, on the Media tab right after switching to
+// an agent: "I put in this agent's Google Drive folder and it's saying that
+// we do not have the right permissions. There's a bug because I have the
+// right permissions." What he actually saw ("Unauthorized: No authorization
+// header provided" on both the Public upload link card AND the media grid
+// below it, at the same time) has nothing to do with Google Drive or his
+// permissions — that's the literal error the app's own auth middleware
+// throws when a server call goes out with no session token attached at all.
+// Root cause: every server-function call attaches the current Supabase
+// session's access token client-side (see auth-attacher.ts — generated,
+// not something we hand-edit), by calling `supabase.auth.getSession()` at
+// the moment the call fires. These two particular calls both fire the
+// instant this tab mounts (a plain `useEffect` with no gate), which is
+// exactly the moment right after switching agents/tabs when that in-memory
+// session can be mid-refresh and briefly returns nothing — a timing race,
+// not a real permissions problem, and not specific to Drive at all (Drive
+// access itself runs through a totally separate server-side Google API key,
+// see setAgentDriveFolder below). Mitigated by retrying once, after a short
+// pause, specifically when a call fails with that exact "no session yet"
+// error — long enough for the background refresh to finish — before ever
+// showing an error to Mike. If it still fails twice in a row, that's a real
+// problem worth seeing, so the error still surfaces as before.
+async function withAuthRetry<T>(call: () => Promise<T>): Promise<T> {
+  try {
+    return await call();
+  } catch (e) {
+    const message = e instanceof Error ? e.message : String(e);
+    if (!message.includes("No authorization header provided")) throw e;
+    await new Promise((resolve) => setTimeout(resolve, 700));
+    return call();
+  }
+}
+
+// Anyone with this link can open a simple upload page for and add photos to
 // this agent — added 2026-09-20 per Mike: "I want to create a simple link I
 // can send them that will open up directly into the Media folder no
 // differently than how we share a google drive link... upload photos to
@@ -2204,7 +2238,7 @@ function PublicUploadLinkCard({ agentId }: { agentId: string }) {
   useEffect(() => {
     setToken(null);
     setError(null);
-    getMediaUploadLink({ data: { agentId } })
+    withAuthRetry(() => getMediaUploadLink({ data: { agentId } }))
       .then((r) => setToken(r.token))
       .catch((e) => setError(e instanceof Error ? e.message : String(e)));
   }, [agentId]);
@@ -2355,7 +2389,7 @@ function MediaTab({ agentId, isAdmin }: { agentId: string; isAdmin: boolean }) {
   function reload() {
     setMedia(null);
     setError(null);
-    listMarketingMedia({ data: { agentId, status } })
+    withAuthRetry(() => listMarketingMedia({ data: { agentId, status } }))
       .then((m) => setMedia(m))
       .catch((e) => setError(e instanceof Error ? e.message : String(e)));
   }

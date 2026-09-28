@@ -815,8 +815,18 @@ function PostsTab({ agentId, isAdmin }: { agentId: string; isAdmin: boolean }) {
     setActionError(null);
     setSendNote(null);
     try {
-      await sendContentToAgent({ data: { agentId, month } });
-      setSendNote("Sent — they'll get an email with a link to review and approve.");
+      const res = await sendContentToAgent({ data: { agentId, month } });
+      // Surfaced 2026-09-28 per Mike: "agents not being sent the email" —
+      // GoHighLevel accepting this call (no error) only means it logged the
+      // message, not that it actually delivered — this id is what to look up
+      // directly inside GoHighLevel (Contacts → this agent → Conversations)
+      // for the real, authoritative delivery status if it doesn't arrive.
+      setSendNote(
+        "Sent — they'll get an email with a link to review and approve." +
+          (res.ghlMessageId
+            ? ` (GoHighLevel message ID: ${res.ghlMessageId} — if it doesn't arrive, look this up in GHL's Conversations tab for this agent to see its real delivery status.)`
+            : ""),
+      );
     } catch (e) {
       setActionError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -3867,8 +3877,13 @@ function MonthWorkspace({
     setSending(true);
     setSendNote(null);
     try {
-      await sendContentToAgent({ data: { agentId, month: folder.month } });
-      setSendNote("Sent — they'll get an email with a link to review and approve.");
+      const res = await sendContentToAgent({ data: { agentId, month: folder.month } });
+      setSendNote(
+        "Sent — they'll get an email with a link to review and approve." +
+          (res.ghlMessageId
+            ? ` (GoHighLevel message ID: ${res.ghlMessageId} — if it doesn't arrive, look this up in GHL's Conversations tab for this agent to see its real delivery status.)`
+            : ""),
+      );
     } catch (e) {
       setSendNote(e instanceof Error ? e.message : String(e));
     } finally {

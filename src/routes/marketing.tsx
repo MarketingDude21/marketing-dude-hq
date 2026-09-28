@@ -823,8 +823,8 @@ function PostsTab({ agentId, isAdmin }: { agentId: string; isAdmin: boolean }) {
       // for the real, authoritative delivery status if it doesn't arrive.
       setSendNote(
         "Sent — they'll get an email with a link to review and approve." +
-          (res.ghlMessageId
-            ? ` (GoHighLevel message ID: ${res.ghlMessageId} — if it doesn't arrive, look this up in GHL's Conversations tab for this agent to see its real delivery status.)`
+          ((res as { ghlMessageId?: string }).ghlMessageId
+            ? ` (GoHighLevel message ID: ${(res as { ghlMessageId?: string }).ghlMessageId} — if it doesn't arrive, look this up in GHL's Conversations tab for this agent to see its real delivery status.)`
             : ""),
       );
     } catch (e) {
@@ -3880,8 +3880,8 @@ function MonthWorkspace({
       const res = await sendContentToAgent({ data: { agentId, month: folder.month } });
       setSendNote(
         "Sent — they'll get an email with a link to review and approve." +
-          (res.ghlMessageId
-            ? ` (GoHighLevel message ID: ${res.ghlMessageId} — if it doesn't arrive, look this up in GHL's Conversations tab for this agent to see its real delivery status.)`
+          ((res as { ghlMessageId?: string }).ghlMessageId
+            ? ` (GoHighLevel message ID: ${(res as { ghlMessageId?: string }).ghlMessageId} — if it doesn't arrive, look this up in GHL's Conversations tab for this agent to see its real delivery status.)`
             : ""),
       );
     } catch (e) {

@@ -1,159 +1,2187 @@
-import { createServerFn } from "@tanstack/react-start";
-import { requireSupabaseAuth } from "@/integrations/supabase/auth-middleware";
-import type { TablesInsert } from "@/integrations/supabase/types";
+import { useEffect, useRef, useState } from "react";
+import { createFileRoute } from "@tanstack/react-router";
+import { AppShell } from "@/components/AppShell";
+import { supabase } from "@/integrations/supabase/client";
+import {
+  getMarketingAccess,
+  listMarketingAgents,
+  listMarketingPosts,
+  listMarketingMonths,
+  updateMarketingPost,
+  submitMarketingFeedback,
+  setPostMedia,
+  setPostDrivePhoto,
+  searchUnsplashPhotos,
+  addEmailPhotoFromLibrary,
+  addEmailPhotoFromDrive,
+  addEmailPhotoFromUnsplash,
+  updateEmailPhotoInstructions,
+  removeEmailPhoto,
+  rewritePostContent,
+  listMarketingMedia,
+  createMediaUploadUrl,
+  finalizeMediaUpload,
+  setMediaTags,
+  markMediaUsed,
+  restoreMediaToAvailable,
+  deleteMarketingMedia,
+  getMediaUploadLink,
+  regenerateMediaUploadLink,
+  listAgentDriveMedia,
+  markDriveFileUsed,
+  restoreDriveFileToActive,
+  setAgentDriveFolder,
+  listCalendarMonths,
+  listAllCalendarMonthsForAdmin,
+  addCalendarMonth,
+  removeCalendarMonth,
+  setCalendarMonthArchived,
+  listCalendarItems,
+  addCalendarItem,
+  removeCalendarItem,
+  readContentCalendar,
+  generateMonthlyBatch,
+  deleteMonthContent,
+  archiveMonthContent,
+  listArchivedBatchesForMonth,
+  restoreArchivedBatch,
+  scanAgentDrivePhotos,
+  scanAgentLibraryPhotos,
+  addPhotoPostsToBatch,
+  approveBatch,
+  approveAllPending,
+  sendContentToAgent,
+  listAgentChatMessages,
+  sendAgentChatMessage,
+  saveChatMessageAsPost,
+  logPhotoScanToChat,
+  getReviewLink,
+  regenerateReviewLink,
+  type MarketingAccess,
+  type MediaRow,
+  type DriveFile,
+  type CalendarMonth,
+  type CalendarItem,
+  type CalendarDoc,
+  type PhotoScanSuggestion,
+  type PostMetadata,
+  type UnsplashResult,
+  type EmailPhoto,
+  type ArchivedBatchSummary,
+  type ChatMode,
+  type ChatMessageRow,
+} from "@/lib/marketing";
+// Type-only import (erased at build) — the runtime docx library is loaded
+// lazily inside buildContentDocxBlob() below instead of imported at the top
+// of the file, so its ~170KB gzipped bundle only ever downloads for someone
+// who actually clicks "Approve All & Download," not on every visit to this
+// page.
+import type { Paragraph, TextRun, ExternalHyperlink } from "docx";
 
-// ============================================================================
-// Monthly Marketing — native integration
-//
-// Unlike Build My Database, this does NOT talk to a separate Supabase
-// project. The agents / generated_posts / feedback_history / agent_photos
-// tables already live in THIS dashboard's own project (agents was set up
-// for Voice DNA — an agent's row id IS their dashboard auth user id).
-//
-// Why this file exists: the old standalone tool (a Netlify app) had no
-// login and no per-client boundary at all.
-//   - Its back-office console (index.html) loaded every agent, unscoped —
-//     anyone who opened it saw every client's content.
-//   - Its client-facing "review" page (review.html) took the agent to show
-//     from a plain ?agent=<id>&batch=<id> URL with zero auth check — anyone
-//     with (or guessing) a link could view AND edit that agent's posts.
-//
-// This file fixes both, using the exact same identity model Voice DNA
-// already proved (admin_allowlist for Mike's team, agents.id = auth user id
-// for everyone else):
-//   - A signed-in agent can only ever see/edit their OWN posts — agentId is
-//     always re-derived server-side from their verified session, never
-//     trusted from the browser.
-//   - Mike's team (admin_allowlist) can look up and act as ANY agent — the
-//     "log into anyone's and just do it for them" upsell flow — but every
-//     single action re-checks the allowlist fresh, and every write is
-//     re-verified against the row it's touching before it's allowed.
-// ============================================================================
+export const Route = createFileRoute("/marketing")({
+  head: () => ({
+    meta: [
+      { title: "Monthly Marketing — Your Marketing Dude" },
+      {
+        name: "description",
+        content: "Monthly social posts, emails, and video scripts generated in your voice.",
+      },
+      { property: "og:title", content: "Monthly Marketing — Your Marketing Dude" },
+      {
+        property: "og:description",
+        content: "Monthly social posts, emails, and video scripts generated in your voice.",
+      },
+      { property: "og:type", content: "website" },
+      { name: "twitter:card", content: "summary_large_image" },
+    ],
+  }),
+  component: MarketingPage,
+});
 
-export type MarketingAccess =
-  { role: "admin" } | { role: "agent"; agentId: string; agentName: string } | { role: "none" };
+type AgentOption = { id: string; name: string; email: string | null };
 
-async function resolveAccess(userId: string, email: string | undefined): Promise<MarketingAccess> {
-  const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
-
-  if (email) {
-    const { data: allow } = await supabaseAdmin
-      .from("admin_allowlist")
-      .select("email")
-      .eq("email", email.toLowerCase().trim())
-      .maybeSingle();
-    if (allow) return { role: "admin" };
-  }
-
-  const { data: agent } = await supabaseAdmin.from("agents").select("id, full_name").eq("id", userId).maybeSingle();
-  if (agent) {
-    return { role: "agent", agentId: agent.id, agentName: agent.full_name ?? "Your account" };
-  }
-
-  return { role: "none" };
-}
-
-export const getMarketingAccess = createServerFn({ method: "GET" })
-  .middleware([requireSupabaseAuth])
-  .handler(async ({ context }): Promise<MarketingAccess> => {
-    const email = (context.claims as { email?: string } | undefined)?.email;
-    return resolveAccess(context.userId, email);
-  });
-
-// Admin-only picker — every agent in the system, so Mike's team can pick who
-// to work as. Only ever returned to a caller resolveAccess already confirmed
-// is on admin_allowlist.
-export const listMarketingAgents = createServerFn({ method: "GET" })
-  .middleware([requireSupabaseAuth])
-  .handler(async ({ context }) => {
-    const email = (context.claims as { email?: string } | undefined)?.email;
-    const access = await resolveAccess(context.userId, email);
-    if (access.role !== "admin") {
-      throw new Error("Only team members can view the agent list.");
-    }
-    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
-    const { data, error } = await supabaseAdmin
-      .from("agents")
-      .select("id, full_name, market_area, email")
-      .order("full_name", { ascending: true });
-    if (error) throw error;
-    return data;
-  });
-
-// Shared guard used by every per-agent action below — re-resolves the
-// caller's access on every call (never trusts an agentId the browser sends)
-// so an agent can never read or edit someone else's content, and an admin's
-// access is always verified fresh rather than cached client-side.
-//
-// Exported (2026-09-28) so Build My Brand (voice-dna.ts) can reuse this
-// exact same admin/agent boundary instead of re-deriving its own copy —
-// Voice DNA and Monthly Marketing already share one identity model
-// (admin_allowlist + agents.id = auth user id, see the file header above),
-// so the access check itself should live in exactly one place, not two
-// copies that could quietly drift apart from each other over time.
-export async function requireAgentAccess(
-  userId: string,
-  email: string | undefined,
-  requestedAgentId: string,
-): Promise<void> {
-  const access = await resolveAccess(userId, email);
-  if (access.role === "admin") return;
-  if (access.role === "agent" && access.agentId === requestedAgentId) return;
-  throw new Error("Not authorized for this agent's content");
-}
-
-// Guards for the shared content calendar below — it isn't scoped to any one
-// agent (every agent reads the same months/items), so these check the
-// caller's role directly rather than re-deriving a specific agentId match.
-async function requireAnyMarketingAccess(userId: string, email: string | undefined): Promise<void> {
-  const access = await resolveAccess(userId, email);
-  if (access.role === "none") throw new Error("You don't have access to Monthly Marketing.");
-}
-
-async function requireAdmin(userId: string, email: string | undefined): Promise<void> {
-  const access = await resolveAccess(userId, email);
-  if (access.role !== "admin") throw new Error("Only team members can manage the content calendar.");
-}
-
-export type PostMetadata = {
-  batch_id?: string | undefined;
-  canva_link?: string | undefined;
-  canva_instructions?: string | null | undefined;
-  goal?: string | undefined;
-  image_suggestion?: string | undefined;
-  source?: string | undefined;
-  drive_file_id?: string | undefined;
-  drive_thumbnail_url?: string | undefined;
-  media_id?: string | null | undefined;
-  media_url?: string | null | undefined;
-  media_type?: string | null | undefined;
-  // Set when a photo was picked from Unsplash on the per-post picker (added
-  // 2026-09-18, per Mike's request for a stock-photo option — mainly meant
-  // for emails, whose photos don't come from an agent's own Drive/library).
-  // Unsplash's API terms require visible photographer credit on any hotlinked
-  // image, so these travel with the post specifically so the UI can render
-  // that credit line next to the photo.
-  unsplash_photographer?: string | null | undefined;
-  unsplash_credit_url?: string | null | undefined;
-  // Up to 3 photos attached to an EMAIL specifically — added 2026-09-21 per
-  // Mike: "Emails should have the ability to include up to 3 photos from
-  // any combination. Those images would come with publishing instructions."
-  // A post still only ever has one photo (the media_id/drive_file_id/
-  // unsplash_* fields above), so this is deliberately separate rather than
-  // turning those into arrays. See the EmailPhoto type and the
-  // addEmailPhotoFrom.../updateEmailPhotoInstructions/removeEmailPhoto
-  // functions below.
-  email_photos?: EmailPhoto[] | undefined;
-  [key: string]: string | number | boolean | null | undefined | EmailPhoto[];
+type Post = {
+  id: string;
+  content: string;
+  content_type: string;
+  title: string | null;
+  platform: string | null;
+  status: string;
+  month: string | null;
+  scheduled_for: string | null;
+  created_at: string;
+  metadata: PostMetadata | null;
 };
 
-// Fixed tag vocabulary for the native Media library, ported from the old
-// app's separate "Tag Photos" screen (PHOTO_TAGS) so the team keys in the
-// same categories they already know — folded into the Media tab itself here
-// instead of a separate screen, since there's no Drive-scan step to hang a
-// separate screen off of. Exported so the Media tab's tag chips use the
-// exact same list the matching logic below understands.
-export const PHOTO_TAG_OPTIONS = [
+// Content is grouped and ordered by kind everywhere it's shown in a batch
+// (the Posts tab and the calendar review screen) so the four different
+// pieces of content Mike's team produces each month never get mixed
+// together in one visually identical pile — added per Mike's request
+// (2026-09-18) for a clearer, more obviously-categorized layout with icons.
+// Order is fixed: posts, then Canva templates, then emails, then video
+// scripts.
+type ContentCategory = "post" | "canva" | "email" | "video";
+
+const CATEGORY_ORDER: ContentCategory[] = ["post", "canva", "email", "video"];
+
+// The three metadata.source values that mean "this post belongs to a
+// month's calendar batch" — already fully reviewable on the "Generate My
+// Monthly Content Calendar" tab (MonthWorkspace's own batchPosts filter).
+// Shared by that filter and by "Create Individual Posts" (PostsTab), which
+// excludes exactly this set so the two tabs show disjoint content instead
+// of the same posts twice — see the comment on PostsTab (2026-09-18, per
+// Mike: "this post section is repetitive to the generate my monthly
+// content... we do need to remove everything that displays in it").
+const BATCH_SOURCES = new Set(["content_calendar", "drive_photo_scan", "library_photo_scan"]);
+
+const CATEGORY_META: Record<ContentCategory, { label: string; icon: string; accent: string }> = {
+  post: {
+    label: "Posts",
+    icon: "📝",
+    accent: "border-sky-500/30 bg-sky-500/10 text-sky-700 dark:text-sky-300",
+  },
+  canva: {
+    label: "Canva Templates",
+    icon: "🎨",
+    accent: "border-violet-500/30 bg-violet-500/10 text-violet-700 dark:text-violet-300",
+  },
+  email: {
+    label: "Emails",
+    icon: "✉️",
+    accent: "border-emerald-500/30 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300",
+  },
+  video: {
+    label: "Video Scripts",
+    icon: "🎬",
+    accent: "border-amber-500/30 bg-amber-500/10 text-amber-700 dark:text-amber-300",
+  },
+};
+
+function categorizePost(post: Post): ContentCategory {
+  if (post.content_type === "email") return "email";
+  if (post.content_type === "video") return "video";
+  return post.metadata?.canva_link ? "canva" : "post";
+}
+
+function Card({ children, className = "" }: { children: React.ReactNode; className?: string }) {
+  return (
+    <div className={`rounded-3xl border border-border bg-glass p-6 backdrop-blur-2xl ${className}`}>{children}</div>
+  );
+}
+
+function Button({
+  children,
+  onClick,
+  variant = "primary",
+  disabled,
+  title,
+}: {
+  children: React.ReactNode;
+  onClick?: () => void;
+  variant?: "primary" | "secondary" | "danger";
+  disabled?: boolean;
+  title?: string | undefined;
+}) {
+  const styles =
+    variant === "primary"
+      ? "bg-primary text-primary-foreground shadow-lg shadow-primary/30 hover:-translate-y-0.5"
+      : variant === "danger"
+        ? "border border-destructive/40 text-destructive hover:bg-destructive/10"
+        : "border border-border bg-glass hover:bg-secondary";
+  return (
+    <button
+      onClick={onClick}
+      disabled={disabled}
+      title={title}
+      className={`rounded-full px-5 py-2 text-sm font-semibold transition-all disabled:cursor-not-allowed disabled:opacity-50 ${styles}`}
+    >
+      {children}
+    </button>
+  );
+}
+
+// A textarea that grows to fit its content instead of staying pinned to a
+// small fixed height — added 2026-09-21 per Mike's bug report: "when you
+// click edit an email the whole edit screen shrinks." Root cause: the plain
+// <textarea> used everywhere content gets edited had only a min-height, so
+// a genuinely long piece of content (an email body is often 200+ words)
+// rendered as a small scrollable box the moment you clicked Edit, instead of
+// showing the same amount of text at once that the read-only view (an
+// uncapped <p>) already did — it wasn't actually losing anything, it just
+// LOOKED like the card had shrunk. This measures the textarea's own
+// scrollHeight on mount and on every keystroke and sets its CSS height to
+// match, so the edit view is always at least as tall as its content, same
+// as the read view. Used everywhere a piece of already-generated content
+// gets edited (a post/email/video card, a photo-scan suggestion) — not the
+// small "Publishing instructions" boxes on an email photo, which are meant
+// to hold a short note and are fine staying a fixed, manually resizable size.
+function AutoResizeTextarea({
+  value,
+  onChange,
+  className,
+  placeholder,
+  minHeightPx = 140,
+}: {
+  value: string;
+  onChange: (value: string) => void;
+  className?: string;
+  placeholder?: string;
+  minHeightPx?: number;
+}) {
+  const ref = useRef<HTMLTextAreaElement>(null);
+
+  useEffect(() => {
+    const el = ref.current;
+    if (!el) return;
+    el.style.height = "auto";
+    el.style.height = `${Math.max(minHeightPx, el.scrollHeight)}px`;
+  }, [value, minHeightPx]);
+
+  return (
+    <textarea
+      ref={ref}
+      value={value}
+      onChange={(e) => onChange(e.target.value)}
+      placeholder={placeholder}
+      className={className}
+      style={{ overflow: "hidden", resize: "vertical" }}
+    />
+  );
+}
+
+// Renders a calendar brief's image/Canva instructions as an actual bulleted
+// list instead of one run-on paragraph — added 2026-09-20 per Mike's
+// screenshot feedback ("too long," "very confusing," asked for bullet
+// points). New content comes from marketing.ts's parsePostDoc/toBullets
+// already newline-joined and cleaned; older, already-generated posts made
+// before this fix still have their text semicolon-joined, so this falls
+// back to splitting on "; " too, so existing pending content reads better
+// immediately rather than only after a fresh Generate. Long briefs (more
+// than 4 lines — the common case for a multi-slide carousel/video brief)
+// show only the first 3 up front with the rest tucked behind a native
+// <details> disclosure, so the card itself stays short without losing any
+// detail — this is what actually answers "this is too long."
+function SuggestionBullets({ text }: { text: string }) {
+  const lines = (text.includes("\n") ? text.split("\n") : text.split("; ")).map((l) => l.trim()).filter(Boolean);
+  if (lines.length === 0) return null;
+  if (lines.length <= 4) {
+    return (
+      <ul className="list-disc space-y-0.5 pl-4">
+        {lines.map((l, i) => (
+          <li key={i}>{l}</li>
+        ))}
+      </ul>
+    );
+  }
+  const shown = lines.slice(0, 3);
+  const rest = lines.slice(3);
+  return (
+    <>
+      <ul className="list-disc space-y-0.5 pl-4">
+        {shown.map((l, i) => (
+          <li key={i}>{l}</li>
+        ))}
+      </ul>
+      <details className="mt-1">
+        <summary className="cursor-pointer text-[11px] font-semibold text-primary">+{rest.length} more</summary>
+        <ul className="mt-1 list-disc space-y-0.5 pl-4">
+          {rest.map((l, i) => (
+            <li key={i}>{l}</li>
+          ))}
+        </ul>
+      </details>
+    </>
+  );
+}
+
+function StatusBadge({ status }: { status: string }) {
+  const styles =
+    status === "approved"
+      ? "bg-[color-mix(in_oklab,var(--color-primary)_14%,transparent)] text-primary"
+      : status === "flagged"
+        ? "bg-destructive/10 text-destructive"
+        : "bg-muted text-muted-foreground";
+  const label = status === "approved" ? "Approved" : status === "flagged" ? "Flagged" : "Pending review";
+  return <span className={`rounded-full px-3 py-1 text-xs font-semibold ${styles}`}>{label}</span>;
+}
+
+// Minimal ambient typing for the Web Speech API — it isn't in lib.dom.d.ts.
+// Same approach voice.tsx's mic already uses; duplicated here (not imported)
+// since it's a small, self-contained bit and the two routes don't currently
+// share a components module.
+type SpeechRecognitionLike = {
+  continuous: boolean;
+  interimResults: boolean;
+  lang: string;
+  onstart: (() => void) | null;
+  onresult: ((event: any) => void) | null;
+  onend: (() => void) | null;
+  onerror: ((event: any) => void) | null;
+  start: () => void;
+  abort: () => void;
+};
+
+function getSpeechRecognitionCtor(): (new () => SpeechRecognitionLike) | undefined {
+  if (typeof window === "undefined") return undefined;
+  const w = window as unknown as {
+    SpeechRecognition?: new () => SpeechRecognitionLike;
+    webkitSpeechRecognition?: new () => SpeechRecognitionLike;
+  };
+  return w.SpeechRecognition ?? w.webkitSpeechRecognition;
+}
+
+function isIOSDevice(): boolean {
+  if (typeof navigator === "undefined") return false;
+  return (
+    /iPad|iPhone|iPod/.test(navigator.userAgent) || (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1)
+  );
+}
+
+// A small dictation button for any textarea/input in this page — added per
+// Mike's request (2026-09-17, "there is no microphone options here at all").
+// Same underlying browser Speech Recognition mechanism Voice DNA's own mic
+// already uses (no server cost, no new secret), generalized here to work
+// against any value/onChange pair instead of one indexed answers array. Tap
+// to start, tap again to stop; speech is appended to whatever was already
+// typed, so it can be mixed with typing.
+function MicButton({ value, onChange }: { value: string; onChange: (v: string) => void }) {
+  const [supported] = useState<boolean>(() => Boolean(getSpeechRecognitionCtor()));
+  const [listening, setListening] = useState(false);
+  const [label, setLabel] = useState<string | null>(null);
+  const recogRef = useRef<SpeechRecognitionLike | null>(null);
+  const userStoppedRef = useRef(false);
+  const deniedRef = useRef(false);
+  const valueRef = useRef(value);
+  valueRef.current = value;
+
+  useEffect(() => {
+    return () => {
+      const r = recogRef.current;
+      if (r) {
+        r.onstart = null;
+        r.onresult = null;
+        r.onend = null;
+        r.onerror = null;
+        try {
+          r.abort();
+        } catch {
+          // ignore
+        }
+        recogRef.current = null;
+      }
+    };
+  }, []);
+
+  function resetUI(msg?: string) {
+    setListening(false);
+    setLabel(msg ?? null);
+  }
+
+  function attemptRestart(baseText: string, attemptNum: number) {
+    if (userStoppedRef.current || deniedRef.current) return;
+    try {
+      startInstance(baseText);
+    } catch {
+      if (attemptNum < 5) {
+        setTimeout(() => attemptRestart(baseText, attemptNum + 1), 150 * (attemptNum + 1));
+      } else {
+        resetUI("Mic paused — tap to resume, what you said so far is kept.");
+      }
+    }
+  }
+
+  function startInstance(baseTextIn: string) {
+    let baseText = baseTextIn;
+    const Ctor = getSpeechRecognitionCtor();
+    if (!Ctor) return;
+    const recog = new Ctor();
+    recog.continuous = !isIOSDevice();
+    recog.interimResults = true;
+    recog.lang = "en-US";
+    let finalTranscript = "";
+
+    recog.onstart = () => {
+      setListening(true);
+      deniedRef.current = false;
+      finalTranscript = "";
+      setLabel("Listening… tap to stop");
+    };
+    recog.onresult = (e: any) => {
+      let interim = "";
+      for (let i = e.resultIndex; i < e.results.length; i++) {
+        if (e.results[i].isFinal) finalTranscript += e.results[i][0].transcript + " ";
+        else interim += e.results[i][0].transcript;
+      }
+      onChange(baseText + finalTranscript + interim);
+    };
+    recog.onend = () => {
+      setListening(false);
+      baseText = baseText + finalTranscript;
+      if (!userStoppedRef.current && !deniedRef.current) {
+        attemptRestart(baseText, 0);
+        return;
+      }
+      resetUI();
+    };
+    recog.onerror = (e: any) => {
+      setListening(false);
+      if (e.error === "not-allowed" || e.error === "service-not-allowed") {
+        deniedRef.current = true;
+        userStoppedRef.current = true;
+        resetUI("Mic access blocked — allow microphone access, or just type.");
+        return;
+      }
+      if (e.error === "no-speech" || e.error === "aborted") return;
+      if (e.error === "network") {
+        resetUI("Network hiccup — tap to try again.");
+        userStoppedRef.current = true;
+        return;
+      }
+      resetUI("Error — please type instead.");
+      userStoppedRef.current = true;
+    };
+
+    recogRef.current = recog;
+    recog.start();
+  }
+
+  function toggle() {
+    if (!supported) return;
+    if (listening) {
+      userStoppedRef.current = true;
+      const r = recogRef.current;
+      if (r) {
+        try {
+          r.abort();
+        } catch {
+          // ignore
+        }
+      }
+      resetUI();
+      return;
+    }
+    userStoppedRef.current = false;
+    deniedRef.current = false;
+    startInstance(valueRef.current);
+  }
+
+  if (!supported) return null;
+
+  return (
+    <span className="inline-flex items-center gap-2">
+      <button
+        type="button"
+        onClick={toggle}
+        title={listening ? "Tap to stop dictating" : "Tap to dictate"}
+        className={`inline-flex h-7 w-7 items-center justify-center rounded-full border text-xs transition-colors ${
+          listening
+            ? "border-primary bg-primary text-primary-foreground animate-pulse"
+            : "border-border text-muted-foreground hover:border-primary/50"
+        }`}
+      >
+        🎤
+      </button>
+      {label && <span className="text-[11px] text-muted-foreground">{label}</span>}
+    </span>
+  );
+}
+
+function MarketingPage() {
+  const [access, setAccess] = useState<MarketingAccess | null>(null);
+  const [accessError, setAccessError] = useState<string | null>(null);
+  const [agents, setAgents] = useState<AgentOption[]>([]);
+  const [selected, setSelected] = useState<AgentOption | null>(null);
+  const [showCalendarAdmin, setShowCalendarAdmin] = useState(false);
+
+  useEffect(() => {
+    getMarketingAccess()
+      .then(async (a) => {
+        setAccess(a);
+        if (a.role === "admin") {
+          const list = await listMarketingAgents();
+          setAgents(
+            list.map((ag) => ({
+              id: ag.id,
+              name: ag.full_name ?? ag.email ?? "Unnamed agent",
+              email: ag.email ?? null,
+            })),
+          );
+        } else if (a.role === "agent") {
+          setSelected({ id: a.agentId, name: a.agentName, email: null });
+        }
+      })
+      .catch((e) => setAccessError(e instanceof Error ? e.message : String(e)));
+  }, []);
+
+  if (accessError) {
+    return (
+      <AppShell>
+        <PageHeader />
+        <Card className="mt-5">
+          <p className="text-sm text-destructive">{accessError}</p>
+        </Card>
+      </AppShell>
+    );
+  }
+
+  if (!access) {
+    return (
+      <AppShell>
+        <PageHeader />
+        <Card className="mt-5">
+          <p className="text-sm text-muted-foreground">Loading…</p>
+        </Card>
+      </AppShell>
+    );
+  }
+
+  if (access.role === "none") {
+    return (
+      <AppShell>
+        <PageHeader />
+        <Card className="mt-5">
+          <p className="text-sm text-muted-foreground">
+            Your account isn't set up in Monthly Marketing yet. Ask your team to add you as an agent.
+          </p>
+        </Card>
+      </AppShell>
+    );
+  }
+
+  if (access.role === "admin" && showCalendarAdmin) {
+    return (
+      <AppShell>
+        <PageHeader />
+        <ManageCalendarScreen onBack={() => setShowCalendarAdmin(false)} />
+      </AppShell>
+    );
+  }
+
+  if (access.role === "admin" && !selected) {
+    return (
+      <AppShell>
+        <PageHeader />
+        <Card className="mt-5">
+          <div className="flex flex-wrap items-start justify-between gap-3">
+            <div>
+              <h2 className="font-display text-lg font-semibold">Content Calendar</h2>
+              <p className="mt-1 text-sm text-muted-foreground">
+                One calendar, shared by every agent — build out each month's posts, emails, and video briefs once here,
+                and every agent generates their own personalized version of it from their own login.
+              </p>
+            </div>
+            <Button onClick={() => setShowCalendarAdmin(true)}>Manage Content Calendar</Button>
+          </div>
+        </Card>
+        <Card className="mt-5">
+          <h2 className="font-display text-lg font-semibold">Choose an agent</h2>
+          <p className="mt-1 text-sm text-muted-foreground">
+            Pick who you're working on behalf of. Every action you take here is logged against their account, not yours.
+          </p>
+          <div className="mt-4 grid gap-2 sm:grid-cols-2 lg:grid-cols-3">
+            {agents.map((a) => {
+              // Flags a duplicate display name — added 2026-09-18 while
+              // investigating Mike's report that Meghan Simons' Drive folder
+              // "still" doesn't appear client-side even after being set here.
+              // The code path that reads/writes drive_folder_id is confirmed
+              // correct (see DriveTab) — every save/read targets the exact
+              // agentId this button carries, so the leading theory left is
+              // that two separate agent rows share the same display name and
+              // admin is unknowingly saving the folder onto the wrong one.
+              // Two identical-looking buttons here would make that mistake
+              // invisible, so each one now also shows its email — and any
+              // name shared by more than one row gets a visible flag.
+              const isDuplicateName = agents.filter((o) => o.name === a.name).length > 1;
+              return (
+                <button
+                  key={a.id}
+                  onClick={() => setSelected(a)}
+                  className="rounded-2xl border border-border bg-glass px-4 py-3 text-left text-sm font-medium transition-colors hover:bg-secondary"
+                >
+                  <span className="flex items-center gap-1.5">
+                    {a.name}
+                    {isDuplicateName && (
+                      <span
+                        title="Another agent also has this exact name — double check the email below before connecting anything to this one."
+                        className="rounded-full bg-amber-500/20 px-1.5 py-0.5 text-[10px] font-semibold text-amber-600 dark:text-amber-400"
+                      >
+                        ⚠ duplicate name
+                      </span>
+                    )}
+                  </span>
+                  {a.email && <span className="mt-0.5 block text-xs font-normal text-muted-foreground">{a.email}</span>}
+                </button>
+              );
+            })}
+            {agents.length === 0 && <p className="text-sm text-muted-foreground">No agents yet.</p>}
+          </div>
+        </Card>
+      </AppShell>
+    );
+  }
+
+  if (!selected) return null;
+
+  return (
+    <AppShell>
+      <PageHeader
+        agentName={selected.name}
+        onChangeAgent={access.role === "admin" ? () => setSelected(null) : undefined}
+      />
+      <Workspace agentId={selected.id} agentEmail={selected.email} isAdmin={access.role === "admin"} />
+    </AppShell>
+  );
+}
+
+function PageHeader({
+  agentName,
+  onChangeAgent,
+}: {
+  agentName?: string | undefined;
+  onChangeAgent?: (() => void) | undefined;
+}) {
+  return (
+    <div className="flex flex-wrap items-end justify-between gap-3 pt-2">
+      <div>
+        <h1 className="font-display text-2xl font-bold tracking-tight">Monthly Marketing</h1>
+        <p className="mt-1 text-sm text-muted-foreground">
+          {agentName ? `Viewing as: ${agentName}` : "Posts, emails, and video scripts in your voice — every month."}
+        </p>
+      </div>
+      {onChangeAgent && (
+        <Button variant="secondary" onClick={onChangeAgent}>
+          Change agent
+        </Button>
+      )}
+    </div>
+  );
+}
+
+function Workspace({ agentId, agentEmail, isAdmin }: { agentId: string; agentEmail: string | null; isAdmin: boolean }) {
+  const [tab, setTab] = useState<"posts" | "calendar" | "media" | "drive">("posts");
+  return (
+    <div className="mt-5">
+      {/* Heading + mobile-centered nav, added 2026-09-23 per Mike: "it needs
+          to say above the first set of buttons What Do You Want To Do? on
+          both desktop and mobile. Then on mobile center the buttons." The
+          pill row itself is unchanged (still `w-fit` so it hugs its own
+          content) — it's wrapped in a flex container that centers it on
+          small screens and reverts to left-aligned from `sm:` up, matching
+          the desktop layout Mike didn't ask to change. */}
+      <h2 className="text-center text-sm font-semibold text-foreground sm:text-left">What Do You Want To Do?</h2>
+      <div className="mt-2 flex justify-center sm:justify-start">
+        <div className="flex flex-wrap justify-center gap-1 rounded-full border border-border bg-glass p-1 backdrop-blur-xl w-fit">
+          {(["posts", "calendar", "media", "drive"] as const).map((t) => (
+            <button
+              key={t}
+              onClick={() => setTab(t)}
+              className={`rounded-full px-4 py-1.5 text-sm font-medium transition-colors ${
+                tab === t ? "bg-secondary text-foreground" : "text-muted-foreground hover:text-foreground"
+              }`}
+            >
+              {t === "posts"
+                ? "Create Individual Posts"
+                : t === "calendar"
+                  ? "Generate My Monthly Content Calendar"
+                  : t === "media"
+                    ? "Media"
+                    : "Google Drive"}
+            </button>
+          ))}
+        </div>
+      </div>
+      <div className="mt-5">
+        {tab === "posts" && <PostsTab agentId={agentId} isAdmin={isAdmin} />}
+        {tab === "calendar" && <ContentCalendarTab agentId={agentId} isAdmin={isAdmin} />}
+        {tab === "media" && <MediaTab agentId={agentId} isAdmin={isAdmin} />}
+        {tab === "drive" && <DriveTab agentId={agentId} agentEmail={agentEmail} isAdmin={isAdmin} />}
+      </div>
+    </div>
+  );
+}
+
+// Renamed "Posts" → "Create Individual Posts" and cut down substantially
+// (2026-09-18) per Mike: "this post section is repetitive to the generate
+// my monthly content... we do need to remove everything that displays in it
+// because that already displays in create my monthly content... there's
+// nothing for you to even look at in there." He's right that it was mixed:
+// this tab's grid showed EVERY post for the agent regardless of source, so
+// a month's calendar-generated batch (already fully reviewable, with its
+// own Approve/Send/Download, on the "Generate My Monthly Content Calendar"
+// tab) was also showing up here a second time.
+//
+// Fix: this tab's grid is now filtered to exclude the three sources that
+// already have a home on the calendar tab (content_calendar,
+// drive_photo_scan, library_photo_scan — see BATCH_SOURCES below, shared
+// with MonthWorkspace's own filter so the two stay exact opposites of each
+// other) — what's left here is only content this tab itself creates
+// one-off, via "+ New content" (metadata.source "native_generate"). The
+// Drive/Media-Library photo-scan panel was removed from this tab entirely
+// for the same reason: MonthWorkspace already has its own copy, and a
+// suggestion added from either one is a content_calendar-adjacent source
+// that would only ever show on the calendar tab anyway — having two
+// separate scan buttons that both feed the same one destination was exactly
+// the kind of duplication Mike flagged, just one level deeper.
+function PostsTab({ agentId, isAdmin }: { agentId: string; isAdmin: boolean }) {
+  const [months, setMonths] = useState<string[]>([]);
+  const [month, setMonth] = useState<string>("");
+  const [posts, setPosts] = useState<Post[] | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [approvingAll, setApprovingAll] = useState(false);
+  const [approveNote, setApproveNote] = useState<string | null>(null);
+  const [sending, setSending] = useState(false);
+  const [sendNote, setSendNote] = useState<string | null>(null);
+  const [actionError, setActionError] = useState<string | null>(null);
+  // Still needed here even without the photo-scan panel — PostCard's own
+  // "Change photo" picker has a Google Drive tab gated on this being set.
+  const [driveFolderId, setDriveFolderId] = useState<string | null>(null);
+
+  // `clear` only true for a genuine month/agent switch — an action-triggered
+  // reload (after Approve, Save, a photo change, etc.) keeps the current
+  // posts on screen while the fresh list loads in the background instead of
+  // wiping the whole grid to nothing first. Fixes Mike's report (2026-09-18)
+  // that editing and saving a post "does a weird timeout and then comes back
+  // like a reset" — that was this screen briefly unmounting every card
+  // (including whichever ones had feedback/photo panels open) every single
+  // time anything changed, not an actual save failure.
+  function reload(opts?: { clear?: boolean }) {
+    if (opts?.clear) setPosts(null);
+    const payload = month ? { agentId, month } : { agentId };
+    listMarketingPosts({ data: payload })
+      .then((p) => setPosts(p as Post[]))
+      .catch((e) => setError(e instanceof Error ? e.message : String(e)));
+  }
+
+  useEffect(() => {
+    setMonths([]);
+    setMonth("");
+    listMarketingMonths({ data: { agentId } })
+      .then((m) => setMonths(m))
+      .catch(() => {});
+    listAgentDriveMedia({ data: { agentId } })
+      .then((d) => setDriveFolderId(d.folderId))
+      .catch(() => setDriveFolderId(null));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [agentId]);
+
+  useEffect(() => {
+    reload({ clear: true });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [agentId, month]);
+
+  // Explicit confirmation text after this finishes — added per Mike's
+  // report (2026-09-18) that clicking Approve all didn't seem to do
+  // anything until he navigated away and back. The status badges on each
+  // card do update immediately once reload() resolves, but there was no
+  // unmistakable, un-missable confirmation that the click itself worked, so
+  // this adds one plainly on the screen without needing to go find it.
+  //
+  // Also downloads the txt+docx export now (2026-09-18, second pass), via
+  // the same downloadContentExport() the calendar tab's "Approve All &
+  // Download" already used — this tab's "Approve all" previously only
+  // flipped statuses with no download at all, which is exactly what Mike
+  // meant by "no download comes up when the client or user approves on
+  // their end": the client mostly lives on this tab (it's the default one),
+  // not the calendar tab, so it's the one that actually needed this. Only
+  // downloads when a specific month is picked — "All months" mixes batches
+  // together in a way that doesn't make sense as one publishing doc.
+  async function approveAll() {
+    setApprovingAll(true);
+    setActionError(null);
+    setApproveNote(null);
+    try {
+      const res = await approveAllPending({ data: month ? { agentId, month } : { agentId } });
+      let noteTail = "";
+      if (month) {
+        const files = await downloadContentExport(posts ?? [], month);
+        if (files) noteTail = ` Downloaded ${files.textFileName} and ${files.docxFileName}.`;
+      }
+      setApproveNote(
+        (res.updated > 0
+          ? `Approved ${res.updated} post${res.updated === 1 ? "" : "s"}.`
+          : "Nothing left to approve — everything here is already approved.") + noteTail,
+      );
+      reload();
+    } catch (e) {
+      setActionError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setApprovingAll(false);
+    }
+  }
+
+  async function sendToAgent() {
+    if (!month) return;
+    setSending(true);
+    setActionError(null);
+    setSendNote(null);
+    try {
+      const res = await sendContentToAgent({ data: { agentId, month } });
+      // Surfaced 2026-09-28 per Mike: "agents not being sent the email" —
+      // GoHighLevel accepting this call (no error) only means it logged the
+      // message, not that it actually delivered — this id is what to look up
+      // directly inside GoHighLevel (Contacts → this agent → Conversations)
+      // for the real, authoritative delivery status if it doesn't arrive.
+      setSendNote(
+        "Sent — they'll get an email with a link to review and approve." +
+          (res.ghlMessageId
+            ? ` (GoHighLevel message ID: ${res.ghlMessageId} — if it doesn't arrive, look this up in GHL's Conversations tab for this agent to see its real delivery status.)`
+            : ""),
+      );
+    } catch (e) {
+      setActionError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setSending(false);
+    }
+  }
+
+  if (error) {
+    return (
+      <Card>
+        <p className="text-sm text-destructive">{error}</p>
+      </Card>
+    );
+  }
+
+  // Only this tab's own one-off content (see BATCH_SOURCES/comment above) —
+  // a calendar batch's posts, or ones added via the other tab's photo scan,
+  // never show here now, only on "Generate My Monthly Content Calendar".
+  const ownPosts = (posts ?? []).filter((p) => !BATCH_SOURCES.has(p.metadata?.source ?? ""));
+  const pendingCount = ownPosts.filter((p) => p.status !== "approved").length;
+
+  return (
+    <div className="space-y-4">
+      <ChatHub agentId={agentId} driveFolderId={driveFolderId} onSavedPost={reload} />
+
+      <div className="flex flex-wrap items-center gap-2">
+        {months.length > 0 && (
+          <>
+            <span className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">Month</span>
+            <select
+              value={month}
+              onChange={(e) => setMonth(e.target.value)}
+              className="rounded-xl border border-border bg-glass px-3 py-1.5 text-sm outline-none"
+            >
+              <option value="">All months</option>
+              {months.map((m) => (
+                <option key={m} value={m}>
+                  {m}
+                </option>
+              ))}
+            </select>
+          </>
+        )}
+        {ownPosts.length > 0 && (
+          <Button onClick={approveAll} disabled={approvingAll || pendingCount === 0}>
+            {approvingAll ? "Approving…" : `Approve all${pendingCount ? ` (${pendingCount})` : ""}`}
+          </Button>
+        )}
+        {isAdmin && (
+          <Button
+            variant="secondary"
+            onClick={sendToAgent}
+            disabled={sending || !month}
+            title={month ? undefined : "Pick a specific month above first"}
+          >
+            {sending ? "Sending…" : "Send to Agent"}
+          </Button>
+        )}
+      </div>
+
+      {approveNote && <p className="text-xs text-muted-foreground">{approveNote}</p>}
+      {sendNote && <p className="text-xs text-muted-foreground">{sendNote}</p>}
+      {actionError && <p className="text-xs text-destructive">{actionError}</p>}
+
+      {isAdmin && <PublicReviewLinkCard agentId={agentId} />}
+
+      {posts === null && (
+        <Card>
+          <p className="text-sm text-muted-foreground">Loading…</p>
+        </Card>
+      )}
+
+      {posts !== null && ownPosts.length === 0 && (
+        <Card>
+          <p className="text-sm text-muted-foreground">
+            Nothing created one-off yet — use "+ New content" above. Content from a month's calendar (or its photo scan)
+            lives on the "Generate My Monthly Content Calendar" tab instead, not here.
+          </p>
+        </Card>
+      )}
+
+      {ownPosts.length > 0 && (
+        <div className="space-y-6">
+          {CATEGORY_ORDER.map((cat) => {
+            const group = ownPosts.filter((p) => categorizePost(p) === cat);
+            if (!group.length) return null;
+            return (
+              <BatchSection
+                key={cat}
+                category={cat}
+                posts={group}
+                agentId={agentId}
+                driveFolderId={driveFolderId}
+                onChanged={reload}
+              />
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ============================================================================
+// Individual Posts — "personal marketing dude" chat hub (2026-09-21).
+//
+// Replaces the old CreateContentForm (a form that submitted into the list
+// below) with a real persistent thread per agent, per Mike's voice note:
+// "this should basically be their individualized chat, personalized chat
+// GPT... every post has to go through their voice DNA, the data needs to be
+// saved, it needs to get smarter as they post." Backed by
+// agent_chat_messages (see listAgentChatMessages/sendAgentChatMessage in
+// marketing.ts) — one continuous conversation with a mode switcher, not a
+// separate siloed thread per content type. Scan My Photos reuses the exact
+// same scanAgentDrivePhotos/scanAgentLibraryPhotos/addPhotoPostsToBatch this
+// app's calendar-tab PhotoScanPanel already uses, just logged into the
+// thread via logPhotoScanToChat instead of a separate panel. Carousel mode
+// is shown but disabled — blocked on Mike sending a brand/template
+// direction, see individual-posts-hub-scoping.md.
+// ============================================================================
+
+const CHAT_MODE_LABELS: Record<ChatMode, string> = {
+  post: "Social post",
+  email: "Email",
+  video_script: "Video script",
+  photo_scan: "Scan my photos",
+};
+
+function ChatMessageBubble({ msg, agentId, onSaved }: { msg: ChatMessageRow; agentId: string; onSaved: () => void }) {
+  const [saving, setSaving] = useState(false);
+  const [saved, setSaved] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const isAssistant = msg.role === "assistant";
+  const isPhotoScan = msg.mode === "photo_scan";
+  const meta = (msg.metadata ?? {}) as {
+    thumbnailUrl?: string;
+    source?: "drive" | "library";
+    sourceId?: string;
+  };
+
+  async function saveAsPost() {
+    setSaving(true);
+    setError(null);
+    try {
+      if (isPhotoScan && meta.source && meta.sourceId) {
+        await addPhotoPostsToBatch({
+          data: {
+            agentId,
+            month: new Date().toISOString().slice(0, 7),
+            items: [
+              {
+                title: msg.content.slice(0, 60),
+                content: msg.content,
+                source: meta.source,
+                sourceId: meta.sourceId,
+                thumbnailUrl: meta.thumbnailUrl ?? "",
+              },
+            ],
+          },
+        });
+      } else {
+        await saveChatMessageAsPost({
+          data: {
+            agentId,
+            messageId: msg.id,
+            contentType: msg.mode === "email" ? "email" : msg.mode === "video_script" ? "video" : "post",
+          },
+        });
+      }
+      setSaved(true);
+      onSaved();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <div className={`flex ${isAssistant ? "justify-start" : "justify-end"}`}>
+      <div
+        className={`max-w-[85%] rounded-2xl px-4 py-3 text-sm ${
+          isAssistant ? "border border-border bg-glass" : "bg-primary text-primary-foreground"
+        }`}
+      >
+        {meta.thumbnailUrl && (
+          <img src={meta.thumbnailUrl} alt="" className="mb-2 h-32 w-full rounded-xl object-cover" />
+        )}
+        <p className="whitespace-pre-wrap">{msg.content}</p>
+        {isAssistant && (
+          <div className="mt-2 flex flex-wrap items-center gap-2">
+            {!saved ? (
+              <Button variant="secondary" onClick={saveAsPost} disabled={saving}>
+                {saving ? "Saving…" : "Save as draft post"}
+              </Button>
+            ) : (
+              <span className="text-xs font-semibold text-primary">Saved — review it below</span>
+            )}
+          </div>
+        )}
+        {error && <p className="mt-1 text-xs text-destructive">{error}</p>}
+      </div>
+    </div>
+  );
+}
+
+function ChatHub({
+  agentId,
+  driveFolderId,
+  onSavedPost,
+}: {
+  agentId: string;
+  driveFolderId: string | null;
+  onSavedPost: () => void;
+}) {
+  const [mode, setMode] = useState<ChatMode>("post");
+  const [messages, setMessages] = useState<ChatMessageRow[] | null>(null);
+  const [draft, setDraft] = useState("");
+  const [sending, setSending] = useState(false);
+  const [scanning, setScanning] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const bottomRef = useRef<HTMLDivElement>(null);
+
+  function loadMessages() {
+    listAgentChatMessages({ data: { agentId } })
+      .then((m) => setMessages(m))
+      .catch((e) => setError(e instanceof Error ? e.message : String(e)));
+  }
+
+  useEffect(() => {
+    setMessages(null);
+    loadMessages();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [agentId]);
+
+  useEffect(() => {
+    bottomRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [messages]);
+
+  async function send() {
+    const text = draft.trim();
+    if (!text) return;
+    setSending(true);
+    setError(null);
+    setDraft("");
+    try {
+      await sendAgentChatMessage({ data: { agentId, mode, message: text } });
+      loadMessages();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setSending(false);
+    }
+  }
+
+  // Scans a few unused photos (Drive if this agent has a folder connected,
+  // their native Media Library otherwise — same source choice the old
+  // PhotoScanPanel offered) and drops each caption straight into the thread.
+  async function scanPhotos() {
+    setScanning(true);
+    setError(null);
+    try {
+      const res = driveFolderId
+        ? await scanAgentDrivePhotos({ data: { agentId, folderId: driveFolderId, maxPhotos: 3 } })
+        : await scanAgentLibraryPhotos({ data: { agentId, maxPhotos: 3 } });
+      if (!res.suggestions.length) {
+        setError("No new unused photos found right now.");
+      } else {
+        for (const s of res.suggestions) {
+          await logPhotoScanToChat({
+            data: {
+              agentId,
+              suggestedPost: s.suggestedPost,
+              source: s.source,
+              sourceId: s.fileId,
+              thumbnailUrl: s.thumbnailUrl,
+              fileName: s.fileName,
+            },
+          });
+        }
+        loadMessages();
+      }
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setScanning(false);
+    }
+  }
+
+  return (
+    <Card>
+      {/* Renamed 2026-09-23 per Mike: "instead of Your Marketing Dude should
+          say What Kind Of Content Do You Want To Create?" */}
+      <h3 className="font-display text-sm font-semibold">What Kind Of Content Do You Want To Create?</h3>
+      <p className="mt-1 text-xs text-muted-foreground">
+        One ongoing thread, grounded in your Voice DNA — ask for a post, a video script, or scan your photos for ideas.
+        Everything here is a draft until you save it as a post.
+      </p>
+
+      <div className="mt-4 flex flex-wrap gap-1 rounded-full border border-border bg-glass p-1 w-fit">
+        {(["post", "email", "video_script", "photo_scan"] as ChatMode[]).map((m) => (
+          <button
+            key={m}
+            onClick={() => setMode(m)}
+            className={`rounded-full px-4 py-1.5 text-sm font-medium transition-colors ${
+              mode === m ? "bg-secondary text-foreground" : "text-muted-foreground hover:text-foreground"
+            }`}
+          >
+            {CHAT_MODE_LABELS[m]}
+          </button>
+        ))}
+        <button
+          disabled
+          title="Coming soon — unlocks once a carousel brand/template direction is set"
+          className="cursor-not-allowed rounded-full px-4 py-1.5 text-sm font-medium text-muted-foreground/50"
+        >
+          Carousel (coming soon)
+        </button>
+      </div>
+
+      <div className="mt-4 max-h-[420px] min-h-[160px] space-y-3 overflow-y-auto rounded-2xl border border-border bg-background/40 p-4">
+        {messages === null && <p className="text-sm text-muted-foreground">Loading your thread…</p>}
+        {messages !== null && messages.length === 0 && (
+          <p className="text-sm text-muted-foreground">
+            Nothing here yet — say what you want made, or switch to "Scan my photos" below.
+          </p>
+        )}
+        {(messages ?? []).map((m) => (
+          <ChatMessageBubble key={m.id} msg={m} agentId={agentId} onSaved={onSavedPost} />
+        ))}
+        <div ref={bottomRef} />
+      </div>
+
+      {error && <p className="mt-2 text-xs text-destructive">{error}</p>}
+
+      {mode === "photo_scan" ? (
+        <div className="mt-3">
+          <Button onClick={scanPhotos} disabled={scanning}>
+            {scanning ? "Scanning…" : "Scan my photos"}
+          </Button>
+        </div>
+      ) : (
+        <div className="mt-3 space-y-2">
+          <div className="flex items-center justify-between">
+            <span className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
+              {mode === "email"
+                ? "What's the email about"
+                : mode === "video_script"
+                  ? "What's the video about"
+                  : "What's on your mind"}
+            </span>
+            <MicButton value={draft} onChange={setDraft} />
+          </div>
+          <AutoResizeTextarea
+            value={draft}
+            onChange={setDraft}
+            minHeightPx={60}
+            placeholder="Talk to your Marketing Dude…"
+            className="min-h-[60px] w-full rounded-xl border border-border bg-glass px-3 py-2 text-sm outline-none"
+          />
+          <Button onClick={send} disabled={sending || !draft.trim()}>
+            {sending ? "Writing…" : "Send"}
+          </Button>
+        </div>
+      )}
+    </Card>
+  );
+}
+
+// Multi-photo attachments for EMAILS — added 2026-09-21 per Mike: "Emails
+// should have the ability to include up to 3 photos from any combination.
+// Those images would come with publishing instructions." Posts keep the
+// single-photo picker in PostCard just below (openPicker/pickMedia/etc.),
+// since a post only ever needs one photo — this is a separate flow just for
+// emails, which can hold up to three at once, from any mix of sources, each
+// with its own note for whoever actually publishes the email. Every add/
+// edit/remove below calls one of the addEmailPhotoFrom.../
+// updateEmailPhotoInstructions/removeEmailPhoto functions in marketing.ts,
+// which re-save the post's metadata.email_photos array server-side.
+//
+// An email generated before this feature existed only has the old
+// single-photo fields (media_url/drive_thumbnail_url/unsplash_photographer)
+// — those still display read-only below as a "legacy" photo until removed,
+// rather than being silently dropped or auto-migrated into the new array.
+function EmailPhotosPanel({
+  post,
+  agentId,
+  driveFolderId,
+  onChanged,
+}: {
+  post: Post;
+  agentId: string;
+  driveFolderId: string | null;
+  onChanged: () => void;
+}) {
+  // Kept in sync with MAX_EMAIL_PHOTOS in marketing.ts.
+  const MAX_PHOTOS = 3;
+  const photos = post.metadata?.email_photos ?? [];
+  const legacyUrl = photos.length === 0 ? post.metadata?.media_url || post.metadata?.drive_thumbnail_url || null : null;
+
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [drafts, setDrafts] = useState<Record<string, string>>({});
+  const [pickerOpen, setPickerOpen] = useState(false);
+  const [pickerTab, setPickerTab] = useState<"library" | "drive" | "unsplash">("library");
+  const [mediaOptions, setMediaOptions] = useState<MediaRow[] | null>(null);
+  const [driveOptions, setDriveOptions] = useState<DriveFile[] | null>(null);
+  const [driveOptionsError, setDriveOptionsError] = useState<string | null>(null);
+  const [unsplashQuery, setUnsplashQuery] = useState(post.title || "lifestyle real estate");
+  const [unsplashResults, setUnsplashResults] = useState<UnsplashResult[] | null>(null);
+  const [unsplashLoading, setUnsplashLoading] = useState(false);
+  const [unsplashError, setUnsplashError] = useState<string | null>(null);
+
+  async function openPicker() {
+    setPickerOpen(true);
+    setPickerTab("library");
+    setError(null);
+    if (!mediaOptions) {
+      try {
+        setMediaOptions(await listMarketingMedia({ data: { agentId, status: "available" } }));
+      } catch {
+        setMediaOptions([]);
+      }
+    }
+  }
+
+  async function openDriveTab() {
+    setPickerTab("drive");
+    if (!driveOptions && driveFolderId) {
+      try {
+        const res = await listAgentDriveMedia({ data: { agentId } });
+        setDriveOptions(res.files);
+        setDriveOptionsError(null);
+      } catch (e) {
+        setDriveOptions([]);
+        setDriveOptionsError(e instanceof Error ? e.message : String(e));
+      }
+    }
+  }
+
+  async function runUnsplashSearch(query: string) {
+    setUnsplashLoading(true);
+    setUnsplashError(null);
+    try {
+      const res = await searchUnsplashPhotos({ data: { agentId, query } });
+      setUnsplashResults(res.results);
+    } catch (e) {
+      setUnsplashResults([]);
+      setUnsplashError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setUnsplashLoading(false);
+    }
+  }
+
+  function openUnsplashTab() {
+    setPickerTab("unsplash");
+    if (!unsplashResults) runUnsplashSearch(unsplashQuery);
+  }
+
+  async function addFromLibrary(mediaId: string) {
+    setBusy(true);
+    setError(null);
+    try {
+      await addEmailPhotoFromLibrary({ data: { agentId, postId: post.id, mediaId } });
+      setPickerOpen(false);
+      onChanged();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function addFromDrive(file: DriveFile) {
+    setBusy(true);
+    setError(null);
+    try {
+      await addEmailPhotoFromDrive({
+        data: { agentId, postId: post.id, driveFileId: file.id, thumbnailUrl: file.thumbnailUrl },
+      });
+      setPickerOpen(false);
+      onChanged();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function addFromUnsplash(r: UnsplashResult) {
+    setBusy(true);
+    setError(null);
+    try {
+      await addEmailPhotoFromUnsplash({
+        data: {
+          agentId,
+          postId: post.id,
+          photoUrl: r.fullUrl,
+          photographerName: r.photographerName,
+          photographerProfileUrl: r.photographerProfileUrl,
+        },
+      });
+      setPickerOpen(false);
+      onChanged();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function removePhoto(photoId: string) {
+    setBusy(true);
+    setError(null);
+    try {
+      await removeEmailPhoto({ data: { agentId, postId: post.id, photoId } });
+      onChanged();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function saveInstructions(photoId: string) {
+    const value = drafts[photoId];
+    if (value === undefined) return;
+    setBusy(true);
+    setError(null);
+    try {
+      await updateEmailPhotoInstructions({
+        data: { agentId, postId: post.id, photoId, publishingInstructions: value },
+      });
+      onChanged();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function removeLegacyPhoto() {
+    setBusy(true);
+    setError(null);
+    try {
+      await setPostMedia({ data: { agentId, postId: post.id, mediaId: null } });
+      onChanged();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className="mb-3">
+      {legacyUrl && (
+        <div className="mb-3 rounded-2xl border border-border bg-muted p-3">
+          <p className="mb-2 text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
+            Photo (added before multi-photo support)
+          </p>
+          <div className="overflow-hidden rounded-xl border border-border">
+            {post.metadata?.media_type === "video" ? (
+              <video src={legacyUrl} controls className="max-h-56 w-full object-contain" />
+            ) : (
+              <img src={legacyUrl} alt="" className="max-h-56 w-full object-contain" />
+            )}
+          </div>
+          {post.metadata?.unsplash_photographer && (
+            <p className="mt-1 text-[11px] text-muted-foreground">
+              Photo by {post.metadata.unsplash_photographer} on Unsplash
+            </p>
+          )}
+          <button
+            onClick={removeLegacyPhoto}
+            disabled={busy}
+            className="mt-2 text-xs font-semibold text-destructive hover:underline disabled:opacity-50"
+          >
+            Remove — I'll add new photos below instead
+          </button>
+        </div>
+      )}
+
+      {photos.length > 0 && (
+        <div className="mb-3 grid gap-3 sm:grid-cols-3">
+          {photos.map((p) => (
+            <div key={p.id} className="rounded-2xl border border-border bg-muted p-2">
+              <div className="overflow-hidden rounded-xl border border-border">
+                {p.mediaType === "video" ? (
+                  <video src={p.url} controls className="aspect-square w-full object-cover" />
+                ) : (
+                  <img src={p.url} alt="" className="aspect-square w-full object-cover" />
+                )}
+              </div>
+              <p className="mt-1 text-[10px] uppercase tracking-wide text-muted-foreground">
+                {p.source === "library" ? "Media Library" : p.source === "drive" ? "Google Drive" : "Stock photo"}
+              </p>
+              {p.source === "unsplash" && p.unsplashPhotographer && (
+                <p className="text-[10px] text-muted-foreground">
+                  Photo by{" "}
+                  <a
+                    href={p.unsplashCreditUrl ?? "https://unsplash.com"}
+                    target="_blank"
+                    rel="noreferrer"
+                    className="underline hover:text-foreground"
+                  >
+                    {p.unsplashPhotographer}
+                  </a>{" "}
+                  on Unsplash
+                </p>
+              )}
+              <textarea
+                value={drafts[p.id] ?? p.publishingInstructions}
+                onChange={(e) => setDrafts((d) => ({ ...d, [p.id]: e.target.value }))}
+                onBlur={() => saveInstructions(p.id)}
+                placeholder="Publishing instructions (optional) — e.g. use as header image"
+                className="mt-2 min-h-[50px] w-full rounded-lg border border-border bg-glass px-2 py-1.5 text-xs outline-none"
+                disabled={busy}
+              />
+              <div className="mt-1 flex items-center justify-between gap-2">
+                {p.url && (
+                  <button
+                    onClick={() => downloadRemoteFile(p.url!, p.url!.split("/").pop() || `${p.id}`)}
+                    className="text-[11px] font-semibold text-muted-foreground hover:text-foreground hover:underline"
+                  >
+                    ⬇ Download
+                  </button>
+                )}
+                <button
+                  onClick={() => removePhoto(p.id)}
+                  disabled={busy}
+                  className="text-[11px] font-semibold text-destructive hover:underline disabled:opacity-50"
+                >
+                  Remove photo
+                </button>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {error && <p className="mb-2 text-xs text-destructive">{error}</p>}
+
+      {photos.length < MAX_PHOTOS && (
+        <Button variant="secondary" onClick={openPicker} disabled={busy}>
+          {photos.length === 0 && !legacyUrl ? "Add photo" : "Add another photo"} ({photos.length}/{MAX_PHOTOS})
+        </Button>
+      )}
+
+      {pickerOpen && (
+        <div className="mt-3 rounded-2xl border border-border bg-background/40 p-4">
+          <div className="flex items-center justify-between gap-3">
+            <p className="text-sm font-semibold">Add a photo to this email</p>
+            <button
+              onClick={() => setPickerOpen(false)}
+              className="shrink-0 text-xs text-muted-foreground hover:text-foreground"
+            >
+              Close
+            </button>
+          </div>
+
+          <div className="mt-3 flex flex-wrap gap-2 border-b border-border pb-3">
+            <button
+              onClick={() => setPickerTab("library")}
+              className={`rounded-full px-3 py-1 text-xs font-semibold transition-colors ${
+                pickerTab === "library"
+                  ? "bg-primary text-primary-foreground"
+                  : "bg-muted text-muted-foreground hover:text-foreground"
+              }`}
+            >
+              Media Library
+            </button>
+            {driveFolderId && (
+              <button
+                onClick={openDriveTab}
+                className={`rounded-full px-3 py-1 text-xs font-semibold transition-colors ${
+                  pickerTab === "drive"
+                    ? "bg-primary text-primary-foreground"
+                    : "bg-muted text-muted-foreground hover:text-foreground"
+                }`}
+              >
+                Google Drive
+              </button>
+            )}
+            <button
+              onClick={openUnsplashTab}
+              className={`rounded-full px-3 py-1 text-xs font-semibold transition-colors ${
+                pickerTab === "unsplash"
+                  ? "bg-primary text-primary-foreground"
+                  : "bg-muted text-muted-foreground hover:text-foreground"
+              }`}
+            >
+              Stock Photos
+            </button>
+          </div>
+
+          {pickerTab === "library" && (
+            <div className="mt-3">
+              {mediaOptions === null && <p className="text-xs text-muted-foreground">Loading…</p>}
+              {mediaOptions !== null && mediaOptions.length === 0 && (
+                <p className="text-xs text-muted-foreground">
+                  No available photos or videos uploaded for this agent yet — add some on the Media tab.
+                </p>
+              )}
+              {mediaOptions !== null && mediaOptions.length > 0 && (
+                <div className="grid grid-cols-3 gap-2 sm:grid-cols-4">
+                  {mediaOptions.map((m) => (
+                    <button
+                      key={m.id}
+                      onClick={() => addFromLibrary(m.id)}
+                      disabled={busy}
+                      className="overflow-hidden rounded-xl border border-border transition-colors hover:border-primary disabled:opacity-50"
+                    >
+                      {m.media_type === "video"
+                        ? m.url && <video src={m.url} className="aspect-square w-full object-cover" />
+                        : m.url && (
+                            <img src={m.url} alt={m.caption ?? ""} className="aspect-square w-full object-cover" />
+                          )}
+                    </button>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
+
+          {pickerTab === "drive" && (
+            <div className="mt-3">
+              {driveOptionsError && <p className="text-xs text-destructive">{driveOptionsError}</p>}
+              {!driveOptionsError && driveOptions === null && <p className="text-xs text-muted-foreground">Loading…</p>}
+              {!driveOptionsError && driveOptions !== null && driveOptions.length === 0 && (
+                <p className="text-xs text-muted-foreground">
+                  No unused photos or videos found in this agent's Drive folder.
+                </p>
+              )}
+              {driveOptions !== null && driveOptions.length > 0 && (
+                <div className="grid grid-cols-3 gap-2 sm:grid-cols-4">
+                  {driveOptions.map((f) => (
+                    <button
+                      key={f.id}
+                      onClick={() => addFromDrive(f)}
+                      disabled={busy}
+                      className="overflow-hidden rounded-xl border border-border transition-colors hover:border-primary disabled:opacity-50"
+                    >
+                      {f.isVideo ? (
+                        <video src={f.thumbnailUrl} className="aspect-square w-full object-cover" />
+                      ) : (
+                        <img src={f.thumbnailUrl} alt={f.name} className="aspect-square w-full object-cover" />
+                      )}
+                    </button>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
+
+          {pickerTab === "unsplash" && (
+            <div className="mt-3">
+              <div className="flex gap-2">
+                <input
+                  value={unsplashQuery}
+                  onChange={(e) => setUnsplashQuery(e.target.value)}
+                  onKeyDown={(e) => e.key === "Enter" && runUnsplashSearch(unsplashQuery)}
+                  placeholder="Search stock photos — coffee, fall, neighborhood…"
+                  className="flex-1 rounded-xl border border-border bg-glass px-3 py-1.5 text-sm outline-none"
+                />
+                <Button variant="secondary" onClick={() => runUnsplashSearch(unsplashQuery)} disabled={unsplashLoading}>
+                  {unsplashLoading ? "Searching…" : "Search"}
+                </Button>
+              </div>
+              {unsplashError && <p className="mt-2 text-xs text-destructive">{unsplashError}</p>}
+              {!unsplashError && unsplashResults !== null && unsplashResults.length === 0 && !unsplashLoading && (
+                <p className="mt-2 text-xs text-muted-foreground">No results — try a different search.</p>
+              )}
+              {unsplashResults !== null && unsplashResults.length > 0 && (
+                <div className="mt-3 grid grid-cols-3 gap-2 sm:grid-cols-4">
+                  {unsplashResults.map((r) => (
+                    <button
+                      key={r.id}
+                      onClick={() => addFromUnsplash(r)}
+                      disabled={busy}
+                      title={`Photo by ${r.photographerName} on Unsplash`}
+                      className="overflow-hidden rounded-xl border border-border transition-colors hover:border-primary disabled:opacity-50"
+                    >
+                      <img src={r.thumbUrl} alt="" className="aspect-square w-full object-cover" />
+                    </button>
+                  ))}
+                </div>
+              )}
+              <p className="mt-2 text-[11px] text-muted-foreground">
+                Photos via Unsplash — credit is added automatically.
+              </p>
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function PostCard({
+  post,
+  agentId,
+  driveFolderId,
+  onChanged,
+}: {
+  post: Post;
+  agentId: string;
+  driveFolderId: string | null;
+  onChanged: () => void;
+}) {
+  const [draft, setDraft] = useState(post.content);
+  const [editing, setEditing] = useState(false);
+  const [feedbackOpen, setFeedbackOpen] = useState(false);
+  const [notes, setNotes] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [saveError, setSaveError] = useState<string | null>(null);
+  // Post's own single-photo picker — Media Library + Google Drive (if
+  // enabled) only. Stock Photos (Unsplash) was dropped from here 2026-09-21
+  // per Mike ("No need for stock photos here. But they do need ability to
+  // choose for google drive if enabled.") — posts always have their own
+  // Drive/library photos to draw from, so there was never really a need for
+  // stock photos on a post the way there was for an email. Emails now have
+  // their own separate multi-photo flow — see EmailPhotosPanel below, which
+  // still offers Stock Photos since that's genuinely useful there.
+  const [pickerOpen, setPickerOpen] = useState(false);
+  const [pickerTab, setPickerTab] = useState<"library" | "drive">("library");
+  const [mediaOptions, setMediaOptions] = useState<MediaRow[] | null>(null);
+  const [mediaBusy, setMediaBusy] = useState(false);
+  const [driveOptions, setDriveOptions] = useState<DriveFile[] | null>(null);
+  const [driveOptionsError, setDriveOptionsError] = useState<string | null>(null);
+  const [rewriting, setRewriting] = useState(false);
+  const [rewriteHistory, setRewriteHistory] = useState<{ feedback: string; result: string }[]>([]);
+
+  useEffect(() => {
+    setDraft(post.content);
+  }, [post.content]);
+
+  async function approve() {
+    setBusy(true);
+    setSaveError(null);
+    try {
+      await updateMarketingPost({ data: { agentId, postId: post.id, status: "approved" } });
+      onChanged();
+    } catch (e) {
+      setSaveError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function saveEdit() {
+    setBusy(true);
+    setSaveError(null);
+    try {
+      await updateMarketingPost({ data: { agentId, postId: post.id, content: draft } });
+      setEditing(false);
+      onChanged();
+    } catch (e) {
+      setSaveError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function sendFeedback() {
+    setBusy(true);
+    setSaveError(null);
+    try {
+      const trimmedNotes = notes.trim();
+      const payload = trimmedNotes
+        ? { agentId, postId: post.id, rating: "flagged", notes: trimmedNotes }
+        : { agentId, postId: post.id, rating: "flagged" };
+      await submitMarketingFeedback({ data: payload });
+      await updateMarketingPost({ data: { agentId, postId: post.id, status: "flagged" } });
+      setFeedbackOpen(false);
+      setNotes("");
+      onChanged();
+    } catch (e) {
+      setSaveError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function rewrite() {
+    const feedback = notes.trim();
+    if (!feedback) {
+      setSaveError("Tell us what to fix first.");
+      return;
+    }
+    setRewriting(true);
+    setSaveError(null);
+    try {
+      const res = await rewritePostContent({ data: { agentId, postId: post.id, feedback } });
+      setRewriteHistory((h) => [...h, { feedback, result: res.content }]);
+      setNotes("");
+      onChanged();
+    } catch (e) {
+      setSaveError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setRewriting(false);
+    }
+  }
+
+  async function openPicker() {
+    setPickerOpen(true);
+    setPickerTab("library");
+    if (!mediaOptions) {
+      try {
+        const list = await listMarketingMedia({ data: { agentId, status: "available" } });
+        setMediaOptions(list);
+      } catch {
+        setMediaOptions([]);
+      }
+    }
+  }
+
+  async function pickMedia(mediaId: string | null) {
+    setMediaBusy(true);
+    setSaveError(null);
+    try {
+      await setPostMedia({ data: { agentId, postId: post.id, mediaId } });
+      setPickerOpen(false);
+      onChanged();
+    } catch (e) {
+      setSaveError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setMediaBusy(false);
+    }
+  }
+
+  // Google Drive tab of the picker — added 2026-09-18 per Mike's request
+  // ("when changing a photo for one of the posts we need to add a button to
+  // check google drive photos too"). Reuses the same listing the Google
+  // Drive tab already calls, so it's the exact same set of files, minus
+  // whatever's already been moved to that folder's "used" subfolder.
+  async function openDriveTab() {
+    setPickerTab("drive");
+    if (!driveOptions && driveFolderId) {
+      try {
+        const res = await listAgentDriveMedia({ data: { agentId } });
+        setDriveOptions(res.files);
+        setDriveOptionsError(null);
+      } catch (e) {
+        setDriveOptions([]);
+        setDriveOptionsError(e instanceof Error ? e.message : String(e));
+      }
+    }
+  }
+
+  async function pickDriveFile(file: DriveFile) {
+    setMediaBusy(true);
+    setSaveError(null);
+    try {
+      await setPostDrivePhoto({
+        data: { agentId, postId: post.id, driveFileId: file.id, thumbnailUrl: file.thumbnailUrl },
+      });
+      setPickerOpen(false);
+      onChanged();
+    } catch (e) {
+      setSaveError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setMediaBusy(false);
+    }
+  }
+
+  const typeLabel = post.content_type === "email" ? "Email" : post.content_type === "video" ? "Video script" : "Post";
+  const photoUrl = post.metadata?.media_url || post.metadata?.drive_thumbnail_url || null;
+
+  return (
+    <Card>
+      {/* Header is deliberately not clickable — per Mike's request (2026-09-18)
+          after collapsing a card on click turned out to offer no value and
+          just made content vanish unexpectedly. Cards always show everything. */}
+      <div className="flex w-full items-center justify-between gap-3 text-left">
+        <div>
+          <p className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
+            {typeLabel}
+            {post.platform ? ` · ${post.platform}` : ""}
+            {post.month ? ` · ${post.month}` : ""}
+          </p>
+          <h3 className="mt-1 font-display text-base font-semibold">
+            {post.title || post.content.slice(0, 60) + (post.content.length > 60 ? "…" : "")}
+          </h3>
+        </div>
+        <StatusBadge status={post.status} />
+      </div>
+
+      <div className="mt-4 border-t border-border pt-4">
+        {/* Single-photo display — posts only now. Emails moved to their
+              own multi-photo flow (EmailPhotosPanel, just below) 2026-09-21
+              per Mike's request for up to 3 photos per email, each with its
+              own publishing instructions — a single photoUrl can no longer
+              represent an email's attached photos. */}
+        {post.content_type === "post" && photoUrl && (
+          <div className="mb-3 overflow-hidden rounded-2xl border border-border bg-muted">
+            {post.metadata?.media_type === "video" ? (
+              <video src={photoUrl} controls className="max-h-64 w-full object-contain" />
+            ) : (
+              <img src={photoUrl} alt="" className="max-h-64 w-full object-contain" />
+            )}
+            <button
+              onClick={() => downloadRemoteFile(photoUrl, photoUrl.split("/").pop() || "photo")}
+              className="w-full border-t border-border bg-glass py-1 text-[11px] font-semibold text-muted-foreground transition-colors hover:bg-secondary hover:text-foreground"
+            >
+              ⬇ Download
+            </button>
+          </div>
+        )}
+        {post.content_type === "post" && photoUrl && post.metadata?.unsplash_photographer && (
+          <p className="-mt-2 mb-3 text-[11px] text-muted-foreground">
+            Photo by{" "}
+            <a
+              href={post.metadata.unsplash_credit_url ?? "https://unsplash.com"}
+              target="_blank"
+              rel="noreferrer"
+              className="underline hover:text-foreground"
+            >
+              {post.metadata.unsplash_photographer}
+            </a>{" "}
+            on Unsplash
+          </p>
+        )}
+        {post.content_type === "email" && (
+          <EmailPhotosPanel post={post} agentId={agentId} driveFolderId={driveFolderId} onChanged={onChanged} />
+        )}
+        {post.content_type === "post" && post.metadata?.image_suggestion && (
+          <div className="mb-2 text-xs text-muted-foreground">
+            <p className="mb-1 font-semibold">📸 Image direction from the brief</p>
+            <SuggestionBullets text={post.metadata.image_suggestion} />
+            {!photoUrl && (
+              <p className="mt-1">
+                No photo on file yet to attach automatically — add one on the Media tab or pick one below.
+              </p>
+            )}
+          </div>
+        )}
+        {editing ? (
+          <AutoResizeTextarea
+            value={draft}
+            onChange={setDraft}
+            minHeightPx={140}
+            className="w-full rounded-2xl bg-muted px-4 py-3 text-sm leading-relaxed outline-none ring-ring transition focus:ring-2"
+          />
+        ) : (
+          <p className="whitespace-pre-wrap text-sm leading-relaxed">{post.content}</p>
+        )}
+
+        {post.metadata?.canva_link && (
+          <>
+            <a
+              href={post.metadata.canva_link}
+              target="_blank"
+              rel="noreferrer"
+              className="mt-2 inline-block text-xs font-semibold text-primary hover:underline"
+            >
+              Open Canva template →
+            </a>
+            {/* Instructions for what to actually put in the template —
+                  added 2026-09-18 per Mike: "the Canva images need the
+                  instructions posted beneath it, just like they are in the
+                  posts." A regular post's own image direction (above) was
+                  always being captured from its "Post Image/Video
+                  Suggestions" section; a Canva item's "Canva Template
+                  Direction" section had the equivalent instructions but that
+                  section's actual content was never being read out of the
+                  calendar doc at all — only used to know where other
+                  sections ended — so nothing ever showed here before this
+                  fix. See parsePostDoc's canvaDirection in marketing.ts. */}
+            {post.metadata?.canva_instructions && (
+              <div className="mt-2 text-xs text-muted-foreground">
+                <p className="mb-1 font-semibold">🎨 Instructions for this template</p>
+                <SuggestionBullets text={post.metadata.canva_instructions} />
+              </div>
+            )}
+          </>
+        )}
+
+        {saveError && <p className="mt-2 text-xs text-destructive">{saveError}</p>}
+
+        <div className="mt-4 flex flex-wrap gap-2">
+          {editing ? (
+            <>
+              <Button onClick={saveEdit} disabled={busy}>
+                Save
+              </Button>
+              <Button
+                variant="secondary"
+                onClick={() => {
+                  setDraft(post.content);
+                  setEditing(false);
+                }}
+                disabled={busy}
+              >
+                Cancel
+              </Button>
+            </>
+          ) : (
+            <>
+              <Button onClick={approve} disabled={busy || post.status === "approved"}>
+                {post.status === "approved" ? "Approved" : "Approve"}
+              </Button>
+              <Button variant="secondary" onClick={() => setEditing(true)} disabled={busy}>
+                Edit
+              </Button>
+              <Button variant="danger" onClick={() => setFeedbackOpen((v) => !v)} disabled={busy}>
+                Flag / feedback
+              </Button>
+              {post.content_type === "post" && (
+                <Button variant="secondary" onClick={openPicker} disabled={busy}>
+                  {photoUrl ? "Change photo" : "Add photo"}
+                </Button>
+              )}
+            </>
+          )}
+        </div>
+
+        {post.content_type === "post" && pickerOpen && (
+          <div className="mt-4 rounded-2xl border border-border bg-background/40 p-4">
+            <div className="flex items-center justify-between gap-3">
+              <p className="text-sm font-semibold">
+                Which image or video do you want to use dude? Click and I will make it happen.
+              </p>
+              <button
+                onClick={() => setPickerOpen(false)}
+                className="shrink-0 text-xs text-muted-foreground hover:text-foreground"
+              >
+                Close
+              </button>
+            </div>
+
+            <div className="mt-3 flex flex-wrap gap-2 border-b border-border pb-3">
+              <button
+                onClick={() => setPickerTab("library")}
+                className={`rounded-full px-3 py-1 text-xs font-semibold transition-colors ${
+                  pickerTab === "library"
+                    ? "bg-primary text-primary-foreground"
+                    : "bg-muted text-muted-foreground hover:text-foreground"
+                }`}
+              >
+                Media Library
+              </button>
+              {driveFolderId && (
+                <button
+                  onClick={openDriveTab}
+                  className={`rounded-full px-3 py-1 text-xs font-semibold transition-colors ${
+                    pickerTab === "drive"
+                      ? "bg-primary text-primary-foreground"
+                      : "bg-muted text-muted-foreground hover:text-foreground"
+                  }`}
+                >
+                  Google Drive
+                </button>
+              )}
+            </div>
+
+            {pickerTab === "library" && (
+              <div className="mt-3">
+                {mediaOptions === null && <p className="text-xs text-muted-foreground">Loading…</p>}
+                {mediaOptions !== null && mediaOptions.length === 0 && (
+                  <p className="text-xs text-muted-foreground">
+                    No available photos or videos uploaded for this agent yet — add some on the Media tab, then come
+                    back here.
+                  </p>
+                )}
+                {mediaOptions !== null && mediaOptions.length > 0 && (
+                  <div className="grid grid-cols-3 gap-2 sm:grid-cols-4">
+                    {mediaOptions.map((m) => (
+                      <button
+                        key={m.id}
+                        onClick={() => pickMedia(m.id)}
+                        disabled={mediaBusy}
+                        className="overflow-hidden rounded-xl border border-border transition-colors hover:border-primary disabled:opacity-50"
+                      >
+                        {m.media_type === "video"
+                          ? m.url && <video src={m.url} className="aspect-square w-full object-cover" />
+                          : m.url && (
+                              <img src={m.url} alt={m.caption ?? ""} className="aspect-square w-full object-cover" />
+                            )}
+                      </button>
+                    ))}
+                  </div>
+                )}
+              </div>
+            )}
+
+            {pickerTab === "drive" && (
+              <div className="mt-3">
+                {driveOptionsError && <p className="text-xs text-destructive">{driveOptionsError}</p>}
+                {!driveOptionsError && driveOptions === null && (
+                  <p className="text-xs text-muted-foreground">Loading…</p>
+                )}
+                {!driveOptionsError && driveOptions !== null && driveOptions.length === 0 && (
+                  <p className="text-xs text-muted-foreground">
+                    No unused photos or videos found in this agent's Drive folder.
+                  </p>
+                )}
+                {driveOptions !== null && driveOptions.length > 0 && (
+                  <div className="grid grid-cols-3 gap-2 sm:grid-cols-4">
+                    {driveOptions.map((f) => (
+                      <button
+                        key={f.id}
+                        onClick={() => pickDriveFile(f)}
+                        disabled={mediaBusy}
+                        className="overflow-hidden rounded-xl border border-border transition-colors hover:border-primary disabled:opacity-50"
+                      >
+                        {f.isVideo ? (
+                          <video src={f.thumbnailUrl} className="aspect-square w-full object-cover" />
+                        ) : (
+                          <img src={f.thumbnailUrl} alt={f.name} className="aspect-square w-full object-cover" />
+                        )}
+                      </button>
+                    ))}
+                  </div>
+                )}
+              </div>
+            )}
+
+            {photoUrl && (
+              <button
+                onClick={() => pickMedia(null)}
+                disabled={mediaBusy}
+                className="mt-3 text-xs font-semibold text-destructive hover:underline disabled:opacity-50"
+              >
+                Remove photo
+              </button>
+            )}
+          </div>
+        )}
+
+        {feedbackOpen && (
+          <div className="mt-4 rounded-2xl border border-border bg-background/40 p-4">
+            <div className="flex items-center justify-between">
+              <p className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
+                What should change?
+              </p>
+              <MicButton value={notes} onChange={setNotes} />
+            </div>
+            {rewriteHistory.length > 0 && (
+              <div className="mt-2 space-y-2">
+                {rewriteHistory.map((h, i) => (
+                  <div key={i} className="rounded-xl bg-muted px-3 py-2 text-xs leading-relaxed">
+                    <p className="text-muted-foreground">You asked: "{h.feedback}"</p>
+                    <p className="mt-1 italic">Result: {h.result}</p>
+                  </div>
+                ))}
+              </div>
+            )}
+            <textarea
+              value={notes}
+              onChange={(e) => setNotes(e.target.value)}
+              placeholder="What is off? Too formal, they never say this, make it shorter…"
+              className="mt-2 min-h-[80px] w-full rounded-2xl bg-muted px-4 py-3 text-sm outline-none ring-ring transition focus:ring-2"
+            />
+            <div className="mt-3 flex flex-wrap gap-2">
+              <Button onClick={rewrite} disabled={busy || rewriting}>
+                {rewriting ? "Rewriting…" : "Rewrite in their voice →"}
+              </Button>
+              <Button onClick={sendFeedback} variant="secondary" disabled={busy || rewriting}>
+                Submit feedback
+              </Button>
+              <Button
+                variant="secondary"
+                onClick={() => {
+                  setFeedbackOpen(false);
+                  setRewriteHistory([]);
+                }}
+                disabled={busy || rewriting}
+              >
+                Done
+              </Button>
+            </div>
+            {rewriteHistory.length > 0 && (
+              <p className="mt-2 text-xs text-muted-foreground">
+                Not right yet? Add more feedback above and rewrite again.
+              </p>
+            )}
+          </div>
+        )}
+      </div>
+    </Card>
+  );
+}
+
+// Photos capped at ~2000px on the long edge before upload — invisible for
+// social content (which gets downsized again on posting anyway) but cuts
+// storage 70-90% versus a raw phone photo. Runs entirely client-side via
+// canvas, no library needed.
+async function resizeImage(file: File, maxEdge = 2000, quality = 0.85): Promise<File> {
+  const bitmap = await createImageBitmap(file).catch(() => null);
+  if (!bitmap) return file; // not a decodable image — upload as-is
+  const scale = Math.min(1, maxEdge / Math.max(bitmap.width, bitmap.height));
+  if (scale === 1) return file; // already small enough
+  const canvas = document.createElement("canvas");
+  canvas.width = Math.round(bitmap.width * scale);
+  canvas.height = Math.round(bitmap.height * scale);
+  const ctx = canvas.getContext("2d");
+  if (!ctx) return file;
+  ctx.drawImage(bitmap, 0, 0, canvas.width, canvas.height);
+  const blob = await new Promise<Blob | null>((resolve) => canvas.toBlob(resolve, "image/jpeg", quality));
+  if (!blob) return file;
+  return new File([blob], file.name.replace(/\.\w+$/, ".jpg"), { type: "image/jpeg" });
+}
+
+// Short-form video only — reads duration client-side before spending any
+// upload bandwidth on something too long to be usable content anyway.
+function getVideoDuration(file: File): Promise<number> {
+  return new Promise((resolve) => {
+    const video = document.createElement("video");
+    video.preload = "metadata";
+    video.onloadedmetadata = () => {
+      URL.revokeObjectURL(video.src);
+      resolve(video.duration);
+    };
+    video.onerror = () => resolve(0);
+    video.src = URL.createObjectURL(file);
+  });
+}
+
+const MAX_VIDEO_SECONDS = 120;
+
+// Added 2026-09-21 per Mike: "photos in all libraries should be
+// downloadable." A plain <a href> works for a same-origin file (Media
+// Library items, on Supabase Storage) but the browser's `download`
+// attribute is unreliable cross-origin, so this fetches the file as a blob
+// and saves it directly — the same reliable pattern regardless of source.
+// Falls back to just opening the URL in a new tab if the fetch itself fails
+// (e.g. a host that blocks cross-origin reads even though it serves the
+// file fine to a normal link click — Google Drive's own uc?export=download
+// endpoint, for one, doesn't allow that kind of fetch from a browser, but it
+// already forces a real download on a plain click, so the fallback covers
+// it correctly either way).
+async function downloadRemoteFile(url: string, filename: string) {
+  try {
+    const res = await fetch(url);
+    if (!res.ok) throw new Error(`${res.status}`);
+    const blob = await res.blob();
+    const objectUrl = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = objectUrl;
+    link.download = filename;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    URL.revokeObjectURL(objectUrl);
+  } catch {
+    window.open(url, "_blank", "noreferrer");
+  }
+}
+
+// Same fixed vocabulary marketing.ts's PHOTO_TAG_OPTIONS uses for matching —
+// kept as its own small client-side copy rather than importing the server
+// module's export, so nothing about the server bundle is a dependency of
+// this chip UI. Keep these two lists in sync if the vocabulary ever changes.
+const PHOTO_TAG_OPTIONS = [
   "outdoor portrait",
   "desk or work",
   "neighborhood walk",
@@ -168,4010 +2196,2192 @@ export const PHOTO_TAG_OPTIONS = [
   "behind the scenes",
 ] as const;
 
-// Buckets each fixed tag into one of the same four categories the old app's
-// classifyPostType()/classifyPhotoType() used. The old app derived a
-// photo's category from a freeform tags string via regex; ours has a fixed
-// fixed vocabulary instead (set from the Media tab's tag chips), so this is
-// a direct lookup rather than a regex — same four buckets, same intent:
-// never put a family/appreciation photo on a straight business post or vice
-// versa.
-const TAG_CATEGORY: Record<string, "real_estate" | "appreciation" | "community" | "neutral"> = {
-  "desk or work": "real_estate",
-  "listing or property": "real_estate",
-  "with clients": "appreciation",
-  family: "appreciation",
-  "holiday or seasonal": "appreciation",
-  "community event": "community",
-  "outdoor portrait": "community",
-  "neighborhood walk": "community",
-  "coffee or local spot": "community",
-  "casual lifestyle": "community",
-  "car or on the go": "neutral",
-  "behind the scenes": "neutral",
-};
-
-// Ported from the old app's classifyPostType() — same keyword signals, same
-// four buckets: real estate business posts, appreciation/thank-you posts,
-// community/lifestyle posts, or neutral.
-function classifyPostType(titleAndCopy: string): "real_estate" | "appreciation" | "community" | "neutral" {
-  const text = (titleAndCopy || "").toLowerCase();
-  const isRealEstate =
-    /list|sold|closing|deal|market|buyer|seller|home|house|property|showing|offer|contract|price|rate|mortgage|commission|referral.*business|database|client|agent|real estate|escrow|inspection|title|pending|equity|invest/.test(
-      text,
-    );
-  const isAppreciation =
-    /thank|referral|grateful|appreciate|honor|trust|introduce|word of mouth|client.*friend|friend.*client|mean a lot|support/.test(
-      text,
-    );
-  const isCommunity =
-    /local|town|community|neighborhood|area|restaurant|coffee|spot|weekend|summer|fall|spring|winter|beach|park|trail|family|kids|life|morning|routine|enjoy|love where|live here/.test(
-      text,
-    );
-  if (isAppreciation) return "appreciation";
-  if (isRealEstate && !isCommunity) return "real_estate";
-  if (isCommunity && !isRealEstate) return "community";
-  return "neutral";
-}
-
-// Ported from the old app's getPreferredPhotoTypes() — the ranked list of
-// photo categories acceptable for each post category, best match first.
-function getPreferredPhotoTypes(postType: "real_estate" | "appreciation" | "community" | "neutral"): string[] {
-  switch (postType) {
-    case "real_estate":
-      return ["real_estate", "neutral", "video"];
-    case "appreciation":
-      return ["appreciation", "community", "neutral"];
-    case "community":
-      return ["community", "appreciation", "neutral"];
-    default:
-      return ["neutral", "community", "real_estate", "appreciation"];
-  }
-}
-
-function classifyMediaCategory(tags: string[], mediaType: string): string {
-  if (mediaType === "video") return "video";
-  for (const tag of tags) {
-    const category = TAG_CATEGORY[tag];
-    if (category) return category;
-  }
-  return "neutral";
-}
-
-// A suggestion can come from either photo source this app has — the native
-// Media Library (which we can mark "used" automatically once approved) or
-// the agent's connected Google Drive folder (read-only — see the note on
-// verifyDriveFolderAccessible above about why this integration can't write
-// back to Drive). The two need different fields written onto the post
-// (media_id/media_url vs. drive_file_id/drive_thumbnail_url), so callers
-// switch on `source` rather than assuming one shape.
-type SuggestedMediaPick =
-  | { source: "media"; id: string; url: string; mediaType: string }
-  | { source: "drive"; driveFileId: string; driveThumbnailUrl: string; mediaType: string };
-
-// Auto-suggests a photo/video per post from BOTH of the agent's photo
-// sources — the native Media library (the "available" pool) and, as of
-// 2026-09-18, their connected Google Drive folder too — one request per
-// post, each carrying that post's own image direction/title/copy so the
-// match is per-post, not one pick reused for the whole batch.
-//
-// Drive was added per Mike's report the same day that "a lot of photos
-// weren't automatically populating" when he ran the content calendar: this
-// function previously only ever looked at agent_photos, so any agent whose
-// available photos mostly still live in Drive (the common case for
-// longer-running clients — native upload is the newer path) came up with
-// nothing to suggest for most or all of a batch. Pulling in the same live
-// Drive listing the Google Drive tab already uses fixes that directly.
-//
-// This is the native replacement for the old app's Drive-tag matchPhoto():
-// now that the Media tab has a tagging UI (2026-09-17), a Media Library item
-// is matched by its tag's category the same way matchPhoto() worked — same
-// post/photo category buckets, same "don't put a family photo on a business
-// post" rule. A Drive file carries no tag data at all, so it's scored as
-// "neutral" (the same safe default an untagged Media Library item gets) —
-// this is a real, honest limitation, not a bug: matching a Drive photo by
-// what it actually shows (the way Photo Scan's AI captioning reads a photo)
-// would mean a vision call per candidate photo on every single generation,
-// which is a real latency/cost tradeoff worth deciding on deliberately
-// rather than building silently — flagged back to Mike rather than assumed.
-// FIFO (oldest-first for Media Library; Drive's own listing order otherwise)
-// is the tiebreak within a category, same as before. The "Change photo"
-// picker on each post still lets the team override the suggestion, logged to
-// feedback_history as a learning signal, same as always.
-async function assignSuggestedMedia(
-  agentId: string,
-  requests: { direction?: string | null; title?: string | null; copy?: string | null }[],
-): Promise<(SuggestedMediaPick | null)[]> {
-  if (!requests.length) return [];
-  const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
-  const { data, error } = await supabaseAdmin
-    .from("agent_photos")
-    .select("id, url, media_type, tags, created_at")
-    .eq("agent_id", agentId)
-    .eq("status", "available")
-    .order("created_at", { ascending: true })
-    .limit(50);
-  if (error) throw error;
-
-  type Candidate = { key: string; category: string; pick: SuggestedMediaPick };
-
-  const candidates: Candidate[] = (data ?? [])
-    .filter((m) => Boolean(m.url))
-    .map((m) => ({
-      key: `media:${m.id}`,
-      category: classifyMediaCategory(m.tags ?? [], m.media_type),
-      pick: { source: "media", id: m.id, url: m.url as string, mediaType: m.media_type },
-    }));
-
-  // Best-effort: any failure here (Drive not connected, no folder set, a
-  // folder the connected account can't see, a transient Drive API error)
-  // just means Drive contributes zero candidates for this run — it never
-  // blocks or fails the batch. A generation should always deliver its best
-  // guess with whatever photo source actually works, not error out over an
-  // optional one.
+// Admin-only card on the Media tab that surfaces the public upload link for
+// FIXED (2026-09-28) — per Mike, on the Media tab right after switching to
+// an agent: "I put in this agent's Google Drive folder and it's saying that
+// we do not have the right permissions. There's a bug because I have the
+// right permissions." What he actually saw ("Unauthorized: No authorization
+// header provided" on both the Public upload link card AND the media grid
+// below it, at the same time) has nothing to do with Google Drive or his
+// permissions — that's the literal error the app's own auth middleware
+// throws when a server call goes out with no session token attached at all.
+// Root cause: every server-function call attaches the current Supabase
+// session's access token client-side (see auth-attacher.ts — generated,
+// not something we hand-edit), by calling `supabase.auth.getSession()` at
+// the moment the call fires. These two particular calls both fire the
+// instant this tab mounts (a plain `useEffect` with no gate), which is
+// exactly the moment right after switching agents/tabs when that in-memory
+// session can be mid-refresh and briefly returns nothing — a timing race,
+// not a real permissions problem, and not specific to Drive at all (Drive
+// access itself runs through a totally separate server-side Google API key,
+// see setAgentDriveFolder below). Mitigated by retrying once, after a short
+// pause, specifically when a call fails with that exact "no session yet"
+// error — long enough for the background refresh to finish — before ever
+// showing an error to Mike. If it still fails twice in a row, that's a real
+// problem worth seeing, so the error still surfaces as before.
+async function withAuthRetry<T>(call: () => Promise<T>): Promise<T> {
   try {
-    const { data: agent } = await supabaseAdmin
-      .from("agents")
-      .select("drive_folder_id")
-      .eq("id", agentId)
-      .maybeSingle();
-    const folderId = agent?.drive_folder_id ?? null;
-    if (folderId) {
-      const accessToken = await getDriveAccessToken();
-      const files = await fetchDriveMediaFiles(folderId, accessToken);
-      for (const f of files) {
-        candidates.push({
-          key: `drive:${f.id}`,
-          category: f.isVideo ? "video" : "neutral",
-          pick: {
-            source: "drive",
-            driveFileId: f.id,
-            driveThumbnailUrl: f.thumbnailUrl,
-            mediaType: f.isVideo ? "video" : "image",
-          },
-        });
-      }
-    }
-  } catch {
-    // Drive is an optional extra source here — see comment above.
-  }
-
-  if (!candidates.length) return requests.map(() => null);
-
-  const assignedThisBatch = new Set<string>();
-
-  return requests.map((req) => {
-    const combinedText = `${req.direction || ""} ${req.title || ""} ${req.copy || ""}`;
-    const postType = classifyPostType(combinedText);
-    const preferredTypes = getPreferredPhotoTypes(postType);
-    const preferVideo = /clip|reel|video|b-?roll|footage|walking through|short form/i.test(req.direction || "");
-
-    // Prefer media not already handed to an earlier post in this same batch;
-    // if that empties the pool (more posts than available media), reset and
-    // allow repeats rather than leaving a post with nothing — same fallback
-    // the old app used once it ran out of unused photos.
-    let pool = candidates.filter((c) => !assignedThisBatch.has(c.key));
-    if (!pool.length) pool = candidates;
-
-    const scored = pool
-      .map((c) => {
-        let score = preferredTypes.indexOf(c.category);
-        if (score === -1) score = preferredTypes.length;
-        if (preferVideo && c.category === "video") score -= 0.5;
-        // Tiny tiebreak toward a Media Library pick over a Drive pick when
-        // everything else scores equal — a Media Library item is the one
-        // this app can actually mark "used" automatically once the post is
-        // approved (see approveBatch/approveAllPending); a Drive pick can't
-        // be, since this integration only ever has read access to Drive.
-        if (c.pick.source === "drive") score += 0.1;
-        return { c, score };
-      })
-      .sort((a, b) => a.score - b.score);
-
-    const winner = scored[0]?.c ?? null;
-    if (!winner) return null;
-    assignedThisBatch.add(winner.key);
-    return winner.pick;
-  });
-}
-
-export type PostRow = {
-  id: string;
-  content: string;
-  content_type: string;
-  title: string | null;
-  platform: string | null;
-  status: string;
-  month: string | null;
-  scheduled_for: string | null;
-  created_at: string;
-  archived: boolean;
-  metadata: PostMetadata | null;
-};
-
-export const listMarketingPosts = createServerFn({ method: "GET" })
-  .middleware([requireSupabaseAuth])
-  .validator((data: { agentId: string; month?: string; archivedOnly?: boolean }) => data)
-  .handler(async ({ data, context }): Promise<PostRow[]> => {
-    const email = (context.claims as { email?: string } | undefined)?.email;
-    await requireAgentAccess(context.userId, email, data.agentId);
-    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
-    let query = supabaseAdmin
-      .from("generated_posts")
-      .select(
-        "id, content, content_type, title, platform, status, month, scheduled_for, created_at, archived, metadata",
-      )
-      .eq("agent_id", data.agentId)
-      // Archived content (2026-09-20, see archiveMonthContent below) is
-      // hidden from the normal list by default — that's the whole point of
-      // archiving a month's test batch: get it out of the way so "Generate
-      // Now" can be run again cleanly. Pass archivedOnly to see just the
-      // archived history instead (used by the "view archived" list).
-      .eq("archived", Boolean(data.archivedOnly))
-      // Secondary tiebreak on `id` — REAL BUG FIX (2026-09-18). Every post in
-      // one calendar batch is written in a single bulk insert, so posts from
-      // the same batch (e.g. two emails) can end up with the exact same
-      // `created_at` timestamp. `ORDER BY created_at` alone leaves ties in an
-      // UNDEFINED order in Postgres — in practice it's whatever the rows'
-      // current physical position happens to be, which an UPDATE can change
-      // (Postgres writes an updated row as a new row version). That's exactly
-      // what was happening here: picking a photo for one email calls
-      // setPostUnsplashPhoto/setPostMedia, which UPDATEs that one row, then
-      // the picker's onChanged() re-fetches this exact list — and a tied pair
-      // could come back in a different order than before, so the photo you
-      // just watched attach to "the email in slot 2" visually reappears on
-      // whatever email now occupies slot 2. This is Mike's report (2026-09-18):
-      // "when I select a photo to use it's placed in the other email and not
-      // the one I selected it for" — the save was always going to the right
-      // row, only the on-screen ordering was unstable. Adding `id` as a
-      // secondary sort gives every fetch of this list one single, repeatable
-      // order regardless of ties or intervening updates.
-      .order("created_at", { ascending: true })
-      .order("id", { ascending: true });
-    if (data.month) query = query.eq("month", data.month);
-    const { data: posts, error } = await query;
-    if (error) throw error;
-    return (posts ?? []) as unknown as PostRow[];
-  });
-
-// Shared by approveBatch and approveAllPending below — marks every photo/
-// video attached to a just-approved batch of posts "used," across BOTH
-// sources at once (Media Library rows via a real status flag, Drive files
-// via our own agent_drive_used_files tracking — see markDriveFileUsed's
-// comment for why Drive can't be a real folder move). Added/split out
-// 2026-09-21 after Mike reported "photos on the approve all did not move,
-// they need to move to the used folder in both media library and google
-// drive as well" — previously only the media_id half of this existed here;
-// a Drive-sourced photo on an approved post was never marked used at all.
-async function markAttachedMediaUsedForBatch(
-  supabaseAdmin: (typeof import("@/integrations/supabase/client.server"))["supabaseAdmin"],
-  agentId: string,
-  rows: { id: string; metadata: unknown }[],
-): Promise<void> {
-  const mediaIds = Array.from(
-    new Set(rows.map((r) => (r.metadata as PostMetadata | null)?.media_id).filter((id): id is string => Boolean(id))),
-  );
-  if (mediaIds.length) {
-    await supabaseAdmin
-      .from("agent_photos")
-      .update({ status: "used", used_at: new Date().toISOString() })
-      .in("id", mediaIds)
-      .eq("status", "available");
-  }
-
-  const driveFileIds = Array.from(
-    new Set(
-      rows.map((r) => (r.metadata as PostMetadata | null)?.drive_file_id).filter((id): id is string => Boolean(id)),
-    ),
-  );
-  if (driveFileIds.length) {
-    await supabaseAdmin.from("agent_drive_used_files").upsert(
-      driveFileIds.map((driveFileId) => ({
-        agent_id: agentId,
-        drive_file_id: driveFileId,
-        used_at: new Date().toISOString(),
-      })),
-      { onConflict: "agent_id,drive_file_id" },
-    );
-  }
-}
-
-export const approveBatch = createServerFn({ method: "POST" })
-  .middleware([requireSupabaseAuth])
-  .validator((data: { agentId: string; batchId: string }) => data)
-  .handler(async ({ data, context }): Promise<{ ok: true; updated: number }> => {
-    const email = (context.claims as { email?: string } | undefined)?.email;
-    await requireAgentAccess(context.userId, email, data.agentId);
-    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
-    const { data: rows, error: fetchErr } = await supabaseAdmin
-      .from("generated_posts")
-      .select("id, metadata")
-      .eq("agent_id", data.agentId)
-      .eq("metadata->>batch_id", data.batchId);
-    if (fetchErr) throw fetchErr;
-    const ids = (rows ?? []).map((r) => r.id);
-    if (!ids.length) return { ok: true, updated: 0 };
-    const { error } = await supabaseAdmin
-      .from("generated_posts")
-      .update({ status: "approved", updated_at: new Date().toISOString() })
-      .in("id", ids);
-    if (error) throw error;
-
-    // Same auto-mark-used behavior as the single-post approve path, applied
-    // to the whole batch at once, across both photo sources.
-    await markAttachedMediaUsedForBatch(supabaseAdmin, data.agentId, rows ?? []);
-
-    return { ok: true, updated: ids.length };
-  });
-
-// Bulk-approves every not-yet-approved post for this agent (optionally
-// scoped to one month) — added per Mike's request (2026-09-17) for the Posts
-// tab, which had no "approve all" of its own (only a calendar batch did, via
-// approveBatch above). Same auto-mark-used-media behavior as the other two
-// approve paths.
-export const approveAllPending = createServerFn({ method: "POST" })
-  .middleware([requireSupabaseAuth])
-  .validator((data: { agentId: string; month?: string }) => data)
-  .handler(async ({ data, context }): Promise<{ ok: true; updated: number }> => {
-    const email = (context.claims as { email?: string } | undefined)?.email;
-    await requireAgentAccess(context.userId, email, data.agentId);
-    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
-    let query = supabaseAdmin
-      .from("generated_posts")
-      .select("id, metadata")
-      .eq("agent_id", data.agentId)
-      .neq("status", "approved");
-    if (data.month) query = query.eq("month", data.month);
-    const { data: rows, error: fetchErr } = await query;
-    if (fetchErr) throw fetchErr;
-    const ids = (rows ?? []).map((r) => r.id);
-    if (!ids.length) return { ok: true, updated: 0 };
-    const { error } = await supabaseAdmin
-      .from("generated_posts")
-      .update({ status: "approved", updated_at: new Date().toISOString() })
-      .in("id", ids);
-    if (error) throw error;
-
-    await markAttachedMediaUsedForBatch(supabaseAdmin, data.agentId, rows ?? []);
-
-    return { ok: true, updated: ids.length };
-  });
-
-export const listMarketingMonths = createServerFn({ method: "GET" })
-  .middleware([requireSupabaseAuth])
-  .validator((data: { agentId: string }) => data)
-  .handler(async ({ data, context }): Promise<string[]> => {
-    const email = (context.claims as { email?: string } | undefined)?.email;
-    await requireAgentAccess(context.userId, email, data.agentId);
-    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
-    const { data: rows, error } = await supabaseAdmin
-      .from("generated_posts")
-      .select("month")
-      .eq("agent_id", data.agentId);
-    if (error) throw error;
-    const months = Array.from(new Set((rows ?? []).map((r) => r.month).filter((m): m is string => Boolean(m))));
-    months.sort();
-    months.reverse();
-    return months;
-  });
-
-export const updateMarketingPost = createServerFn({ method: "POST" })
-  .middleware([requireSupabaseAuth])
-  .validator((data: { agentId: string; postId: string; content?: string; status?: string }) => data)
-  .handler(async ({ data, context }): Promise<{ ok: true }> => {
-    const email = (context.claims as { email?: string } | undefined)?.email;
-    await requireAgentAccess(context.userId, email, data.agentId);
-    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
-
-    // Belt-and-suspenders: confirm the row we're about to touch actually
-    // belongs to the agentId we just verified access for, so a postId alone
-    // can never reach into a different agent's row.
-    const { data: existing, error: fetchErr } = await supabaseAdmin
-      .from("generated_posts")
-      .select("agent_id, metadata")
-      .eq("id", data.postId)
-      .maybeSingle();
-    if (fetchErr) throw fetchErr;
-    if (!existing || existing.agent_id !== data.agentId) {
-      throw new Error("Post not found for this agent.");
-    }
-
-    const update: { updated_at: string; content?: string; status?: string } = {
-      updated_at: new Date().toISOString(),
-    };
-    if (data.content !== undefined) update.content = data.content;
-    if (data.status !== undefined) update.status = data.status;
-
-    const { error } = await supabaseAdmin.from("generated_posts").update(update).eq("id", data.postId);
-    if (error) throw error;
-
-    // Auto-mark the attached photo/video "used" the moment a post is
-    // approved — the native equivalent of the old app's move-to-used, which
-    // also only ever fired once content was actually approved, never at
-    // suggestion time. As of 2026-09-21, this covers a Drive-sourced photo
-    // too, not just a Media Library one — see markDriveFileUsed above for
-    // why Drive's version is a DB flag rather than an actual Drive move.
-    if (data.status === "approved") {
-      const meta = existing.metadata as PostMetadata | null;
-      const mediaId = meta?.media_id;
-      if (mediaId) {
-        await supabaseAdmin
-          .from("agent_photos")
-          .update({ status: "used", used_at: new Date().toISOString(), used_in_post_id: data.postId })
-          .eq("id", mediaId)
-          .eq("status", "available");
-      }
-      const driveFileId = meta?.drive_file_id;
-      if (driveFileId) {
-        await supabaseAdmin.from("agent_drive_used_files").upsert(
-          {
-            agent_id: data.agentId,
-            drive_file_id: driveFileId,
-            used_at: new Date().toISOString(),
-            used_in_post_id: data.postId,
-          },
-          { onConflict: "agent_id,drive_file_id" },
-        );
-      }
-    }
-
-    return { ok: true };
-  });
-
-// Lets the team swap the auto-suggested photo/video on a post for a
-// different one from this agent's native Media library, or remove it
-// entirely (mediaId: null). Ported concept from the old app's photo picker —
-// including logging the swap to feedback_history as a learning signal, same
-// as the old app did when a VA picked something other than the suggestion.
-export const setPostMedia = createServerFn({ method: "POST" })
-  .middleware([requireSupabaseAuth])
-  .validator((data: { agentId: string; postId: string; mediaId: string | null }) => data)
-  .handler(async ({ data, context }): Promise<{ ok: true }> => {
-    const email = (context.claims as { email?: string } | undefined)?.email;
-    await requireAgentAccess(context.userId, email, data.agentId);
-    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
-
-    const { data: existing, error: fetchErr } = await supabaseAdmin
-      .from("generated_posts")
-      .select("agent_id, metadata")
-      .eq("id", data.postId)
-      .maybeSingle();
-    if (fetchErr) throw fetchErr;
-    if (!existing || existing.agent_id !== data.agentId) {
-      throw new Error("Post not found for this agent.");
-    }
-    const prevMediaId = (existing.metadata as PostMetadata | null)?.media_id ?? null;
-
-    let mediaUrl: string | null = null;
-    let mediaType: string | null = null;
-    if (data.mediaId) {
-      const { data: media, error: mediaErr } = await supabaseAdmin
-        .from("agent_photos")
-        .select("id, url, media_type, agent_id")
-        .eq("id", data.mediaId)
-        .maybeSingle();
-      if (mediaErr) throw mediaErr;
-      if (!media || media.agent_id !== data.agentId) {
-        throw new Error("That media item doesn't belong to this agent.");
-      }
-      mediaUrl = media.url;
-      mediaType = media.media_type;
-    }
-
-    const nextMetadata = {
-      ...((existing.metadata as Record<string, unknown> | null) ?? {}),
-      media_id: data.mediaId,
-      media_url: mediaUrl,
-      media_type: mediaType,
-      // Clear out any Drive/Unsplash photo that was attached before — a post
-      // only ever shows one photo, and without this a stale drive_file_id or
-      // Unsplash credit could keep hanging around after switching sources.
-      drive_file_id: null,
-      drive_thumbnail_url: null,
-      unsplash_photographer: null,
-      unsplash_credit_url: null,
-    };
-
-    const { error } = await supabaseAdmin
-      .from("generated_posts")
-      .update({ metadata: nextMetadata, updated_at: new Date().toISOString() })
-      .eq("id", data.postId);
-    if (error) throw error;
-
-    if (data.mediaId !== prevMediaId) {
-      await supabaseAdmin.from("feedback_history").insert({
-        agent_id: data.agentId,
-        post_id: data.postId,
-        rating: "photo_changed",
-        notes: data.mediaId
-          ? `Photo changed to media ${data.mediaId}${prevMediaId ? ` (was ${prevMediaId})` : ""}.`
-          : `Photo removed${prevMediaId ? ` (was ${prevMediaId})` : ""}.`,
-      });
-    }
-
-    return { ok: true };
-  });
-
-// Attaches a photo straight from the agent's connected Google Drive folder
-// to a post — the "Change photo" panel's Google Drive tab (added 2026-09-18
-// per Mike's request; previously the panel only offered the native Media
-// Library, with no way to reach the Drive folder that already existed).
-// Mirrors setPostMedia above but writes drive_file_id/drive_thumbnail_url
-// instead of a media_id, and clears the media-library + Unsplash fields so
-// only one photo source is ever active on a post at a time.
-export const setPostDrivePhoto = createServerFn({ method: "POST" })
-  .middleware([requireSupabaseAuth])
-  .validator((data: { agentId: string; postId: string; driveFileId: string; thumbnailUrl: string }) => data)
-  .handler(async ({ data, context }): Promise<{ ok: true }> => {
-    const email = (context.claims as { email?: string } | undefined)?.email;
-    await requireAgentAccess(context.userId, email, data.agentId);
-    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
-
-    const { data: existing, error: fetchErr } = await supabaseAdmin
-      .from("generated_posts")
-      .select("agent_id, metadata")
-      .eq("id", data.postId)
-      .maybeSingle();
-    if (fetchErr) throw fetchErr;
-    if (!existing || existing.agent_id !== data.agentId) {
-      throw new Error("Post not found for this agent.");
-    }
-
-    const nextMetadata = {
-      ...((existing.metadata as Record<string, unknown> | null) ?? {}),
-      drive_file_id: data.driveFileId,
-      drive_thumbnail_url: data.thumbnailUrl,
-      media_id: null,
-      media_url: null,
-      media_type: null,
-      unsplash_photographer: null,
-      unsplash_credit_url: null,
-    };
-
-    const { error } = await supabaseAdmin
-      .from("generated_posts")
-      .update({ metadata: nextMetadata, updated_at: new Date().toISOString() })
-      .eq("id", data.postId);
-    if (error) throw error;
-
-    await supabaseAdmin.from("feedback_history").insert({
-      agent_id: data.agentId,
-      post_id: data.postId,
-      rating: "photo_changed",
-      notes: `Photo changed to Drive file ${data.driveFileId}.`,
-    });
-
-    return { ok: true };
-  });
-
-// Searches Unsplash for free stock photos and attaches one to a post — added
-// 2026-09-18 per Mike's request: emails in particular never had a photo
-// option (they don't draw from an agent's own Drive/library the way posts
-// do), and the old app used Unsplash for exactly this. Requires an
-// UNSPLASH_ACCESS_KEY (a free Unsplash Developer account/app), same
-// self-explaining-when-missing pattern as GOOGLE_API_KEY/ANTHROPIC_API_KEY.
-export type UnsplashResult = {
-  id: string;
-  thumbUrl: string;
-  fullUrl: string;
-  photographerName: string;
-  photographerProfileUrl: string;
-  unsplashPageUrl: string;
-};
-
-export const searchUnsplashPhotos = createServerFn({ method: "POST" })
-  .middleware([requireSupabaseAuth])
-  .validator((data: { agentId: string; query: string }) => data)
-  .handler(async ({ data, context }): Promise<{ results: UnsplashResult[] }> => {
-    const email = (context.claims as { email?: string } | undefined)?.email;
-    await requireAgentAccess(context.userId, email, data.agentId);
-    // .trim() guards against a stray leading/trailing space or newline from
-    // copy-pasting the key into Lovable Cloud → Secrets — that alone is
-    // enough to make Unsplash reject it with "OAuth error: The access token
-    // is invalid" (2026-09-18: Mike hit exactly this error after adding a
-    // key). Confirmed against Unsplash's current API docs that `client_id`
-    // as a query param is the correct, supported auth method here (the
-    // alternative is an `Authorization: Client-ID <key>` header — same
-    // credential, same result), so that error means the value Unsplash
-    // received didn't match a real access key, not a request-shape bug.
-    // The most common causes: the Secret Key was pasted instead of the
-    // Access Key (an Unsplash app has both, only the Access Key works here),
-    // or whitespace around the value.
-    const key = process.env["UNSPLASH_ACCESS_KEY"]?.trim();
-    if (!key) {
-      throw new Error(
-        "Stock photos aren't connected yet — add UNSPLASH_ACCESS_KEY in Lovable Cloud → Secrets (free at unsplash.com/developers).",
-      );
-    }
-    const query = data.query.trim() || "lifestyle";
-    const url =
-      "https://api.unsplash.com/search/photos?per_page=8&query=" + encodeURIComponent(query) + "&client_id=" + key;
-    const res = await fetch(url);
-    // Read as text first, then parse — added 2026-09-18 after Mike reported
-    // stock photos "still not pulling" with no error text to go on. A plain
-    // `res.json()` here throws an opaque "Unexpected token..." parse error
-    // whenever Unsplash's response body isn't JSON, which happens on at
-    // least one real, common case this app hadn't accounted for: a brand
-    // new Unsplash app starts in "Demo" mode, capped at 50 requests/hour,
-    // and once that's exceeded the response isn't always the clean JSON
-    // error body the code below expects. Reading as text first means a
-    // non-JSON response now surfaces a clear, specific message instead of a
-    // cryptic parser crash — and the rate-limit case gets its own explicit
-    // explanation rather than falling through to a generic one.
-    const bodyText = await res.text();
-    let json: {
-      results?: {
-        id: string;
-        urls?: { small?: string; regular?: string };
-        links?: { html?: string };
-        user?: { name?: string; links?: { html?: string } };
-      }[];
-      errors?: string[];
-    };
-    try {
-      json = JSON.parse(bodyText);
-    } catch {
-      if (res.status === 403 || res.status === 429) {
-        throw new Error(
-          `Unsplash blocked this request (status ${res.status}) — likely the app's Demo-mode limit of 50 requests/hour. If stock photos have been used a lot this hour, wait a bit, or apply for production access at unsplash.com/oauth/applications to raise that limit.`,
-        );
-      }
-      throw new Error(
-        `Unsplash returned an unexpected (non-JSON) response, status ${res.status}. First part of the response: ${bodyText.slice(0, 200)}`,
-      );
-    }
-    if (!res.ok) {
-      const apiError = json.errors?.[0] ?? `Unsplash API error (${res.status})`;
-      throw new Error(
-        /access token is invalid/i.test(apiError)
-          ? `${apiError} — double check UNSPLASH_ACCESS_KEY in Lovable Cloud → Secrets is the app's "Access Key" (not the "Secret Key"), pasted with no extra spaces.`
-          : /rate limit/i.test(apiError)
-            ? `${apiError} — this Unsplash app is likely still in Demo mode (50 requests/hour cap). Apply for production access at unsplash.com/oauth/applications to raise that limit.`
-            : apiError,
-      );
-    }
-    const results: UnsplashResult[] = (json.results ?? [])
-      .filter((r) => r.urls?.small && r.urls?.regular)
-      .slice(0, 8)
-      .map((r) => ({
-        id: r.id,
-        thumbUrl: r.urls!.small!,
-        fullUrl: r.urls!.regular!,
-        photographerName: r.user?.name ?? "Unsplash photographer",
-        photographerProfileUrl: r.user?.links?.html ?? "https://unsplash.com",
-        unsplashPageUrl: r.links?.html ?? "https://unsplash.com",
-      }));
-    return { results };
-  });
-
-export const setPostUnsplashPhoto = createServerFn({ method: "POST" })
-  .middleware([requireSupabaseAuth])
-  .validator(
-    (data: {
-      agentId: string;
-      postId: string;
-      photoUrl: string;
-      photographerName: string;
-      photographerProfileUrl: string;
-    }) => data,
-  )
-  .handler(async ({ data, context }): Promise<{ ok: true }> => {
-    const email = (context.claims as { email?: string } | undefined)?.email;
-    await requireAgentAccess(context.userId, email, data.agentId);
-    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
-
-    const { data: existing, error: fetchErr } = await supabaseAdmin
-      .from("generated_posts")
-      .select("agent_id, metadata")
-      .eq("id", data.postId)
-      .maybeSingle();
-    if (fetchErr) throw fetchErr;
-    if (!existing || existing.agent_id !== data.agentId) {
-      throw new Error("Post not found for this agent.");
-    }
-
-    const nextMetadata = {
-      ...((existing.metadata as Record<string, unknown> | null) ?? {}),
-      media_id: null,
-      media_url: data.photoUrl,
-      media_type: "image",
-      drive_file_id: null,
-      drive_thumbnail_url: null,
-      unsplash_photographer: data.photographerName,
-      unsplash_credit_url: data.photographerProfileUrl,
-    };
-
-    const { error } = await supabaseAdmin
-      .from("generated_posts")
-      .update({ metadata: nextMetadata, updated_at: new Date().toISOString() })
-      .eq("id", data.postId);
-    if (error) throw error;
-
-    await supabaseAdmin.from("feedback_history").insert({
-      agent_id: data.agentId,
-      post_id: data.postId,
-      rating: "photo_changed",
-      notes: `Photo changed to an Unsplash photo by ${data.photographerName}.`,
-    });
-
-    return { ok: true };
-  });
-
-// ============================================================================
-// Email multi-photo attachments — added 2026-09-21 per Mike: "Emails should
-// have the ability to include up to 3 photos from any combination. Those
-// images would come with publishing instructions." A post only ever needs
-// one photo (setPostMedia/setPostDrivePhoto/setPostUnsplashPhoto above,
-// which all write directly onto PostMetadata's media_id/drive_file_id/
-// unsplash_* fields), but an email can hold several at once, from different
-// sources, each with its own note for whoever ends up actually publishing
-// it — so these live in their own metadata.email_photos array instead of
-// turning those single-photo fields into arrays (which would also change
-// what every post everywhere reads).
-//
-// One small function per source (mirrors setPostMedia/setPostDrivePhoto/
-// setPostUnsplashPhoto's own split above) plus one to edit an existing
-// photo's instructions and one to remove a photo — each does its own
-// read-modify-write of metadata.email_photos rather than sharing a
-// mid-request cache, which costs an extra round trip per call but keeps
-// every one of these obviously correct on its own, which matters more than
-// the round trip on a feature nobody calls at any real volume.
-// ============================================================================
-
-const MAX_EMAIL_PHOTOS = 3;
-
-// A single photo attached to an email. `id` is a small server-generated key
-// used purely so the UI can edit or remove one photo without touching the
-// others — it has no meaning beyond that (it is NOT the Media Library
-// media_id, the Drive file id, or anything else that identifies the photo
-// at its source; those are captured separately below when relevant).
-export type EmailPhoto = {
-  id: string;
-  source: "library" | "drive" | "unsplash";
-  url: string;
-  mediaType: "photo" | "video";
-  publishingInstructions: string;
-  driveFileId?: string | null | undefined;
-  unsplashPhotographer?: string | null | undefined;
-  unsplashCreditUrl?: string | null | undefined;
-};
-
-// Fetches a post, confirms it belongs to this agent AND is actually an
-// email (multi-photo is email-only — a post keeps the single-photo fields
-// above), and returns its current email_photos array (empty if none yet).
-// Every function below calls this first.
-async function requireEmailPost(agentId: string, postId: string): Promise<EmailPhoto[]> {
-  const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
-  const { data: existing, error } = await supabaseAdmin
-    .from("generated_posts")
-    .select("agent_id, content_type, metadata")
-    .eq("id", postId)
-    .maybeSingle();
-  if (error) throw error;
-  if (!existing || existing.agent_id !== agentId) {
-    throw new Error("Post not found for this agent.");
-  }
-  if (existing.content_type !== "email") {
-    throw new Error("Multi-photo attachments are only available for emails.");
-  }
-  const metadata = (existing.metadata as Record<string, unknown> | null) ?? {};
-  return Array.isArray(metadata["email_photos"]) ? (metadata["email_photos"] as EmailPhoto[]) : [];
-}
-
-// Writes a full replacement email_photos array — every add/edit/remove below
-// ends with this, same "spread the existing metadata, overwrite one field"
-// shape setPostMedia/setPostDrivePhoto/setPostUnsplashPhoto already use.
-async function writeEmailPhotos(postId: string, photos: EmailPhoto[]): Promise<void> {
-  const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
-  const { data: existing, error: fetchErr } = await supabaseAdmin
-    .from("generated_posts")
-    .select("metadata")
-    .eq("id", postId)
-    .maybeSingle();
-  if (fetchErr) throw fetchErr;
-  const nextMetadata = {
-    ...((existing?.metadata as Record<string, unknown> | null) ?? {}),
-    email_photos: photos,
-  };
-  const { error } = await supabaseAdmin
-    .from("generated_posts")
-    .update({ metadata: nextMetadata, updated_at: new Date().toISOString() })
-    .eq("id", postId);
-  if (error) throw error;
-}
-
-// Adds a photo from the agent's own native Media Library — re-verifies the
-// media item actually belongs to this agent (same trust level setPostMedia
-// already applies to library photos) before trusting its URL.
-export const addEmailPhotoFromLibrary = createServerFn({ method: "POST" })
-  .middleware([requireSupabaseAuth])
-  .validator((data: { agentId: string; postId: string; mediaId: string }) => data)
-  .handler(async ({ data, context }): Promise<{ photos: EmailPhoto[] }> => {
-    const email = (context.claims as { email?: string } | undefined)?.email;
-    await requireAgentAccess(context.userId, email, data.agentId);
-    const photos = await requireEmailPost(data.agentId, data.postId);
-    if (photos.length >= MAX_EMAIL_PHOTOS) {
-      throw new Error(`Emails can only carry up to ${MAX_EMAIL_PHOTOS} photos — remove one first.`);
-    }
-
-    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
-    const { data: media, error: mediaErr } = await supabaseAdmin
-      .from("agent_photos")
-      .select("id, url, media_type, agent_id")
-      .eq("id", data.mediaId)
-      .maybeSingle();
-    if (mediaErr) throw mediaErr;
-    if (!media || media.agent_id !== data.agentId || !media.url) {
-      throw new Error("That media item doesn't belong to this agent.");
-    }
-
-    const next: EmailPhoto[] = [
-      ...photos,
-      {
-        id: crypto.randomUUID(),
-        source: "library",
-        url: media.url,
-        mediaType: media.media_type as "photo" | "video",
-        publishingInstructions: "",
-      },
-    ];
-    await writeEmailPhotos(data.postId, next);
-    await supabaseAdmin.from("feedback_history").insert({
-      agent_id: data.agentId,
-      post_id: data.postId,
-      rating: "photo_changed",
-      notes: `Email photo added from Media Library (${next.length}/${MAX_EMAIL_PHOTOS}).`,
-    });
-    return { photos: next };
-  });
-
-// Adds a photo from the agent's connected Google Drive folder — trusts the
-// client-supplied thumbnailUrl as-is, same trust level setPostDrivePhoto
-// already applies (the Drive listing itself is what's scoped to this agent;
-// nothing further to re-verify against a Drive file id here).
-export const addEmailPhotoFromDrive = createServerFn({ method: "POST" })
-  .middleware([requireSupabaseAuth])
-  .validator((data: { agentId: string; postId: string; driveFileId: string; thumbnailUrl: string }) => data)
-  .handler(async ({ data, context }): Promise<{ photos: EmailPhoto[] }> => {
-    const email = (context.claims as { email?: string } | undefined)?.email;
-    await requireAgentAccess(context.userId, email, data.agentId);
-    const photos = await requireEmailPost(data.agentId, data.postId);
-    if (photos.length >= MAX_EMAIL_PHOTOS) {
-      throw new Error(`Emails can only carry up to ${MAX_EMAIL_PHOTOS} photos — remove one first.`);
-    }
-
-    const next: EmailPhoto[] = [
-      ...photos,
-      {
-        id: crypto.randomUUID(),
-        source: "drive",
-        url: data.thumbnailUrl,
-        mediaType: "photo",
-        driveFileId: data.driveFileId,
-        publishingInstructions: "",
-      },
-    ];
-    await writeEmailPhotos(data.postId, next);
-    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
-    await supabaseAdmin.from("feedback_history").insert({
-      agent_id: data.agentId,
-      post_id: data.postId,
-      rating: "photo_changed",
-      notes: `Email photo added from Google Drive (${next.length}/${MAX_EMAIL_PHOTOS}).`,
-    });
-    return { photos: next };
-  });
-
-// Adds a photo from Unsplash — trusts the client-supplied photo URL as-is,
-// same trust level setPostUnsplashPhoto already applies (the URL only ever
-// comes from a live searchUnsplashPhotos result, never typed in by hand).
-export const addEmailPhotoFromUnsplash = createServerFn({ method: "POST" })
-  .middleware([requireSupabaseAuth])
-  .validator(
-    (data: {
-      agentId: string;
-      postId: string;
-      photoUrl: string;
-      photographerName: string;
-      photographerProfileUrl: string;
-    }) => data,
-  )
-  .handler(async ({ data, context }): Promise<{ photos: EmailPhoto[] }> => {
-    const email = (context.claims as { email?: string } | undefined)?.email;
-    await requireAgentAccess(context.userId, email, data.agentId);
-    const photos = await requireEmailPost(data.agentId, data.postId);
-    if (photos.length >= MAX_EMAIL_PHOTOS) {
-      throw new Error(`Emails can only carry up to ${MAX_EMAIL_PHOTOS} photos — remove one first.`);
-    }
-
-    const next: EmailPhoto[] = [
-      ...photos,
-      {
-        id: crypto.randomUUID(),
-        source: "unsplash",
-        url: data.photoUrl,
-        mediaType: "photo",
-        unsplashPhotographer: data.photographerName,
-        unsplashCreditUrl: data.photographerProfileUrl,
-        publishingInstructions: "",
-      },
-    ];
-    await writeEmailPhotos(data.postId, next);
-    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
-    await supabaseAdmin.from("feedback_history").insert({
-      agent_id: data.agentId,
-      post_id: data.postId,
-      rating: "photo_changed",
-      notes: `Email photo added from Unsplash (${next.length}/${MAX_EMAIL_PHOTOS}).`,
-    });
-    return { photos: next };
-  });
-
-// Edits one already-attached email photo's publishing instructions without
-// touching the others — the "Publishing instructions" box under each photo
-// in the panel saves through this on blur.
-export const updateEmailPhotoInstructions = createServerFn({ method: "POST" })
-  .middleware([requireSupabaseAuth])
-  .validator((data: { agentId: string; postId: string; photoId: string; publishingInstructions: string }) => data)
-  .handler(async ({ data, context }): Promise<{ photos: EmailPhoto[] }> => {
-    const email = (context.claims as { email?: string } | undefined)?.email;
-    await requireAgentAccess(context.userId, email, data.agentId);
-    const photos = await requireEmailPost(data.agentId, data.postId);
-    const next = photos.map((p) =>
-      p.id === data.photoId ? { ...p, publishingInstructions: data.publishingInstructions } : p,
-    );
-    await writeEmailPhotos(data.postId, next);
-    return { photos: next };
-  });
-
-// Removes one attached email photo, leaving the others as-is.
-export const removeEmailPhoto = createServerFn({ method: "POST" })
-  .middleware([requireSupabaseAuth])
-  .validator((data: { agentId: string; postId: string; photoId: string }) => data)
-  .handler(async ({ data, context }): Promise<{ photos: EmailPhoto[] }> => {
-    const email = (context.claims as { email?: string } | undefined)?.email;
-    await requireAgentAccess(context.userId, email, data.agentId);
-    const photos = await requireEmailPost(data.agentId, data.postId);
-    const next = photos.filter((p) => p.id !== data.photoId);
-    await writeEmailPhotos(data.postId, next);
-    return { photos: next };
-  });
-
-export const submitMarketingFeedback = createServerFn({ method: "POST" })
-  .middleware([requireSupabaseAuth])
-  .validator((data: { agentId: string; postId: string; rating?: string; notes?: string }) => data)
-  .handler(async ({ data, context }): Promise<{ ok: true }> => {
-    const email = (context.claims as { email?: string } | undefined)?.email;
-    await requireAgentAccess(context.userId, email, data.agentId);
-    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
-
-    const { data: existing, error: fetchErr } = await supabaseAdmin
-      .from("generated_posts")
-      .select("agent_id")
-      .eq("id", data.postId)
-      .maybeSingle();
-    if (fetchErr) throw fetchErr;
-    if (!existing || existing.agent_id !== data.agentId) {
-      throw new Error("Post not found for this agent.");
-    }
-
-    const { error } = await supabaseAdmin.from("feedback_history").insert({
-      agent_id: data.agentId,
-      post_id: data.postId,
-      rating: data.rating ?? null,
-      notes: data.notes ?? null,
-    });
-    if (error) throw error;
-    return { ok: true };
-  });
-
-// Regenerates a post/email/video's content in the agent's voice,
-// incorporating whatever the reviewer typed into the Flag/feedback panel —
-// added per Mike's request (2026-09-17) as the native version of the old
-// app's "Rewrite in their voice" button, same prompt shape: keep the
-// original concept, apply the feedback exactly, write it in the agent's
-// Voice DNA, output only the finished text. Sets the post back to "pending"
-// so the rewritten version goes through review again, and logs the round to
-// feedback_history as a learning signal, same as the old app did.
-export const rewritePostContent = createServerFn({ method: "POST" })
-  .middleware([requireSupabaseAuth])
-  .validator((data: { agentId: string; postId: string; feedback: string }) => data)
-  .handler(async ({ data, context }): Promise<{ ok: true; content: string }> => {
-    const email = (context.claims as { email?: string } | undefined)?.email;
-    await requireAgentAccess(context.userId, email, data.agentId);
-    const feedback = data.feedback.trim();
-    if (!feedback) throw new Error("Tell us what to fix first.");
-
-    const apiKey = process.env["ANTHROPIC_API_KEY"];
-    if (!apiKey) {
-      throw new Error("Rewriting isn't configured yet — add ANTHROPIC_API_KEY in Lovable Cloud → Secrets.");
-    }
-
-    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
-    const { data: existing, error: fetchErr } = await supabaseAdmin
-      .from("generated_posts")
-      .select("agent_id, content, content_type, title")
-      .eq("id", data.postId)
-      .maybeSingle();
-    if (fetchErr) throw fetchErr;
-    if (!existing || existing.agent_id !== data.agentId) {
-      throw new Error("Post not found for this agent.");
-    }
-
-    const { data: agent, error: agentErr } = await supabaseAdmin
-      .from("agents")
-      .select("full_name, market_area, voice_summary")
-      .eq("id", data.agentId)
-      .maybeSingle();
-    if (agentErr) throw agentErr;
-    const agentName = agent?.full_name ?? "the agent";
-    const firstName = agentName.split(" ")[0] || agentName;
-    const agentCity = agent?.market_area ?? "their market";
-    const dna =
-      agent?.voice_summary ?? "Warm, conversational, authentic real estate agent. Short posts. Real human energy.";
-
-    const kind =
-      existing.content_type === "email"
-        ? "email"
-        : existing.content_type === "video"
-          ? "video script"
-          : "social media post";
-    const formatRule =
-      existing.content_type === "post"
-        ? "4. 2 to 4 sentences max\n"
-        : existing.content_type === "video"
-          ? "4. Keep the HOOK / BODY / CLOSE format, written to be spoken, 150 words maximum\n"
-          : "4. Keep the SUBJECT OPTIONS / EMAIL BODY format\n";
-    const learnedFeedback = await fetchLearnedFeedback(data.agentId);
-    const prompt =
-      `You are rewriting a ${kind} for ${agentName} in ${agentCity}.\n\n` +
-      `VOICE DNA (this is how they actually talk):\n${dna}\n\n` +
-      (existing.title ? `ORIGINAL CONCEPT: ${existing.title}\n` : "") +
-      `CURRENT VERSION:\n${existing.content}\n\n` +
-      `FEEDBACK FROM REVIEWER: ${feedback}${learnedFeedback}\n\n` +
-      "YOUR JOB:\n" +
-      "1. Keep the same concept and emotional core as the current version\n" +
-      "2. Apply the feedback exactly as described\n" +
-      `3. Write in ${firstName}'s voice based on their Voice DNA above\n` +
-      formatRule +
-      "5. No hyphens, no corporate language, sounds like a real person, not a brand\n" +
-      "6. Standard capitalization always — never write in all lowercase\n" +
-      `7. AUTHENTICITY TEST: would ${firstName} actually say this?\n\n` +
-      "Output ONLY the rewritten text. Nothing else. No explanation.";
-
-    const maxTokens = existing.content_type === "email" ? 2000 : existing.content_type === "video" ? 600 : 400;
-    const raw = await callClaude(apiKey, prompt, maxTokens);
-    if (!raw) throw new Error("Empty response from Claude — try again.");
-    const rewritten = cleanCopy(raw);
-
-    const { error } = await supabaseAdmin
-      .from("generated_posts")
-      .update({ content: rewritten, status: "pending", updated_at: new Date().toISOString() })
-      .eq("id", data.postId);
-    if (error) throw error;
-
-    await supabaseAdmin.from("feedback_history").insert({
-      agent_id: data.agentId,
-      post_id: data.postId,
-      rating: "rewritten",
-      notes: `Feedback: "${feedback}" — rewritten in ${agentName}'s voice.`,
-    });
-
-    return { ok: true, content: rewritten };
-  });
-
-type PhotoRow = {
-  id: string;
-  url: string | null;
-  caption: string | null;
-  tags: string[];
-  created_at: string;
-};
-
-export const listMarketingPhotos = createServerFn({ method: "GET" })
-  .middleware([requireSupabaseAuth])
-  .validator((data: { agentId: string }) => data)
-  .handler(async ({ data, context }): Promise<PhotoRow[]> => {
-    const email = (context.claims as { email?: string } | undefined)?.email;
-    await requireAgentAccess(context.userId, email, data.agentId);
-    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
-    const { data: photos, error } = await supabaseAdmin
-      .from("agent_photos")
-      .select("id, url, caption, tags, created_at")
-      .eq("agent_id", data.agentId)
-      .order("created_at", { ascending: false });
-    if (error) throw error;
-    return (photos ?? []) as PhotoRow[];
-  });
-
-// ============================================================================
-// Native media library (photos + short-form video) — lives in Monthly
-// Marketing (not Build My Brand) because this is where the files actually
-// get used, each month, to generate content. Coexists with Google Drive:
-// each agent's `photo_source` ('drive' | 'upload' | 'both') decides which
-// pool(s) get queried once content generation is wired up to read this
-// (Phase 2) — existing Drive-based agents default to 'drive' and are
-// completely unaffected by any of this until that agent is switched.
-//
-// Direction confirmed by Mike (2026-09-16): we own the media natively going
-// forward. Drive gets no further development — the three Drive functions
-// already read (drive-photos.js / analyze-photos.js / move-to-used.js) are
-// the last Drive code this touches. No hard upload cap: Mike's own point —
-// once a photo/video is marked "used" it drops out of the active pool the
-// same way Drive's "used" folder does today, so the *visible/active* set
-// stays small on its own without needing an artificial ceiling.
-// ============================================================================
-
-export type MediaRow = {
-  id: string;
-  url: string | null;
-  caption: string | null;
-  tags: string[];
-  media_type: "photo" | "video";
-  source: "upload" | "drive";
-  status: "available" | "used";
-  created_at: string;
-  used_at: string | null;
-};
-
-export const listMarketingMedia = createServerFn({ method: "GET" })
-  .middleware([requireSupabaseAuth])
-  .validator((data: { agentId: string; status?: "available" | "used" }) => data)
-  .handler(async ({ data, context }): Promise<MediaRow[]> => {
-    const email = (context.claims as { email?: string } | undefined)?.email;
-    await requireAgentAccess(context.userId, email, data.agentId);
-    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
-    let query = supabaseAdmin
-      .from("agent_photos")
-      .select("id, url, caption, tags, media_type, source, status, created_at, used_at")
-      .eq("agent_id", data.agentId)
-      .order("created_at", { ascending: false });
-    if (data.status) query = query.eq("status", data.status);
-    const { data: rows, error } = await query;
-    if (error) throw error;
-    return (rows ?? []) as MediaRow[];
-  });
-
-// Step 1 of a native upload: mint a short-lived signed Storage upload URL for
-// this exact agent + file, after re-checking the caller actually has access
-// to that agent. The browser uploads the raw bytes straight to Storage using
-// this URL — the file itself never passes through this server function (no
-// base64/JSON relay), so there's no request-size ceiling to worry about for
-// video the way there would be if uploads were proxied through here.
-export const createMediaUploadUrl = createServerFn({ method: "POST" })
-  .middleware([requireSupabaseAuth])
-  .validator((data: { agentId: string; fileName: string }) => data)
-  .handler(async ({ data, context }): Promise<{ path: string; token: string }> => {
-    const email = (context.claims as { email?: string } | undefined)?.email;
-    await requireAgentAccess(context.userId, email, data.agentId);
-    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
-    const safeName = data.fileName.replace(/[^a-zA-Z0-9._-]/g, "_").slice(-120);
-    const path = `${data.agentId}/${crypto.randomUUID()}-${safeName}`;
-    const { data: signed, error } = await supabaseAdmin.storage.from("media").createSignedUploadUrl(path);
-    if (error) throw error;
-    return { path, token: signed.token };
-  });
-
-// Step 2: once the browser's direct upload to Storage succeeds, record the
-// new media row. Re-checks access again, and re-checks the path itself
-// actually belongs to this agent — never trusts anything the browser reports
-// back about its own upload.
-export const finalizeMediaUpload = createServerFn({ method: "POST" })
-  .middleware([requireSupabaseAuth])
-  .validator((data: { agentId: string; storagePath: string; mediaType: "photo" | "video"; caption?: string }) => data)
-  .handler(async ({ data, context }): Promise<{ ok: true; id: string }> => {
-    const email = (context.claims as { email?: string } | undefined)?.email;
-    await requireAgentAccess(context.userId, email, data.agentId);
-    if (!data.storagePath.startsWith(`${data.agentId}/`)) {
-      throw new Error("Upload path does not belong to this agent.");
-    }
-    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
-    const { data: pub } = supabaseAdmin.storage.from("media").getPublicUrl(data.storagePath);
-    const { data: row, error } = await supabaseAdmin
-      .from("agent_photos")
-      .insert({
-        agent_id: data.agentId,
-        url: pub.publicUrl,
-        storage_path: data.storagePath,
-        media_type: data.mediaType,
-        source: "upload",
-        status: "available",
-        caption: data.caption ?? null,
-        tags: [],
-      })
-      .select("id")
-      .single();
-    if (error) throw error;
-    return { ok: true, id: row.id };
-  });
-
-// Sets a media item's tags from the Media tab's tag-chip editor — added per
-// Mike's request (2026-09-17) as the native equivalent of the old app's
-// separate "Tag Photos" screen, folded into the Media tab itself since
-// there's no Drive-scan step here to hang a separate screen off of. These
-// tags are exactly what assignSuggestedMedia() above reads to match photos
-// to posts by category instead of pure FIFO.
-export const setMediaTags = createServerFn({ method: "POST" })
-  .middleware([requireSupabaseAuth])
-  .validator((data: { agentId: string; mediaId: string; tags: string[] }) => data)
-  .handler(async ({ data, context }): Promise<{ ok: true }> => {
-    const email = (context.claims as { email?: string } | undefined)?.email;
-    await requireAgentAccess(context.userId, email, data.agentId);
-    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
-    const { data: existing, error: fetchErr } = await supabaseAdmin
-      .from("agent_photos")
-      .select("agent_id")
-      .eq("id", data.mediaId)
-      .maybeSingle();
-    if (fetchErr) throw fetchErr;
-    if (!existing || existing.agent_id !== data.agentId) {
-      throw new Error("Media not found for this agent.");
-    }
-    const allowed = new Set<string>(PHOTO_TAG_OPTIONS);
-    const tags = Array.from(new Set(data.tags.filter((t) => allowed.has(t))));
-    const { error } = await supabaseAdmin
-      .from("agent_photos")
-      .update({ tags, updated_at: new Date().toISOString() })
-      .eq("id", data.mediaId);
-    if (error) throw error;
-    return { ok: true };
-  });
-
-// Marks one or more media items "used" — the native equivalent of Drive's
-// move-to-used.js. Moves the row out of the "available" pool for good
-// without ever deleting the file, so there's always a record of what got
-// used and when (used_at / used_in_post_id). Content generation isn't native
-// yet (Phase 2), so nothing calls this automatically on approve yet — the
-// Media tab below exposes it as a manual action so the team can mark
-// something used the moment it's actually used in a piece of content,
-// same as they'd manually confirm today. Wiring this to fire automatically
-// on approval is a Phase 2 item once generation records which photo went
-// into which post.
-export const markMediaUsed = createServerFn({ method: "POST" })
-  .middleware([requireSupabaseAuth])
-  .validator((data: { agentId: string; mediaIds: string[]; postId?: string }) => data)
-  .handler(async ({ data, context }): Promise<{ ok: true; updated: number }> => {
-    const email = (context.claims as { email?: string } | undefined)?.email;
-    await requireAgentAccess(context.userId, email, data.agentId);
-    if (!data.mediaIds.length) return { ok: true, updated: 0 };
-    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
-    const { error } = await supabaseAdmin
-      .from("agent_photos")
-      .update({
-        status: "used",
-        used_at: new Date().toISOString(),
-        used_in_post_id: data.postId ?? null,
-      })
-      .eq("agent_id", data.agentId)
-      .in("id", data.mediaIds);
-    if (error) throw error;
-    return { ok: true, updated: data.mediaIds.length };
-  });
-
-// Added 2026-09-21 per Mike: "photos and videos should be able to be moved
-// back to active folder form used folder." There was previously no way to
-// undo markMediaUsed (or the automatic used-marking on approve) at all —
-// once something was used, it stayed used forever. This is the Media
-// Library equivalent of restoreDriveFileToActive below; both undo the same
-// kind of mistake (marked used too early, or a piece of content got
-// deleted/rejected after all) the same way.
-export const restoreMediaToAvailable = createServerFn({ method: "POST" })
-  .middleware([requireSupabaseAuth])
-  .validator((data: { agentId: string; mediaId: string }) => data)
-  .handler(async ({ data, context }): Promise<{ ok: true }> => {
-    const email = (context.claims as { email?: string } | undefined)?.email;
-    await requireAgentAccess(context.userId, email, data.agentId);
-    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
-    const { error } = await supabaseAdmin
-      .from("agent_photos")
-      .update({ status: "available", used_at: null, used_in_post_id: null })
-      .eq("agent_id", data.agentId)
-      .eq("id", data.mediaId);
-    if (error) throw error;
-    return { ok: true };
-  });
-
-export const deleteMarketingMedia = createServerFn({ method: "POST" })
-  .middleware([requireSupabaseAuth])
-  .validator((data: { agentId: string; mediaId: string }) => data)
-  .handler(async ({ data, context }): Promise<{ ok: true }> => {
-    const email = (context.claims as { email?: string } | undefined)?.email;
-    await requireAgentAccess(context.userId, email, data.agentId);
-    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
-    const { data: existing, error: fetchErr } = await supabaseAdmin
-      .from("agent_photos")
-      .select("agent_id, storage_path, source")
-      .eq("id", data.mediaId)
-      .maybeSingle();
-    if (fetchErr) throw fetchErr;
-    if (!existing || existing.agent_id !== data.agentId) {
-      throw new Error("Media not found for this agent.");
-    }
-    if (existing.storage_path) {
-      await supabaseAdmin.storage.from("media").remove([existing.storage_path]);
-    }
-    const { error } = await supabaseAdmin.from("agent_photos").delete().eq("id", data.mediaId);
-    if (error) throw error;
-    return { ok: true };
-  });
-
-// ============================================================================
-// Public media-upload link (2026-09-20) — Mike's request: "I want to create
-// a simple link I can send them that will open up directly into the Media
-// folder no differently than how we share a google drive link. You would
-// click to copy and we can send it to anyone who can click on it and then
-// upload photos to that media library without logging in." This is the same
-// pattern as a Drive "anyone with the link can upload" folder, deliberately
-// scoped to upload-only: the public page below can never list, view, or
-// delete anything already in an agent's library, and it never exposes
-// agentId, email, or any other agent data — only a display name, so admin
-// can confirm they're sending the right person the right link.
-//
-// Access model: instead of the usual session-based requireAgentAccess, these
-// three functions carry NO auth middleware at all (they need to work for
-// someone who never logs in) and are gated purely by knowing a long random
-// per-agent token — never the agent's real id, which could otherwise be
-// guessed/enumerated. Getting or regenerating the token itself IS admin-only
-// (mirrors setAgentDriveFolder's pattern) and issuing a fresh token
-// invalidates whatever link was shared before, the same way Mike could stop
-// sharing a Drive folder by moving it or changing its share setting.
-// ============================================================================
-
-// Admin-only: read (creating on first use) this agent's public upload token.
-export const getMediaUploadLink = createServerFn({ method: "POST" })
-  .middleware([requireSupabaseAuth])
-  .validator((data: { agentId: string }) => data)
-  .handler(async ({ data, context }): Promise<{ token: string }> => {
-    const email = (context.claims as { email?: string } | undefined)?.email;
-    await requireAdmin(context.userId, email);
-    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
-    const { data: agent, error: fetchErr } = await supabaseAdmin
-      .from("agents")
-      .select("media_upload_token")
-      .eq("id", data.agentId)
-      .maybeSingle();
-    if (fetchErr) throw fetchErr;
-    if (agent?.media_upload_token) return { token: agent.media_upload_token };
-    const token = crypto.randomUUID();
-    const { error } = await supabaseAdmin.from("agents").update({ media_upload_token: token }).eq("id", data.agentId);
-    if (error) throw error;
-    return { token };
-  });
-
-// Admin-only: issue a brand-new token, permanently breaking any link already
-// shared — for when a link needs to be revoked (sent to the wrong person,
-// been floating around too long, etc.).
-export const regenerateMediaUploadLink = createServerFn({ method: "POST" })
-  .middleware([requireSupabaseAuth])
-  .validator((data: { agentId: string }) => data)
-  .handler(async ({ data, context }): Promise<{ token: string }> => {
-    const email = (context.claims as { email?: string } | undefined)?.email;
-    await requireAdmin(context.userId, email);
-    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
-    const token = crypto.randomUUID();
-    const { error } = await supabaseAdmin.from("agents").update({ media_upload_token: token }).eq("id", data.agentId);
-    if (error) throw error;
-    return { token };
-  });
-
-async function resolveAgentIdFromUploadToken(token: string): Promise<{ agentId: string; agentName: string }> {
-  const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
-  const { data: agent, error } = await supabaseAdmin
-    .from("agents")
-    .select("id, full_name")
-    .eq("media_upload_token", token)
-    .maybeSingle();
-  if (error) throw error;
-  if (!agent) throw new Error("This upload link isn't valid — ask your team for a new one.");
-  return { agentId: agent.id, agentName: agent.full_name ?? "this agent" };
-}
-
-// Public — no login required. Only ever returns a display name, never the
-// agent's real id or any other data about them.
-export const getPublicUploadAgent = createServerFn({ method: "POST" })
-  .validator((data: { token: string }) => data)
-  .handler(async ({ data }): Promise<{ agentName: string }> => {
-    const { agentName } = await resolveAgentIdFromUploadToken(data.token);
-    return { agentName };
-  });
-
-// Public — mints a signed Storage upload URL, exactly like createMediaUploadUrl
-// above, but resolving the agent from the token instead of a logged-in
-// session. The browser still uploads the raw bytes straight to Storage.
-export const createPublicMediaUploadUrl = createServerFn({ method: "POST" })
-  .validator((data: { token: string; fileName: string }) => data)
-  .handler(async ({ data }): Promise<{ path: string; uploadToken: string }> => {
-    const { agentId } = await resolveAgentIdFromUploadToken(data.token);
-    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
-    const safeName = data.fileName.replace(/[^a-zA-Z0-9._-]/g, "_").slice(-120);
-    const path = `${agentId}/${crypto.randomUUID()}-${safeName}`;
-    const { data: signed, error } = await supabaseAdmin.storage.from("media").createSignedUploadUrl(path);
-    if (error) throw error;
-    return { path, uploadToken: signed.token };
-  });
-
-// Public — records the row once the browser's direct upload succeeds, same
-// shape as finalizeMediaUpload, resolved via the token instead of a session.
-export const finalizePublicMediaUpload = createServerFn({ method: "POST" })
-  .validator((data: { token: string; storagePath: string; mediaType: "photo" | "video" }) => data)
-  .handler(async ({ data }): Promise<{ ok: true }> => {
-    const { agentId } = await resolveAgentIdFromUploadToken(data.token);
-    if (!data.storagePath.startsWith(`${agentId}/`)) {
-      throw new Error("Upload path does not belong to this agent.");
-    }
-    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
-    const { data: pub } = supabaseAdmin.storage.from("media").getPublicUrl(data.storagePath);
-    const { error } = await supabaseAdmin.from("agent_photos").insert({
-      agent_id: agentId,
-      url: pub.publicUrl,
-      storage_path: data.storagePath,
-      media_type: data.mediaType,
-      source: "upload",
-      status: "available",
-      tags: [],
-    });
-    if (error) throw error;
-    return { ok: true };
-  });
-
-// Public — read-only listing of this agent's uploaded media, added
-// 2026-09-23 per Mike: "It should follow the exact layout as the app does.
-// This way they can see what's inside there." A deliberate, narrow scope
-// change from this page's original upload-only design — still no Delete, no
-// Mark used, no tag editing, and no access to any other agent's content or
-// to their Google Drive folder (this only reads agent_photos, the native
-// library) — but a client with this link can now also SEE this agent's
-// already-uploaded photos/videos, not just add to them. Matches exactly the
-// "Available" view of the authenticated Media tab, nothing more.
-export const listPublicMedia = createServerFn({ method: "POST" })
-  .validator((data: { token: string }) => data)
-  .handler(async ({ data }): Promise<MediaRow[]> => {
-    const { agentId } = await resolveAgentIdFromUploadToken(data.token);
-    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
-    const { data: rows, error } = await supabaseAdmin
-      .from("agent_photos")
-      .select("id, url, caption, tags, media_type, source, status, created_at, used_at")
-      .eq("agent_id", agentId)
-      .eq("status", "available")
-      .order("created_at", { ascending: false });
-    if (error) throw error;
-    return (rows ?? []) as MediaRow[];
-  });
-
-// ============================================================================
-// Public, no-login review link (2026-09-22) — per Mike: "it is not sending
-// the file for the agent to review... this must be a public facing link
-// that does not require login." Same trust model as the media-upload token
-// just above (an unguessable per-agent token, resolved server-side,
-// revocable any time), NOT the old app's guessable review.html?agent=...
-// &batch=... link — that was the actual security hole this whole native
-// rewrite closed, so this deliberately doesn't reopen it. Scoped narrowly:
-// the public page this backs can only view and Approve/Flag one agent's own
-// content (mirroring exactly what that agent could already do here after
-// logging in), never edit content, swap photos, or see anything about any
-// other agent. Full editing stays behind login.
-// ============================================================================
-
-async function resolveAgentIdFromReviewToken(token: string): Promise<{ agentId: string; agentName: string }> {
-  const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
-  const { data: agent, error } = await supabaseAdmin
-    .from("agents")
-    .select("id, full_name")
-    .eq("review_token", token)
-    .maybeSingle();
-  if (error) throw error;
-  if (!agent) throw new Error("This review link isn't valid — ask your team for a new one.");
-  return { agentId: agent.id, agentName: agent.full_name ?? "there" };
-}
-
-// Admin-only: read (creating on first use) this agent's public review token.
-// Shares the same crypto.randomUUID()-as-token approach as
-// getMediaUploadLink above — a v4 UUID has 122 bits of randomness, not
-// practically guessable, and the whole point of this design is that
-// possessing the link IS the credential, same as a Drive share link.
-export const getReviewLink = createServerFn({ method: "POST" })
-  .middleware([requireSupabaseAuth])
-  .validator((data: { agentId: string }) => data)
-  .handler(async ({ data, context }): Promise<{ token: string }> => {
-    const email = (context.claims as { email?: string } | undefined)?.email;
-    await requireAdmin(context.userId, email);
-    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
-    const { data: agent, error: fetchErr } = await supabaseAdmin
-      .from("agents")
-      .select("review_token")
-      .eq("id", data.agentId)
-      .maybeSingle();
-    if (fetchErr) throw fetchErr;
-    if (agent?.review_token) return { token: agent.review_token };
-    const token = crypto.randomUUID();
-    const { error } = await supabaseAdmin.from("agents").update({ review_token: token }).eq("id", data.agentId);
-    if (error) throw error;
-    return { token };
-  });
-
-// Admin-only: issue a brand-new token, permanently breaking any link already
-// shared — for revoking a link sent to the wrong person or that's been
-// floating around too long.
-export const regenerateReviewLink = createServerFn({ method: "POST" })
-  .middleware([requireSupabaseAuth])
-  .validator((data: { agentId: string }) => data)
-  .handler(async ({ data, context }): Promise<{ token: string }> => {
-    const email = (context.claims as { email?: string } | undefined)?.email;
-    await requireAdmin(context.userId, email);
-    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
-    const token = crypto.randomUUID();
-    const { error } = await supabaseAdmin.from("agents").update({ review_token: token }).eq("id", data.agentId);
-    if (error) throw error;
-    return { token };
-  });
-
-// Public — no login required. Only ever returns a display name, never the
-// agent's real id or any other data about them, same as getPublicUploadAgent.
-export const getPublicReviewAgent = createServerFn({ method: "POST" })
-  .validator((data: { token: string }) => data)
-  .handler(async ({ data }): Promise<{ agentName: string }> => {
-    const { agentName } = await resolveAgentIdFromReviewToken(data.token);
-    return { agentName };
-  });
-
-// Public — which months this agent has non-archived content in, most recent
-// first, so the review page can default to the newest one instead of
-// showing an empty screen.
-export const listPublicReviewMonths = createServerFn({ method: "POST" })
-  .validator((data: { token: string }) => data)
-  .handler(async ({ data }): Promise<{ months: string[] }> => {
-    const { agentId } = await resolveAgentIdFromReviewToken(data.token);
-    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
-    const { data: rows, error } = await supabaseAdmin
-      .from("generated_posts")
-      .select("month")
-      .eq("agent_id", agentId)
-      .eq("archived", false)
-      .not("month", "is", null);
-    if (error) throw error;
-    const months = Array.from(new Set((rows ?? []).map((r) => r.month as string)))
-      .sort()
-      .reverse();
-    return { months };
-  });
-
-// Public — same shape as listMarketingPosts, resolved via token instead of a
-// session. Only non-archived content for the ONE agent the token belongs to.
-export const listPublicReviewPosts = createServerFn({ method: "POST" })
-  .validator((data: { token: string; month: string }) => data)
-  .handler(async ({ data }): Promise<PostRow[]> => {
-    const { agentId } = await resolveAgentIdFromReviewToken(data.token);
-    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
-    const { data: posts, error } = await supabaseAdmin
-      .from("generated_posts")
-      .select(
-        "id, content, content_type, title, platform, status, month, scheduled_for, created_at, archived, metadata",
-      )
-      .eq("agent_id", agentId)
-      .eq("month", data.month)
-      .eq("archived", false)
-      .order("created_at", { ascending: true })
-      .order("id", { ascending: true });
-    if (error) throw error;
-    return (posts ?? []) as unknown as PostRow[];
-  });
-
-// Public — approve one post. Re-verifies the post belongs to the token's
-// agent before writing, same defense-in-depth every other write here uses.
-export const approvePublicReviewPost = createServerFn({ method: "POST" })
-  .validator((data: { token: string; postId: string }) => data)
-  .handler(async ({ data }): Promise<{ ok: true }> => {
-    const { agentId } = await resolveAgentIdFromReviewToken(data.token);
-    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
-    const { data: existing, error: fetchErr } = await supabaseAdmin
-      .from("generated_posts")
-      .select("agent_id")
-      .eq("id", data.postId)
-      .maybeSingle();
-    if (fetchErr) throw fetchErr;
-    if (!existing || existing.agent_id !== agentId) throw new Error("Post not found for this agent.");
-    const { error } = await supabaseAdmin.from("generated_posts").update({ status: "approved" }).eq("id", data.postId);
-    if (error) throw error;
-    return { ok: true };
-  });
-
-// Public — flag a post with a note, same as submitMarketingFeedback but
-// token-resolved. Also flips status to "flagged" so it's visually distinct
-// from a plain pending post on the admin side too.
-export const submitPublicReviewFeedback = createServerFn({ method: "POST" })
-  .validator((data: { token: string; postId: string; notes?: string }) => data)
-  .handler(async ({ data }): Promise<{ ok: true }> => {
-    const { agentId } = await resolveAgentIdFromReviewToken(data.token);
-    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
-    const { data: existing, error: fetchErr } = await supabaseAdmin
-      .from("generated_posts")
-      .select("agent_id")
-      .eq("id", data.postId)
-      .maybeSingle();
-    if (fetchErr) throw fetchErr;
-    if (!existing || existing.agent_id !== agentId) throw new Error("Post not found for this agent.");
-
-    const { error: updateErr } = await supabaseAdmin
-      .from("generated_posts")
-      .update({ status: "flagged" })
-      .eq("id", data.postId);
-    if (updateErr) throw updateErr;
-
-    const { error } = await supabaseAdmin.from("feedback_history").insert({
-      agent_id: agentId,
-      post_id: data.postId,
-      rating: "flagged",
-      notes: data.notes ?? null,
-    });
-    if (error) throw error;
-    return { ok: true };
-  });
-
-// ============================================================================
-// Google Drive tab — Phase 2, requested by Mike (2026-09-16) on top of the
-// native media library above. This is a LIVE, read-only view straight from
-// the Drive API of what's actually in an agent's existing Drive folder —
-// mainly for agents on YMD's video services, who still send long-form
-// footage through Drive. It never writes back to Drive; uploading/marking
-// used there still happens exactly as it does today, untouched.
-//
-// This mirrors the old drive-photos.js logic exactly, including excluding
-// the "used" subfolder, for parity with however that client's Drive-side
-// used-tracking already works.
-//
-// AUTH, rewritten 2026-09-28 — was a plain GOOGLE_API_KEY, now real OAuth:
-// Regina Flores's folder kept failing with Google's raw "The user does not
-// have sufficient permissions for this file" even after confirming (directly
-// against Drive's own permissions API, not just the sharing dialog) that the
-// folder genuinely was shared "Anyone with the link can edit." A bare API
-// key — no signed-in identity behind it at all — is just unreliable for
-// real user-owned Drive content, sharing settings aside; this was previously
-// documented in this file as a known limitation ("a real per-agent OAuth
-// connection ... is a separate, much bigger project"), but that undersold
-// it: full OAuth credentials for this exact integration already existed,
-// sitting unused in the ORIGINAL Netlify+Supabase app's environment
-// variables from before this was ported here (found by Mike 2026-09-28) —
-// GOOGLE_OAUTH_CLIENT_ID / GOOGLE_OAUTH_CLIENT_SECRET / GOOGLE_REFRESH_TOKEN.
-// They just never made it into this project's secrets during the port.
-// Needs, in Lovable Cloud → Secrets:
-//   1. GOOGLE_OAUTH_CLIENT_ID / GOOGLE_OAUTH_CLIENT_SECRET / GOOGLE_REFRESH_TOKEN
-//      — see getDriveAccessToken() below for how these turn into a real
-//      access token. Whatever real Google account did the original consent
-//      grant is who this now reads Drive as — no "Anyone with the link"
-//      requirement anymore, just normal folder sharing with that account.
-//   2. Each agent's own agents.drive_folder_id set once — there's no bulk
-//      migration for this (the old admin UI's folder-ID field was never
-//      backed by a table we inherited), so it's set per-agent via
-//      setAgentDriveFolder below, either from this tab or an admin screen.
-// ============================================================================
-
-export type DriveFile = {
-  id: string;
-  name: string;
-  mimeType: string;
-  isVideo: boolean;
-  thumbnailUrl: string;
-  viewUrl: string;
-  // Direct-content endpoint (added 2026-09-21 per Mike: "photos in all
-  // libraries should be downloadable") — unlike thumbnailUrl (a small
-  // preview) or viewUrl (opens Drive's own viewer), this serves the actual
-  // full-resolution file so a person can save it in one click. These three
-  // URLs are plain drive.google.com links rendered in the viewer's own
-  // browser (not routed through our backend's Drive auth at all), so they
-  // still rely on the file being visible to whoever clicks them — same as
-  // before, unaffected by the OAuth rewrite below.
-  downloadUrl: string;
-  // Set only when this file is returned from the "used" side of
-  // listAgentDriveMedia (see below) — the moment our own app marked it used,
-  // when known. Undefined/omitted on the "available" listing.
-  usedAt?: string | null;
-};
-
-// Mints a real Drive API access token from the long-lived refresh token
-// (see the big comment block above for why this replaced GOOGLE_API_KEY).
-// Access tokens are short-lived (~1hr per Google); cached in module scope so
-// a warm server instance handling several Drive calls back-to-back (listing
-// a folder tree is many calls) doesn't re-hit Google's token endpoint every
-// time — refreshed automatically once it's within 30s of expiring.
-let cachedDriveToken: { token: string; expiresAt: number } | null = null;
-
-async function getDriveAccessToken(): Promise<string> {
-  if (cachedDriveToken && cachedDriveToken.expiresAt > Date.now() + 30_000) {
-    return cachedDriveToken.token;
-  }
-  const clientId = process.env["GOOGLE_OAUTH_CLIENT_ID"];
-  const clientSecret = process.env["GOOGLE_OAUTH_CLIENT_SECRET"];
-  const refreshToken = process.env["GOOGLE_REFRESH_TOKEN"];
-  if (!clientId || !clientSecret || !refreshToken) {
-    throw new Error(
-      "Google Drive isn't connected yet — add GOOGLE_OAUTH_CLIENT_ID, GOOGLE_OAUTH_CLIENT_SECRET, and GOOGLE_REFRESH_TOKEN in Lovable Cloud → Secrets.",
-    );
-  }
-  const res = await fetchWithTimeout(
-    "https://oauth2.googleapis.com/token",
-    {
-      method: "POST",
-      headers: { "Content-Type": "application/x-www-form-urlencoded" },
-      body: new URLSearchParams({
-        client_id: clientId,
-        client_secret: clientSecret,
-        refresh_token: refreshToken,
-        grant_type: "refresh_token",
-      }).toString(),
-    },
-    15_000,
-  );
-  const json = (await res.json().catch(() => ({}))) as {
-    access_token?: string;
-    expires_in?: number;
-    error?: string;
-    error_description?: string;
-  };
-  if (!res.ok || !json.access_token) {
-    // "invalid_grant" specifically means the refresh token itself has been
-    // revoked or expired (the connected Google account's password changed,
-    // or access was revoked in that account's security settings) — worth
-    // saying plainly, since the fix there is "reconnect the Google sign-in
-    // and save a new refresh token," not a code change.
-    const reason =
-      json.error === "invalid_grant"
-        ? "the saved Google sign-in (GOOGLE_REFRESH_TOKEN) has been revoked or expired — it needs to be reconnected."
-        : (json.error_description ?? json.error ?? `HTTP ${res.status}`);
-    throw new Error(`Google Drive sign-in failed: ${reason}`);
-  }
-  cachedDriveToken = { token: json.access_token, expiresAt: Date.now() + (json.expires_in ?? 3600) * 1000 };
-  return cachedDriveToken.token;
-}
-
-function driveAuthHeaders(accessToken: string): Record<string, string> {
-  return { Authorization: `Bearer ${accessToken}` };
-}
-
-// Which real Google account the refresh token above signs in as — fetched
-// lazily (only when something's already gone wrong) purely so a folder-
-// access error can tell Mike/the agent exactly which account to share the
-// folder with, instead of a vague "the connected account." Cached the same
-// way the token is.
-let cachedDriveEmail: string | null = null;
-
-async function getDriveAccountEmail(accessToken: string): Promise<string | null> {
-  if (cachedDriveEmail) return cachedDriveEmail;
-  try {
-    const res = await fetchWithTimeout(
-      "https://www.googleapis.com/drive/v3/about?fields=user(emailAddress)",
-      { headers: driveAuthHeaders(accessToken) },
-      10_000,
-    );
-    if (!res.ok) return null;
-    const json = (await res.json()) as { user?: { emailAddress?: string } };
-    cachedDriveEmail = json.user?.emailAddress ?? null;
-    return cachedDriveEmail;
-  } catch {
-    return null;
-  }
-}
-
-// A private folder ID saved to an agent's record looks fully "connected" on
-// our side (setAgentDriveFolder succeeds, drive_folder_id is set) but Drive
-// will just quietly act as if it doesn't exist if the signed-in account
-// above doesn't actually have access — this checks the folder itself first
-// and gives Mike/the agent something actionable instead of a silent "no
-// photos found." Added 2026-09-18 per Mike: "I attached a google drive
-// folder for this agent but although connected on the admin end is not
-// connected on the google drive end."
-async function verifyDriveFolderAccessible(folderId: string, accessToken: string): Promise<void> {
-  const metaUrl = `https://www.googleapis.com/drive/v3/files/${folderId}?fields=id,name,mimeType&supportsAllDrives=true`;
-  const res = await fetch(metaUrl, { headers: driveAuthHeaders(accessToken) });
-  if (res.ok) return;
-  const email = await getDriveAccountEmail(accessToken);
-  const whoText = email ? `the "${email}" Google account` : "the account this app signs in as";
-  if (res.status === 404) {
-    throw new Error(
-      `This Drive folder isn't visible to ${whoText} — double-check the folder ID is correct, and share the folder with ${email ?? "that account"} directly (Share → add them by email, Viewer is enough) the same way you'd share it with any person.`,
-    );
-  }
-  const json = (await res.json().catch(() => ({}))) as { error?: { message?: string } };
-  const raw = json.error?.message;
-  throw new Error(
-    (raw ? `Google Drive says: "${raw}". ` : "") +
-      `${whoText} doesn't have access to this folder — share it with ${email ?? "that account"} and try again.`,
-  );
-}
-
-// Real Drive folders are often organized into subfolders (by month, by
-// listing, by whatever) rather than one flat pile of files — but Drive's
-// query language only matches a file's DIRECT parent ('X' in parents does
-// NOT recurse into subfolders), so every Drive listing in this file used to
-// silently miss any photo one folder deeper than the one an agent's
-// drive_folder_id points at. Added 2026-09-21 per Mike's bug report: "There
-// are photos in google drive but its saying there are not. Theres a bug
-// that's not reqading them." — the most likely explanation once the folder
-// itself is confirmed shared correctly (verifyDriveFolderAccessible already
-// rules out the "not shared" case) is exactly this: the photos are one or
-// more folders deep inside the shared root.
-//
-// This walks the folder tree under rootFolderId a few levels deep and
-// returns every folder id worth searching for files, skipping the "used"
-// subfolder (and everything inside it) entirely so it never needs a
-// separate exclusion pass afterward — capped at MAX_DRIVE_FOLDERS so an
-// unexpectedly large folder tree can't blow up the files query or make this
-// take forever.
-const MAX_DRIVE_FOLDER_DEPTH = 4;
-const MAX_DRIVE_FOLDERS = 40;
-
-// Runs `fn` over `items` with at most `limit` calls in flight at once.
-// Added 2026-09-28 per Mike, after the OAuth rewrite above still didn't fix
-// Regina Flores's folder: he narrowed it down himself — "its all the folders
-// in the agents drive folder. I removed the[m], and left only used and
-// pictures and it worked." Checked several of the removed subfolders
-// directly against Drive's own permissions API and they were all shared
-// correctly, same as the root — so it isn't one bad subfolder. Her folder
-// had 10+ subfolders (several full of video-project files), and this file
-// was firing one Drive API call per subfolder, every one of them at once,
-// at every level of the tree walk — plus, in queryDriveFilesInFolders below,
-// one single combined query spanning every folder id found. A burst and a
-// query that size is exactly the kind of thing Drive's API pushes back on
-// for a real client folder that's accumulated a lot of subfolders over
-// months, which is the normal case, not an edge case. Limiting concurrency
-// here (and chunking the combined query below) trades a little speed for
-// not choking on that.
-async function mapLimit<T, R>(items: T[], limit: number, fn: (item: T) => Promise<R>): Promise<R[]> {
-  const results: R[] = new Array(items.length);
-  let next = 0;
-  async function worker() {
-    while (next < items.length) {
-      const i = next++;
-      results[i] = await fn(items[i] as T);
-    }
-  }
-  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, () => worker()));
-  return results;
-}
-
-async function listDriveFolderIds(rootFolderId: string, accessToken: string): Promise<string[]> {
-  const ids = [rootFolderId];
-  let frontier = [rootFolderId];
-  for (let depth = 0; depth < MAX_DRIVE_FOLDER_DEPTH && frontier.length && ids.length < MAX_DRIVE_FOLDERS; depth++) {
-    const batches = await mapLimit(frontier, 5, async (parentId) => {
-      const url =
-        "https://www.googleapis.com/drive/v3/files?" +
-        "q=" +
-        encodeURIComponent(
-          `'${parentId}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false`,
-        ) +
-        "&fields=files(id,name)&pageSize=100&supportsAllDrives=true&includeItemsFromAllDrives=true";
-      try {
-        const res = await fetchWithTimeout(url, { headers: driveAuthHeaders(accessToken) }, 15_000);
-        const json = (await res.json()) as { files?: { id: string; name: string }[] };
-        return json.files ?? [];
-      } catch {
-        // A slow/failed subfolder lookup shouldn't take down the whole
-        // scan — it just means that one branch's photos won't show up
-        // this time, same as any other partial-failure spot in this file.
-        return [];
-      }
-    });
-    const nextFrontier: string[] = [];
-    for (const folders of batches) {
-      for (const f of folders) {
-        if (f.name.trim().toLowerCase() === "used") continue; // never descend into the "used" folder or its contents
-        if (ids.length >= MAX_DRIVE_FOLDERS) break;
-        ids.push(f.id);
-        nextFrontier.push(f.id);
-      }
-    }
-    frontier = nextFrontier;
-  }
-  return ids;
-}
-
-function driveParentsClause(folderIds: string[]): string {
-  return "(" + folderIds.map((id) => `'${id}' in parents`).join(" or ") + ")";
-}
-
-// Sibling to listDriveFolderIds above, walking the exact same tree, but
-// doing the OPPOSITE thing with a folder literally named "used": instead of
-// skipping it, this collects its id (without descending further into it,
-// matching how listDriveFolderIds treats it as a dead end either way). Added
-// 2026-09-21 per Mike: "google drive folder Used needs to show" — a legacy
-// Drive-workflow agent may already have real photos sitting in an actual
-// "used" subfolder (from the old app's move-to-used, or a manual move), and
-// until now nothing in this app ever surfaced that folder's contents
-// anywhere — it was just silently excluded, full stop.
-async function listDriveUsedFolderIds(rootFolderId: string, accessToken: string): Promise<string[]> {
-  const usedIds: string[] = [];
-  let frontier = [rootFolderId];
-  for (
-    let depth = 0;
-    depth < MAX_DRIVE_FOLDER_DEPTH && frontier.length && usedIds.length < MAX_DRIVE_FOLDERS;
-    depth++
-  ) {
-    const batches = await mapLimit(frontier, 5, async (parentId) => {
-      const url =
-        "https://www.googleapis.com/drive/v3/files?" +
-        "q=" +
-        encodeURIComponent(
-          `'${parentId}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false`,
-        ) +
-        "&fields=files(id,name)&pageSize=100&supportsAllDrives=true&includeItemsFromAllDrives=true";
-      try {
-        const res = await fetchWithTimeout(url, { headers: driveAuthHeaders(accessToken) }, 15_000);
-        const json = (await res.json()) as { files?: { id: string; name: string }[] };
-        return json.files ?? [];
-      } catch {
-        return [];
-      }
-    });
-    const nextFrontier: string[] = [];
-    for (const folders of batches) {
-      for (const f of folders) {
-        if (f.name.trim().toLowerCase() === "used") {
-          usedIds.push(f.id); // found one — don't descend into it
-          continue;
-        }
-        nextFrontier.push(f.id);
-      }
-    }
-    frontier = nextFrontier;
-  }
-  return usedIds;
-}
-
-// A HEIC/HEIF photo (the default format on an iPhone camera) can be listed
-// and thumbnailed by Drive just fine, but Claude's vision API can't read
-// its bytes — captioning it just fails. Callers filter these out up front
-// so a batch of iPhone photos doesn't silently look like "no photos found."
-function isHeicDriveFile(f: { name: string; mimeType: string }): boolean {
-  return (
-    f.mimeType === "image/heif" || f.mimeType === "image/heic" || /\.heic$/i.test(f.name) || /\.heif$/i.test(f.name)
-  );
-}
-
-// Lists the images/videos actually in a Drive folder (and its subfolders,
-// see listDriveFolderIds above), excluding whatever's in a "used" subfolder
-// anywhere in that tree — pulled out of listAgentDriveMedia below so
-// assignSuggestedMedia() can call the exact same live Drive listing when
-// auto-suggesting a photo for a calendar-generated post, not just when an
-// agent opens the Google Drive tab. Caller is responsible for having already
-// confirmed the folder is accessible (verifyDriveFolderAccessible) if it
-// wants a clear error on a private/unshared folder — this function itself
-// just throws whatever the Drive API returns.
-function mapDriveApiFile(f: { id: string; name: string; mimeType: string }): DriveFile {
-  return {
-    id: f.id,
-    name: f.name,
-    mimeType: f.mimeType,
-    isVideo: f.mimeType.startsWith("video/"),
-    thumbnailUrl: `https://drive.google.com/thumbnail?id=${f.id}&sz=w400`,
-    viewUrl: `https://drive.google.com/file/d/${f.id}/view`,
-    downloadUrl: `https://drive.google.com/uc?export=download&id=${f.id}`,
-  };
-}
-
-// Kept deliberately small (rather than one giant query spanning every
-// folder id at once) — see mapLimit's comment above. Splitting the combined
-// "'X' in parents or 'Y' in parents or ..." query into chunks means one
-// oversized or momentarily-troublesome combination of folders can't take
-// down the whole listing.
-const DRIVE_QUERY_CHUNK_SIZE = 10;
-
-// Shared by fetchDriveMediaFiles and fetchDriveUsedFiles below — both just
-// query "every image/video directly inside this set of folder ids," they
-// only differ in which folder ids they pass in (the active tree vs. a
-// "used" folder found inside it). A chunk that fails outright (transient
-// error, or a combined query Drive doesn't like) is skipped rather than
-// failing the whole listing — best-effort, same spirit as the folder-tree
-// walk above: a client's real Drive folder can easily have a dozen-plus
-// subfolders, and one rough patch in the middle of that shouldn't blank out
-// everything else that DID come back fine.
-async function queryDriveFilesInFolders(folderIds: string[], accessToken: string): Promise<DriveFile[]> {
-  if (!folderIds.length) return [];
-  const chunks: string[][] = [];
-  for (let i = 0; i < folderIds.length; i += DRIVE_QUERY_CHUNK_SIZE) {
-    chunks.push(folderIds.slice(i, i + DRIVE_QUERY_CHUNK_SIZE));
-  }
-  const results = await mapLimit(chunks, 3, async (chunk) => {
-    const q = `${driveParentsClause(chunk)} and (mimeType contains 'image/' or mimeType contains 'video/') and trashed=false`;
-    const url =
-      "https://www.googleapis.com/drive/v3/files?" +
-      "q=" +
-      encodeURIComponent(q) +
-      "&fields=files(id,name,mimeType)&pageSize=200&supportsAllDrives=true&includeItemsFromAllDrives=true";
-    try {
-      const res = await fetchWithTimeout(url, { headers: driveAuthHeaders(accessToken) }, 15_000);
-      const json = (await res.json()) as { files?: { id: string; name: string; mimeType: string }[] };
-      if (!res.ok) return [];
-      return (json.files ?? []).map(mapDriveApiFile);
-    } catch {
-      return [];
-    }
-  });
-  return results.flat();
-}
-
-async function fetchDriveMediaFiles(folderId: string, accessToken: string): Promise<DriveFile[]> {
-  const folderIds = await listDriveFolderIds(folderId, accessToken);
-  return queryDriveFilesInFolders(folderIds, accessToken);
-}
-
-// The contents of whatever "used" subfolder(s) exist anywhere in this Drive
-// folder's tree — added 2026-09-21 alongside listDriveUsedFolderIds above,
-// so the "Used" side of the Drive tab has something real to show.
-async function fetchDriveUsedFiles(folderId: string, accessToken: string): Promise<DriveFile[]> {
-  const usedFolderIds = await listDriveUsedFolderIds(folderId, accessToken);
-  return queryDriveFilesInFolders(usedFolderIds, accessToken);
-}
-
-// Looks up a specific set of Drive file ids directly (files.get, one call
-// per id — Drive v3 has no bulk multi-get without the more involved batch/
-// multipart endpoint, and this is only ever called for a handful of ids at
-// once: files OUR app has marked "used" that don't already show up in the
-// structural "used" folder listing above). A file that's been deleted,
-// trashed, or had its sharing revoked since being marked used is silently
-// skipped rather than failing the whole listing — the used-tracking row
-// stays either way, but there's nothing to render for it.
-async function fetchDriveFilesByIds(fileIds: string[], accessToken: string): Promise<DriveFile[]> {
-  const results = await Promise.all(
-    fileIds.map(async (id) => {
-      try {
-        const url = `https://www.googleapis.com/drive/v3/files/${id}?fields=id,name,mimeType,trashed&supportsAllDrives=true`;
-        const res = await fetchWithTimeout(url, { headers: driveAuthHeaders(accessToken) }, 15_000);
-        if (!res.ok) return null;
-        const json = (await res.json()) as { id: string; name: string; mimeType: string; trashed?: boolean };
-        if (json.trashed) return null;
-        return mapDriveApiFile(json);
-      } catch {
-        return null;
-      }
-    }),
-  );
-  return results.filter((f): f is DriveFile => Boolean(f));
-}
-
-export const listAgentDriveMedia = createServerFn({ method: "GET" })
-  .middleware([requireSupabaseAuth])
-  .validator((data: { agentId: string; status?: "available" | "used" }) => data)
-  .handler(async ({ data, context }): Promise<{ folderId: string | null; files: DriveFile[] }> => {
-    const email = (context.claims as { email?: string } | undefined)?.email;
-    await requireAgentAccess(context.userId, email, data.agentId);
-    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
-    const { data: agent, error: agentErr } = await supabaseAdmin
-      .from("agents")
-      .select("drive_folder_id")
-      .eq("id", data.agentId)
-      .maybeSingle();
-    if (agentErr) throw agentErr;
-    const folderId = agent?.drive_folder_id ?? null;
-    if (!folderId) return { folderId: null, files: [] };
-
-    const accessToken = await getDriveAccessToken();
-    await verifyDriveFolderAccessible(folderId, accessToken);
-
-    // agent_drive_used_files — our own DB-side "used" tracking for Drive
-    // photos, added 2026-09-21 (see markDriveFileUsed below for why this
-    // exists rather than a real Drive move).
-    const { data: trackedRows, error: trackedErr } = await supabaseAdmin
-      .from("agent_drive_used_files")
-      .select("drive_file_id, used_at")
-      .eq("agent_id", data.agentId);
-    if (trackedErr) throw trackedErr;
-    const trackedUsed = new Map((trackedRows ?? []).map((r) => [r.drive_file_id as string, r.used_at as string]));
-
-    if ((data.status ?? "available") === "used") {
-      // Two sources, merged: (1) whatever's structurally sitting inside a
-      // real "used" subfolder in Drive right now (a legacy client's old
-      // workflow, or a manual move) — see listDriveUsedFolderIds — and
-      // (2) anything OUR app has marked used via approve/Mark used, which
-      // may or may not also be one of those structural files. De-duped by
-      // file id so something in both places only shows once.
-      const structural = await fetchDriveUsedFiles(folderId, accessToken);
-      const structuralIds = new Set(structural.map((f) => f.id));
-      const onlyTrackedIds = Array.from(trackedUsed.keys()).filter((id) => !structuralIds.has(id));
-      const trackedOnly = onlyTrackedIds.length ? await fetchDriveFilesByIds(onlyTrackedIds, accessToken) : [];
-      const files = [...structural, ...trackedOnly].map((f) => ({
-        ...f,
-        usedAt: trackedUsed.get(f.id) ?? null,
-      }));
-      return { folderId, files };
-    }
-
-    // "available" — the normal active-tree listing, minus anything we've
-    // separately marked used ourselves (covers a file our app marked used
-    // that's still physically sitting in a normal, non-"used" folder, since
-    // we can't move the real file without Drive write access — see below).
-    const files = (await fetchDriveMediaFiles(folderId, accessToken)).filter((f) => !trackedUsed.has(f.id));
-    return { folderId, files };
-  });
-
-// Added 2026-09-21 per Mike: "photos on the approve all did not move, they
-// need to move to the used folder in both media library and google drive as
-// well." For the native Media library, "moving to used" was already just a
-// status flag on our own row (agent_photos.status) — that part already
-// worked. Google Drive has no equivalent at all — "used" for Drive is
-// tracked the same way as Media Library instead — as our own flag, in our
-// own database — so approve/restore work identically for both sources. The
-// file itself never physically moves in the agent's real Drive.
-// UPDATE 2026-09-28: this comment previously said a real move was blocked on
-// not having Drive OAuth/write credentials — that's no longer true, this
-// file now signs in with real OAuth (see the big comment block above
-// DriveFile) via GOOGLE_REFRESH_TOKEN, which may well carry write access.
-// Left as DB-only tracking for now since actually moving a file is a bigger,
-// riskier change (real file mutation vs. our own bookkeeping) worth its own
-// explicit go-ahead from Mike rather than bundling into this auth fix.
-export const markDriveFileUsed = createServerFn({ method: "POST" })
-  .middleware([requireSupabaseAuth])
-  .validator((data: { agentId: string; driveFileId: string; postId?: string }) => data)
-  .handler(async ({ data, context }): Promise<{ ok: true }> => {
-    const email = (context.claims as { email?: string } | undefined)?.email;
-    await requireAgentAccess(context.userId, email, data.agentId);
-    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
-    const { error } = await supabaseAdmin.from("agent_drive_used_files").upsert(
-      {
-        agent_id: data.agentId,
-        drive_file_id: data.driveFileId,
-        used_at: new Date().toISOString(),
-        used_in_post_id: data.postId ?? null,
-      },
-      { onConflict: "agent_id,drive_file_id" },
-    );
-    if (error) throw error;
-    return { ok: true };
-  });
-
-// Undoes markDriveFileUsed above — added 2026-09-21 per Mike: "photos and
-// videos should be able to be moved back to active folder from used
-// folder." Only clears OUR tracking flag. If the file is genuinely sitting
-// inside a real "used" subfolder in the agent's actual Drive (the legacy/
-// structural case — see fetchDriveUsedFiles), this can't move the real file
-// back out of it — that would need the same Drive write access noted above.
-// A file this app itself marked used (without any physical move) restores
-// fully and correctly either way.
-export const restoreDriveFileToActive = createServerFn({ method: "POST" })
-  .middleware([requireSupabaseAuth])
-  .validator((data: { agentId: string; driveFileId: string }) => data)
-  .handler(async ({ data, context }): Promise<{ ok: true }> => {
-    const email = (context.claims as { email?: string } | undefined)?.email;
-    await requireAgentAccess(context.userId, email, data.agentId);
-    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
-    const { error } = await supabaseAdmin
-      .from("agent_drive_used_files")
-      .delete()
-      .eq("agent_id", data.agentId)
-      .eq("drive_file_id", data.driveFileId);
-    if (error) throw error;
-    return { ok: true };
-  });
-
-// Admin-only — sets which Drive folder a given agent's tab reads from.
-export const setAgentDriveFolder = createServerFn({ method: "POST" })
-  .middleware([requireSupabaseAuth])
-  .validator((data: { agentId: string; driveFolderId: string }) => data)
-  .handler(async ({ data, context }): Promise<{ ok: true }> => {
-    const email = (context.claims as { email?: string } | undefined)?.email;
-    const access = await resolveAccess(context.userId, email);
-    if (access.role !== "admin") {
-      throw new Error("Only team members can set an agent's Drive folder.");
-    }
-    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
-    const { error } = await supabaseAdmin
-      .from("agents")
-      .update({ drive_folder_id: data.driveFolderId.trim() || null })
-      .eq("id", data.agentId);
-    if (error) throw error;
-    return { ok: true };
-  });
-
-// ============================================================================
-// Native "Create content" — Phase 2, step 2. The old app sourced post/email/
-// video copy from a Google Drive content calendar (content-calendar.js, one
-// Doc per post). Per Mike's explicit call (2026-09-16), that gets replaced
-// entirely with a native form: the agent (or an admin acting as them) types
-// what they want, and this writes a full draft straight into generated_posts
-// using the exact same prompt rules/voice logic the old generateAll() used —
-// no Drive dependency anywhere in this path. Reuses the agent's existing
-// voice_summary (from Voice DNA) as the "Voice DNA" input, same as before.
-// ============================================================================
-
-type GenerateContentInput = {
-  agentId: string;
-  contentType: "post" | "email" | "video";
-  title: string;
-  goal: string;
-  instructions?: string | undefined;
-  hook?: string | undefined;
-  useHashtags?: boolean | undefined;
-};
-
-// Pulls this agent's most recent reviewer feedback (flags and rewrite
-// requests — not photo-swap logging, that's not about the writing) and
-// formats it as a short block of "lessons" to fold into a generation prompt.
-// Added per Mike's explicit ask (2026-09-17): feedback was already being
-// SAVED to feedback_history (flag notes, rewrite requests), but nothing ever
-// read it back into future generations — so the "gets smarter over time"
-// part of the feedback loop wasn't actually happening yet. This is what
-// closes that loop: every new draft (native single-item generate, a
-// calendar batch, or an AI rewrite) now sees a digest of what reviewers have
-// corrected for this agent before and is told to apply those lessons too.
-async function fetchLearnedFeedback(agentId: string): Promise<string> {
-  const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
-  const { data, error } = await supabaseAdmin
-    .from("feedback_history")
-    .select("rating, notes")
-    .eq("agent_id", agentId)
-    .in("rating", ["flagged", "rewritten"])
-    .not("notes", "is", null)
-    .order("created_at", { ascending: false })
-    .limit(8);
-  if (error || !data?.length) return "";
-  const lines = data.map((r) => `- ${r.notes}`).filter((l) => l.trim() !== "-");
-  if (!lines.length) return "";
-  return (
-    "\n\nLESSONS FROM PAST REVIEWER FEEDBACK FOR THIS AGENT (apply these too, don't repeat these mistakes):\n" +
-    lines.join("\n")
-  );
-}
-
-function buildContentPrompt(
-  input: GenerateContentInput,
-  agentName: string,
-  agentCity: string,
-  voiceDna: string,
-  learnedFeedback: string,
-): string {
-  const extra =
-    (input.instructions?.trim() ? `\n\nADDITIONAL DIRECTION:\n${input.instructions.trim()}` : "") + learnedFeedback;
-
-  if (input.contentType === "post") {
-    return (
-      "You are the best real estate social media copywriter in the country. Your specialty: writing posts that remind people someone is in real estate without ever preaching about it. Every post tells a small story. Every post has a clear point. Every post sounds like a real person.\n\n" +
-      `You are writing for ${agentName} in ${agentCity}.\n\n` +
-      `VOICE DNA:\n${voiceDna}\n\n` +
-      `WHAT THIS POST IS ABOUT:\n${input.goal}${extra}\n\n` +
-      "RULES — follow every one:\n" +
-      "- Write a COMPLETE post. Every sentence must connect to the next. The post must make full sense start to finish.\n" +
-      "- Tell a story or make a single clear point.\n" +
-      "- 2 to 4 sentences max. Short. Punchy. Human.\n" +
-      "- No hyphens used as dashes anywhere\n" +
-      '- No "As a real estate professional" or any version of that\n' +
-      '- No "Navigating the market" — never\n' +
-      "- No corporate language. No buzzwords. No filler.\n" +
-      "- Standard capitalization always.\n" +
-      "- Real estate should feel like a casual aside, not the whole point\n" +
-      "- AUTHENTICITY CHECK: read it out loud — if a real person would never say this, rewrite it.\n" +
-      (input.useHashtags ? "- Add 2-3 relevant hashtags at the very end\n" : "- NO hashtags\n") +
-      "\nOutput ONLY the finished post text — no title, no labels, no quotation marks."
-    );
-  }
-
-  if (input.contentType === "email") {
-    return (
-      `You are writing a real estate email for ${agentName} in ${agentCity}.\n\n` +
-      `VOICE DNA:\n${voiceDna}\n\n` +
-      `EMAIL GOAL:\n${input.goal}${extra}\n\n` +
-      "Write this email in the voice above. NO hyphens. NO corporate language. NO AI-tell phrases. Standard capitalization always.\n\n" +
-      "Output format:\nSUBJECT OPTIONS:\n1. [subject]\n2. [subject]\n3. [subject]\n\nEMAIL BODY:\n[full email in plain text, no HTML tags]"
-    );
-  }
-
-  return (
-    `You are writing a short real estate video script for ${agentName} in ${agentCity}.\n\n` +
-    `VOICE DNA:\n${voiceDna}\n\n` +
-    `VIDEO GOAL:\n${input.goal}${extra}\n\n` +
-    (input.hook?.trim() ? `HOOK DIRECTION:\n${input.hook.trim()}\n\n` : "") +
-    `Write a 60 second video script in ${agentName}'s voice. Format:\n` +
-    "HOOK (first 3 seconds — grab attention):\n[hook line]\n\n" +
-    "BODY (main point, story, or insight):\n[15 to 45 seconds of content]\n\n" +
-    "CLOSE (natural ending, no hard sell):\n[closing line]\n\n" +
-    "Rules: written to be SPOKEN, not read — short sentences, natural pauses. NO hyphens, NO corporate language, NO AI phrases. Standard capitalization, never all lowercase. 150 words maximum."
-  );
-}
-
-export const generateMarketingContent = createServerFn({ method: "POST" })
-  .middleware([requireSupabaseAuth])
-  .validator((data: GenerateContentInput) => data)
-  .handler(async ({ data, context }): Promise<{ ok: true; postId: string }> => {
-    const email = (context.claims as { email?: string } | undefined)?.email;
-    await requireAgentAccess(context.userId, email, data.agentId);
-    if (!data.goal?.trim()) throw new Error("Tell us what this should be about first.");
-
-    const apiKey = process.env["ANTHROPIC_API_KEY"];
-    if (!apiKey) {
-      throw new Error("Content generation isn't configured yet — add ANTHROPIC_API_KEY in Lovable Cloud → Secrets.");
-    }
-
-    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
-    const { data: agent, error: agentErr } = await supabaseAdmin
-      .from("agents")
-      .select("full_name, market_area, voice_summary")
-      .eq("id", data.agentId)
-      .maybeSingle();
-    if (agentErr) throw agentErr;
-
-    const agentName = agent?.full_name ?? "the agent";
-    const agentCity = agent?.market_area ?? "their market";
-    const voiceDna =
-      agent?.voice_summary ?? "Warm, conversational, authentic real estate agent. Short posts. Real human energy.";
-
-    const learnedFeedback = await fetchLearnedFeedback(data.agentId);
-    const prompt = buildContentPrompt(data, agentName, agentCity, voiceDna, learnedFeedback);
-    const suggestedMedia =
-      data.contentType === "post"
-        ? ((
-            await assignSuggestedMedia(data.agentId, [{ direction: null, title: data.title ?? null, copy: data.goal }])
-          )[0] ?? null)
-        : null;
-
-    const res = await fetch("https://api.anthropic.com/v1/messages", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "x-api-key": apiKey,
-        "anthropic-version": "2023-06-01",
-      },
-      body: JSON.stringify({
-        model: "claude-haiku-4-5-20251001",
-        max_tokens: data.contentType === "video" ? 600 : data.contentType === "email" ? 2000 : 800,
-        messages: [{ role: "user", content: prompt }],
-      }),
-    });
-    const json = (await res.json()) as {
-      content?: { text?: string }[];
-      error?: { message?: string };
-    };
-    if (!res.ok) throw new Error(json.error?.message ?? `Claude API error (${res.status})`);
-    const raw = (json.content ?? [])
-      .map((b) => b.text ?? "")
-      .join("")
-      .trim();
-    if (!raw) throw new Error("Empty response from Claude — try again.");
-
-    const { data: row, error } = await supabaseAdmin
-      .from("generated_posts")
-      .insert({
-        agent_id: data.agentId,
-        content: raw,
-        content_type: data.contentType,
-        title: data.title?.trim() || null,
-        status: "pending",
-        month: new Date().toISOString().slice(0, 7),
-        metadata: {
-          goal: data.goal,
-          instructions: data.instructions ?? null,
-          hook: data.hook ?? null,
-          use_hashtags: data.useHashtags ?? null,
-          source: "native_generate",
-          media_id: suggestedMedia?.source === "media" ? suggestedMedia.id : null,
-          media_url: suggestedMedia?.source === "media" ? suggestedMedia.url : null,
-          media_type: suggestedMedia?.mediaType ?? null,
-          drive_file_id: suggestedMedia?.source === "drive" ? suggestedMedia.driveFileId : null,
-          drive_thumbnail_url: suggestedMedia?.source === "drive" ? suggestedMedia.driveThumbnailUrl : null,
-        },
-      })
-      .select("id")
-      .single();
-    if (error) throw error;
-    return { ok: true, postId: row.id };
-  });
-
-// ============================================================================
-// Individual Posts — "personal marketing dude" chat hub (2026-09-21).
-//
-// Per Mike's voice note: the old "+ New content" form-and-list should become
-// a real, persistent, per-agent chat thread — "your own personal marketing
-// dude," embedded in the agent's whole workflow, not a set of separate
-// tools. One continuous conversation per agent (backed by
-// agent_chat_messages, see monthly-marketing-chat-hub-migration.sql) with a
-// content-type switcher (post/email, video script, photo scan — carousel to
-// follow once Mike sends a template/brand direction) that changes how the
-// NEXT reply gets generated, not a separate siloed thread per mode — a
-// correction made while drafting an email should still be visible context
-// if the agent switches to video-script mode a minute later.
-//
-// Full scoping: individual-posts-hub-scoping.md.
-// ============================================================================
-
-export type ChatMode = "post" | "email" | "video_script" | "photo_scan";
-
-export type ChatMessageRow = {
-  id: string;
-  role: string;
-  content: string;
-  mode: string;
-  metadata: Record<string, string> | null;
-  created_at: string;
-};
-
-// Mike's actual video-script template (received 2026-09-21), confirmed the
-// same day as reference grounding, NOT the only format or a rigid fill-in-
-// the-blanks shape: "not the only one, just what I typically feed into AI
-// to create scripts now... There is both short form and long form, but tap
-// into AI too, these are just for reference." So this is woven into the
-// video-script prompt as an EXAMPLE of a shape that's worked before, not a
-// template to force every script into.
-const VIDEO_SCRIPT_REFERENCE_TEMPLATE =
-  "Hook:\n[Insert a strong hook that will get people to stop and watch this video]\n\n" +
-  "The Problem(s):\n[Identify a clear problem the intended viewer of this video faces or could face]\n\n" +
-  'Twist The Knife:\n[add in another pain point to twist the knife, for example, "Plus if…"]\n\n' +
-  "Promise Of Value:\nOver the next few minutes I'm going to show you how [INSERT SITUATION and get INSERT BENEFIT]\n\n" +
-  "Intro:\nMy name is [INSERT NAME] And I help people [INSERT END RESULT].\n\n" +
-  "Body\n" +
-  "Point 1 - The Problem - Clearly Identify the problem:\n" +
-  "Point 2 - What most people are doing to solve that problem:\n" +
-  "Point 3 - Why what they are doing to solve that problem won't work:\n" +
-  "Point 4 - Introduce Your Solution:\n" +
-  "Point 5 - Why Your Solution Works:\n  Step 1\n  Step 2\n  Step 3\n\n" +
-  "Outro\nIf you need additional assistance or have questions to your specific situation, schedule a consultation with our office. We will spend about 30 minutes going through your scenario and then advise what you might need to do next FREE of charge!";
-
-function buildChatSystemPrompt(
-  mode: ChatMode,
-  agentName: string,
-  agentCity: string,
-  voiceDna: string,
-  learnedFeedback: string,
-): string {
-  const base =
-    `You are ${agentName}'s own personal marketing assistant — their "Marketing Dude," embedded in their day-to-day workflow. You know their voice and you're having an ongoing conversation with them, not filling out a form. Keep replies focused on the content they're working on; don't pad with generic assistant chatter.\n\n` +
-    `You are writing for ${agentName} in ${agentCity}.\n\n` +
-    `VOICE DNA:\n${voiceDna}${learnedFeedback}\n\n` +
-    'House rules that apply no matter what you\'re writing: no hyphens used as dashes, no "As a real estate professional" or any version of that, no "Navigating the market," no corporate language, no buzzwords, no filler, standard capitalization always, never write in a way a real person wouldn\'t actually say out loud.\n\n';
-
-  if (mode === "email") {
-    return (
-      base +
-      "Right now you're helping draft an EMAIL. When you're ready to give a finished draft, format it as:\nSUBJECT OPTIONS:\n1. [subject]\n2. [subject]\n3. [subject]\n\nEMAIL BODY:\n[full email in plain text]\n\nIt's fine to ask a quick clarifying question first if you genuinely need more to go on, but don't stall on a clear, simple request — just write it."
-    );
-  }
-
-  if (mode === "video_script") {
-    return (
-      base +
-      "Right now you're helping write a VIDEO SCRIPT. Below is a real example of the kind of script this agency has fed into AI before — treat it as reference grounding for tone and shape, NOT a rigid template to fill in word-for-word every time. This agent's real script library also has a mix of short-form and long-form scripts, so match the length and structure to what THIS video actually needs rather than defaulting to this one example.\n\n" +
-      `REFERENCE EXAMPLE (education/single-topic shape):\n${VIDEO_SCRIPT_REFERENCE_TEMPLATE}\n\n` +
-      "Write scripts to be SPOKEN, not read — short sentences, natural pauses. Ask what the video is about and whether they want short-form or long-form if it isn't already clear, otherwise just write it."
-    );
-  }
-
-  // "post" and "photo_scan" — photo_scan messages are logged directly by
-  // logPhotoScanToChat below without a Claude call, but this is the
-  // sensible default system prompt if this mode is ever routed through here.
-  return (
-    base +
-    "Right now you're helping write a SOCIAL POST. Every post should tell a small story or make one clear point, be short (2-4 sentences), and feel like a text to a friend, not a broadcast. Real estate should feel like a casual aside, not the whole point, unless they're specifically asking for something transaction-focused."
-  );
-}
-
-export const listAgentChatMessages = createServerFn({ method: "GET" })
-  .middleware([requireSupabaseAuth])
-  .validator((data: { agentId: string }) => data)
-  .handler(async ({ data, context }): Promise<ChatMessageRow[]> => {
-    const email = (context.claims as { email?: string } | undefined)?.email;
-    await requireAgentAccess(context.userId, email, data.agentId);
-    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
-    const { data: rows, error } = await supabaseAdmin
-      .from("agent_chat_messages")
-      .select("id, role, content, mode, metadata, created_at")
-      .eq("agent_id", data.agentId)
-      .order("created_at", { ascending: true })
-      .limit(200);
-    if (error) throw error;
-    return (rows ?? []) as unknown as ChatMessageRow[];
-  });
-
-export const sendAgentChatMessage = createServerFn({ method: "POST" })
-  .middleware([requireSupabaseAuth])
-  .validator((data: { agentId: string; mode: ChatMode; message: string }) => data)
-  .handler(async ({ data, context }): Promise<{ ok: true; reply: ChatMessageRow }> => {
-    const email = (context.claims as { email?: string } | undefined)?.email;
-    await requireAgentAccess(context.userId, email, data.agentId);
-    const message = data.message.trim();
-    if (!message) throw new Error("Type something first.");
-
-    const apiKey = process.env["ANTHROPIC_API_KEY"];
-    if (!apiKey) {
-      throw new Error("Content generation isn't configured yet — add ANTHROPIC_API_KEY in Lovable Cloud → Secrets.");
-    }
-
-    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
-    const { data: agent } = await supabaseAdmin
-      .from("agents")
-      .select("full_name, market_area, voice_summary")
-      .eq("id", data.agentId)
-      .maybeSingle();
-    const agentName = agent?.full_name ?? "the agent";
-    const agentCity = agent?.market_area ?? "their market";
-    const voiceDna =
-      agent?.voice_summary ?? "Warm, conversational, authentic real estate agent. Short posts. Real human energy.";
-
-    const learnedFeedback = await fetchLearnedFeedback(data.agentId);
-    const systemPrompt = buildChatSystemPrompt(data.mode, agentName, agentCity, voiceDna, learnedFeedback);
-
-    // Save the agent's turn first so it's never lost even if the Claude call
-    // below fails, and so it's part of the history the call below reads.
-    const { error: userInsertErr } = await supabaseAdmin.from("agent_chat_messages").insert({
-      agent_id: data.agentId,
-      role: "user",
-      mode: data.mode,
-      content: message,
-    });
-    if (userInsertErr) throw userInsertErr;
-
-    // Recent thread as conversational context — capped so a long-running
-    // relationship doesn't grow the prompt without bound.
-    const { data: history } = await supabaseAdmin
-      .from("agent_chat_messages")
-      .select("role, content")
-      .eq("agent_id", data.agentId)
-      .order("created_at", { ascending: false })
-      .limit(20);
-    const claudeMessages = (history ?? [])
-      .slice()
-      .reverse()
-      .map((m) => ({ role: m.role === "assistant" ? "assistant" : "user", content: m.content }));
-
-    const res = await fetch("https://api.anthropic.com/v1/messages", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "x-api-key": apiKey,
-        "anthropic-version": "2023-06-01",
-      },
-      body: JSON.stringify({
-        model: "claude-haiku-4-5-20251001",
-        max_tokens: 1200,
-        system: systemPrompt,
-        messages: claudeMessages,
-      }),
-    });
-    const json = (await res.json()) as {
-      content?: { text?: string }[];
-      error?: { message?: string };
-    };
-    if (!res.ok) throw new Error(json.error?.message ?? `Claude API error (${res.status})`);
-    const raw = (json.content ?? [])
-      .map((b) => b.text ?? "")
-      .join("")
-      .trim();
-    if (!raw) throw new Error("Empty response from Claude — try again.");
-
-    const { data: assistantRow, error: assistantInsertErr } = await supabaseAdmin
-      .from("agent_chat_messages")
-      .insert({ agent_id: data.agentId, role: "assistant", mode: data.mode, content: raw })
-      .select("id, role, content, mode, metadata, created_at")
-      .single();
-    if (assistantInsertErr) throw assistantInsertErr;
-
-    return { ok: true, reply: assistantRow as unknown as ChatMessageRow };
-  });
-
-// Turns one of Claude's chat replies into a real post that goes through the
-// same review/approve pipeline as everything else — the thread itself is
-// scratch space for drafting and refining, not the review surface, exactly
-// like AI-Rewrite already works elsewhere in this app.
-export const saveChatMessageAsPost = createServerFn({ method: "POST" })
-  .middleware([requireSupabaseAuth])
-  .validator(
-    (data: { agentId: string; messageId: string; contentType: "post" | "email" | "video"; title?: string }) => data,
-  )
-  .handler(async ({ data, context }): Promise<{ ok: true; postId: string }> => {
-    const email = (context.claims as { email?: string } | undefined)?.email;
-    await requireAgentAccess(context.userId, email, data.agentId);
-    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
-
-    const { data: msg, error: msgErr } = await supabaseAdmin
-      .from("agent_chat_messages")
-      .select("agent_id, role, content")
-      .eq("id", data.messageId)
-      .maybeSingle();
-    if (msgErr) throw msgErr;
-    if (!msg || msg.agent_id !== data.agentId || msg.role !== "assistant") {
-      throw new Error("That message can't be saved as a post.");
-    }
-
-    const { data: row, error } = await supabaseAdmin
-      .from("generated_posts")
-      .insert({
-        agent_id: data.agentId,
-        content: msg.content,
-        content_type: data.contentType,
-        title: data.title?.trim() || null,
-        status: "pending",
-        month: new Date().toISOString().slice(0, 7),
-        metadata: { source: "chat_hub" },
-      })
-      .select("id")
-      .single();
-    if (error) throw error;
-    return { ok: true, postId: row.id };
-  });
-
-// Drops a photo-scan suggestion straight into the agent's chat thread as an
-// assistant message, with no separate Claude call — captionPhotoInVoice
-// already wrote the caption when scanAgentDrivePhotos/scanAgentLibraryPhotos
-// ran. Keeps "Scan My Photos" inside the hub feeling like part of the same
-// conversation instead of a separate screen. "Save as post" on the resulting
-// message calls the existing addPhotoPostsToBatch directly from the client
-// using this row's metadata, same as the old PhotoScanPanel already does.
-export const logPhotoScanToChat = createServerFn({ method: "POST" })
-  .middleware([requireSupabaseAuth])
-  .validator(
-    (data: {
-      agentId: string;
-      suggestedPost: string;
-      source: "drive" | "library";
-      sourceId: string;
-      thumbnailUrl: string;
-      fileName: string;
-    }) => data,
-  )
-  .handler(async ({ data, context }): Promise<{ ok: true; message: ChatMessageRow }> => {
-    const email = (context.claims as { email?: string } | undefined)?.email;
-    await requireAgentAccess(context.userId, email, data.agentId);
-    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
-    const { data: row, error } = await supabaseAdmin
-      .from("agent_chat_messages")
-      .insert({
-        agent_id: data.agentId,
-        role: "assistant",
-        mode: "photo_scan",
-        content: data.suggestedPost,
-        metadata: {
-          source: data.source,
-          sourceId: data.sourceId,
-          thumbnailUrl: data.thumbnailUrl,
-          fileName: data.fileName,
-        },
-      })
-      .select("id, role, content, mode, metadata, created_at")
-      .single();
-    if (error) throw error;
-    return { ok: true, message: row as unknown as ChatMessageRow };
-  });
-
-// ============================================================================
-// Content calendar — native and SHARED across every agent (2026-09-17).
-//
-// Corrected twice from the original Drive-folder port: first to a per-agent
-// Drive folder (admin-only add/remove), then — per Mike, after he saw the
-// per-agent "Manage months" list and said it was backwards — to this: ONE
-// calendar, built once by admin, that every agent generates their own
-// personalized version of through their own login. There is no agentId
-// dimension on a month or an item anymore; `agentId` still appears on the
-// read/generate calls below only because those calls also need to know
-// WHICH agent's Voice DNA to write in and whose generated_posts to create.
-//
-// Mike's explicit reasoning for going fully native here (not a Drive folder
-// shared across agents instead): the recurring operational headache with
-// Drive has always been the photo "move to used" mechanics, and native
-// content also sets up the later Meta-posting integration he's planning.
-// He pointed at a real Drive folder of his own briefs as the reference for
-// the shape a piece of content needs (goal / image suggestions / canva
-// link / copy for a post; goal / subject lines / instructions for an email;
-// goal / hook / script for a video) — confirmed by reading it directly.
-// That shape is exactly what the old Drive-doc parser below already
-// extracts, so admin authors that same shape as plain text per item, and
-// the SAME parsing functions run against it — no new prompt/logic was
-// invented, only the source changed from a Drive Doc export to a native
-// textarea.
-// ============================================================================
-
-export type CalendarMonth = { id: string; month: string; archived: boolean };
-
-// Excludes archived months — added 2026-09-18 per Mike: "We also need an
-// Archive so we can archive that content and we dont have a long list of
-// stuff to do." This is the one every agent's "Create My Monthly Content"
-// picker and (by default) ManageCalendarScreen use, so an archived month
-// disappears from both without any call-site changes. Archiving is purely a
-// visibility flag (see the migration comment) — it hides a finished month,
-// it doesn't delete its items or any already-generated posts.
-export const listCalendarMonths = createServerFn({ method: "GET" })
-  .middleware([requireSupabaseAuth])
-  .handler(async ({ context }): Promise<CalendarMonth[]> => {
-    const email = (context.claims as { email?: string } | undefined)?.email;
-    await requireAnyMarketingAccess(context.userId, email);
-    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
-    const { data, error } = await supabaseAdmin
-      .from("content_calendar_months")
-      .select("id, month, archived")
-      .eq("archived", false)
-      .order("created_at", { ascending: false });
-    if (error) throw error;
-    return (data ?? []) as CalendarMonth[];
-  });
-
-// Admin-only, includes archived months too — powers ManageCalendarScreen's
-// "Show archived" toggle, since that screen is the only place admin needs
-// to find an archived month again (to unarchive it, or just to look back).
-export const listAllCalendarMonthsForAdmin = createServerFn({ method: "GET" })
-  .middleware([requireSupabaseAuth])
-  .handler(async ({ context }): Promise<CalendarMonth[]> => {
-    const email = (context.claims as { email?: string } | undefined)?.email;
-    await requireAdmin(context.userId, email);
-    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
-    const { data, error } = await supabaseAdmin
-      .from("content_calendar_months")
-      .select("id, month, archived")
-      .order("created_at", { ascending: false });
-    if (error) throw error;
-    return (data ?? []) as CalendarMonth[];
-  });
-
-export const setCalendarMonthArchived = createServerFn({ method: "POST" })
-  .middleware([requireSupabaseAuth])
-  .validator((data: { monthId: string; archived: boolean }) => data)
-  .handler(async ({ data, context }): Promise<{ ok: true }> => {
-    const email = (context.claims as { email?: string } | undefined)?.email;
-    await requireAdmin(context.userId, email);
-    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
-    const { error } = await supabaseAdmin
-      .from("content_calendar_months")
-      .update({ archived: data.archived })
-      .eq("id", data.monthId);
-    if (error) throw error;
-    return { ok: true };
-  });
-
-export const addCalendarMonth = createServerFn({ method: "POST" })
-  .middleware([requireSupabaseAuth])
-  .validator((data: { month: string }) => data)
-  .handler(async ({ data, context }): Promise<{ ok: true; month: CalendarMonth }> => {
-    const email = (context.claims as { email?: string } | undefined)?.email;
-    await requireAdmin(context.userId, email);
-    if (!data.month.trim()) throw new Error("Give this month a label.");
-    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
-    const { data: row, error } = await supabaseAdmin
-      .from("content_calendar_months")
-      .insert({ month: data.month.trim() })
-      .select("id, month, archived")
-      .single();
-    if (error) throw error;
-    return { ok: true, month: row as CalendarMonth };
-  });
-
-export const removeCalendarMonth = createServerFn({ method: "POST" })
-  .middleware([requireSupabaseAuth])
-  .validator((data: { monthId: string }) => data)
-  .handler(async ({ data, context }): Promise<{ ok: true }> => {
-    const email = (context.claims as { email?: string } | undefined)?.email;
-    await requireAdmin(context.userId, email);
-    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
-    const { error } = await supabaseAdmin.from("content_calendar_months").delete().eq("id", data.monthId);
-    if (error) throw error;
-    return { ok: true };
-  });
-
-// One row per post/email/video admin authors for a month — the native
-// replacement for a Google Doc in the old Drive folder. `rawText` is typed
-// and structured exactly the way a Drive Doc for that type was (see the
-// parsing functions below); admin picks the type explicitly instead of it
-// being sniffed from a filename.
-export type CalendarItem = { id: string; docType: "post" | "email" | "video"; title: string; rawText: string };
-
-export const listCalendarItems = createServerFn({ method: "GET" })
-  .middleware([requireSupabaseAuth])
-  .validator((data: { monthId: string }) => data)
-  .handler(async ({ data, context }): Promise<CalendarItem[]> => {
-    const email = (context.claims as { email?: string } | undefined)?.email;
-    await requireAdmin(context.userId, email);
-    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
-    const { data: rows, error } = await supabaseAdmin
-      .from("content_calendar_items")
-      .select("id, doc_type, title, raw_text")
-      .eq("month_id", data.monthId)
-      .order("sort_order", { ascending: true })
-      .order("created_at", { ascending: true });
-    if (error) throw error;
-    return (rows ?? []).map((r) => ({
-      id: r.id,
-      docType: r.doc_type as CalendarItem["docType"],
-      title: r.title,
-      rawText: r.raw_text,
-    }));
-  });
-
-export const addCalendarItem = createServerFn({ method: "POST" })
-  .middleware([requireSupabaseAuth])
-  .validator((data: { monthId: string; docType: "post" | "email" | "video"; title: string; rawText: string }) => data)
-  .handler(async ({ data, context }): Promise<{ ok: true }> => {
-    const email = (context.claims as { email?: string } | undefined)?.email;
-    await requireAdmin(context.userId, email);
-    if (!data.title.trim() || !data.rawText.trim()) {
-      throw new Error("Give this piece a title and the brief/copy to generate from.");
-    }
-    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
-    const row: TablesInsert<"content_calendar_items"> = {
-      month_id: data.monthId,
-      doc_type: data.docType,
-      title: data.title.trim(),
-      raw_text: data.rawText.trim(),
-    };
-    const { error } = await supabaseAdmin.from("content_calendar_items").insert(row);
-    if (error) throw error;
-    return { ok: true };
-  });
-
-export const removeCalendarItem = createServerFn({ method: "POST" })
-  .middleware([requireSupabaseAuth])
-  .validator((data: { itemId: string }) => data)
-  .handler(async ({ data, context }): Promise<{ ok: true }> => {
-    const email = (context.claims as { email?: string } | undefined)?.email;
-    await requireAdmin(context.userId, email);
-    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
-    const { error } = await supabaseAdmin.from("content_calendar_items").delete().eq("id", data.itemId);
-    if (error) throw error;
-    return { ok: true };
-  });
-
-// ── Calendar item parsing — the exact same extraction logic that was ported
-// from the old app's Drive-doc parser (content-calendar.js), just applied to
-// natively-authored text instead of a Drive Doc export ─────────────────────
-
-export type CalendarDoc =
-  | {
-      type: "post";
-      title: string;
-      goal: string;
-      image: string;
-      canva: string;
-      canvaDirection: string;
-      copy: string;
-    }
-  | { type: "email"; title: string; goal: string; subjects: string[]; instructions: string }
-  | { type: "video"; title: string; goal: string; hook: string; script: string };
-
-function extractSection(text: string, startLabel: string, endLabels: string[]): string {
-  const startRe = new RegExp("(?:\\d+\\.\\s*)?" + startLabel, "i");
-  const startMatch = text.match(startRe);
-  if (!startMatch) return "";
-  let startIdx = startMatch.index! + startMatch[0].length;
-  const newlineAfterHeader = text.indexOf("\n", startIdx);
-  if (newlineAfterHeader !== -1) startIdx = newlineAfterHeader + 1;
-  let endIdx = text.length;
-  for (const label of endLabels) {
-    const endRe = new RegExp("(?:\\d+\\.\\s*)?" + label, "i");
-    const endMatch = text.slice(startIdx).match(endRe);
-    if (endMatch) {
-      const candidateIdx = startIdx + endMatch.index!;
-      if (candidateIdx < endIdx) endIdx = candidateIdx;
-    }
-  }
-  return text.slice(startIdx, endIdx).trim();
-}
-
-// Turns a raw, multi-line calendar-doc section into clean bullet lines —
-// added 2026-09-20 per Mike's screenshot feedback: a multi-slide/multi-clip
-// brief (several "Image:"/"Text:" pairs, one per slide) was previously
-// flattened into a single "; "-joined run-on paragraph, which is exactly
-// what he called "too long" and "very confusing." Two real problems in the
-// old flattening: (1) a doc that puts a label on its own line and the value
-// on the NEXT line (e.g. "Text:\nYou know exactly how to open the broken
-// drawer.") produced an orphaned, empty-looking "Text:;" fragment once
-// joined — this merges a bare label with whatever line follows it instead;
-// (2) a trailing "Template Link:" line (the calendar author's own record of
-// the Canva link, inside the very section this reads) was being included as
-// a bullet even though the exact same link is already captured separately
-// into canva/canva_link — filtered out here so it doesn't show twice.
-// Returns an array of clean lines; the frontend (marketing.tsx) renders
-// these newline-joined lines as an actual bulleted list instead of a
-// paragraph, and — for the handful of already-generated posts made before
-// this fix, whose stored image_suggestion/canva_instructions are still
-// semicolon-joined — falls back to splitting on "; " there too, so existing
-// pending content reads better immediately, not just future generations.
-function toBullets(sectionText: string): string[] {
-  const rawLines = sectionText
-    .split("\n")
-    .map((l) =>
-      l
-        .replace(/^[-*•]\s*/, "")
-        .replace(/^Clip\s*\d+:\s*/i, "")
-        .replace(/^Option\s*\d+:\s*/i, "")
-        .trim(),
-    )
-    .filter((l) => l.length > 0 && !/^Template Link:/i.test(l));
-
-  const bullets: string[] = [];
-  let pendingLabel: string | null = null;
-  const bareLabelRe = /^(Image|Text|Caption|Hook|Body|Close)\s*:\s*$/i;
-  for (const line of rawLines) {
-    if (bareLabelRe.test(line)) {
-      // Two bare labels in a row (rare) — the first never got a value, so
-      // keep it as its own bullet rather than silently dropping it.
-      if (pendingLabel) bullets.push(pendingLabel);
-      pendingLabel = line.replace(/\s*:\s*$/, ":");
-      continue;
-    }
-    if (pendingLabel) {
-      bullets.push(`${pendingLabel} ${line}`);
-      pendingLabel = null;
-    } else {
-      bullets.push(line);
-    }
-  }
-  if (pendingLabel) bullets.push(pendingLabel);
-  return bullets;
-}
-
-function parsePostDoc(text: string, title: string): CalendarDoc | null {
-  const goal = extractSection(text, "Post Goal", [
-    "Post Image",
-    "Image\\s*/\\s*Video Suggestions",
-    "Canva Template Direction",
-    "Post Copy",
-  ]);
-  const imageSection = extractSection(text, "Post Image\\s*/\\s*Video Suggestions", [
-    "Canva Template Direction",
-    "Post Copy",
-  ]);
-  let copy = extractSection(text, "Post Copy", []);
-  if (!copy) {
-    const lastSectionMatch = text.match(/(?:\d+\.\s*)(?:Post Copy|Copy)[^\n]*/i);
-    if (lastSectionMatch) {
-      copy = text.slice(lastSectionMatch.index! + lastSectionMatch[0].length).trim();
-    }
-  }
-  if (!copy) {
-    const templateLinkIdx = text.search(/Template Link:/i);
-    if (templateLinkIdx > -1) {
-      const afterLink = text.indexOf("\n", templateLinkIdx);
-      copy = text.slice(afterLink > -1 ? afterLink : templateLinkIdx).trim();
-    }
-  }
-  if (!copy) return null;
-
-  const image = toBullets(imageSection).join("\n");
-
-  let canva = "";
-  const canvaMatch =
-    text.match(/Template Link:\s*<?(\S+?)>?(?:\s|$)/i) ||
-    text.match(/\]\((https?:\/\/canva\.[^\s)]+)\)/i) ||
-    text.match(/\((https?:\/\/canva\.link\/[^\s)]+)\)/i) ||
-    text.match(/<(https?:\/\/canva\.[^\s>]+)>/i) ||
-    text.match(/(https?:\/\/canva\.link\/\S+)/i) ||
-    text.match(/(https?:\/\/www\.canva\.com\/\S+)/i);
-  if (canvaMatch)
-    canva = canvaMatch[1]!
-      .trim()
-      .replace(/[<>()[\]]/g, "")
-      .replace(/\*\*/g, "")
-      .trim();
-
-  // The "Canva Template Direction" section itself was previously only ever
-  // used as a boundary marker (to know where "Post Goal"/"Post Image..."
-  // end) — its actual content (what to put in the template: which photo,
-  // which headline, layout notes) was never captured anywhere, so a
-  // Canva-templated post never had any instructions shown under it, unlike
-  // a regular post's "Post Image/Video Suggestions" section. Fixed per
-  // Mike's report (2026-09-18): "the Canva images need the instructions
-  // posted beneath it, just like they are in the posts."
-  const canvaDirection = toBullets(extractSection(text, "Canva Template Direction", ["Post Copy"])).join("\n");
-
-  return { type: "post", title, goal, image, canva, canvaDirection, copy };
-}
-
-function parseEmailDoc(text: string, title: string): CalendarDoc | null {
-  const goal = extractSection(text, "Email Goal", ["Subject Line Options", "Email Instructions", "SUBJECT LINE"]);
-  const subjectSection =
-    extractSection(text, "SUBJECT LINE OPTIONS?(?:\\s*\\([^)]*\\))?", [
-      "Email Instructions",
-      "EMAIL BODY",
-      "Hey \\[",
-      "Hey,",
-    ]) || extractSection(text, "Subject Line Options", ["Email Instructions", "EMAIL BODY", "Hey \\[", "Hey,"]);
-
-  let instructionsText =
-    extractSection(text, "Email Instructions", []) ||
-    extractSection(text, "EMAIL BODY[^:]*:", []) ||
-    extractSection(text, "Hey \\[", []) ||
-    extractSection(text, "Hey,", []);
-
-  if (instructionsText) {
-    instructionsText = instructionsText
-      .replace(/---+[\s\n]*(?:VISUAL ASSETS|Image Idea)[\s\S]*/i, "")
-      .replace(/#+\s*VISUAL ASSETS[\s\S]*/i, "")
-      .replace(/\*\*VISUAL ASSETS[\s\S]*/i, "")
-      .replace(/VISUAL ASSETS[\s\S]*/i, "")
-      .replace(/\*\*Image Idea\s*\d*[:\s][^*]+\*\*[\s\S]*?(?=\*\*Image Idea|$)/gi, "")
-      .replace(/\*\*Image Idea[\s\S]*/i, "")
-      .replace(/Business\/Event Name:.*/gi, "")
-      .replace(/Official Website:.*/gi, "")
-      .replace(/Source Page:.*/gi, "")
-      .replace(/Suggested Image Source:.*/gi, "")
-      .replace(/Backup Search Phrase:.*/gi, "")
-      .replace(/\*\*Business:.*/gi, "")
-      .replace(/\*\*Location:.*/gi, "")
-      .replace(/\n{3,}/g, "\n\n")
-      .trim();
-  }
-  if (!instructionsText && !goal) return null;
-
-  const subjects = (subjectSection || "")
-    .split("\n")
-    .map((l) =>
-      l
-        .replace(/^[-*•\d.)\s]+/, "")
-        .replace(/\*\*/g, "")
-        .replace(/\*/g, "")
-        .replace(/\\/g, "")
-        .trim(),
-    )
-    .filter((l) => l.length > 5 && !/^Pick\s+\d/i.test(l));
-
-  return { type: "email", title, goal, subjects, instructions: instructionsText };
-}
-
-function parseVideoDoc(text: string, title: string): CalendarDoc | null {
-  const firstLine = text.split("\n")[0]!.trim();
-  const isSimpleFormat = /^video[:\s]/i.test(firstLine);
-  if (isSimpleFormat) {
-    const lines = text.split("\n");
-    const conceptTitle = firstLine.replace(/^video[:\s]*/i, "").trim() || title;
-    const scriptContent = lines.slice(1).join("\n").trim() || firstLine;
-    return {
-      type: "video",
-      title: conceptTitle || title,
-      goal: "Short form video — " + conceptTitle,
-      hook: "",
-      script: scriptContent || text,
-    };
-  }
-  const goal = extractSection(text, "Video Goal", ["Hook", "Script Instructions", "Video Script"]);
-  const hook = extractSection(text, "Hook", ["Script Instructions", "Video Script", "Body", "Close"]);
-  const scriptInstructions = extractSection(text, "Script Instructions", ["Video Script"]);
-  const script = extractSection(text, "Video Script", []) || scriptInstructions;
-  if (!script && !goal) return null;
-  return { type: "video", title, goal, hook, script };
-}
-
-function parseCalendarItem(item: { docType: string; title: string; rawText: string }): CalendarDoc | null {
-  const cleaned = item.rawText
-    .replace(/\r\n/g, "\n")
-    .replace(/\\([[\]().*+?^${}|\\])/g, "$1")
-    .trim();
-  if (item.docType === "email") return parseEmailDoc(cleaned, item.title);
-  if (item.docType === "video") return parseVideoDoc(cleaned, item.title);
-  return parsePostDoc(cleaned, item.title);
-}
-
-async function fetchNativeCalendarDocs(monthId: string): Promise<CalendarDoc[]> {
-  const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
-  const { data, error } = await supabaseAdmin
-    .from("content_calendar_items")
-    .select("doc_type, title, raw_text")
-    .eq("month_id", monthId)
-    .order("sort_order", { ascending: true })
-    .order("created_at", { ascending: true });
-  if (error) throw error;
-  const docs = (data ?? [])
-    .map((row) => parseCalendarItem({ docType: row.doc_type, title: row.title, rawText: row.raw_text }))
-    .filter((d): d is CalendarDoc => Boolean(d));
-  const typeOrder: Record<string, number> = { post: 0, video: 1, email: 2 };
-  docs.sort((a, b) => (typeOrder[a.type] ?? 0) - (typeOrder[b.type] ?? 0));
-  return docs;
-}
-
-export const readContentCalendar = createServerFn({ method: "GET" })
-  .middleware([requireSupabaseAuth])
-  .validator((data: { agentId: string; monthId: string }) => data)
-  .handler(async ({ data, context }): Promise<{ docs: CalendarDoc[] }> => {
-    const email = (context.claims as { email?: string } | undefined)?.email;
-    await requireAgentAccess(context.userId, email, data.agentId);
-    const docs = await fetchNativeCalendarDocs(data.monthId);
-    return { docs };
-  });
-
-// ── Batch generation — ported 1:1 from generateAll()'s per-type prompts ────
-
-// Added 2026-09-20: Mike reported a month stuck on "Generating…" with no
-// error (17 pieces landed, then it just hung). generateMonthlyBatch used to
-// run its email and video loops fully sequentially — one callClaude() at a
-// time, no request timeout anywhere — so a single slow/unresponsive call to
-// Claude or Google Drive could stall the whole batch indefinitely (and on a
-// serverless platform, risk the function just getting killed mid-request
-// with nothing written back to the UI). fetchWithTimeout gives every
-// outbound call a hard ceiling so one bad request fails fast and gets
-// skipped (existing try/catch-and-continue behavior) instead of hanging.
-async function fetchWithTimeout(url: string, options: RequestInit, timeoutMs: number): Promise<Response> {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
-  try {
-    return await fetch(url, { ...options, signal: controller.signal });
+    return await call();
   } catch (e) {
-    if (e instanceof Error && e.name === "AbortError") {
-      throw new Error(`Request timed out after ${Math.round(timeoutMs / 1000)}s`);
-    }
-    throw e;
-  } finally {
-    clearTimeout(timer);
+    const message = e instanceof Error ? e.message : String(e);
+    if (!message.includes("No authorization header provided")) throw e;
+    await new Promise((resolve) => setTimeout(resolve, 700));
+    return call();
   }
 }
 
-async function callClaude(apiKey: string, prompt: string, maxTokens: number): Promise<string> {
-  const res = await fetchWithTimeout(
-    "https://api.anthropic.com/v1/messages",
-    {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "x-api-key": apiKey,
-        "anthropic-version": "2023-06-01",
-      },
-      body: JSON.stringify({
-        model: "claude-haiku-4-5-20251001",
-        max_tokens: maxTokens,
-        messages: [{ role: "user", content: prompt }],
-      }),
-    },
-    60_000,
+// Anyone with this link can open a simple upload page for and add photos to
+// this agent — added 2026-09-20 per Mike: "I want to create a simple link I
+// can send them that will open up directly into the Media folder no
+// differently than how we share a google drive link... upload photos to
+// that media library without logging in." Getting the link lazily creates a
+// token the first time (getMediaUploadLink), so nothing changes for an
+// agent whose link has never been requested. Regenerating issues a brand
+// new token and immediately breaks whatever link was shared before — the
+// equivalent of un-sharing a Drive folder.
+function PublicUploadLinkCard({ agentId }: { agentId: string }) {
+  const [token, setToken] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [copied, setCopied] = useState(false);
+
+  useEffect(() => {
+    setToken(null);
+    setError(null);
+    withAuthRetry(() => getMediaUploadLink({ data: { agentId } }))
+      .then((r) => setToken(r.token))
+      .catch((e) => setError(e instanceof Error ? e.message : String(e)));
+  }, [agentId]);
+
+  const link = token && typeof window !== "undefined" ? `${window.location.origin}/media-upload/${token}` : null;
+
+  async function copyLink() {
+    if (!link) return;
+    try {
+      await navigator.clipboard.writeText(link);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    } catch {
+      setError("Couldn't copy automatically — select and copy the link text instead.");
+    }
+  }
+
+  async function regenerate() {
+    setBusy(true);
+    setError(null);
+    setCopied(false);
+    try {
+      const r = await regenerateMediaUploadLink({ data: { agentId } });
+      setToken(r.token);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <Card>
+      <h3 className="font-display text-sm font-semibold">Public upload link</h3>
+      <p className="mt-1 text-xs text-muted-foreground">
+        Anyone with this link can open a simple upload page for this agent and add photos or videos straight into this
+        Media library — no login needed, same idea as sharing a Google Drive upload link. They can only upload; they
+        can't see, download, or delete anything already here.
+      </p>
+      {error && <p className="mt-2 text-xs text-destructive">{error}</p>}
+      {link && (
+        <div className="mt-3 flex flex-wrap items-center gap-2">
+          <input
+            readOnly
+            value={link}
+            onFocus={(e) => e.currentTarget.select()}
+            className="min-w-0 flex-1 rounded-full border border-border bg-muted px-4 py-2 text-xs text-foreground"
+          />
+          <Button variant="secondary" onClick={copyLink}>
+            {copied ? "Copied ✓" : "Copy link"}
+          </Button>
+          <Button variant="secondary" onClick={regenerate} disabled={busy}>
+            {busy ? "Regenerating…" : "Regenerate link"}
+          </Button>
+        </div>
+      )}
+      {!link && !error && <p className="mt-2 text-xs text-muted-foreground">Loading…</p>}
+    </Card>
   );
-  const json = (await res.json()) as { content?: { text?: string }[]; error?: { message?: string } };
-  if (!res.ok) throw new Error(json.error?.message ?? `Claude API error (${res.status})`);
-  return (json.content ?? [])
-    .map((b) => b.text ?? "")
-    .join("")
-    .trim();
 }
 
-function cleanCopy(text: string): string {
-  return text
-    .replace(/\*\*/g, "")
-    .replace(/^["']|["']$/g, "")
-    .trim();
-}
+// Admin-only card on the Posts tab, same pattern as PublicUploadLinkCard
+// just above — added 2026-09-22 per Mike: "it is not sending the file for
+// the agent to review... this must be a public facing link that does not
+// require login." "Send to Agent" now emails this same link automatically,
+// but this card lets an admin copy/regenerate it directly (e.g. to text it
+// instead, or revoke one that leaked) without waiting on GoHighLevel.
+function PublicReviewLinkCard({ agentId }: { agentId: string }) {
+  const [token, setToken] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [copied, setCopied] = useState(false);
 
-export const generateMonthlyBatch = createServerFn({ method: "POST" })
-  .middleware([requireSupabaseAuth])
-  .validator((data: { agentId: string; monthId: string; month: string; useHashtags?: boolean }) => data)
-  .handler(async ({ data, context }): Promise<{ ok: true; batchId: string; created: number }> => {
-    const email = (context.claims as { email?: string } | undefined)?.email;
-    await requireAgentAccess(context.userId, email, data.agentId);
+  useEffect(() => {
+    setToken(null);
+    setError(null);
+    getReviewLink({ data: { agentId } })
+      .then((r) => setToken(r.token))
+      .catch((e) => setError(e instanceof Error ? e.message : String(e)));
+  }, [agentId]);
 
-    const anthropicKey = process.env["ANTHROPIC_API_KEY"];
-    if (!anthropicKey)
-      throw new Error("Content generation isn't configured yet — add ANTHROPIC_API_KEY in Lovable Cloud → Secrets.");
+  const link = token && typeof window !== "undefined" ? `${window.location.origin}/review/${token}` : null;
 
-    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
-    const { data: agent, error: agentErr } = await supabaseAdmin
-      .from("agents")
-      .select("full_name, market_area, voice_summary")
-      .eq("id", data.agentId)
-      .maybeSingle();
-    if (agentErr) throw agentErr;
-    const agentName = agent?.full_name ?? "the agent";
-    const agentCity = agent?.market_area ?? "their market";
-    const dna =
-      agent?.voice_summary ?? "Warm, conversational, authentic real estate agent. Short posts. Real human energy.";
-    const learnedFeedback = await fetchLearnedFeedback(data.agentId);
-
-    const docs = await fetchNativeCalendarDocs(data.monthId);
-    const postDocs = docs.filter((d): d is Extract<CalendarDoc, { type: "post" }> => d.type === "post");
-    const emailDocs = docs.filter((d): d is Extract<CalendarDoc, { type: "email" }> => d.type === "email");
-    const videoDocs = docs.filter((d): d is Extract<CalendarDoc, { type: "video" }> => d.type === "video");
-
-    const batchId = `${data.agentId}-${data.month}-${Date.now()}`;
-    const rows: TablesInsert<"generated_posts">[] = [];
-
-    // Posts — one combined prompt, same REWRITTEN-block format the old app used.
-    if (postDocs.length) {
-      const postPrompt =
-        "You are the best real estate social media copywriter in the country. Your specialty: writing posts that remind people someone is in real estate without ever preaching about it. Every post tells a small story. Every post has a clear point. Every post sounds like a real person.\n\n" +
-        `You are writing for ${agentName} in ${agentCity}.\n\n` +
-        `VOICE DNA:\n${dna}\n\n` +
-        "RULES — follow every one:\n" +
-        "- Write a COMPLETE post. Every sentence must connect to the next. The post must make full sense start to finish.\n" +
-        "- Tell a story or make a single clear point. If you cannot explain what the post is about in one sentence, rewrite it.\n" +
-        "- 2 to 4 sentences max. Short. Punchy. Human.\n" +
-        "- No hyphens used as dashes anywhere\n" +
-        '- No "As a real estate professional" or any version of that\n' +
-        '- No "Navigating the market" — never\n' +
-        "- No corporate language. No buzzwords. No filler.\n" +
-        "- Standard capitalization always. First letter of every sentence capitalized.\n" +
-        "- Real estate should feel like a casual aside, not the whole point\n" +
-        `- The post should remind people ${agentName} is in real estate — not sell them on it\n` +
-        "- AUTHENTICITY CHECK: Read it out loud. If it sounds like an ad, rewrite it. If a real person would never say this, rewrite it.\n" +
-        (data.useHashtags ? "- Add 2-3 relevant hashtags at the very end\n" : "- NO hashtags\n") +
-        learnedFeedback +
-        "\nFor each post below:\n1. Read the CONCEPT and ORIGINAL carefully\n2. Find the story or the human truth in it\n3. Write it clearly in the agent's voice\n4. Make sure the last sentence lands and the whole post makes sense\n\n" +
-        "Output format for each post:\nPOST [N]: [TITLE]\nREWRITTEN: [complete caption]\n---\n\n" +
-        "Posts to write:\n" +
-        postDocs.map((p, i) => `POST ${i + 1}: ${p.title}\nCONCEPT: ${p.goal}\nORIGINAL: ${p.copy}`).join("\n\n");
-
-      const raw = await callClaude(anthropicKey, postPrompt, 4000);
-      const blocks = raw.split("---").filter((b) => b.trim());
-      const media = await assignSuggestedMedia(
-        data.agentId,
-        postDocs.map((d) => ({ direction: d.image, title: d.title, copy: d.copy })),
-      );
-      blocks.forEach((block, i) => {
-        const rm = block.match(/REWRITTEN:\s*([\s\S]*?)$/);
-        const rewritten = rm ? cleanCopy(rm[1]!.trim()) : "";
-        const doc = postDocs[i];
-        const pick = media[i] ?? null;
-        if (rewritten && doc) {
-          rows.push({
-            agent_id: data.agentId,
-            content: rewritten,
-            content_type: "post",
-            title: doc.title,
-            status: "pending",
-            month: data.month,
-            metadata: {
-              batch_id: batchId,
-              month: data.month,
-              canva_link: doc.canva || null,
-              canva_instructions: doc.canvaDirection || null,
-              goal: doc.goal,
-              image_suggestion: doc.image || null,
-              source: "content_calendar",
-              media_id: pick?.source === "media" ? pick.id : null,
-              media_url: pick?.source === "media" ? pick.url : null,
-              media_type: pick?.mediaType ?? null,
-              drive_file_id: pick?.source === "drive" ? pick.driveFileId : null,
-              drive_thumbnail_url: pick?.source === "drive" ? pick.driveThumbnailUrl : null,
-            },
-          });
-        }
-      });
+  async function copyLink() {
+    if (!link) return;
+    try {
+      await navigator.clipboard.writeText(link);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    } catch {
+      setError("Couldn't copy automatically — select and copy the link text instead.");
     }
+  }
 
-    // Emails — one prompt per doc, same brief-vs-prewritten detection as
-    // before. Changed 2026-09-20 from a sequential for-loop to Promise.all:
-    // each email was one full callClaude() round trip, awaited one at a
-    // time, so a month with a dozen emails meant a dozen sequential network
-    // calls with no timeout — the likely cause of the "stuck Generating…"
-    // report. Running them concurrently (each still wrapped in its own
-    // try/catch so one bad email doesn't drop the rest) cuts total wall
-    // time roughly to the slowest single call instead of the sum of all of
-    // them, and the new fetchWithTimeout on callClaude means a stuck one
-    // fails and gets skipped instead of hanging the batch.
-    const emailResults = await Promise.all(
-      emailDocs.map(async (ed): Promise<TablesInsert<"generated_posts"> | null> => {
-        const instructions = ed.instructions || "";
-        const hasCompleteBody = /Hey\s*\[/.test(instructions) || /Hey,\s*\n/.test(instructions);
-        const isPromptBrief =
-          !hasCompleteBody &&
-          /Opening:|Structure:|Style Rules|AFTER THE EMAIL|SUBJECT LINES|Write a complete email|Blend together:|Create a section|observations|Local Letter|BEFORE YOU WRITE/i.test(
-            instructions,
-          );
-        const isLocalLetter =
-          /observations|Local Letter|three to four|reads like a note|newsletter.*rewrite|sound like a note/i.test(
-            instructions,
-          ) || /CRITICAL RULES FOR THIS FORMAT|Do NOT use headers|Do NOT write bullet/i.test(instructions);
+  async function regenerate() {
+    setBusy(true);
+    setError(null);
+    setCopied(false);
+    try {
+      const r = await regenerateReviewLink({ data: { agentId } });
+      setToken(r.token);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
 
-        let emailPrompt: string;
-        if (isPromptBrief) {
-          if (isLocalLetter) {
-            emailPrompt =
-              `You are writing a personal community letter for ${agentName} in ${agentCity}.\n\n` +
-              `VOICE DNA:\n${dna}\n\n` +
-              `EMAIL GOAL:\n${ed.goal || ""}\n\n` +
-              `FULL BRIEF:\n${instructions}\n\n` +
-              "CRITICAL: Write this as three to four natural observations that flow into each other. Do NOT use headers. Do NOT use bullet lists. Do NOT structure this as a newsletter with named sections. Each observation transitions naturally into the next. The real estate mention is one short paragraph near the end, treated as a casual aside — not a featured section. End with one or two lines. No call to action. No pitch. " +
-              `This should read like a personal note from someone who lives in ${agentCity} and noticed a few things worth sharing. If it reads like a newsletter when done, it is wrong. Replace all [CITY], [NAME] placeholders with ${agentName} and ${agentCity}.\n` +
-              "NO hyphens. NO corporate language. NO AI tell phrases. Standard capitalization always." +
-              learnedFeedback +
-              "\n\nOutput format:\nSUBJECT OPTIONS:\n1. [subject]\n2. [subject]\n3. [subject]\n\nEMAIL BODY:\n[full email — reads like a note, not a newsletter]";
-          } else {
-            emailPrompt =
-              `You are writing a real estate email for ${agentName} in ${agentCity}.\n\n` +
-              `VOICE DNA:\n${dna}\n\n` +
-              `EMAIL GOAL:\n${ed.goal || ""}\n\n` +
-              `BRIEF TO FOLLOW:\n${instructions}\n\n` +
-              `Write this email EXACTLY as ${agentName} would write it based on their Voice DNA above. Replace all [CITY], [NAME], [CITY, STATE] placeholders with ${agentName} and ${agentCity}.\n` +
-              "NO hyphens. NO corporate language. NO AI-tell phrases. Standard capitalization always." +
-              learnedFeedback +
-              "\n\n" +
-              "Output format:\nSUBJECT OPTIONS:\n1. [subject]\n2. [subject]\n3. [subject]\n\nEMAIL BODY:\n[full email in plain text, no HTML tags]";
+  return (
+    <Card>
+      <h3 className="font-display text-sm font-semibold">Public review link</h3>
+      <p className="mt-1 text-xs text-muted-foreground">
+        Anyone with this link can review and Approve/Flag this agent's own content — no login needed. "Send to Agent"
+        emails this same link automatically; use this to copy it directly (e.g. to text it) or regenerate it if it's
+        been shared somewhere it shouldn't have been.
+      </p>
+      {error && <p className="mt-2 text-xs text-destructive">{error}</p>}
+      {link && (
+        <div className="mt-3 flex flex-wrap items-center gap-2">
+          <input
+            readOnly
+            value={link}
+            onFocus={(e) => e.currentTarget.select()}
+            className="min-w-0 flex-1 rounded-full border border-border bg-muted px-4 py-2 text-xs text-foreground"
+          />
+          <Button variant="secondary" onClick={copyLink}>
+            {copied ? "Copied ✓" : "Copy link"}
+          </Button>
+          <Button variant="secondary" onClick={regenerate} disabled={busy}>
+            {busy ? "Regenerating…" : "Regenerate link"}
+          </Button>
+        </div>
+      )}
+      {!link && !error && <p className="mt-2 text-xs text-muted-foreground">Loading…</p>}
+    </Card>
+  );
+}
+
+function MediaTab({ agentId, isAdmin }: { agentId: string; isAdmin: boolean }) {
+  const [status, setStatus] = useState<"available" | "used">("available");
+  const [media, setMedia] = useState<MediaRow[] | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [uploading, setUploading] = useState(false);
+  const [uploadNote, setUploadNote] = useState<string | null>(null);
+  const [busyId, setBusyId] = useState<string | null>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+
+  function reload() {
+    setMedia(null);
+    setError(null);
+    withAuthRetry(() => listMarketingMedia({ data: { agentId, status } }))
+      .then((m) => setMedia(m))
+      .catch((e) => setError(e instanceof Error ? e.message : String(e)));
+  }
+
+  useEffect(() => {
+    reload();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [agentId, status]);
+
+  async function handleFiles(fileList: FileList | null) {
+    if (!fileList || !fileList.length) return;
+    setUploading(true);
+    setUploadNote(null);
+    let uploaded = 0;
+    let skipped = 0;
+    for (const file of Array.from(fileList)) {
+      try {
+        const isVideo = file.type.startsWith("video/");
+        const mediaType: "photo" | "video" = isVideo ? "video" : "photo";
+
+        if (isVideo) {
+          const duration = await getVideoDuration(file);
+          if (duration > MAX_VIDEO_SECONDS) {
+            skipped++;
+            continue;
           }
-        } else {
-          const preWrittenSubjects = ed.subjects?.length ? ed.subjects : [];
-          const subjectBlock = preWrittenSubjects.length
-            ? preWrittenSubjects.map((s, i) => `${i + 1}. ${s}`).join("\n")
-            : "1. [See email below]\n2. \n3. ";
-          emailPrompt =
-            `You are personalizing a pre-written real estate email for ${agentName} in ${agentCity}.\n\n` +
-            `VOICE DNA (use this to lightly align tone, do NOT rewrite the email):\n${dna}\n\n` +
-            `PRE-WRITTEN EMAIL (keep this mostly intact — only replace placeholders and fix any [CITY]/[NAME] references):\n${instructions}\n\n` +
-            `Rules:\n- Do NOT rewrite or restructure this email\n- Replace [CITY], [NAME], [CITY, STATE] with ${agentName} and ${agentCity}\n- Fix any placeholder brackets that are still unfilled\n- NO hyphens. NO corporate language. Standard capitalization.\n\n` +
-            `Output format:\nSUBJECT OPTIONS:\n${subjectBlock}\n\nEMAIL BODY:\n[the personalized email]`;
         }
 
-        try {
-          const eraw = await callClaude(anthropicKey, emailPrompt, 2000);
-          const sm = eraw.match(/SUBJECT OPTIONS:([\s\S]*?)EMAIL BODY:/);
-          const bm = eraw.match(/EMAIL BODY:([\s\S]*)/);
-          const body = cleanCopy(
-            (bm ? bm[1]! : eraw)
-              .replace(/#+\s*VISUAL ASSETS[\s\S]*/i, "")
-              .replace(/\*\*Image Idea:\*\*[\s\S]*/i, "")
-              .replace(/# VISUAL[\s\S]*/i, "")
-              .replace(/VISUAL ASSETS[\s\S]*/i, "")
-              .replace(/\n{3,}/g, "\n\n")
-              .trim(),
-          );
-          const subjectsRaw = sm ? sm[1]!.trim() : "";
-          const subjects = subjectsRaw
-            .split("\n")
-            .filter((s) => s.trim() && /^\d/.test(s.trim()))
-            .map((s) => s.replace(/^\d+\.\s*/, "").trim());
-          return {
-            agent_id: data.agentId,
-            content:
-              (subjects.length ? `SUBJECT OPTIONS:\n${subjects.map((s, i) => `${i + 1}. ${s}`).join("\n")}\n\n` : "") +
-              body,
-            content_type: "email",
-            title: ed.title.replace("Email — ", ""),
-            status: "pending",
-            month: data.month,
-            metadata: { batch_id: batchId, month: data.month, goal: ed.goal, source: "content_calendar" },
-          };
-        } catch {
-          // Skip this email but keep generating the rest, same as the old app.
-          return null;
-        }
-      }),
-    );
-    for (const r of emailResults) if (r) rows.push(r);
-
-    // Video scripts — same Promise.all treatment as emails above, for the
-    // same reason: sequential per-video callClaude() calls were another
-    // place a single slow request could stall the whole batch.
-    const videoResults = await Promise.all(
-      videoDocs.map(async (vd): Promise<TablesInsert<"generated_posts"> | null> => {
-        const isVideoBrief = /Hook:|Body:|Close:|Structure:|STYLE RULES|Script Instructions/i.test(vd.script || "");
-        const videoPrompt =
-          `You are writing a short real estate video script for ${agentName} in ${agentCity}.\n\n` +
-          `VOICE DNA:\n${dna}\n\n` +
-          `VIDEO GOAL:\n${vd.goal || ""}\n\n` +
-          (vd.hook ? `HOOK DIRECTION:\n${vd.hook}\n\n` : "") +
-          (isVideoBrief ? "SCRIPT BRIEF TO FOLLOW:\n" : "SCRIPT DIRECTION:\n") +
-          `${vd.script}\n\n` +
-          `Write a 60 second video script in ${agentName}'s voice. Format:\n` +
-          "HOOK (first 3 seconds — grab attention):\n[hook line]\n\nBODY (main point, story, or insight):\n[15 to 45 seconds of content]\n\nCLOSE (natural ending, no hard sell):\n[closing line]\n\n" +
-          `Rules:\n- Sounds exactly like ${agentName} based on their Voice DNA\n- Written to be SPOKEN, not read — short sentences, natural pauses\n- NO hyphens, NO corporate language, NO AI phrases\n- Standard capitalization, never all lowercase\n- Real estate reminder energy — top of mind, not a pitch\n- 150 words maximum` +
-          learnedFeedback;
-
-        try {
-          const vraw = cleanCopy(await callClaude(anthropicKey, videoPrompt, 600));
-          return {
-            agent_id: data.agentId,
-            content: vraw,
-            content_type: "video",
-            title: vd.title,
-            status: "pending",
-            month: data.month,
-            metadata: { batch_id: batchId, month: data.month, goal: vd.goal, source: "content_calendar" },
-          };
-        } catch {
-          // Skip, keep going.
-          return null;
-        }
-      }),
-    );
-    for (const r of videoResults) if (r) rows.push(r);
-
-    if (rows.length) {
-      const { error } = await supabaseAdmin.from("generated_posts").insert(rows);
-      if (error) throw error;
-    }
-    return { ok: true, batchId, created: rows.length };
-  });
-
-// The three metadata.source values that mean "this row belongs to a month's
-// generated batch" (a calendar generation, or a photo-scan suggestion added
-// to one) — as opposed to a one-off post made through "+ New content"
-// (source "native_generate"), which never belongs to any month's batch and
-// should never be touched by delete/archive/restore below. Shared by all
-// three so they stay in sync — this used to be redeclared inline just in
-// deleteMonthContent; pulled out when archiveMonthContent needed the exact
-// same set (2026-09-20). Mirrors BATCH_SOURCES in marketing.tsx (kept as a
-// separate constant there since the frontend needs it for display grouping,
-// not data mutation, but the values must always match).
-const BATCH_CONTENT_SOURCES = new Set(["content_calendar", "drive_photo_scan", "library_photo_scan"]);
-
-// Deletes a month's generated content for one agent so it can be
-// regenerated cleanly — added 2026-09-18 per Mike: "Put a delete in case we
-// want to re generate that months content." Without this, clicking
-// "Generate Now" a second time just adds a second batch of posts on top of
-// the first (generateMonthlyBatch only ever inserts), so a real "start
-// over" always needed this. Admin-only, same as the other actions that
-// change what an agent's data actually contains rather than just reviewing
-// it (approve/flag stay agent-doable; deleting a whole batch is a "done for
-// you" action, and it's the one that's actually destructive — archiving,
-// added below, is the non-destructive alternative). Scoped to exactly the
-// sources this month's workspace shows (batchPosts in MonthWorkspace) —
-// content_calendar/drive_photo_scan/library_photo_scan for this agent+month
-// — so it never touches a one-off post made through the Posts tab's "+ New
-// content" form, which isn't part of any month's batch.
-export const deleteMonthContent = createServerFn({ method: "POST" })
-  .middleware([requireSupabaseAuth])
-  .validator((data: { agentId: string; month: string }) => data)
-  .handler(async ({ data, context }): Promise<{ ok: true; deleted: number }> => {
-    const email = (context.claims as { email?: string } | undefined)?.email;
-    await requireAdmin(context.userId, email);
-    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
-    const { data: rows, error: selErr } = await supabaseAdmin
-      .from("generated_posts")
-      .select("id, metadata")
-      .eq("agent_id", data.agentId)
-      .eq("month", data.month);
-    if (selErr) throw selErr;
-    const idsToDelete = (rows ?? [])
-      .filter((r) => BATCH_CONTENT_SOURCES.has((r.metadata as { source?: string } | null)?.source ?? ""))
-      .map((r) => r.id);
-    if (!idsToDelete.length) return { ok: true, deleted: 0 };
-    const { error: delErr } = await supabaseAdmin.from("generated_posts").delete().in("id", idsToDelete);
-    if (delErr) throw delErr;
-    return { ok: true, deleted: idsToDelete.length };
-  });
-
-// Archives a month's generated content for one agent — added 2026-09-20 per
-// Mike: "I'm trying to test and retest, but I can't retest without the
-// ability to archive the monthly content." deleteMonthContent above already
-// covers "clear it out to regenerate," but it's permanent and admin-only;
-// this is the safer, reversible version of the same need, and — per his
-// explicit "the admin and or the user needs the ability" — available to the
-// agent themselves too, not just admin (requireAgentAccess, same guard
-// approveAllPending/submitMarketingFeedback use, not requireAdmin).
-// Archiving just flips a flag: listMarketingPosts excludes archived rows by
-// default, so an archived batch disappears from the review screen and
-// "Generate Now" can be run again cleanly — but nothing is deleted, and
-// listArchivedBatchesForMonth/restoreArchivedBatch below can always bring a
-// past attempt back. Same BATCH_CONTENT_SOURCES scoping as delete, so a
-// one-off "+ New content" post is never swept up by accident.
-export const archiveMonthContent = createServerFn({ method: "POST" })
-  .middleware([requireSupabaseAuth])
-  .validator((data: { agentId: string; month: string }) => data)
-  .handler(async ({ data, context }): Promise<{ ok: true; archived: number }> => {
-    const email = (context.claims as { email?: string } | undefined)?.email;
-    await requireAgentAccess(context.userId, email, data.agentId);
-    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
-    const { data: rows, error: selErr } = await supabaseAdmin
-      .from("generated_posts")
-      .select("id, metadata")
-      .eq("agent_id", data.agentId)
-      .eq("month", data.month)
-      .eq("archived", false);
-    if (selErr) throw selErr;
-    const idsToArchive = (rows ?? [])
-      .filter((r) => BATCH_CONTENT_SOURCES.has((r.metadata as { source?: string } | null)?.source ?? ""))
-      .map((r) => r.id);
-    if (!idsToArchive.length) return { ok: true, archived: 0 };
-    const { error } = await supabaseAdmin
-      .from("generated_posts")
-      .update({ archived: true, updated_at: new Date().toISOString() })
-      .in("id", idsToArchive);
-    if (error) throw error;
-    return { ok: true, archived: idsToArchive.length };
-  });
-
-// Groups this agent+month's archived rows by batch_id so the UI can show a
-// short history ("14 pieces, generated Sep 18") with a Restore button per
-// past attempt, instead of one undifferentiated pile. A batch_id groups
-// everything one "Generate Now" click produced (see generateMonthlyBatch);
-// photo-scan additions carry their own batch_id from addPhotoPostsToBatch,
-// so those group separately too, which is correct — restoring one doesn't
-// have to restore the other.
-export type ArchivedBatchSummary = { batchId: string; count: number; generatedAt: string };
-
-export const listArchivedBatchesForMonth = createServerFn({ method: "GET" })
-  .middleware([requireSupabaseAuth])
-  .validator((data: { agentId: string; month: string }) => data)
-  .handler(async ({ data, context }): Promise<ArchivedBatchSummary[]> => {
-    const email = (context.claims as { email?: string } | undefined)?.email;
-    await requireAgentAccess(context.userId, email, data.agentId);
-    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
-    const { data: rows, error } = await supabaseAdmin
-      .from("generated_posts")
-      .select("created_at, metadata")
-      .eq("agent_id", data.agentId)
-      .eq("month", data.month)
-      .eq("archived", true);
-    if (error) throw error;
-    const groups = new Map<string, { count: number; earliest: string }>();
-    for (const r of rows ?? []) {
-      const meta = r.metadata as { batch_id?: string; source?: string } | null;
-      if (!meta?.batch_id || !BATCH_CONTENT_SOURCES.has(meta.source ?? "")) continue;
-      const createdAt = r.created_at as string;
-      const g = groups.get(meta.batch_id);
-      if (g) {
-        g.count += 1;
-        if (createdAt < g.earliest) g.earliest = createdAt;
-      } else {
-        groups.set(meta.batch_id, { count: 1, earliest: createdAt });
+        const toUpload = isVideo ? file : await resizeImage(file);
+        const { path, token } = await createMediaUploadUrl({
+          data: { agentId, fileName: toUpload.name },
+        });
+        const { error: uploadErr } = await supabase.storage.from("media").uploadToSignedUrl(path, token, toUpload);
+        if (uploadErr) throw uploadErr;
+        await finalizeMediaUpload({ data: { agentId, storagePath: path, mediaType } });
+        uploaded++;
+      } catch (e) {
+        skipped++;
+        // eslint-disable-next-line no-console
+        console.error("Media upload failed:", e);
       }
     }
-    return Array.from(groups.entries())
-      .map(([batchId, g]) => ({ batchId, count: g.count, generatedAt: g.earliest }))
-      .sort((a, b) => (a.generatedAt < b.generatedAt ? 1 : -1));
-  });
+    setUploading(false);
+    if (fileInputRef.current) fileInputRef.current.value = "";
+    setUploadNote(
+      skipped > 0
+        ? `Uploaded ${uploaded}, skipped ${skipped} (a video over ${MAX_VIDEO_SECONDS}s, or a file that failed to upload).`
+        : `Uploaded ${uploaded} file${uploaded === 1 ? "" : "s"}.`,
+    );
+    if (status === "available") reload();
+  }
 
-// Un-archives one past batch (by batch_id) for one agent — the recovery
-// half of archiveMonthContent. Same access level as archive (agent or
-// admin). Scoped to this agent's own rows even though a batch_id is already
-// effectively unique per generation, as belt-and-suspenders consistent with
-// every other per-post/per-batch action in this file.
-export const restoreArchivedBatch = createServerFn({ method: "POST" })
-  .middleware([requireSupabaseAuth])
-  .validator((data: { agentId: string; batchId: string }) => data)
-  .handler(async ({ data, context }): Promise<{ ok: true; restored: number }> => {
-    const email = (context.claims as { email?: string } | undefined)?.email;
-    await requireAgentAccess(context.userId, email, data.agentId);
-    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
-    const { data: rows, error: selErr } = await supabaseAdmin
-      .from("generated_posts")
-      .select("id")
-      .eq("agent_id", data.agentId)
-      .eq("archived", true)
-      .eq("metadata->>batch_id", data.batchId);
-    if (selErr) throw selErr;
-    const ids = (rows ?? []).map((r) => r.id);
-    if (!ids.length) return { ok: true, restored: 0 };
-    const { error } = await supabaseAdmin
-      .from("generated_posts")
-      .update({ archived: false, updated_at: new Date().toISOString() })
-      .in("id", ids);
-    if (error) throw error;
-    return { ok: true, restored: ids.length };
-  });
+  async function markUsed(id: string) {
+    setBusyId(id);
+    try {
+      await markMediaUsed({ data: { agentId, mediaIds: [id] } });
+      reload();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusyId(null);
+    }
+  }
 
-// ── Photo scan + caption — ported 1:1 from analyze-photos.js ───────────────
+  // Added 2026-09-21 per Mike: "photos and videos should be able to be moved
+  // back to active folder form used folder." Mirrors markUsed above.
+  async function restoreToAvailable(id: string) {
+    setBusyId(id);
+    try {
+      await restoreMediaToAvailable({ data: { agentId, mediaId: id } });
+      reload();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusyId(null);
+    }
+  }
 
-// `source` distinguishes where the suggestion came from — added 2026-09-18
-// when this panel grew a second source (the native Media Library) per
-// Mike's request that the photo-scan tool "scan the media library too and
-// all photos", not just Drive. `driveUrl` is kept as the field name for the
-// original/full-size view link for BOTH sources (a Drive file's viewer link,
-// or a library photo's own URL) rather than renaming it, to avoid touching
-// every existing caller.
-export type PhotoScanSuggestion = {
-  source: "drive" | "library";
-  fileId: string;
-  fileName: string;
-  driveUrl: string;
-  thumbnailUrl: string;
-  description: string;
-  suggestedPost: string;
+  async function remove(id: string) {
+    setBusyId(id);
+    try {
+      await deleteMarketingMedia({ data: { agentId, mediaId: id } });
+      reload();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusyId(null);
+    }
+  }
+
+  // Tags feed assignSuggestedMedia's category matching (marketing.ts) —
+  // added per Mike's request (2026-09-17) so photo suggestions can be
+  // smarter than plain FIFO. Toggling a chip saves immediately, optimistic
+  // in the grid, so tagging a whole library doesn't need a separate save
+  // step per item.
+  async function toggleTag(item: MediaRow, tag: string) {
+    const nextTags = item.tags.includes(tag) ? item.tags.filter((t) => t !== tag) : [...item.tags, tag];
+    setMedia((prev) => (prev ? prev.map((m) => (m.id === item.id ? { ...m, tags: nextTags } : m)) : prev));
+    try {
+      await setMediaTags({ data: { agentId, mediaId: item.id, tags: nextTags } });
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+      setMedia((prev) => (prev ? prev.map((m) => (m.id === item.id ? { ...m, tags: item.tags } : m)) : prev));
+    }
+  }
+
+  return (
+    <div className="space-y-4">
+      <Card>
+        <h3 className="font-display text-sm font-semibold">Upload photos or short-form video</h3>
+        <p className="mt-1 text-xs text-muted-foreground">
+          Uploaded here, these are used for this agent's content the same way Drive photos are — once something's used
+          in a piece of content, mark it used below and it drops out of the active pool so it doesn't get suggested
+          again. This is separate from this agent's Google Drive folder — Drive photos still work exactly as they do
+          today, they just won't show up in this grid unless they're also uploaded here.
+        </p>
+        <div className="mt-3 flex flex-wrap items-center gap-3">
+          <input
+            ref={fileInputRef}
+            type="file"
+            accept="image/*,video/*"
+            multiple
+            onChange={(e) => handleFiles(e.target.files)}
+            disabled={uploading}
+            className="text-sm text-muted-foreground file:mr-3 file:rounded-full file:border-0 file:bg-primary file:px-4 file:py-2 file:text-sm file:font-semibold file:text-primary-foreground"
+          />
+          {uploading && <span className="text-xs text-muted-foreground">Uploading…</span>}
+        </div>
+        {uploadNote && <p className="mt-2 text-xs text-muted-foreground">{uploadNote}</p>}
+      </Card>
+
+      {isAdmin && <PublicUploadLinkCard agentId={agentId} />}
+
+      <div className="flex flex-wrap gap-1 rounded-full border border-border bg-glass p-1 backdrop-blur-xl w-fit">
+        {(["available", "used"] as const).map((s) => (
+          <button
+            key={s}
+            onClick={() => setStatus(s)}
+            className={`rounded-full px-4 py-1.5 text-sm font-medium transition-colors ${
+              status === s ? "bg-secondary text-foreground" : "text-muted-foreground hover:text-foreground"
+            }`}
+          >
+            {s === "available" ? "Available" : "Used"}
+          </button>
+        ))}
+      </div>
+
+      {error && (
+        <Card>
+          <p className="text-sm text-destructive">{error}</p>
+        </Card>
+      )}
+
+      {!error && media === null && (
+        <Card>
+          <p className="text-sm text-muted-foreground">Loading…</p>
+        </Card>
+      )}
+
+      {!error && media !== null && media.length === 0 && (
+        <Card>
+          <p className="text-sm text-muted-foreground">
+            {status === "available"
+              ? "Nothing uploaded natively for this agent yet — use the upload box above, or keep managing their Google Drive folder the way you do today."
+              : "Nothing marked used yet."}
+          </p>
+        </Card>
+      )}
+
+      {!error && media !== null && media.length > 0 && (
+        <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-4">
+          {media.map((m) => (
+            <div key={m.id} className="overflow-hidden rounded-2xl border border-border bg-glass">
+              {m.media_type === "video"
+                ? m.url && <video src={m.url} controls className="aspect-square w-full object-cover" />
+                : m.url && <img src={m.url} alt={m.caption ?? ""} className="aspect-square w-full object-cover" />}
+              <div className="flex items-center justify-between gap-1 px-2 pt-2">
+                <span className="rounded-full bg-muted px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">
+                  {m.media_type}
+                </span>
+                <span className="rounded-full bg-muted px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">
+                  {m.source === "upload" ? "Uploaded" : "Drive"}
+                </span>
+              </div>
+              <div className="flex flex-wrap gap-1 px-2 pt-2">
+                {PHOTO_TAG_OPTIONS.map((tag) => {
+                  const active = m.tags.includes(tag);
+                  return (
+                    <button
+                      key={tag}
+                      onClick={() => toggleTag(m, tag)}
+                      className={`rounded-full border px-2 py-0.5 text-[10px] font-medium transition-colors ${
+                        active
+                          ? "border-primary bg-primary text-primary-foreground"
+                          : "border-border text-muted-foreground hover:border-primary/50"
+                      }`}
+                    >
+                      {tag}
+                    </button>
+                  );
+                })}
+              </div>
+              <div className="flex flex-wrap gap-1 p-2">
+                {status === "available" ? (
+                  <button
+                    onClick={() => markUsed(m.id)}
+                    disabled={busyId === m.id}
+                    className="flex-1 rounded-full border border-border px-2 py-1 text-[11px] font-semibold transition-colors hover:bg-secondary disabled:opacity-50"
+                  >
+                    Mark used
+                  </button>
+                ) : (
+                  <button
+                    onClick={() => restoreToAvailable(m.id)}
+                    disabled={busyId === m.id}
+                    className="flex-1 rounded-full border border-border px-2 py-1 text-[11px] font-semibold transition-colors hover:bg-secondary disabled:opacity-50"
+                    title={m.used_at ? `Used ${new Date(m.used_at).toLocaleDateString()}` : "Used"}
+                  >
+                    Move to active
+                  </button>
+                )}
+                {m.url && (
+                  <button
+                    onClick={() => downloadRemoteFile(m.url!, m.url!.split("/").pop() || `${m.id}`)}
+                    className="rounded-full border border-border px-2 py-1 text-[11px] font-semibold transition-colors hover:bg-secondary"
+                  >
+                    ⬇ Download
+                  </button>
+                )}
+                <button
+                  onClick={() => remove(m.id)}
+                  disabled={busyId === m.id}
+                  className="rounded-full border border-destructive/40 px-2 py-1 text-[11px] font-semibold text-destructive transition-colors hover:bg-destructive/10 disabled:opacity-50"
+                >
+                  Delete
+                </button>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// Live, read-only view of an agent's actual Google Drive folder — mainly for
+// agents on YMD's video services who still send long-form footage through
+// Drive. Nothing here ever writes back to Drive; their existing Drive
+// workflow (upload, the "used" subfolder move) is completely untouched.
+function DriveTab({ agentId, agentEmail, isAdmin }: { agentId: string; agentEmail: string | null; isAdmin: boolean }) {
+  const [data, setData] = useState<{ folderId: string | null; files: DriveFile[] } | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [folderInput, setFolderInput] = useState("");
+  const [saving, setSaving] = useState(false);
+  // Added 2026-09-18 per Mike's report that a folder "still does not appear
+  // for the agent" after he believed he'd already connected one — there was
+  // no confirmation at all when Save actually succeeded, so there was no way
+  // to tell "it didn't save" from "it saved, but for a different agent than
+  // I meant to." This makes success (and exactly which agent it applied to)
+  // unmissable, the same instinct as the Approve-All confirmation text.
+  const [saveNote, setSaveNote] = useState<string | null>(null);
+  const [removing, setRemoving] = useState(false);
+  // Added 2026-09-21 per Mike: "google drive folder Used needs to show" —
+  // mirrors MediaTab's Available/Used toggle exactly, so both photo sources
+  // work the same way. See listAgentDriveMedia in marketing.ts for what
+  // "used" means here (a real "used" subfolder's contents, plus anything
+  // this app itself has marked used — there's no real Drive write access to
+  // physically move a file, see the comment there).
+  const [status, setStatus] = useState<"available" | "used">("available");
+  const [busyId, setBusyId] = useState<string | null>(null);
+
+  function reload() {
+    setData(null);
+    setError(null);
+    listAgentDriveMedia({ data: { agentId, status } })
+      .then((d) => setData(d))
+      .catch((e) => setError(e instanceof Error ? e.message : String(e)));
+  }
+
+  useEffect(() => {
+    reload();
+    setSaveNote(null);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [agentId, status]);
+
+  async function markUsed(fileId: string) {
+    setBusyId(fileId);
+    try {
+      await markDriveFileUsed({ data: { agentId, driveFileId: fileId } });
+      reload();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusyId(null);
+    }
+  }
+
+  async function restoreToActive(fileId: string) {
+    setBusyId(fileId);
+    try {
+      await restoreDriveFileToActive({ data: { agentId, driveFileId: fileId } });
+      reload();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusyId(null);
+    }
+  }
+
+  async function saveFolder() {
+    setSaving(true);
+    setError(null);
+    setSaveNote(null);
+    try {
+      await setAgentDriveFolder({ data: { agentId, driveFolderId: folderInput } });
+      setSaveNote(`Saved — this agent's Drive folder is now ${folderInput.trim()}.`);
+      setFolderInput("");
+      reload();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  // "we need a way to remove [a connected folder]" (2026-09-18) — Save was
+  // previously the only control here and it's disabled on an empty input,
+  // so there was actually no way to clear a folder ID from this screen at
+  // all before this. Clears agents.drive_folder_id back to null.
+  async function removeFolder() {
+    setRemoving(true);
+    setError(null);
+    setSaveNote(null);
+    try {
+      await setAgentDriveFolder({ data: { agentId, driveFolderId: "" } });
+      setSaveNote("Removed — this agent's Drive connection is cleared.");
+      reload();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setRemoving(false);
+    }
+  }
+
+  return (
+    <div className="space-y-4">
+      <Card>
+        <h3 className="font-display text-sm font-semibold">This agent's Google Drive folder</h3>
+        <p className="mt-1 text-xs text-muted-foreground">
+          A live, read-only view of what's actually in their Drive folder right now — mainly useful for agents on our
+          video services who still send long-form footage through Drive. This never writes anything back to Drive;
+          uploading and marking things used still happens exactly as it does today, over there, untouched.
+        </p>
+        {/* Cross-check for admin (2026-09-18) — per Mike's report that a
+            Drive folder connection "still" isn't reaching the client-facing
+            view even after being set here. The save/read code both target
+            this exact agentId (confirmed correct), so if this still happens
+            after a Save, the most likely explanation is two agent records
+            sharing the same display name — admin saving onto one while the
+            agent's real login resolves to the other. Showing the email of
+            the record actually being edited, right here, lets that be ruled
+            in or out at a glance instead of guessing. */}
+        {isAdmin && agentEmail && (
+          <p className="mt-1 text-xs text-muted-foreground">
+            Editing the Drive connection for: <span className="font-semibold">{agentEmail}</span> — double check this is
+            the account they actually log in with if the folder still isn't showing up on their side after saving.
+          </p>
+        )}
+        {isAdmin && (
+          <>
+            <div className="mt-3 flex flex-wrap items-center gap-2">
+              <input
+                value={folderInput}
+                onChange={(e) => setFolderInput(e.target.value)}
+                placeholder={data?.folderId ? `Currently: ${data.folderId}` : "Paste this agent's Drive folder ID"}
+                className="min-w-[220px] flex-1 rounded-xl border border-border bg-glass px-3 py-1.5 text-sm outline-none"
+              />
+              <Button onClick={saveFolder} disabled={saving || !folderInput.trim()}>
+                {saving ? "Saving…" : "Save folder ID"}
+              </Button>
+              {data?.folderId && (
+                <Button variant="danger" onClick={removeFolder} disabled={removing}>
+                  {removing ? "Removing…" : "Remove connection"}
+                </Button>
+              )}
+            </div>
+            {saveNote && <p className="mt-2 text-xs text-muted-foreground">{saveNote}</p>}
+          </>
+        )}
+      </Card>
+
+      {data?.folderId && (
+        <div className="flex flex-wrap gap-1 rounded-full border border-border bg-glass p-1 backdrop-blur-xl w-fit">
+          {(["available", "used"] as const).map((s) => (
+            <button
+              key={s}
+              onClick={() => setStatus(s)}
+              className={`rounded-full px-4 py-1.5 text-sm font-medium transition-colors ${
+                status === s ? "bg-secondary text-foreground" : "text-muted-foreground hover:text-foreground"
+              }`}
+            >
+              {s === "available" ? "Available" : "Used"}
+            </button>
+          ))}
+        </div>
+      )}
+
+      {error && (
+        <Card>
+          <p className="text-sm text-destructive">{error}</p>
+        </Card>
+      )}
+
+      {!error && data === null && (
+        <Card>
+          <p className="text-sm text-muted-foreground">Loading…</p>
+        </Card>
+      )}
+
+      {!error && data !== null && !data.folderId && (
+        <Card>
+          <p className="text-sm text-muted-foreground">
+            No Drive folder connected for this agent yet
+            {isAdmin ? " — paste their folder ID above." : " — ask your team to connect one."}
+          </p>
+        </Card>
+      )}
+
+      {!error && data !== null && data.folderId && data.files.length === 0 && (
+        <Card>
+          <p className="text-sm text-muted-foreground">
+            {status === "available"
+              ? "Their Drive folder is connected but empty right now."
+              : 'Nothing marked used yet — either a real "used" subfolder in their Drive is empty, or nothing\'s been approved with a Drive photo attached yet.'}
+          </p>
+        </Card>
+      )}
+
+      {!error && data !== null && data.files.length > 0 && (
+        <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-4">
+          {data.files.map((f) => (
+            <div key={f.id} className="overflow-hidden rounded-2xl border border-border bg-glass">
+              <a href={f.viewUrl} target="_blank" rel="noreferrer">
+                <img src={f.thumbnailUrl} alt={f.name} className="aspect-square w-full object-cover" />
+              </a>
+              <div className="flex items-center justify-between gap-1 px-2 pt-2">
+                <span className="truncate text-[11px] text-muted-foreground">{f.name}</span>
+                {f.isVideo && (
+                  <span className="shrink-0 rounded-full bg-muted px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">
+                    Video
+                  </span>
+                )}
+              </div>
+              {status === "used" && (
+                <p className="px-2 pt-1 text-[11px] text-muted-foreground">
+                  {f.usedAt ? `Used ${new Date(f.usedAt).toLocaleDateString()}` : "Used"}
+                </p>
+              )}
+              <div className="flex flex-wrap gap-1 p-2">
+                {status === "available" ? (
+                  <button
+                    onClick={() => markUsed(f.id)}
+                    disabled={busyId === f.id}
+                    className="flex-1 rounded-full border border-border px-2 py-1 text-[11px] font-semibold transition-colors hover:bg-secondary disabled:opacity-50"
+                  >
+                    Mark used
+                  </button>
+                ) : (
+                  <button
+                    onClick={() => restoreToActive(f.id)}
+                    disabled={busyId === f.id}
+                    className="flex-1 rounded-full border border-border px-2 py-1 text-[11px] font-semibold transition-colors hover:bg-secondary disabled:opacity-50"
+                    title="If this file is inside a real 'used' folder in Drive itself, this only clears our own tracking — it can't move the actual file back in Drive."
+                  >
+                    Move to active
+                  </button>
+                )}
+                <button
+                  onClick={() => downloadRemoteFile(f.downloadUrl, f.name)}
+                  className="rounded-full border border-border px-2 py-1 text-[11px] font-semibold transition-colors hover:bg-secondary"
+                >
+                  ⬇ Download
+                </button>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ============================================================================
+// Content Calendar — the Google Drive-driven batch generation flow, brought
+// back natively so existing clients keep working exactly like they did in
+// the old standalone tool: one Drive folder per month, full of post/email/
+// video briefs, read and rewritten in the agent's voice with one click. This
+// coexists with the native single-item "Create content" form above — Drive
+// stays the source for clients already set up that way while a fully native
+// baseline-content editor is still on the roadmap.
+//
+// Month-folder setup (add/remove) is a genuinely separate, admin-only step —
+// see ManageMonthsScreen, reached from the agent picker, never from inside
+// this tab. This tab itself is the same screen for admin-acting-as-agent and
+// the agent's own login: pick an already-set-up month, generate, review. The
+// "Send to Agent" button inside MonthWorkspace is the only thing here still
+// gated on isAdmin.
+// ============================================================================
+
+function ManageCalendarScreen({ onBack }: { onBack: () => void }) {
+  const [months, setMonths] = useState<CalendarMonth[] | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [addOpen, setAddOpen] = useState(false);
+  const [newMonth, setNewMonth] = useState("");
+  const [addBusy, setAddBusy] = useState(false);
+  const [addError, setAddError] = useState<string | null>(null);
+  const [busyMonthId, setBusyMonthId] = useState<string | null>(null);
+  const [activeMonth, setActiveMonth] = useState<CalendarMonth | null>(null);
+  // Added 2026-09-18 per Mike: "We also need an Archive so we can archive
+  // that content and we dont have a long list of stuff to do." Off by
+  // default (the plain, non-archived listCalendarMonths — same one every
+  // agent's month picker uses); flipping it switches to the admin-only
+  // listAllCalendarMonthsForAdmin so a past month can still be found again
+  // to unarchive it.
+  const [showArchived, setShowArchived] = useState(false);
+
+  function reload() {
+    setMonths(null);
+    setError(null);
+    (showArchived ? listAllCalendarMonthsForAdmin() : listCalendarMonths())
+      .then((m) => setMonths(m))
+      .catch((e) => setError(e instanceof Error ? e.message : String(e)));
+  }
+
+  useEffect(() => {
+    reload();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [showArchived]);
+
+  async function toggleArchived(m: CalendarMonth) {
+    setBusyMonthId(m.id);
+    setError(null);
+    try {
+      await setCalendarMonthArchived({ data: { monthId: m.id, archived: !m.archived } });
+      if (!showArchived) {
+        // Archiving one while looking at the non-archived list makes it
+        // disappear immediately; unarchiving can't happen from this list
+        // since an archived month was never shown here in the first place.
+        setMonths((prev) => (prev ?? []).filter((x) => x.id !== m.id));
+      } else {
+        setMonths((prev) => (prev ?? []).map((x) => (x.id === m.id ? { ...x, archived: !x.archived } : x)));
+      }
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusyMonthId(null);
+    }
+  }
+
+  async function addMonth() {
+    if (!newMonth.trim()) {
+      setAddError("Give this month a label.");
+      return;
+    }
+    setAddBusy(true);
+    setAddError(null);
+    try {
+      const res = await addCalendarMonth({ data: { month: newMonth.trim() } });
+      setMonths((prev) => [res.month, ...(prev ?? [])]);
+      setNewMonth("");
+      setAddOpen(false);
+    } catch (e) {
+      setAddError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setAddBusy(false);
+    }
+  }
+
+  async function removeMonth(monthId: string) {
+    setBusyMonthId(monthId);
+    try {
+      await removeCalendarMonth({ data: { monthId } });
+      setMonths((prev) => (prev ?? []).filter((m) => m.id !== monthId));
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusyMonthId(null);
+    }
+  }
+
+  if (activeMonth) {
+    return <CalendarMonthItemsScreen month={activeMonth} onBack={() => setActiveMonth(null)} />;
+  }
+
+  return (
+    <div className="mt-5 space-y-4">
+      <button onClick={onBack} className="text-xs font-semibold text-muted-foreground hover:text-foreground">
+        ← Back
+      </button>
+
+      <Card>
+        <h2 className="font-display text-lg font-semibold">Content Calendar</h2>
+        <p className="mt-1 text-sm text-muted-foreground">
+          One shared calendar for every agent. Add a month, then add the posts, emails, and video briefs that belong to
+          it — every agent generates their own personalized version of the same briefs from their own login.
+        </p>
+      </Card>
+
+      <Card>
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <h4 className="font-display text-sm font-semibold">
+            {showArchived ? "All months (including archived)" : "Months"}
+          </h4>
+          <div className="flex items-center gap-2">
+            <label className="flex items-center gap-2 text-xs text-muted-foreground">
+              <input type="checkbox" checked={showArchived} onChange={(e) => setShowArchived(e.target.checked)} />
+              Show archived
+            </label>
+            {!addOpen && <Button onClick={() => setAddOpen(true)}>+ Add month</Button>}
+          </div>
+        </div>
+
+        {addOpen && (
+          <div className="mt-3 space-y-2 rounded-2xl border border-border bg-background/40 p-4">
+            <input
+              value={newMonth}
+              onChange={(e) => setNewMonth(e.target.value)}
+              placeholder='Month label, e.g. "June 2026"'
+              className="w-full rounded-xl border border-border bg-glass px-3 py-2 text-sm outline-none"
+            />
+            {addError && <p className="text-xs text-destructive">{addError}</p>}
+            <div className="flex gap-2">
+              <Button onClick={addMonth} disabled={addBusy}>
+                {addBusy ? "Adding…" : "Add month"}
+              </Button>
+              <Button variant="secondary" onClick={() => setAddOpen(false)} disabled={addBusy}>
+                Cancel
+              </Button>
+            </div>
+          </div>
+        )}
+
+        {error && <p className="mt-3 text-xs text-destructive">{error}</p>}
+        {months === null && !error && <p className="mt-3 text-sm text-muted-foreground">Loading…</p>}
+        {months !== null && months.length === 0 && (
+          <p className="mt-3 text-sm text-muted-foreground">No months yet — add one above to get started.</p>
+        )}
+        {months !== null && months.length > 0 && (
+          <div className="mt-3 grid gap-2 sm:grid-cols-2 lg:grid-cols-3">
+            {months.map((m) => (
+              <div
+                key={m.id}
+                className="flex items-center justify-between gap-2 rounded-2xl border border-border bg-glass px-4 py-3"
+              >
+                <button onClick={() => setActiveMonth(m)} className="text-left text-sm font-semibold">
+                  {m.month}
+                  {m.archived && (
+                    <span className="ml-2 rounded-full bg-muted px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">
+                      Archived
+                    </span>
+                  )}
+                </button>
+                <div className="flex shrink-0 items-center gap-3">
+                  <button
+                    onClick={() => toggleArchived(m)}
+                    disabled={busyMonthId === m.id}
+                    className="text-[11px] font-semibold text-muted-foreground hover:text-foreground hover:underline disabled:opacity-50"
+                  >
+                    {m.archived ? "Unarchive" : "Archive"}
+                  </button>
+                  <button
+                    onClick={() => removeMonth(m.id)}
+                    disabled={busyMonthId === m.id}
+                    className="text-[11px] font-semibold text-destructive hover:underline disabled:opacity-50"
+                  >
+                    Remove
+                  </button>
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+      </Card>
+    </div>
+  );
+}
+
+const DOC_TYPE_LABEL: Record<CalendarItem["docType"], string> = {
+  post: "Social post",
+  email: "Email",
+  video: "Video",
 };
 
-// Shared with scanAgentLibraryPhotos below — one Claude vision call per
-// photo, writing a caption in the agent's voice from the raw image bytes.
-async function captionPhotoInVoice(
-  imageBytes: ArrayBuffer,
-  mediaType: string,
-  anthropicKey: string,
-  agentName: string | undefined,
-  agentCity: string | undefined,
-  voiceDna: string | undefined,
-): Promise<{ description: string; suggestedPost: string } | null> {
-  const base64 = Buffer.from(imageBytes).toString("base64");
-  const safeMediaType = ["image/jpeg", "image/png", "image/gif", "image/webp"].includes(mediaType)
-    ? mediaType
-    : "image/jpeg";
-  // Leans deliberately playful/personality-driven rather than real-estate-y —
-  // per Mike's request (2026-09-18): "These should be more fun and playful
-  // real estate reminders and just personality driven content that makes
-  // them more human since we already have a good balance of real estate
-  // ones." The rest of the content plan already covers the real-estate side;
-  // this scan is specifically the "make them look like a human, not an
-  // agent" lever, so rule 4 below is intentionally stricter than a generic
-  // caption prompt would be.
-  const prompt =
-    `You are creating a social media post for a real estate agent named ${agentName ?? "the agent"} in ${agentCity ?? "their city"}.\n\n` +
-    `VOICE DNA:\n${voiceDna ?? "Warm, authentic, conversational. Sounds like a real person, not a real estate agent."}\n\n` +
-    "Look at this photo and write a social media post that:\n1. Starts from what you actually see — the setting, the mood, the moment\n2. Sounds EXACTLY like this person based on their Voice DNA above\n3. Is 1-3 sentences max — short, human, texted-a-friend energy\n4. Leans playful, funny, or personality-driven by default — treat this as a chance to make them look like a real person with a life, not an agent. Only mention real estate at all if the photo is unmistakably a real estate moment (a listing, a closing, a sign, a showing); otherwise skip it entirely\n5. Does NOT mention any specific location, city, neighborhood, or place name\n6. NO hyphens, NO corporate language, NO AI-tell phrases\n7. Standard capitalization — never write in all lowercase\n\n" +
-    "Also describe what you see in the photo in one short sentence.\n\nOutput format:\nDESCRIPTION: [one sentence of what you see]\nPOST: [the social media caption]";
+const DOC_TYPE_PLACEHOLDER: Record<CalendarItem["docType"], string> = {
+  post: "Post Goal:\n...\n\nPost Image/Video Suggestions:\n...\n\nCanva Template Direction:\nTemplate Link: https://...\n\nPost Copy:\n...",
+  email: "Email Goal:\n...\n\nSubject Line Options:\n1. ...\n2. ...\n\nEmail Instructions:\n...",
+  video: "Video Goal:\n...\n\nHook:\n...\n\nVideo Script:\n...",
+};
 
-  const res = await fetch("https://api.anthropic.com/v1/messages", {
-    method: "POST",
-    headers: { "Content-Type": "application/json", "x-api-key": anthropicKey, "anthropic-version": "2023-06-01" },
-    body: JSON.stringify({
-      model: "claude-haiku-4-5-20251001",
-      max_tokens: 300,
-      messages: [
-        {
-          role: "user",
-          content: [
-            { type: "image", source: { type: "base64", media_type: safeMediaType, data: base64 } },
-            { type: "text", text: prompt },
-          ],
-        },
-      ],
-    }),
-  });
-  const claudeData = (await res.json()) as { content?: { text?: string }[]; error?: { message?: string } };
-  if (!res.ok) throw new Error(claudeData.error?.message ?? "Claude API error");
-  const raw = (claudeData.content ?? [])
-    .map((b) => b.text ?? "")
-    .join("")
-    .trim();
-  const descMatch = raw.match(/DESCRIPTION:\s*(.+)/i);
-  const postMatch = raw.match(/POST:\s*([\s\S]+)/i);
-  return {
-    description: descMatch ? descMatch[1]!.trim() : "Photo",
-    suggestedPost: postMatch ? postMatch[1]!.trim() : raw,
-  };
+function CalendarMonthItemsScreen({ month, onBack }: { month: CalendarMonth; onBack: () => void }) {
+  const [items, setItems] = useState<CalendarItem[] | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [addOpen, setAddOpen] = useState(false);
+  const [docType, setDocType] = useState<CalendarItem["docType"]>("post");
+  const [title, setTitle] = useState("");
+  const [rawText, setRawText] = useState("");
+  const [addBusy, setAddBusy] = useState(false);
+  const [addError, setAddError] = useState<string | null>(null);
+  const [busyItemId, setBusyItemId] = useState<string | null>(null);
+
+  function reload() {
+    setItems(null);
+    setError(null);
+    listCalendarItems({ data: { monthId: month.id } })
+      .then((r) => setItems(r))
+      .catch((e) => setError(e instanceof Error ? e.message : String(e)));
+  }
+
+  useEffect(() => {
+    reload();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [month.id]);
+
+  async function addItem() {
+    if (!title.trim() || !rawText.trim()) {
+      setAddError("Give this piece a title and the brief/copy to generate from.");
+      return;
+    }
+    setAddBusy(true);
+    setAddError(null);
+    try {
+      await addCalendarItem({
+        data: { monthId: month.id, docType, title: title.trim(), rawText: rawText.trim() },
+      });
+      setTitle("");
+      setRawText("");
+      setAddOpen(false);
+      reload();
+    } catch (e) {
+      setAddError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setAddBusy(false);
+    }
+  }
+
+  async function removeItem(itemId: string) {
+    setBusyItemId(itemId);
+    try {
+      await removeCalendarItem({ data: { itemId } });
+      setItems((prev) => (prev ?? []).filter((it) => it.id !== itemId));
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusyItemId(null);
+    }
+  }
+
+  return (
+    <div className="mt-5 space-y-4">
+      <button onClick={onBack} className="text-xs font-semibold text-muted-foreground hover:text-foreground">
+        ← All months
+      </button>
+
+      <Card>
+        <h2 className="font-display text-lg font-semibold">{month.month}</h2>
+        <p className="mt-1 text-sm text-muted-foreground">
+          Add each post, email, and video brief for this month below — the same shape a Drive Doc used to have (goal,
+          image suggestions/Canva link, and copy for a post; goal, subject lines, and instructions for an email; goal,
+          hook, and script for a video). Every agent's Voice DNA turns these into their own personalized version when
+          they generate.
+        </p>
+      </Card>
+
+      <Card>
+        <div className="flex items-center justify-between">
+          <h4 className="font-display text-sm font-semibold">This month's content</h4>
+          {!addOpen && <Button onClick={() => setAddOpen(true)}>+ Add piece</Button>}
+        </div>
+
+        {addOpen && (
+          <div className="mt-3 space-y-2 rounded-2xl border border-border bg-background/40 p-4">
+            <div className="flex flex-wrap gap-1 rounded-full border border-border bg-glass p-1 w-fit">
+              {(["post", "email", "video"] as const).map((t) => (
+                <button
+                  key={t}
+                  onClick={() => setDocType(t)}
+                  className={`rounded-full px-4 py-1.5 text-sm font-medium transition-colors ${
+                    docType === t ? "bg-secondary text-foreground" : "text-muted-foreground hover:text-foreground"
+                  }`}
+                >
+                  {DOC_TYPE_LABEL[t]}
+                </button>
+              ))}
+            </div>
+            <input
+              value={title}
+              onChange={(e) => setTitle(e.target.value)}
+              placeholder="Title"
+              className="w-full rounded-xl border border-border bg-glass px-3 py-2 text-sm outline-none"
+            />
+            <div className="flex justify-end">
+              <MicButton value={rawText} onChange={setRawText} />
+            </div>
+            <textarea
+              value={rawText}
+              onChange={(e) => setRawText(e.target.value)}
+              rows={10}
+              placeholder={DOC_TYPE_PLACEHOLDER[docType]}
+              className="w-full rounded-xl border border-border bg-glass px-3 py-2 text-sm outline-none"
+            />
+            {addError && <p className="text-xs text-destructive">{addError}</p>}
+            <div className="flex gap-2">
+              <Button onClick={addItem} disabled={addBusy}>
+                {addBusy ? "Adding…" : "Add"}
+              </Button>
+              <Button variant="secondary" onClick={() => setAddOpen(false)} disabled={addBusy}>
+                Cancel
+              </Button>
+            </div>
+          </div>
+        )}
+
+        {error && <p className="mt-3 text-xs text-destructive">{error}</p>}
+        {items === null && !error && <p className="mt-3 text-sm text-muted-foreground">Loading…</p>}
+        {items !== null && items.length === 0 && (
+          <p className="mt-3 text-sm text-muted-foreground">Nothing added yet — add a post, email, or video above.</p>
+        )}
+        {items !== null && items.length > 0 && (
+          <div className="mt-3 space-y-2">
+            {items.map((it) => (
+              <div
+                key={it.id}
+                className="flex items-center justify-between gap-2 rounded-2xl border border-border bg-glass px-4 py-3"
+              >
+                <div>
+                  <span className="rounded-full bg-muted px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">
+                    {DOC_TYPE_LABEL[it.docType]}
+                  </span>
+                  <p className="mt-1 text-sm font-semibold">{it.title}</p>
+                </div>
+                <button
+                  onClick={() => removeItem(it.id)}
+                  disabled={busyItemId === it.id}
+                  className="shrink-0 text-[11px] font-semibold text-destructive hover:underline disabled:opacity-50"
+                >
+                  Remove
+                </button>
+              </div>
+            ))}
+          </div>
+        )}
+      </Card>
+    </div>
+  );
 }
 
-export const scanAgentDrivePhotos = createServerFn({ method: "POST" })
-  .middleware([requireSupabaseAuth])
-  .validator((data: { agentId: string; folderId: string; maxPhotos?: number; excludeFileIds?: string[] }) => data)
-  .handler(
-    async ({
-      data,
-      context,
-    }): Promise<{ suggestions: PhotoScanSuggestion[]; totalPhotos: number; unsupportedFormatCount: number }> => {
-      const email = (context.claims as { email?: string } | undefined)?.email;
-      await requireAgentAccess(context.userId, email, data.agentId);
-      const anthropicKey = process.env["ANTHROPIC_API_KEY"];
-      if (!anthropicKey)
-        throw new Error("Photo captioning isn't configured yet — add ANTHROPIC_API_KEY in Lovable Cloud → Secrets.");
-      const accessToken = await getDriveAccessToken();
-      await verifyDriveFolderAccessible(data.folderId, accessToken);
+function ContentCalendarTab({ agentId, isAdmin }: { agentId: string; isAdmin: boolean }) {
+  const [months, setMonths] = useState<CalendarMonth[] | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [activeMonth, setActiveMonth] = useState<CalendarMonth | null>(null);
+  // Added 2026-09-20 per Mike's follow-up screenshot: "On this screen for
+  // both admin and agent view there should be an archive button that can be
+  // clicked and that month can be archived." The archive/restore machinery
+  // itself (archiveMonthContent, requireAgentAccess-gated so it works for
+  // both admin-acting-as-agent and the agent's own login) already existed on
+  // MonthWorkspace's review screen — this just surfaces the same action one
+  // level up, right on the month card, so archiving doesn't require opening
+  // the month first. Archiving here only clears this agent's *generated
+  // content* for that month (same as the button inside the workspace); the
+  // month itself stays in this list, ready for a fresh "Generate Now."
+  const [archivingId, setArchivingId] = useState<string | null>(null);
+  const [noteByMonth, setNoteByMonth] = useState<Record<string, string>>({});
+  // Simplified 2026-09-20, third same-day pass, after Mike found the second
+  // pass (live counts + an inline Generate button on every card) over-built:
+  // "let's not think too hard about this. We're trying to accomplish a very
+  // simple task." What he actually wants: "you have months. There's a
+  // button that says archive. If you press the archive button, it'll go
+  // into the archive folder. There should be an archive folder somewhere on
+  // this screen that shows the past months that were ran. But... if it's
+  // archived, you should just be able to click on create my monthly content
+  // and click the button and it'll generate the content." So the card is
+  // back down to just a month name + Archive; counts are still fetched in
+  // the background (silently) only to decide which section a month sits in,
+  // never shown as text. A month is "archived" once this agent has archived
+  // batches for it and no active content left — it then moves out of
+  // Months and into the Archived section below. Clicking a card in either
+  // section opens MonthWorkspace, where "Generate Now" already works and
+  // was never gated on there being no existing content — that's the one
+  // place Generate lives, and it can be run as many times as needed.
+  const [counts, setCounts] = useState<Record<string, number | null>>({});
+  const [archivedCounts, setArchivedCounts] = useState<Record<string, number>>({});
 
-      const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
-      const { data: agent } = await supabaseAdmin
-        .from("agents")
-        .select("full_name, market_area, voice_summary")
-        .eq("id", data.agentId)
-        .maybeSingle();
-      const agentName = agent?.full_name ?? undefined;
-      const agentCity = agent?.market_area ?? undefined;
-      const voiceDna = agent?.voice_summary ?? undefined;
+  function loadCountsFor(list: CalendarMonth[]) {
+    for (const m of list) {
+      listMarketingPosts({ data: { agentId, month: m.month } })
+        .then((posts) => {
+          const n = posts.filter((p) => BATCH_SOURCES.has(p.metadata?.source ?? "")).length;
+          setCounts((prev) => ({ ...prev, [m.id]: n }));
+        })
+        .catch(() => setCounts((prev) => ({ ...prev, [m.id]: null })));
+      listArchivedBatchesForMonth({ data: { agentId, month: m.month } })
+        .then((batches) =>
+          setArchivedCounts((prev) => ({
+            ...prev,
+            [m.id]: batches.reduce((sum, b) => sum + b.count, 0),
+          })),
+        )
+        .catch(() => {});
+    }
+  }
 
-      // Searches the whole folder tree under this agent's Drive folder, not
-      // just its direct contents — see listDriveFolderIds above for why
-      // (Drive's 'in parents' doesn't recurse, so a photo one folder deep
-      // used to be invisible to this scan even though it's genuinely in the
-      // agent's Drive). listDriveFolderIds already skips any "used" subfolder
-      // and everything inside it, so there's no separate used-folder lookup
-      // needed here the way there used to be.
-      const folderIds = await listDriveFolderIds(data.folderId, accessToken);
-      const listUrl =
-        "https://www.googleapis.com/drive/v3/files?" +
-        "q=" +
-        encodeURIComponent(`${driveParentsClause(folderIds)} and mimeType contains 'image/' and trashed=false`) +
-        "&fields=files(id,name,mimeType)&pageSize=200&supportsAllDrives=true&includeItemsFromAllDrives=true";
-      const listRes = await fetchWithTimeout(listUrl, { headers: driveAuthHeaders(accessToken) }, 15_000);
-      const listData = (await listRes.json()) as {
-        files?: { id: string; name: string; mimeType: string }[];
-        error?: { message?: string };
-      };
-      if (!listRes.ok) throw new Error(listData.error?.message ?? "Drive list failed");
-      const allFiles = listData.files ?? [];
+  useEffect(() => {
+    setMonths(null);
+    setError(null);
+    setActiveMonth(null);
+    setCounts({});
+    setArchivedCounts({});
+    listCalendarMonths()
+      .then((m) => {
+        setMonths(m);
+        loadCountsFor(m);
+      })
+      .catch((e) => setError(e instanceof Error ? e.message : String(e)));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [agentId]);
 
-      // HEIC/HEIF (an iPhone's default photo format) can be listed and
-      // thumbnailed by Drive, but Claude's vision API can't read its bytes —
-      // captioning it always fails. Pulled out up front (instead of
-      // discovered one-by-one inside the caption loop below) so the response
-      // can tell the difference between "this folder is genuinely empty" and
-      // "found photos, but they're all a format we can't scan yet" — added
-      // 2026-09-21 after Mike reported photos that are visibly in Drive
-      // showing up here as if there were none at all.
-      const unsupportedFormatCount = allFiles.filter(isHeicDriveFile).length;
-      const usableFiles = allFiles.filter((f) => !isHeicDriveFile(f));
+  function setNote(monthId: string, text: string) {
+    setNoteByMonth((prev) => ({ ...prev, [monthId]: text }));
+  }
 
-      const excludeIds = new Set(data.excludeFileIds ?? []);
-      const maxPhotos = data.maxPhotos ?? 5;
-      const toProcess = usableFiles.filter((f) => !excludeIds.has(f.id)).slice(0, maxPhotos);
-
-      const results = await Promise.all(
-        toProcess.map(async (f): Promise<PhotoScanSuggestion | null> => {
-          try {
-            const imgUrl = "https://www.googleapis.com/drive/v3/files/" + f.id + "?alt=media&supportsAllDrives=true";
-            const imgRes = await fetchWithTimeout(imgUrl, { headers: driveAuthHeaders(accessToken) }, 15_000);
-            if (!imgRes.ok) return null;
-            const arrayBuffer = await imgRes.arrayBuffer();
-
-            const mediaType = f.mimeType || "image/jpeg";
-            const caption = await captionPhotoInVoice(
-              arrayBuffer,
-              mediaType,
-              anthropicKey,
-              agentName,
-              agentCity,
-              voiceDna,
-            );
-            if (!caption) return null;
-            const { description, suggestedPost } = caption;
-            return {
-              source: "drive" as const,
-              fileId: f.id,
-              fileName: f.name,
-              driveUrl: `https://drive.google.com/file/d/${f.id}/view`,
-              thumbnailUrl: `https://drive.google.com/thumbnail?id=${f.id}&sz=w400`,
-              description,
-              suggestedPost,
-            };
-          } catch {
-            return null;
-          }
-        }),
+  async function archiveFromList(m: CalendarMonth) {
+    setArchivingId(m.id);
+    setNote(m.id, "");
+    try {
+      const res = await archiveMonthContent({ data: { agentId, month: m.month } });
+      setNote(
+        m.id,
+        res.archived > 0
+          ? `Archived ${res.archived} piece${res.archived === 1 ? "" : "s"} — moved to Archived below.`
+          : `Nothing to archive for ${m.month} yet.`,
       );
+      loadCountsFor([m]);
+    } catch (e) {
+      setNote(m.id, e instanceof Error ? e.message : String(e));
+    } finally {
+      setArchivingId(null);
+    }
+  }
 
-      return {
-        suggestions: results.filter((r): r is PhotoScanSuggestion => Boolean(r)),
-        totalPhotos: allFiles.length,
-        unsupportedFormatCount,
-      };
-    },
+  if (activeMonth) {
+    return (
+      <MonthWorkspace agentId={agentId} isAdmin={isAdmin} month={activeMonth} onBack={() => setActiveMonth(null)} />
+    );
+  }
+
+  const activeMonths: CalendarMonth[] = [];
+  const archivedMonths: CalendarMonth[] = [];
+  if (months) {
+    for (const m of months) {
+      const isArchived = (archivedCounts[m.id] ?? 0) > 0 && (counts[m.id] ?? 0) === 0;
+      (isArchived ? archivedMonths : activeMonths).push(m);
+    }
+  }
+
+  function renderMonthCard(m: CalendarMonth, archived: boolean) {
+    const busy = archivingId === m.id;
+    return (
+      <div
+        key={m.id}
+        className="flex flex-col gap-2 rounded-2xl border border-border bg-glass px-4 py-3 transition-colors hover:bg-secondary"
+      >
+        <button onClick={() => setActiveMonth(m)} className="min-w-0 text-left text-sm font-semibold">
+          {m.month}
+        </button>
+        {archived ? (
+          <p className="text-[11px] text-muted-foreground">Archived — click the month to create fresh content.</p>
+        ) : (
+          <button
+            onClick={() => archiveFromList(m)}
+            disabled={busy}
+            className="self-start shrink-0 rounded-full border border-border px-2.5 py-1 text-[11px] font-semibold text-muted-foreground transition-colors hover:bg-background disabled:opacity-50"
+            title={`Archive this agent's generated content for ${m.month}`}
+          >
+            {busy ? "Archiving…" : "Archive"}
+          </button>
+        )}
+        {noteByMonth[m.id] && <p className="text-[11px] text-muted-foreground">{noteByMonth[m.id]}</p>}
+      </div>
+    );
+  }
+
+  return (
+    <div className="space-y-4">
+      <Card>
+        <h3 className="font-display text-sm font-semibold">Create My Monthly Content</h3>
+        <p className="mt-1 text-xs text-muted-foreground">
+          Pick a month below to generate this month's posts, emails, and video scripts in your own voice, then review
+          and approve them. Archive a month to clear it out — it moves to Archived below, and clicking back into it lets
+          you generate a fresh batch.
+        </p>
+      </Card>
+
+      <Card>
+        <h4 className="font-display text-sm font-semibold">Months</h4>
+
+        {error && <p className="mt-3 text-xs text-destructive">{error}</p>}
+        {months === null && !error && <p className="mt-3 text-sm text-muted-foreground">Loading…</p>}
+        {months !== null && months.length === 0 && (
+          <p className="mt-3 text-sm text-muted-foreground">No months set up yet — ask your team to add one.</p>
+        )}
+        {months !== null && activeMonths.length > 0 && (
+          <div className="mt-3 grid gap-2 sm:grid-cols-2 lg:grid-cols-3">
+            {activeMonths.map((m) => renderMonthCard(m, false))}
+          </div>
+        )}
+        {months !== null && months.length > 0 && activeMonths.length === 0 && (
+          <p className="mt-3 text-sm text-muted-foreground">
+            Every month is archived — see Archived below, or click one there to start fresh.
+          </p>
+        )}
+      </Card>
+
+      {archivedMonths.length > 0 && (
+        <Card>
+          <h4 className="font-display text-sm font-semibold">Archived</h4>
+          <p className="mt-1 text-[11px] text-muted-foreground">
+            Past months that were archived. Click one to generate fresh content — it moves back up to Months once it has
+            content again.
+          </p>
+          <div className="mt-3 grid gap-2 sm:grid-cols-2 lg:grid-cols-3">
+            {archivedMonths.map((m) => renderMonthCard(m, true))}
+          </div>
+        </Card>
+      )}
+    </div>
   );
+}
 
-// Same idea as scanAgentDrivePhotos, but scans the agent's own native Media
-// Library instead of their Drive folder — added 2026-09-18 per Mike's
-// request that the scan tool "needs to scan the media library too and all
-// photos," not just Drive. Library photos already have a public URL (no
-// Drive API fetch needed), so this is simpler: pull the same "available,
-// not yet attached to any post" pool assignSuggestedMedia draws from, fetch
-// each image, and run it through the same voice-captioning call.
-export const scanAgentLibraryPhotos = createServerFn({ method: "POST" })
-  .middleware([requireSupabaseAuth])
-  .validator((data: { agentId: string; maxPhotos?: number; excludeFileIds?: string[] }) => data)
-  .handler(async ({ data, context }): Promise<{ suggestions: PhotoScanSuggestion[]; totalPhotos: number }> => {
-    const email = (context.claims as { email?: string } | undefined)?.email;
-    await requireAgentAccess(context.userId, email, data.agentId);
-    const anthropicKey = process.env["ANTHROPIC_API_KEY"];
-    if (!anthropicKey)
-      throw new Error("Photo captioning isn't configured yet — add ANTHROPIC_API_KEY in Lovable Cloud → Secrets.");
+// Builds the Word-doc version of "Approve All & Download" — added
+// 2026-09-18 per Mike's request ("in download is a text file only. Need to
+// keep it the same way it was with word document too. Make sure all links
+// are in there.") The section headings, numbering, and the
+// "PHOTO: Download / View in Drive" line per post are matched to the format
+// of the publishing-instructions doc his team used before this app existed,
+// so this replaces that doc's format rather than inventing a new one.
+const DOCX_SECTION_TITLE: Record<ContentCategory, string> = {
+  post: "SOCIAL POSTS",
+  canva: "CANVA TEMPLATES",
+  email: "EMAILS",
+  video: "VIDEO SCRIPTS",
+};
 
-    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
-    const { data: agent } = await supabaseAdmin
-      .from("agents")
-      .select("full_name, market_area, voice_summary")
-      .eq("id", data.agentId)
-      .maybeSingle();
-    const agentName = agent?.full_name ?? undefined;
-    const agentCity = agent?.market_area ?? undefined;
-    const voiceDna = agent?.voice_summary ?? undefined;
+function photoLinksForPost(p: Post): { downloadUrl: string | null; driveUrl: string | null } {
+  const downloadUrl = p.metadata?.media_url || p.metadata?.drive_thumbnail_url || null;
+  const driveUrl = p.metadata?.drive_file_id
+    ? `https://drive.google.com/file/d/${p.metadata.drive_file_id}/view`
+    : null;
+  return { downloadUrl, driveUrl };
+}
 
-    const { data: photos, error } = await supabaseAdmin
-      .from("agent_photos")
-      .select("id, url, media_type, created_at")
-      .eq("agent_id", data.agentId)
-      .eq("status", "available")
-      .order("created_at", { ascending: true })
-      .limit(50);
-    if (error) throw error;
+async function buildContentDocxBlob(batchPosts: Post[], monthLabel: string): Promise<Blob> {
+  const docxLib = await import("docx");
+  const { Document, Packer, Paragraph, TextRun, HeadingLevel, ExternalHyperlink } = docxLib;
 
-    const maxPhotos = data.maxPhotos ?? 5;
-    const excludeIds = new Set(data.excludeFileIds ?? []);
-    const toProcess = (photos ?? [])
-      .filter((p) => p.url && p.media_type !== "video" && !excludeIds.has(p.id))
-      .slice(0, maxPhotos);
+  const children: Paragraph[] = [
+    new Paragraph({ text: monthLabel, heading: HeadingLevel.TITLE }),
+    new Paragraph({ text: "Publishing Instructions · Your Marketing Dude", spacing: { after: 300 } }),
+  ];
 
-    const results = await Promise.all(
-      toProcess.map(async (p): Promise<PhotoScanSuggestion | null> => {
-        try {
-          const imgRes = await fetch(p.url!);
-          if (!imgRes.ok) return null;
-          const arrayBuffer = await imgRes.arrayBuffer();
-          const contentType = imgRes.headers.get("content-type") || "image/jpeg";
-
-          const caption = await captionPhotoInVoice(
-            arrayBuffer,
-            contentType,
-            anthropicKey,
-            agentName,
-            agentCity,
-            voiceDna,
-          );
-          if (!caption) return null;
-          return {
-            source: "library" as const,
-            fileId: p.id,
-            fileName: p.id,
-            driveUrl: p.url!,
-            thumbnailUrl: p.url!,
-            description: caption.description,
-            suggestedPost: caption.suggestedPost,
-          };
-        } catch {
-          return null;
-        }
+  for (const cat of CATEGORY_ORDER) {
+    const group = batchPosts.filter((p) => categorizePost(p) === cat);
+    if (!group.length) continue;
+    children.push(
+      new Paragraph({
+        text: DOCX_SECTION_TITLE[cat],
+        heading: HeadingLevel.HEADING_1,
+        spacing: { before: 300, after: 150 },
       }),
     );
 
-    return {
-      suggestions: results.filter((r): r is PhotoScanSuggestion => Boolean(r)),
-      totalPhotos: photos?.length ?? 0,
-    };
-  });
-
-export const addPhotoPostsToBatch = createServerFn({ method: "POST" })
-  .middleware([requireSupabaseAuth])
-  .validator(
-    (data: {
-      agentId: string;
-      month: string;
-      batchId?: string | undefined;
-      items: {
-        title: string;
-        content: string;
-        source: "drive" | "library";
-        sourceId: string;
-        thumbnailUrl: string;
-      }[];
-    }) => data,
-  )
-  .handler(async ({ data, context }): Promise<{ ok: true; created: number }> => {
-    const email = (context.claims as { email?: string } | undefined)?.email;
-    await requireAgentAccess(context.userId, email, data.agentId);
-    if (!data.items.length) return { ok: true, created: 0 };
-    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
-    const rows = data.items.map((item) => ({
-      agent_id: data.agentId,
-      content: item.content,
-      content_type: "post",
-      title: item.title,
-      status: "pending",
-      month: data.month,
-      metadata:
-        item.source === "drive"
-          ? {
-              batch_id: data.batchId ?? null,
-              month: data.month,
-              source: "drive_photo_scan",
-              drive_file_id: item.sourceId,
-              drive_thumbnail_url: item.thumbnailUrl,
-            }
-          : {
-              batch_id: data.batchId ?? null,
-              month: data.month,
-              source: "library_photo_scan",
-              media_id: item.sourceId,
-              media_url: item.thumbnailUrl,
-              media_type: "image",
-            },
-    }));
-    const { error } = await supabaseAdmin.from("generated_posts").insert(rows);
-    if (error) throw error;
-    return { ok: true, created: rows.length };
-  });
-
-// ── Send to Agent — admin-only, ported from send-review.js (GoHighLevel) ───
-// UPDATED 2026-09-22: the notification email now links to the public,
-// token-based review page (/review/$token, see the "Public, no-login review
-// link" section above) instead of this app's login screen — per Mike:
-// "it is not sending the file for the agent to review... this must be a
-// public facing link that does not require login." This is NOT a return to
-// the old app's guessable review.html?agent=...&batch=... link (the actual
-// security hole this whole native rewrite closed) — the token is an
-// unguessable per-agent UUID, and the page it unlocks only ever shows and
-// lets someone approve/flag THAT one agent's own content, nothing else.
-
-export const sendContentToAgent = createServerFn({ method: "POST" })
-  .middleware([requireSupabaseAuth])
-  .validator((data: { agentId: string; month: string }) => data)
-  .handler(async ({ data, context }): Promise<{ ok: true }> => {
-    const email = (context.claims as { email?: string } | undefined)?.email;
-    const access = await resolveAccess(context.userId, email);
-    if (access.role !== "admin") {
-      throw new Error("Only team members can send content to an agent for review.");
-    }
-    const ghlKey = process.env["GHL_API_KEY"];
-    const ghlLocation = process.env["GHL_LOCATION_ID"];
-    if (!ghlKey || !ghlLocation) {
-      throw new Error(
-        "Send to Agent isn't configured yet — add GHL_API_KEY and GHL_LOCATION_ID in Lovable Cloud → Secrets.",
-      );
-    }
-    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
-    const { data: agent, error } = await supabaseAdmin
-      .from("agents")
-      .select("full_name, email, review_token")
-      .eq("id", data.agentId)
-      .maybeSingle();
-    if (error) throw error;
-    if (!agent?.email) throw new Error("No email address on file for this agent.");
-
-    // Read-or-create the review token inline (same logic as getReviewLink
-    // above) so "Send to Agent" always has a working link even if no admin
-    // ever visited that agent's link-management UI first.
-    let reviewToken = agent.review_token;
-    if (!reviewToken) {
-      reviewToken = crypto.randomUUID();
-      const { error: tokenErr } = await supabaseAdmin
-        .from("agents")
-        .update({ review_token: reviewToken })
-        .eq("id", data.agentId);
-      if (tokenErr) throw tokenErr;
-    }
-
-    // NOTE (2026-09-18): this used to send Version: "2021-04-15" on every
-    // call here, which is not a version GoHighLevel's v2/LeadConnector API
-    // recognizes for either the contacts endpoints or conversations/messages
-    // — that mismatch is almost certainly why Send to Agent's email was
-    // silently failing even after GHL_API_KEY/GHL_LOCATION_ID were set
-    // correctly. 2021-07-28 is the current stable version for both.
-    const headers = {
-      Authorization: "Bearer " + ghlKey,
-      "Content-Type": "application/json",
-      Version: "2021-07-28",
-    };
-    // FIXED (2026-09-22): this used to silently swallow whatever GoHighLevel
-    // actually said on a failed search or create call — a 401 from a bad
-    // key, a validation error, a locationId mismatch, all collapsed into
-    // the same generic "could not find or create a contact" message, which
-    // is exactly what Mike hit and reported (no way to tell from that
-    // message what was actually wrong). Both calls below now check
-    // response.ok and surface GHL's own error text when either one fails,
-    // instead of only checking "did we end up with a contactId."
-    const searchRes = await fetch(
-      "https://services.leadconnectorhq.com/contacts/search?locationId=" +
-        ghlLocation +
-        "&query=" +
-        encodeURIComponent(agent.email),
-      { headers },
-    );
-    const searchData = (await searchRes.json()) as {
-      contacts?: { id: string }[];
-      message?: string;
-    };
-    if (!searchRes.ok) {
-      throw new Error(
-        `GoHighLevel contact search failed (${searchRes.status}): ${searchData.message ?? "unknown error"}. Check that GHL_API_KEY has contacts access and GHL_LOCATION_ID matches the key's sub-account.`,
-      );
-    }
-    let contactId = searchData.contacts?.[0]?.id ?? null;
-    if (!contactId) {
-      const createRes = await fetch("https://services.leadconnectorhq.com/contacts/", {
-        method: "POST",
-        headers,
-        body: JSON.stringify({
-          locationId: ghlLocation,
-          email: agent.email,
-          firstName: agent.full_name?.split(" ")[0] ?? "Agent",
-          lastName: agent.full_name?.split(" ").slice(1).join(" ") ?? "",
+    group.forEach((p, i) => {
+      const title = p.title || `${DOCX_SECTION_TITLE[cat]} ${i + 1}`;
+      children.push(
+        new Paragraph({
+          spacing: { before: 200 },
+          children: [new TextRun({ text: `${i + 1}. ${title}`, bold: true })],
         }),
-      });
-      const createData = (await createRes.json()) as {
-        contact?: { id?: string };
-        id?: string;
-        message?: string;
-      };
-      if (!createRes.ok) {
-        // GHL returns 400 "duplicated contact" when a contact with this
-        // email already exists but the search above (e.g. a stale index)
-        // didn't surface it — that response includes the existing
-        // contact's id, so recover it instead of failing outright.
-        const dupeId = (createData as { meta?: { contactId?: string } }).meta?.contactId;
-        if (dupeId) {
-          contactId = dupeId;
-        } else {
-          throw new Error(
-            `GoHighLevel contact create failed (${createRes.status}): ${createData.message ?? "unknown error"}.`,
+      );
+      for (const line of p.content.split("\n")) {
+        children.push(new Paragraph({ text: line || " " }));
+      }
+
+      if (cat === "post" || cat === "canva") {
+        const { downloadUrl, driveUrl } = photoLinksForPost(p);
+        if (downloadUrl || driveUrl) {
+          const runs: (TextRun | ExternalHyperlink)[] = [new TextRun({ text: "PHOTO:  " })];
+          if (downloadUrl) {
+            runs.push(
+              new ExternalHyperlink({
+                link: downloadUrl,
+                children: [new TextRun({ text: "⬇ Download", style: "Hyperlink" })],
+              }),
+            );
+          }
+          if (downloadUrl && driveUrl) runs.push(new TextRun({ text: "   " }));
+          if (driveUrl) {
+            runs.push(
+              new ExternalHyperlink({
+                link: driveUrl,
+                children: [new TextRun({ text: "📁 View in Drive", style: "Hyperlink" })],
+              }),
+            );
+          }
+          children.push(new Paragraph({ spacing: { before: 100 }, children: runs }));
+        }
+        if (p.metadata?.canva_link) {
+          children.push(
+            new Paragraph({
+              children: [
+                new TextRun({ text: "Canva template:  " }),
+                new ExternalHyperlink({
+                  link: p.metadata.canva_link,
+                  children: [new TextRun({ text: p.metadata.canva_link, style: "Hyperlink" })],
+                }),
+              ],
+            }),
           );
         }
-      } else {
-        contactId = createData.contact?.id ?? createData.id ?? null;
       }
-    }
-    if (!contactId) throw new Error(`Could not find or create a GoHighLevel contact for ${agent.email}.`);
 
-    const firstName = agent.full_name?.split(" ")[0] ?? "there";
-    const reviewUrl = (process.env["APP_URL"] ?? "https://marketing-dude-hq.lovable.app") + "/review/" + reviewToken;
-    const emailHtml = `
-<html><body style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;padding:20px;color:#1A1A18;">
-  <h2 style="font-size:22px;font-weight:600;margin-bottom:8px;">Hey ${firstName} — your ${data.month} content is ready!</h2>
-  <p style="font-size:15px;color:#5A5A52;line-height:1.6;margin-bottom:24px;">Your social media posts and emails for ${data.month} are ready for your review. Click below to see everything and approve it (or flag anything that doesn't sound like you) — no login needed.</p>
-  <a href="${reviewUrl}" style="display:inline-block;background:#1A1A18;color:#fff;text-decoration:none;padding:14px 28px;border-radius:8px;font-size:15px;font-weight:600;margin-bottom:24px;">Review My Content →</a>
-  <p style="font-size:13px;color:#9A9A90;line-height:1.6;">Takes about 5 minutes. The more feedback you give us, the better your content gets every month.<br/><br/>Talk soon,<br/><strong>Your Marketing Dude Team</strong></p>
-</body></html>`.trim();
-
-    const emailRes = await fetch("https://services.leadconnectorhq.com/conversations/messages", {
-      method: "POST",
-      headers,
-      body: JSON.stringify({
-        type: "Email",
-        contactId,
-        locationId: ghlLocation,
-        emailFrom: "info@info.yourmarketingdude.com",
-        emailTo: agent.email,
-        subject: `${firstName} — Your ${data.month} Content Is Ready To Review`,
-        html: emailHtml,
-        body: emailHtml,
-      }),
+      // Up to 3 photos per email, each with its own publishing instructions
+      // — added 2026-09-21 per Mike's multi-photo request. Falls back to the
+      // old single-credit-line format for an email generated before this
+      // feature existed (metadata.email_photos absent, but the legacy
+      // unsplash_photographer field still set), so re-exporting an
+      // already-approved older email doesn't lose its one credit line.
+      if (cat === "email") {
+        const emailPhotos = p.metadata?.email_photos ?? [];
+        if (emailPhotos.length > 0) {
+          children.push(
+            new Paragraph({
+              spacing: { before: 100 },
+              children: [new TextRun({ text: "EMAIL PHOTOS:", bold: true })],
+            }),
+          );
+          emailPhotos.forEach((photo, idx) => {
+            const runs: (TextRun | ExternalHyperlink)[] = [
+              new TextRun({ text: `Photo ${idx + 1}:  `, bold: true }),
+              new ExternalHyperlink({
+                link: photo.url,
+                children: [new TextRun({ text: "⬇ View/Download", style: "Hyperlink" })],
+              }),
+            ];
+            if (photo.source === "drive" && photo.driveFileId) {
+              runs.push(new TextRun({ text: "   " }));
+              runs.push(
+                new ExternalHyperlink({
+                  link: `https://drive.google.com/file/d/${photo.driveFileId}/view`,
+                  children: [new TextRun({ text: "📁 View in Drive", style: "Hyperlink" })],
+                }),
+              );
+            }
+            if (photo.source === "unsplash" && photo.unsplashPhotographer) {
+              runs.push(new TextRun({ text: `   (Photo by ${photo.unsplashPhotographer} on Unsplash)` }));
+            }
+            children.push(new Paragraph({ spacing: { before: 60 }, children: runs }));
+            if (photo.publishingInstructions.trim()) {
+              children.push(
+                new Paragraph({
+                  spacing: { before: 20 },
+                  children: [
+                    new TextRun({
+                      text: `   Instructions: ${photo.publishingInstructions.trim()}`,
+                      italics: true,
+                    }),
+                  ],
+                }),
+              );
+            }
+          });
+        } else if (p.metadata?.unsplash_photographer) {
+          children.push(
+            new Paragraph({
+              spacing: { before: 100 },
+              children: [new TextRun({ text: "EMAIL PHOTOS:", bold: true })],
+            }),
+          );
+          children.push(new Paragraph({ text: `Photo 1: ${p.metadata.unsplash_photographer}` }));
+        }
+      }
     });
-    if (!emailRes.ok) {
-      const emailData = (await emailRes.json()) as { message?: string };
-      throw new Error(emailData.message ?? "GoHighLevel email send failed.");
-    }
-    return { ok: true };
+  }
+
+  const doc = new Document({ sections: [{ children }] });
+  return Packer.toBlob(doc);
+}
+
+// Shared by PostsTab's "Approve all" and MonthWorkspace's "Approve All &
+// Download" — added 2026-09-18 per Mike: "No download comes up when the
+// client or user approves on their end," plus his broader point that the
+// two review screens (the flat Posts tab and the "Create My Monthly
+// Content" calendar tab) should behave identically since they're really the
+// same app either way. Before this, only the calendar tab's approve button
+// actually built and downloaded the txt/docx export — the Posts tab's
+// "Approve all" just flipped statuses with no download at all, which is
+// exactly what "no download comes up" describes. Now both call this.
+function downloadContentExport(posts: Post[], monthLabel: string) {
+  if (!posts.length) return;
+  const baseName = monthLabel.replace(/\s+/g, "-");
+
+  const textFileName = `${baseName}-content.txt`;
+  const text = posts
+    .map((p) => {
+      const heading = (p.title || p.content_type).toUpperCase();
+      const canva = p.metadata?.canva_link ? `\nCanva template: ${p.metadata.canva_link}` : "";
+      return `${heading}\n${p.content}${canva}`;
+    })
+    .join("\n\n---\n\n");
+  const textBlob = new Blob([text], { type: "text/plain" });
+  const textUrl = URL.createObjectURL(textBlob);
+  const textLink = document.createElement("a");
+  textLink.href = textUrl;
+  textLink.download = textFileName;
+  textLink.click();
+  URL.revokeObjectURL(textUrl);
+
+  const docxFileName = `${baseName}-content.docx`;
+  return buildContentDocxBlob(posts, monthLabel).then((docxBlob) => {
+    const docxUrl = URL.createObjectURL(docxBlob);
+    const docxLink = document.createElement("a");
+    docxLink.href = docxUrl;
+    docxLink.download = docxFileName;
+    docxLink.click();
+    URL.revokeObjectURL(docxUrl);
+    return { textFileName, docxFileName };
   });
+}
+
+function MonthWorkspace({
+  agentId,
+  isAdmin,
+  month: folder,
+  onBack,
+}: {
+  agentId: string;
+  isAdmin: boolean;
+  month: CalendarMonth;
+  onBack: () => void;
+}) {
+  const [docs, setDocs] = useState<CalendarDoc[] | null>(null);
+  const [docsError, setDocsError] = useState<string | null>(null);
+  const [useHashtags, setUseHashtags] = useState(false);
+  const [generating, setGenerating] = useState(false);
+  const [genError, setGenError] = useState<string | null>(null);
+  const [lastBatchId, setLastBatchId] = useState<string | null>(null);
+  const [posts, setPosts] = useState<Post[] | null>(null);
+  const [postsError, setPostsError] = useState<string | null>(null);
+  // Defaults open (2026-09-18, per Mike: "have it already open... I want that
+  // feature. It should already be open... people can see that you can scan
+  // right away.") — previously required a click to expand before an agent
+  // could tell the scan feature even existed.
+  const [photosOpen, setPhotosOpen] = useState(true);
+  const [approving, setApproving] = useState(false);
+  const [sending, setSending] = useState(false);
+  const [sendNote, setSendNote] = useState<string | null>(null);
+  const [approveNote, setApproveNote] = useState<string | null>(null);
+  // The agent's OWN Drive photo folder (set on the separate Google Drive tab,
+  // unrelated to the shared native calendar above) — still how photo
+  // suggestions are sourced today; see the panel below.
+  const [agentDriveFolderId, setAgentDriveFolderId] = useState<string | null>(null);
+  const [driveError, setDriveError] = useState<string | null>(null);
+  // Added 2026-09-18 per Mike: "Put a delete in case we want to re generate
+  // that months content." generateMonthlyBatch only ever inserts, so a
+  // second "Generate Now" click piles a second batch on top of the first —
+  // this clears this agent's generated content for this month so a fresh
+  // Generate Now actually starts clean. Admin-only (it deletes an agent's
+  // data, not just reviews it) and requires clicking twice — Delete arms a
+  // "Really delete?" confirm rather than firing immediately, since there's
+  // no undo.
+  const [deleting, setDeleting] = useState(false);
+  const [deleteArmed, setDeleteArmed] = useState(false);
+  const [deleteNote, setDeleteNote] = useState<string | null>(null);
+  // Added 2026-09-20 per Mike: "the admin and or the user needs the ability
+  // to archive the month's monthly content... I can't retest without the
+  // ability to archive the monthly content." Unlike Delete above, this is
+  // reversible (a flag, not a delete) and open to the agent themselves too,
+  // so no double-click "are you sure" arming is needed — restoring a batch
+  // below undoes it just as easily.
+  const [archiving, setArchiving] = useState(false);
+  const [archiveNote, setArchiveNote] = useState<string | null>(null);
+  const [showArchived, setShowArchived] = useState(false);
+  const [archivedBatches, setArchivedBatches] = useState<ArchivedBatchSummary[] | null>(null);
+  const [archivedError, setArchivedError] = useState<string | null>(null);
+  const [restoringBatchId, setRestoringBatchId] = useState<string | null>(null);
+
+  async function archiveContent() {
+    if (!batchPosts.length) return;
+    setArchiving(true);
+    setArchiveNote(null);
+    try {
+      const res = await archiveMonthContent({ data: { agentId, month: folder.month } });
+      setArchiveNote(
+        res.archived > 0
+          ? `Archived ${res.archived} piece${res.archived === 1 ? "" : "s"} of content for ${folder.month} — the review screen is clear for a fresh "Generate Now." Nothing was deleted; open "Archived content" below to restore it.`
+          : "Nothing to archive — this month has no generated content for this agent yet.",
+      );
+      setLastBatchId(null);
+      loadPosts();
+      if (showArchived) loadArchivedBatches();
+    } catch (e) {
+      setArchiveNote(e instanceof Error ? e.message : String(e));
+    } finally {
+      setArchiving(false);
+    }
+  }
+
+  function loadArchivedBatches() {
+    setArchivedError(null);
+    listArchivedBatchesForMonth({ data: { agentId, month: folder.month } })
+      .then((b) => setArchivedBatches(b))
+      .catch((e) => setArchivedError(e instanceof Error ? e.message : String(e)));
+  }
+
+  function toggleArchivedView() {
+    const next = !showArchived;
+    setShowArchived(next);
+    if (next) {
+      setArchivedBatches(null);
+      loadArchivedBatches();
+    }
+  }
+
+  async function restoreBatch(batchId: string) {
+    setRestoringBatchId(batchId);
+    setArchivedError(null);
+    try {
+      await restoreArchivedBatch({ data: { agentId, batchId } });
+      loadArchivedBatches();
+      loadPosts();
+    } catch (e) {
+      setArchivedError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setRestoringBatchId(null);
+    }
+  }
+
+  async function deleteContent() {
+    if (!deleteArmed) {
+      setDeleteArmed(true);
+      return;
+    }
+    setDeleting(true);
+    setDeleteNote(null);
+    try {
+      const res = await deleteMonthContent({ data: { agentId, month: folder.month } });
+      setDeleteNote(
+        res.deleted > 0
+          ? `Deleted ${res.deleted} piece${res.deleted === 1 ? "" : "s"} of generated content for ${folder.month} — hit "Generate Now" above for a fresh batch.`
+          : "Nothing to delete — this month has no generated content for this agent yet.",
+      );
+      setLastBatchId(null);
+      loadPosts();
+    } catch (e) {
+      setDeleteNote(e instanceof Error ? e.message : String(e));
+    } finally {
+      setDeleting(false);
+      setDeleteArmed(false);
+    }
+  }
+
+  function loadDocs() {
+    setDocs(null);
+    setDocsError(null);
+    readContentCalendar({ data: { agentId, monthId: folder.id } })
+      .then((r) => setDocs(r.docs))
+      .catch((e) => setDocsError(e instanceof Error ? e.message : String(e)));
+  }
+
+  // Same fix as PostsTab's reload() (2026-09-18): only clear the on-screen
+  // list for a genuine month switch, not for every action-triggered refresh
+  // — otherwise saving an edit, approving, or changing a photo makes the
+  // whole grid disappear and reappear, which read as a broken save.
+  function loadPosts(opts?: { clear?: boolean }) {
+    if (opts?.clear) setPosts(null);
+    setPostsError(null);
+    listMarketingPosts({ data: { agentId, month: folder.month } })
+      .then((p) => setPosts(p as Post[]))
+      .catch((e) => setPostsError(e instanceof Error ? e.message : String(e)));
+  }
+
+  useEffect(() => {
+    loadDocs();
+    loadPosts({ clear: true });
+    listAgentDriveMedia({ data: { agentId } })
+      .then((r) => {
+        setAgentDriveFolderId(r.folderId);
+        setDriveError(null);
+      })
+      .catch((e) => {
+        setAgentDriveFolderId(null);
+        setDriveError(e instanceof Error ? e.message : String(e));
+      });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [agentId, folder.id, folder.month]);
+
+  const batchPosts = (posts ?? []).filter((p) => BATCH_SOURCES.has(p.metadata?.source ?? ""));
+  const latestFromPosts = batchPosts.length
+    ? (batchPosts[batchPosts.length - 1]?.metadata?.batch_id as string | undefined)
+    : undefined;
+  const activeBatchId = lastBatchId ?? latestFromPosts ?? null;
+  // Added 2026-09-18 per Mike: "once client/user approves all button should
+  // change to 'Approved! Download Here' — just in case they want to
+  // redownload it." Previously the button always read "Approve All &
+  // Download" no matter what, even after everything was already approved —
+  // so there was no way for the agent (this screen is shared between admin
+  // and an agent's own login) to tell at a glance that they were done, or
+  // that clicking again would just redownload rather than re-do anything.
+  // The click handler itself needs no change: re-approving an already
+  // approved batch is a harmless no-op, and the download always regenerates
+  // from the current batchPosts either way, so clicking this again is a
+  // safe, genuine "redownload" exactly as asked.
+  const allApproved = batchPosts.length > 0 && batchPosts.every((p) => p.status === "approved");
+
+  async function generate() {
+    setGenerating(true);
+    setGenError(null);
+    try {
+      const res = await generateMonthlyBatch({
+        data: { agentId, monthId: folder.id, month: folder.month, useHashtags },
+      });
+      setLastBatchId(res.batchId);
+      loadPosts();
+    } catch (e) {
+      setGenError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setGenerating(false);
+    }
+  }
+
+  // Explicit confirmation text alongside the download — added per Mike's
+  // report (2026-09-18) that Approve All seemed to do nothing until he
+  // navigated away and back. The download itself is one signal something
+  // happened, but it's easy to miss (it just lands in Downloads), so this
+  // also puts a plain-language confirmation right on the screen.
+  //
+  // Downloads BOTH a .txt and a .docx (2026-09-18, per Mike: "in download is
+  // a text file only. Need to keep it the same way it was with word document
+  // too. Make sure all links are in there.") — the .docx is the one that
+  // matches the old publishing-instructions format, with photo download/
+  // Drive links; the .txt is kept too since it was already there and some
+  // people just want to paste text.
+  async function approveAllAndDownload() {
+    if (!batchPosts.length) return;
+    setApproving(true);
+    setPostsError(null);
+    setApproveNote(null);
+    try {
+      if (activeBatchId) {
+        await approveBatch({ data: { agentId, batchId: activeBatchId } });
+      }
+      const files = await downloadContentExport(batchPosts, folder.month);
+      setApproveNote(
+        `Approved ${batchPosts.length} piece${batchPosts.length === 1 ? "" : "s"} of content` +
+          (files ? ` and downloaded ${files.textFileName} and ${files.docxFileName}.` : "."),
+      );
+      loadPosts();
+    } catch (e) {
+      setPostsError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setApproving(false);
+    }
+  }
+
+  async function sendToAgent() {
+    setSending(true);
+    setSendNote(null);
+    try {
+      const res = await sendContentToAgent({ data: { agentId, month: folder.month } });
+      setSendNote(
+        "Sent — they'll get an email with a link to review and approve." +
+          (res.ghlMessageId
+            ? ` (GoHighLevel message ID: ${res.ghlMessageId} — if it doesn't arrive, look this up in GHL's Conversations tab for this agent to see its real delivery status.)`
+            : ""),
+      );
+    } catch (e) {
+      setSendNote(e instanceof Error ? e.message : String(e));
+    } finally {
+      setSending(false);
+    }
+  }
+
+  const postCount = (docs ?? []).filter((d) => d.type === "post").length;
+  const emailCount = (docs ?? []).filter((d) => d.type === "email").length;
+  const videoCount = (docs ?? []).filter((d) => d.type === "video").length;
+
+  return (
+    <div className="space-y-4">
+      <button onClick={onBack} className="text-xs font-semibold text-muted-foreground hover:text-foreground">
+        ← All months
+      </button>
+
+      <Card>
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <div>
+            <h3 className="font-display text-sm font-semibold">{folder.month}</h3>
+            {docsError ? (
+              <p className="mt-1 text-xs text-destructive">{docsError}</p>
+            ) : docs === null ? (
+              <p className="mt-1 text-xs text-muted-foreground">Reading this month's calendar…</p>
+            ) : (
+              <p className="mt-1 text-xs text-muted-foreground">
+                {postCount} post{postCount === 1 ? "" : "s"}, {emailCount} email
+                {emailCount === 1 ? "" : "s"}, {videoCount} video script{videoCount === 1 ? "" : "s"} in this month's
+                calendar.
+              </p>
+            )}
+          </div>
+          <div className="flex items-center gap-3">
+            <label className="flex items-center gap-2 text-xs text-muted-foreground">
+              <input type="checkbox" checked={useHashtags} onChange={(e) => setUseHashtags(e.target.checked)} />
+              Add hashtags to posts
+            </label>
+            <Button onClick={generate} disabled={generating || docs === null}>
+              {generating ? "Generating…" : "Generate Now"}
+            </Button>
+          </div>
+        </div>
+        {genError && <p className="mt-2 text-xs text-destructive">{genError}</p>}
+      </Card>
+
+      <PhotoScanPanel
+        agentId={agentId}
+        folderId={agentDriveFolderId}
+        month={folder.month}
+        batchId={activeBatchId}
+        open={photosOpen}
+        onOpen={() => setPhotosOpen(true)}
+        onClose={() => setPhotosOpen(false)}
+        onAdded={loadPosts}
+      />
+      {!agentDriveFolderId && driveError && <p className="text-xs text-muted-foreground">{driveError}</p>}
+
+      <Card>
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          {/* Made bigger/more of a title, plus a call to action — per Mike
+              (2026-09-18): "make that font a little bit larger... more of a
+              title... add a call to action... check out this month's
+              content, dude!" */}
+          <h4 className="font-display text-xl font-bold">
+            This month's generated content — check out this month's content, dude!
+          </h4>
+          <div className="flex flex-wrap gap-2">
+            <Button variant="secondary" onClick={approveAllAndDownload} disabled={approving || !batchPosts.length}>
+              {approving ? "Working…" : allApproved ? "Approved! Download Here" : "Approve All & Download"}
+            </Button>
+            {isAdmin && (
+              <Button onClick={sendToAgent} disabled={sending || !batchPosts.length}>
+                {sending ? "Sending…" : "Send to Agent"}
+              </Button>
+            )}
+            {/* Not gated on isAdmin — per Mike (2026-09-20): "the admin and or
+                the user needs the ability to archive." Reversible (a flag,
+                not a delete), so it needs no arm/confirm step the way Delete
+                below does. */}
+            {batchPosts.length > 0 && (
+              <Button variant="secondary" onClick={archiveContent} disabled={archiving}>
+                {archiving ? "Archiving…" : "Archive this month's content"}
+              </Button>
+            )}
+            {isAdmin && batchPosts.length > 0 && (
+              <>
+                <Button variant="danger" onClick={deleteContent} disabled={deleting}>
+                  {deleting
+                    ? "Deleting…"
+                    : deleteArmed
+                      ? "Click again to confirm delete"
+                      : "Delete this month's content"}
+                </Button>
+                {deleteArmed && !deleting && (
+                  <Button variant="secondary" onClick={() => setDeleteArmed(false)}>
+                    Cancel
+                  </Button>
+                )}
+              </>
+            )}
+          </div>
+        </div>
+        {approveNote && <p className="mt-2 text-xs text-muted-foreground">{approveNote}</p>}
+        {sendNote && <p className="mt-2 text-xs text-muted-foreground">{sendNote}</p>}
+        {archiveNote && <p className="mt-2 text-xs text-muted-foreground">{archiveNote}</p>}
+        {deleteNote && <p className="mt-2 text-xs text-muted-foreground">{deleteNote}</p>}
+        {postsError && <p className="mt-2 text-xs text-destructive">{postsError}</p>}
+        {posts !== null && batchPosts.length === 0 && (
+          <p className="mt-3 text-sm text-muted-foreground">
+            Nothing generated for this month yet — hit "Generate Now" above.
+          </p>
+        )}
+        <button
+          onClick={toggleArchivedView}
+          className="mt-3 text-xs font-semibold text-muted-foreground hover:text-foreground"
+        >
+          {showArchived ? "▾" : "▸"} Archived content for {folder.month}
+        </button>
+        {showArchived && (
+          <div className="mt-2 space-y-2 border-t border-border pt-2">
+            {archivedError && <p className="text-xs text-destructive">{archivedError}</p>}
+            {archivedBatches === null && !archivedError && (
+              <p className="text-xs text-muted-foreground">Loading archived content…</p>
+            )}
+            {archivedBatches !== null && archivedBatches.length === 0 && (
+              <p className="text-xs text-muted-foreground">Nothing archived for this month yet.</p>
+            )}
+            {archivedBatches?.map((b) => (
+              <div
+                key={b.batchId}
+                className="flex flex-wrap items-center justify-between gap-2 rounded-md bg-muted/40 px-3 py-2"
+              >
+                <span className="text-xs text-muted-foreground">
+                  {b.count} piece{b.count === 1 ? "" : "s"} — generated {new Date(b.generatedAt).toLocaleDateString()}
+                </span>
+                <Button
+                  variant="secondary"
+                  onClick={() => restoreBatch(b.batchId)}
+                  disabled={restoringBatchId === b.batchId}
+                >
+                  {restoringBatchId === b.batchId ? "Restoring…" : "Restore"}
+                </Button>
+              </div>
+            ))}
+          </div>
+        )}
+      </Card>
+
+      {CATEGORY_ORDER.map((cat) => {
+        const group = batchPosts.filter((p) => categorizePost(p) === cat);
+        if (!group.length) return null;
+        return (
+          <BatchSection
+            key={cat}
+            category={cat}
+            posts={group}
+            agentId={agentId}
+            driveFolderId={agentDriveFolderId}
+            onChanged={loadPosts}
+          />
+        );
+      })}
+    </div>
+  );
+}
+
+// Cards here always show everything at once (photo, full copy, and
+// Approve/Edit/Flag/Change photo) — matches the old app's always-expanded
+// review grid. Per Mike's request (2026-09-18), the header used to collapse
+// a card on click, but that offered no value and just made content vanish
+// unexpectedly, so PostCard's header is no longer clickable at all now.
+// Grouped and icon-labeled by content kind (Posts / Canva Templates /
+// Emails / Video Scripts, in that fixed order) per Mike's request
+// (2026-09-18) so the four different pieces of content are never visually
+// indistinguishable from each other.
+function BatchSection({
+  category,
+  posts,
+  agentId,
+  driveFolderId,
+  onChanged,
+}: {
+  category: ContentCategory;
+  posts: Post[];
+  agentId: string;
+  driveFolderId: string | null;
+  onChanged: () => void;
+}) {
+  const meta = CATEGORY_META[category];
+  return (
+    <div>
+      <div
+        className={`mb-3 inline-flex items-center gap-2 rounded-full border px-3 py-1 text-xs font-semibold uppercase tracking-wider ${meta.accent}`}
+      >
+        <span aria-hidden="true">{meta.icon}</span>
+        <span>{meta.label}</span>
+        <span className="rounded-full bg-background/70 px-1.5 py-0.5 text-[10px] font-bold">{posts.length}</span>
+      </div>
+      <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
+        {posts.map((post) => (
+          <PostCard key={post.id} post={post} agentId={agentId} driveFolderId={driveFolderId} onChanged={onChanged} />
+        ))}
+      </div>
+    </div>
+  );
+}
+
+// Scans a handful of unused photos — from the agent's Drive folder AND/OR
+// their native Media Library — and writes a caption for each, in the
+// agent's voice (Drive scanning ported from analyze-photos.js; Library
+// scanning added 2026-09-18 per Mike's request that "this tool is awesome
+// but it's only scanning google drive. It needs to scan the media library
+// too and all photos"). Also given the prominent title he asked for and a
+// bigger closed-state call to action, since this was easy to miss as a
+// small secondary button before. Selected suggestions become pending posts
+// in the same batch via addPhotoPostsToBatch.
+const SCAN_PANEL_TITLE = "Let Your Marketing Dude Scan Your Photos And Create Content That Makes You Human";
+
+function PhotoScanPanel({
+  agentId,
+  folderId,
+  month,
+  batchId,
+  open,
+  onOpen,
+  onClose,
+  onAdded,
+}: {
+  agentId: string;
+  folderId: string | null;
+  month: string;
+  batchId: string | null;
+  open: boolean;
+  onOpen: () => void;
+  onClose: () => void;
+  onAdded: () => void;
+}) {
+  const [source, setSource] = useState<"drive" | "library">(folderId ? "drive" : "library");
+  const [suggestions, setSuggestions] = useState<PhotoScanSuggestion[] | null>(null);
+  // Diagnostic counts from the last scan — added 2026-09-21 alongside the
+  // Drive subfolder-recursion fix, so an empty result can say WHY it's
+  // empty instead of a flat "no unused photos" that reads as a bug even
+  // when it's telling the truth. Only Drive scans currently return
+  // unsupportedFormatCount (HEIC/HEIF, an iPhone's default format, which
+  // Drive can list but Claude's vision API can't read) — a Library scan's
+  // uploads are always converted to JPEG at upload time, so that case
+  // doesn't apply there.
+  const [scanMeta, setScanMeta] = useState<{ totalPhotos: number; unsupportedFormatCount: number } | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [scanning, setScanning] = useState(false);
+  const [scanningMore, setScanningMore] = useState(false);
+  const [selected, setSelected] = useState<Set<string>>(new Set());
+  const [adding, setAdding] = useState(false);
+  // Per-suggestion caption overrides from the inline Edit control below —
+  // keyed by fileId, only set once the user actually edits one. Added
+  // 2026-09-18 per Mike: "need ability to add edits to these types of posts
+  // too... Use the same UI as others." A suggestion isn't a real post yet
+  // (no id in generated_posts until it's added to the batch), so there's
+  // nothing to save an edit *to* until then — this just holds the edited
+  // text client-side and addSelected() uses it instead of the original
+  // suggestedPost when present.
+  const [edits, setEdits] = useState<Record<string, string>>({});
+  const [editingId, setEditingId] = useState<string | null>(null);
+
+  function switchSource(next: "drive" | "library") {
+    setSource(next);
+    setSuggestions(null);
+    setScanMeta(null);
+    setSelected(new Set());
+    setEdits({});
+    setEditingId(null);
+    setError(null);
+  }
+
+  async function scan(more = false) {
+    if (more) setScanningMore(true);
+    else setScanning(true);
+    setError(null);
+    try {
+      // On "scan more," exclude every fileId already shown so far (not just
+      // the current list — skipped/removed ones stay excluded too) so the
+      // next batch is genuinely new photos, not a repeat of the same 5.
+      const excludeFileIds = more ? (suggestions ?? []).map((s) => s.fileId) : [];
+      const res =
+        source === "drive"
+          ? await scanAgentDrivePhotos({
+              data: { agentId, folderId: folderId as string, maxPhotos: 5, excludeFileIds },
+            })
+          : await scanAgentLibraryPhotos({ data: { agentId, maxPhotos: 5, excludeFileIds } });
+      setSuggestions((cur) => (more && cur ? [...cur, ...res.suggestions] : res.suggestions));
+      setScanMeta({
+        totalPhotos: res.totalPhotos,
+        unsupportedFormatCount: (res as { unsupportedFormatCount?: number }).unsupportedFormatCount ?? 0,
+      });
+      setSelected((cur) => {
+        const next = more ? new Set(cur) : new Set<string>();
+        res.suggestions.forEach((s) => next.add(s.fileId));
+        return next;
+      });
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setScanning(false);
+      setScanningMore(false);
+    }
+  }
+
+  function toggle(id: string) {
+    setSelected((cur) => {
+      const next = new Set(cur);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  }
+
+  // "Flag / skip" on a suggestion — matches the same button Mike asked to
+  // reuse from PostCard, but there's no real post row yet to attach
+  // feedback_history to, so this just drops it from the list instead of
+  // pretending to record feedback somewhere. If they want it gone, gone is
+  // the honest behavior.
+  function skip(id: string) {
+    setSuggestions((cur) => (cur ? cur.filter((s) => s.fileId !== id) : cur));
+    setSelected((cur) => {
+      const next = new Set(cur);
+      next.delete(id);
+      return next;
+    });
+    setEdits((cur) => {
+      if (!(id in cur)) return cur;
+      const { [id]: _drop, ...rest } = cur;
+      return rest;
+    });
+    if (editingId === id) setEditingId(null);
+  }
+
+  async function addSelected() {
+    if (!suggestions) return;
+    const items = suggestions
+      .filter((s) => selected.has(s.fileId))
+      .map((s) => ({
+        title: s.description,
+        content: edits[s.fileId] ?? s.suggestedPost,
+        source: s.source,
+        sourceId: s.fileId,
+        thumbnailUrl: s.thumbnailUrl,
+      }));
+    if (!items.length) return;
+    setAdding(true);
+    setError(null);
+    try {
+      await addPhotoPostsToBatch({ data: { agentId, month, batchId: batchId ?? undefined, items } });
+      setSuggestions(null);
+      setSelected(new Set());
+      setEdits({});
+      setEditingId(null);
+      onClose();
+      onAdded();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setAdding(false);
+    }
+  }
+
+  if (!open) {
+    return (
+      <button
+        onClick={onOpen}
+        className="w-full rounded-2xl border border-primary/30 bg-primary/5 px-5 py-4 text-left transition-colors hover:bg-primary/10"
+      >
+        <p className="font-display text-base font-semibold">{SCAN_PANEL_TITLE}</p>
+        <p className="mt-1 text-xs text-muted-foreground">
+          Pulls unused photos from Drive and your Media Library, writes a caption in their voice for each, and lets you
+          pick the ones worth turning into posts. Click to get started →
+        </p>
+      </button>
+    );
+  }
+
+  return (
+    <Card>
+      <div className="flex items-center justify-between gap-3">
+        <h4 className="font-display text-base font-semibold">{SCAN_PANEL_TITLE}</h4>
+        <Button variant="secondary" onClick={onClose}>
+          Close
+        </Button>
+      </div>
+      <p className="mt-1 text-xs text-muted-foreground">
+        Scans a handful of unused photos and writes a caption for each, in their voice. Pick the ones worth turning into
+        posts.
+      </p>
+
+      <div className="mt-3 flex flex-wrap gap-2 border-b border-border pb-3">
+        <button
+          onClick={() => switchSource("drive")}
+          disabled={!folderId}
+          title={folderId ? undefined : "No Google Drive folder set for this agent yet"}
+          className={`rounded-full px-3 py-1 text-xs font-semibold transition-colors disabled:cursor-not-allowed disabled:opacity-40 ${
+            source === "drive"
+              ? "bg-primary text-primary-foreground"
+              : "bg-muted text-muted-foreground hover:text-foreground"
+          }`}
+        >
+          Google Drive
+        </button>
+        <button
+          onClick={() => switchSource("library")}
+          className={`rounded-full px-3 py-1 text-xs font-semibold transition-colors ${
+            source === "library"
+              ? "bg-primary text-primary-foreground"
+              : "bg-muted text-muted-foreground hover:text-foreground"
+          }`}
+        >
+          Media Library
+        </button>
+      </div>
+
+      {!suggestions && (
+        <div className="mt-3">
+          <Button onClick={() => scan(false)} disabled={scanning}>
+            {scanning ? "Scanning…" : "Scan photos"}
+          </Button>
+        </div>
+      )}
+
+      {error && <p className="mt-2 text-xs text-destructive">{error}</p>}
+
+      {suggestions && suggestions.length === 0 && (
+        <p className="mt-3 text-sm text-muted-foreground">
+          {/* Distinguishes "genuinely nothing there" from "found photos but
+              couldn't use any of them" — added 2026-09-21 after a report
+              that this said "no photos" for a Drive folder that visibly had
+              photos in it. A flat "no unused photos" is only ever accurate
+              for the first case; the other two have their own real, fixable
+              cause and deserve their own message instead of looking like a
+              bug. */}
+          {scanMeta && scanMeta.unsupportedFormatCount > 0 && scanMeta.totalPhotos === scanMeta.unsupportedFormatCount
+            ? `Found ${scanMeta.totalPhotos} photo${scanMeta.totalPhotos === 1 ? "" : "s"} in this Drive folder, but ${scanMeta.totalPhotos === 1 ? "it's" : "all of them are"} HEIC/HEIF (an iPhone's default photo format), which can't be scanned yet. Save them as JPEG first (Photos app → Share → "Options" → JPEG), or switch the phone's camera to the more compatible format in Settings → Camera → Formats → "Most Compatible."`
+            : scanMeta && scanMeta.unsupportedFormatCount > 0
+              ? `Found ${scanMeta.totalPhotos} photos in this Drive folder — ${scanMeta.unsupportedFormatCount} of them are HEIC/HEIF and got skipped (see above), and the rest are already used or were already shown. Try "Scan more" or add new photos.`
+              : scanMeta && scanMeta.totalPhotos > 0
+                ? `Found ${scanMeta.totalPhotos} photo${scanMeta.totalPhotos === 1 ? "" : "s"} in ${source === "drive" ? "this Drive folder" : "the Media Library"}, but they're already used or already shown here — add new ones to scan more.`
+                : `No photos found in ${source === "drive" ? "this Drive folder (checked its subfolders too)" : "the Media Library"}.`}
+        </p>
+      )}
+
+      {suggestions && suggestions.length > 0 && (
+        <div className="mt-3 space-y-3">
+          {suggestions.map((s) => (
+            <div key={s.fileId} className="flex gap-3 rounded-2xl border border-border bg-glass p-3 text-sm">
+              <input
+                type="checkbox"
+                checked={selected.has(s.fileId)}
+                onChange={() => toggle(s.fileId)}
+                className="mt-1 shrink-0"
+              />
+              <img src={s.thumbnailUrl} alt={s.description} className="h-16 w-16 shrink-0 rounded-xl object-cover" />
+              <div className="min-w-0 flex-1">
+                <p className="text-xs text-muted-foreground">{s.description}</p>
+                {editingId === s.fileId ? (
+                  <AutoResizeTextarea
+                    value={edits[s.fileId] ?? s.suggestedPost}
+                    onChange={(v) => setEdits((cur) => ({ ...cur, [s.fileId]: v }))}
+                    minHeightPx={90}
+                    className="mt-1 w-full rounded-xl bg-muted px-3 py-2 text-sm leading-relaxed outline-none ring-ring transition focus:ring-2"
+                  />
+                ) : (
+                  <p className="mt-1 whitespace-pre-wrap">{edits[s.fileId] ?? s.suggestedPost}</p>
+                )}
+                <div className="mt-2 flex flex-wrap gap-2">
+                  {editingId === s.fileId ? (
+                    <Button variant="secondary" onClick={() => setEditingId(null)}>
+                      Done editing
+                    </Button>
+                  ) : (
+                    <Button variant="secondary" onClick={() => setEditingId(s.fileId)}>
+                      Edit
+                    </Button>
+                  )}
+                  <Button variant="danger" onClick={() => skip(s.fileId)}>
+                    Flag / skip
+                  </Button>
+                </div>
+              </div>
+            </div>
+          ))}
+          <div className="flex flex-wrap gap-2">
+            <Button onClick={addSelected} disabled={adding || selected.size === 0}>
+              {adding ? "Adding…" : `Add ${selected.size} selected`}
+            </Button>
+            <Button variant="secondary" onClick={() => scan(true)} disabled={scanningMore}>
+              {scanningMore ? "Scanning…" : "Want to scan more? Click here"}
+            </Button>
+          </div>
+        </div>
+      )}
+    </Card>
+  );
+}

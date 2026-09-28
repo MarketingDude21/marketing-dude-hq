@@ -6,9 +6,19 @@ import { supabase } from "@/integrations/supabase/client";
 import {
   VOICE_DNA_QUESTIONS,
   generateVoiceDnaProfile,
+  getAgentVoiceProfile,
+  saveAgentVoiceProfile,
+  createBrandAssetUploadUrl,
+  finalizeBrandAssetUpload,
   type VoiceDnaAnswer,
   type VoiceDnaAnswers,
 } from "@/lib/voice-dna";
+// Reused from Monthly Marketing (2026-09-28) — same admin_allowlist +
+// agents identity model, so "who am I working on behalf of" is resolved the
+// exact same way here as it already is there, instead of a second copy of
+// that logic. See the "Build My Brand — admin act as agent" comment block
+// in voice-dna.ts for the full story on why this page needed it.
+import { getMarketingAccess, listMarketingAgents, type MarketingAccess } from "@/lib/marketing";
 
 export const Route = createFileRoute("/voice")({
   head: () => ({
@@ -75,9 +85,149 @@ function isIOSDevice(): boolean {
   );
 }
 
+type AgentOption = { id: string; name: string; email: string | null };
+
+// FIXED (2026-09-28) — per Mike: he was working on client "John Miller" in
+// Build My Database, clicked Build My Brand, and it showed HIS OWN
+// (mike@yourmarketingdude.com's) Voice DNA profile instead — "whoever the
+// admin is logged in at, that's what should appear under the build my
+// brand section, unless they're logged in as themselves." Root cause: this
+// page always read/wrote the signed-in user's own `agents` row directly
+// (RLS-scoped to auth.uid()), with no concept of "acting as" anyone else.
+// Fixed the same way Monthly Marketing already solved this exact problem —
+// an admin picks which agent to work on behalf of, then everything below
+// operates on THAT agent's id, via server functions that check access
+// explicitly rather than relying on browser-side RLS (which can only ever
+// see the signed-in user's own row). See voice-dna.ts for the new
+// agent-scoped server functions this now calls.
 function VoicePage() {
   const { user, loading: authLoading } = useAuth();
+  const [access, setAccess] = useState<MarketingAccess | null>(null);
+  const [accessError, setAccessError] = useState<string | null>(null);
+  const [agents, setAgents] = useState<AgentOption[]>([]);
+  const [selected, setSelected] = useState<AgentOption | null>(null);
 
+  useEffect(() => {
+    if (!user) return;
+    getMarketingAccess()
+      .then(async (a) => {
+        setAccess(a);
+        if (a.role === "admin") {
+          const list = await listMarketingAgents();
+          setAgents(
+            list.map((ag) => ({
+              id: ag.id,
+              name: ag.full_name ?? ag.email ?? "Unnamed agent",
+              email: ag.email ?? null,
+            })),
+          );
+        } else if (a.role === "agent") {
+          setSelected({ id: a.agentId, name: a.agentName, email: null });
+        }
+      })
+      .catch((e) => setAccessError(e instanceof Error ? e.message : String(e)));
+  }, [user]);
+
+  if (!authLoading && !user) {
+    return (
+      <AppShell>
+        <div className="mt-16 rounded-3xl border border-border bg-glass p-8 text-center backdrop-blur-2xl">
+          <h1 className="font-display text-2xl font-bold">Sign in to build your Voice DNA</h1>
+          <p className="mt-2 text-sm text-muted-foreground">
+            Your Voice DNA profile powers every post written in your voice.
+          </p>
+          <Link
+            to="/login"
+            className="mt-6 inline-block rounded-2xl bg-primary px-6 py-3 text-sm font-semibold text-primary-foreground shadow-lg shadow-primary/30"
+          >
+            Go to sign in
+          </Link>
+        </div>
+      </AppShell>
+    );
+  }
+
+  if (accessError) {
+    return (
+      <AppShell>
+        <div className="mt-16 text-center text-sm text-destructive">{accessError}</div>
+      </AppShell>
+    );
+  }
+
+  if (!access) {
+    return (
+      <AppShell>
+        <div className="mt-16 text-center text-sm text-muted-foreground">Loading…</div>
+      </AppShell>
+    );
+  }
+
+  if (access.role === "none") {
+    return (
+      <AppShell>
+        <div className="mt-16 rounded-3xl border border-border bg-glass p-8 text-center backdrop-blur-2xl">
+          <h1 className="font-display text-xl font-bold">Not set up yet</h1>
+          <p className="mt-2 text-sm text-muted-foreground">
+            Your account isn't set up in Build My Brand yet. Ask your team to add you as an agent.
+          </p>
+        </div>
+      </AppShell>
+    );
+  }
+
+  if (access.role === "admin" && !selected) {
+    return (
+      <AppShell>
+        <div className="mx-auto max-w-2xl pt-2">
+          <div className="rounded-3xl border border-border bg-glass p-6 backdrop-blur-2xl">
+            <h2 className="font-display text-lg font-semibold">Choose an agent</h2>
+            <p className="mt-1 text-sm text-muted-foreground">
+              Pick who you're working on behalf of. Their interview answers, Voice DNA profile, and brand assets are all
+              scoped to this choice — not your own account.
+            </p>
+            <div className="mt-4 grid gap-2 sm:grid-cols-2">
+              {agents.map((a) => (
+                <button
+                  key={a.id}
+                  onClick={() => setSelected(a)}
+                  className="rounded-2xl border border-border bg-glass px-4 py-3 text-left text-sm font-medium transition-colors hover:bg-secondary"
+                >
+                  {a.name}
+                  {a.email && <span className="mt-0.5 block text-xs font-normal text-muted-foreground">{a.email}</span>}
+                </button>
+              ))}
+              {agents.length === 0 && <p className="text-sm text-muted-foreground">No agents yet.</p>}
+            </div>
+          </div>
+        </div>
+      </AppShell>
+    );
+  }
+
+  if (!selected) return null;
+
+  return (
+    <VoiceWorkspace
+      agentId={selected.id}
+      agentName={selected.name}
+      isAdmin={access.role === "admin"}
+      onChangeAgent={access.role === "admin" ? () => setSelected(null) : undefined}
+    />
+  );
+}
+
+function VoiceWorkspace({
+  agentId,
+  agentName,
+  isAdmin,
+  onChangeAgent,
+}: {
+  agentId: string;
+  agentName: string;
+  isAdmin: boolean;
+  onChangeAgent?: (() => void) | undefined;
+}) {
   const [stage, setStage] = useState<Stage>("loading");
   const [basics, setBasics] = useState<Basics>(EMPTY_BASICS);
   const [serviceAreas, setServiceAreas] = useState("");
@@ -99,16 +249,25 @@ function VoicePage() {
   const userStoppedMicRef = useRef(false);
   const micDeniedRef = useRef(false);
 
-  // Load whatever profile already exists for this signed-in agent.
+  // Brand assets (2026-09-28) — headshot + logo, live independent of
+  // interview stage so they can be uploaded/replaced any time.
+  const [headshotUrl, setHeadshotUrl] = useState<string | null>(null);
+  const [logoUrl, setLogoUrl] = useState<string | null>(null);
+  const [uploadingKind, setUploadingKind] = useState<"headshot" | "logo" | null>(null);
+  const [brandAssetError, setBrandAssetError] = useState<string | null>(null);
+
+  // Load whatever profile already exists for the agent we're working on —
+  // via the access-checked server function (see voice-dna.ts), not a direct
+  // browser Supabase read, since that read used to be RLS-scoped to
+  // auth.uid() and could only ever see the SIGNED-IN user's own row. That's
+  // exactly the bug Mike reported: an admin acting on behalf of another
+  // agent still only ever saw their own profile.
   useEffect(() => {
-    if (!user) return;
+    if (!agentId) return;
     let cancelled = false;
-    supabase
-      .from("agents")
-      .select("full_name, market_area, phone, voice_answers, voice_summary")
-      .eq("id", user.id)
-      .maybeSingle()
-      .then(({ data }) => {
+    setStage("loading");
+    getAgentVoiceProfile({ data: { agentId } })
+      .then((data) => {
         if (cancelled) return;
         if (data) {
           setBasics({
@@ -116,7 +275,9 @@ function VoicePage() {
             marketArea: data.market_area ?? "",
             phone: data.phone ?? "",
           });
-          const stored = data.voice_answers as Partial<VoiceDnaAnswers> | null;
+          setHeadshotUrl(data.headshot_url);
+          setLogoUrl(data.logo_url);
+          const stored = data.voice_answers;
           if (stored?.answers?.length) {
             const restored = emptyAnswers();
             stored.answers.forEach((a, i) => {
@@ -132,11 +293,31 @@ function VoicePage() {
           }
         }
         setStage("intro");
+      })
+      .catch(() => {
+        if (!cancelled) setStage("intro");
       });
     return () => {
       cancelled = true;
     };
-  }, [user]);
+  }, [agentId]);
+
+  async function uploadBrandAsset(file: File, kind: "headshot" | "logo") {
+    setBrandAssetError(null);
+    setUploadingKind(kind);
+    try {
+      const { path, token } = await createBrandAssetUploadUrl({ data: { agentId, fileName: file.name, kind } });
+      const { error: uploadErr } = await supabase.storage.from("media").uploadToSignedUrl(path, token, file);
+      if (uploadErr) throw uploadErr;
+      const result = await finalizeBrandAssetUpload({ data: { agentId, storagePath: path, kind } });
+      if (kind === "headshot") setHeadshotUrl(result.url);
+      else setLogoUrl(result.url);
+    } catch (e) {
+      setBrandAssetError(e instanceof Error ? e.message : "Couldn't upload that file.");
+    } finally {
+      setUploadingKind(null);
+    }
+  }
 
   // Rotate the "reading your personality..." messages while generating.
   useEffect(() => {
@@ -335,7 +516,6 @@ function VoicePage() {
   }
 
   async function saveToSupabase(generatedProfile: string) {
-    if (!user) return;
     const payload: VoiceDnaAnswers = {
       answers: VOICE_DNA_QUESTIONS.map((q, i) => ({
         question: q.question,
@@ -343,18 +523,17 @@ function VoicePage() {
       })),
       serviceAreas,
     };
-    const { error } = await supabase
-      .from("agents")
-      .update({
-        full_name: basics.fullName.trim() || null,
-        market_area: basics.marketArea.trim() || null,
-        phone: basics.phone.trim() || null,
-        voice_answers: payload,
-        voice_summary: generatedProfile,
-        updated_at: new Date().toISOString(),
-      })
-      .eq("id", user.id);
-    setSaveStatus(error ? `Could not save: ${error.message}` : "Saved to your profile.");
+    const result = await saveAgentVoiceProfile({
+      data: {
+        agentId,
+        fullName: basics.fullName,
+        marketArea: basics.marketArea,
+        phone: basics.phone,
+        voiceAnswers: payload,
+        voiceSummary: generatedProfile,
+      },
+    });
+    setSaveStatus(result.ok ? "Saved to your profile." : `Could not save: ${result.error}`);
   }
 
   async function handleGenerate() {
@@ -424,25 +603,6 @@ function VoicePage() {
     setStage("basics");
   }
 
-  if (!authLoading && !user) {
-    return (
-      <AppShell>
-        <div className="mt-16 rounded-3xl border border-border bg-glass p-8 text-center backdrop-blur-2xl">
-          <h1 className="font-display text-2xl font-bold">Sign in to build your Voice DNA</h1>
-          <p className="mt-2 text-sm text-muted-foreground">
-            Your Voice DNA profile powers every post written in your voice.
-          </p>
-          <Link
-            to="/login"
-            className="mt-6 inline-block rounded-2xl bg-primary px-6 py-3 text-sm font-semibold text-primary-foreground shadow-lg shadow-primary/30"
-          >
-            Go to sign in
-          </Link>
-        </div>
-      </AppShell>
-    );
-  }
-
   if (stage === "loading") {
     return (
       <AppShell>
@@ -457,6 +617,82 @@ function VoicePage() {
   return (
     <AppShell>
       <div className="mx-auto max-w-2xl pt-2">
+        {isAdmin && (
+          <div className="mb-4 flex items-center justify-between gap-3 rounded-2xl border border-border bg-glass px-4 py-2.5 text-sm">
+            <span className="text-muted-foreground">
+              Working on <span className="font-semibold text-foreground">{agentName}</span>'s brand
+            </span>
+            {onChangeAgent && (
+              <button
+                onClick={onChangeAgent}
+                className="rounded-full border border-border px-3 py-1 text-xs font-semibold transition-colors hover:bg-secondary"
+              >
+                Change agent
+              </button>
+            )}
+          </div>
+        )}
+
+        {/* Brand Assets (2026-09-28) — headshot + logo, per Mike: "the whole
+            Build My Brand section should be a place where they could take
+            their interview. They should also be able to upload their
+            headshots and logos to this section... this needs to be the
+            build my brand section... it needs to incorporate anything and
+            everything that they would have for building their own personal
+            brand." Shown above the interview, on every stage, since these
+            aren't part of the linear interview flow — upload/replace either
+            one any time. Built now: upload + storage + display, tagged so
+            we always know whose brand each asset belongs to. NOT built yet
+            (no spec from Mike to build against): automatic brand-color
+            extraction from these images, a bio builder, and Facebook/
+            YouTube header generation — Mike flagged those as "eventually"
+            additions to this same section; tracked in build-status.md as
+            roadmap, not part of this pass. */}
+        <div className="mb-5 rounded-3xl border border-border bg-glass p-6 backdrop-blur-2xl">
+          <h2 className="font-display text-lg font-semibold">Headshot & Logo</h2>
+          <p className="mt-1 text-sm text-muted-foreground">
+            Upload a headshot and your logo — these will power your brand colors and everything else we build for you
+            going forward.
+          </p>
+          <div className="mt-4 grid grid-cols-1 gap-4 sm:grid-cols-2">
+            {[
+              { kind: "headshot" as const, label: "Headshot", url: headshotUrl },
+              { kind: "logo" as const, label: "Logo", url: logoUrl },
+            ].map((slot) => (
+              <div
+                key={slot.kind}
+                className="flex items-center gap-4 rounded-2xl border border-border bg-background/40 p-4"
+              >
+                <div className="grid size-16 shrink-0 place-items-center overflow-hidden rounded-2xl border border-border bg-muted">
+                  {slot.url ? (
+                    <img src={slot.url} alt={slot.label} className="size-full object-cover" />
+                  ) : (
+                    <span className="text-[10px] text-muted-foreground">No {slot.label.toLowerCase()}</span>
+                  )}
+                </div>
+                <div className="min-w-0 flex-1">
+                  <p className="text-sm font-medium">{slot.label}</p>
+                  <label className="mt-1.5 inline-block cursor-pointer rounded-full border border-border bg-glass px-3 py-1.5 text-xs font-semibold transition-colors hover:bg-secondary">
+                    {uploadingKind === slot.kind ? "Uploading…" : slot.url ? "Replace" : "Choose file"}
+                    <input
+                      type="file"
+                      accept="image/*"
+                      className="hidden"
+                      disabled={uploadingKind !== null}
+                      onChange={(e) => {
+                        const file = e.target.files?.[0];
+                        e.target.value = "";
+                        if (file) uploadBrandAsset(file, slot.kind);
+                      }}
+                    />
+                  </label>
+                </div>
+              </div>
+            ))}
+          </div>
+          {brandAssetError && <p className="mt-3 text-xs text-destructive">{brandAssetError}</p>}
+        </div>
+
         {stage === "intro" && (
           <div className="rounded-3xl border border-border bg-glass p-8 backdrop-blur-2xl">
             <p className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">Agent onboarding</p>

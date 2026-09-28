@@ -1862,7 +1862,7 @@ export type DriveFile = {
 // sharing requirement entirely, but is a separate, much bigger project —
 // this is the fix available within the current API-key architecture.
 async function verifyDriveFolderAccessible(folderId: string, apiKey: string): Promise<void> {
-  const metaUrl = `https://www.googleapis.com/drive/v3/files/${folderId}?fields=id,name,mimeType&key=${apiKey}`;
+  const metaUrl = `https://www.googleapis.com/drive/v3/files/${folderId}?fields=id,name,mimeType&supportsAllDrives=true&key=${apiKey}`;
   const res = await fetch(metaUrl);
   if (res.ok) return;
   if (res.status === 404) {
@@ -1871,7 +1871,25 @@ async function verifyDriveFolderAccessible(folderId: string, apiKey: string): Pr
     );
   }
   const json = (await res.json().catch(() => ({}))) as { error?: { message?: string } };
-  throw new Error(json.error?.message ?? `Google Drive API error (${res.status}) while checking folder access.`);
+  const raw = json.error?.message;
+  if (res.status === 403) {
+    // Added 2026-09-28 per Mike: "Regina flores google drive is not
+    // working" — the raw Google error was just "The user does not have
+    // sufficient permissions for this file," which reads like our bug even
+    // though the folder ID was saved correctly. The #1 real-world cause of
+    // that exact message on a folder that LOOKS properly link-shared is
+    // that it actually lives inside a Shared Drive (Team Drive): the Shared
+    // Drive's own access settings can still block a bare API-key request
+    // even when the folder inside it shows "Anyone with the link." Give
+    // Mike/the agent something concrete to go check instead of Google's raw
+    // string (also added supportsAllDrives=true above and on every other
+    // Drive call in this file, the actual fix when that's the cause).
+    throw new Error(
+      (raw ? `Google Drive says: "${raw}". ` : "") +
+        'This usually means the sharing is still too narrow for a link-only (API key) connection: double-check General access on the folder is set to "Anyone with the link can view" (not shared with specific people only), and if this folder lives inside a Shared Drive / Team Drive, check that the Shared Drive itself also allows this — a folder can show as shared while the Shared Drive around it is still locked down.',
+    );
+  }
+  throw new Error(raw ?? `Google Drive API error (${res.status}) while checking folder access.`);
 }
 
 // Real Drive folders are often organized into subfolders (by month, by
@@ -1907,7 +1925,7 @@ async function listDriveFolderIds(rootFolderId: string, apiKey: string): Promise
           encodeURIComponent(
             `'${parentId}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false`,
           ) +
-          "&fields=files(id,name)&pageSize=100&key=" +
+          "&fields=files(id,name)&pageSize=100&supportsAllDrives=true&includeItemsFromAllDrives=true&key=" +
           apiKey;
         try {
           const res = await fetchWithTimeout(url, {}, 15_000);
@@ -1964,7 +1982,7 @@ async function listDriveUsedFolderIds(rootFolderId: string, apiKey: string): Pro
           encodeURIComponent(
             `'${parentId}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false`,
           ) +
-          "&fields=files(id,name)&pageSize=100&key=" +
+          "&fields=files(id,name)&pageSize=100&supportsAllDrives=true&includeItemsFromAllDrives=true&key=" +
           apiKey;
         try {
           const res = await fetchWithTimeout(url, {}, 15_000);
@@ -2032,7 +2050,7 @@ async function queryDriveFilesInFolders(folderIds: string[], apiKey: string): Pr
     "https://www.googleapis.com/drive/v3/files?" +
     "q=" +
     encodeURIComponent(q) +
-    "&fields=files(id,name,mimeType)&pageSize=200&key=" +
+    "&fields=files(id,name,mimeType)&pageSize=200&supportsAllDrives=true&includeItemsFromAllDrives=true&key=" +
     apiKey;
   const res = await fetchWithTimeout(url, {}, 15_000);
   const json = (await res.json()) as {
@@ -2068,7 +2086,7 @@ async function fetchDriveFilesByIds(fileIds: string[], apiKey: string): Promise<
   const results = await Promise.all(
     fileIds.map(async (id) => {
       try {
-        const url = `https://www.googleapis.com/drive/v3/files/${id}?fields=id,name,mimeType,trashed&key=${apiKey}`;
+        const url = `https://www.googleapis.com/drive/v3/files/${id}?fields=id,name,mimeType,trashed&supportsAllDrives=true&key=${apiKey}`;
         const res = await fetchWithTimeout(url, {}, 15_000);
         if (!res.ok) return null;
         const json = (await res.json()) as { id: string; name: string; mimeType: string; trashed?: boolean };
@@ -3689,7 +3707,7 @@ export const scanAgentDrivePhotos = createServerFn({ method: "POST" })
         "https://www.googleapis.com/drive/v3/files?" +
         "q=" +
         encodeURIComponent(`${driveParentsClause(folderIds)} and mimeType contains 'image/' and trashed=false`) +
-        "&fields=files(id,name,mimeType)&pageSize=200&key=" +
+        "&fields=files(id,name,mimeType)&pageSize=200&supportsAllDrives=true&includeItemsFromAllDrives=true&key=" +
         googleKey;
       const listRes = await fetchWithTimeout(listUrl, {}, 15_000);
       const listData = (await listRes.json()) as {
@@ -3717,7 +3735,11 @@ export const scanAgentDrivePhotos = createServerFn({ method: "POST" })
       const results = await Promise.all(
         toProcess.map(async (f): Promise<PhotoScanSuggestion | null> => {
           try {
-            const imgUrl = "https://www.googleapis.com/drive/v3/files/" + f.id + "?alt=media&key=" + googleKey;
+            const imgUrl =
+              "https://www.googleapis.com/drive/v3/files/" +
+              f.id +
+              "?alt=media&supportsAllDrives=true&key=" +
+              googleKey;
             const imgRes = await fetchWithTimeout(imgUrl, {}, 15_000);
             if (!imgRes.ok) return null;
             const arrayBuffer = await imgRes.arrayBuffer();

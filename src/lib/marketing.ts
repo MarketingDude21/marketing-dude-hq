@@ -1998,31 +1998,58 @@ async function verifyDriveFolderAccessible(folderId: string, accessToken: string
 const MAX_DRIVE_FOLDER_DEPTH = 4;
 const MAX_DRIVE_FOLDERS = 40;
 
+// Runs `fn` over `items` with at most `limit` calls in flight at once.
+// Added 2026-09-28 per Mike, after the OAuth rewrite above still didn't fix
+// Regina Flores's folder: he narrowed it down himself — "its all the folders
+// in the agents drive folder. I removed the[m], and left only used and
+// pictures and it worked." Checked several of the removed subfolders
+// directly against Drive's own permissions API and they were all shared
+// correctly, same as the root — so it isn't one bad subfolder. Her folder
+// had 10+ subfolders (several full of video-project files), and this file
+// was firing one Drive API call per subfolder, every one of them at once,
+// at every level of the tree walk — plus, in queryDriveFilesInFolders below,
+// one single combined query spanning every folder id found. A burst and a
+// query that size is exactly the kind of thing Drive's API pushes back on
+// for a real client folder that's accumulated a lot of subfolders over
+// months, which is the normal case, not an edge case. Limiting concurrency
+// here (and chunking the combined query below) trades a little speed for
+// not choking on that.
+async function mapLimit<T, R>(items: T[], limit: number, fn: (item: T) => Promise<R>): Promise<R[]> {
+  const results: R[] = new Array(items.length);
+  let next = 0;
+  async function worker() {
+    while (next < items.length) {
+      const i = next++;
+      results[i] = await fn(items[i] as T);
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, () => worker()));
+  return results;
+}
+
 async function listDriveFolderIds(rootFolderId: string, accessToken: string): Promise<string[]> {
   const ids = [rootFolderId];
   let frontier = [rootFolderId];
   for (let depth = 0; depth < MAX_DRIVE_FOLDER_DEPTH && frontier.length && ids.length < MAX_DRIVE_FOLDERS; depth++) {
-    const batches = await Promise.all(
-      frontier.map(async (parentId) => {
-        const url =
-          "https://www.googleapis.com/drive/v3/files?" +
-          "q=" +
-          encodeURIComponent(
-            `'${parentId}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false`,
-          ) +
-          "&fields=files(id,name)&pageSize=100&supportsAllDrives=true&includeItemsFromAllDrives=true";
-        try {
-          const res = await fetchWithTimeout(url, { headers: driveAuthHeaders(accessToken) }, 15_000);
-          const json = (await res.json()) as { files?: { id: string; name: string }[] };
-          return json.files ?? [];
-        } catch {
-          // A slow/failed subfolder lookup shouldn't take down the whole
-          // scan — it just means that one branch's photos won't show up
-          // this time, same as any other partial-failure spot in this file.
-          return [];
-        }
-      }),
-    );
+    const batches = await mapLimit(frontier, 5, async (parentId) => {
+      const url =
+        "https://www.googleapis.com/drive/v3/files?" +
+        "q=" +
+        encodeURIComponent(
+          `'${parentId}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false`,
+        ) +
+        "&fields=files(id,name)&pageSize=100&supportsAllDrives=true&includeItemsFromAllDrives=true";
+      try {
+        const res = await fetchWithTimeout(url, { headers: driveAuthHeaders(accessToken) }, 15_000);
+        const json = (await res.json()) as { files?: { id: string; name: string }[] };
+        return json.files ?? [];
+      } catch {
+        // A slow/failed subfolder lookup shouldn't take down the whole
+        // scan — it just means that one branch's photos won't show up
+        // this time, same as any other partial-failure spot in this file.
+        return [];
+      }
+    });
     const nextFrontier: string[] = [];
     for (const folders of batches) {
       for (const f of folders) {
@@ -2058,24 +2085,22 @@ async function listDriveUsedFolderIds(rootFolderId: string, accessToken: string)
     depth < MAX_DRIVE_FOLDER_DEPTH && frontier.length && usedIds.length < MAX_DRIVE_FOLDERS;
     depth++
   ) {
-    const batches = await Promise.all(
-      frontier.map(async (parentId) => {
-        const url =
-          "https://www.googleapis.com/drive/v3/files?" +
-          "q=" +
-          encodeURIComponent(
-            `'${parentId}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false`,
-          ) +
-          "&fields=files(id,name)&pageSize=100&supportsAllDrives=true&includeItemsFromAllDrives=true";
-        try {
-          const res = await fetchWithTimeout(url, { headers: driveAuthHeaders(accessToken) }, 15_000);
-          const json = (await res.json()) as { files?: { id: string; name: string }[] };
-          return json.files ?? [];
-        } catch {
-          return [];
-        }
-      }),
-    );
+    const batches = await mapLimit(frontier, 5, async (parentId) => {
+      const url =
+        "https://www.googleapis.com/drive/v3/files?" +
+        "q=" +
+        encodeURIComponent(
+          `'${parentId}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false`,
+        ) +
+        "&fields=files(id,name)&pageSize=100&supportsAllDrives=true&includeItemsFromAllDrives=true";
+      try {
+        const res = await fetchWithTimeout(url, { headers: driveAuthHeaders(accessToken) }, 15_000);
+        const json = (await res.json()) as { files?: { id: string; name: string }[] };
+        return json.files ?? [];
+      } catch {
+        return [];
+      }
+    });
     const nextFrontier: string[] = [];
     for (const folders of batches) {
       for (const f of folders) {
@@ -2122,25 +2147,45 @@ function mapDriveApiFile(f: { id: string; name: string; mimeType: string }): Dri
   };
 }
 
+// Kept deliberately small (rather than one giant query spanning every
+// folder id at once) — see mapLimit's comment above. Splitting the combined
+// "'X' in parents or 'Y' in parents or ..." query into chunks means one
+// oversized or momentarily-troublesome combination of folders can't take
+// down the whole listing.
+const DRIVE_QUERY_CHUNK_SIZE = 10;
+
 // Shared by fetchDriveMediaFiles and fetchDriveUsedFiles below — both just
 // query "every image/video directly inside this set of folder ids," they
 // only differ in which folder ids they pass in (the active tree vs. a
-// "used" folder found inside it).
+// "used" folder found inside it). A chunk that fails outright (transient
+// error, or a combined query Drive doesn't like) is skipped rather than
+// failing the whole listing — best-effort, same spirit as the folder-tree
+// walk above: a client's real Drive folder can easily have a dozen-plus
+// subfolders, and one rough patch in the middle of that shouldn't blank out
+// everything else that DID come back fine.
 async function queryDriveFilesInFolders(folderIds: string[], accessToken: string): Promise<DriveFile[]> {
   if (!folderIds.length) return [];
-  const q = `${driveParentsClause(folderIds)} and (mimeType contains 'image/' or mimeType contains 'video/') and trashed=false`;
-  const url =
-    "https://www.googleapis.com/drive/v3/files?" +
-    "q=" +
-    encodeURIComponent(q) +
-    "&fields=files(id,name,mimeType)&pageSize=200&supportsAllDrives=true&includeItemsFromAllDrives=true";
-  const res = await fetchWithTimeout(url, { headers: driveAuthHeaders(accessToken) }, 15_000);
-  const json = (await res.json()) as {
-    files?: { id: string; name: string; mimeType: string }[];
-    error?: { message?: string };
-  };
-  if (!res.ok) throw new Error(json.error?.message ?? `Google Drive API error (${res.status})`);
-  return (json.files ?? []).map(mapDriveApiFile);
+  const chunks: string[][] = [];
+  for (let i = 0; i < folderIds.length; i += DRIVE_QUERY_CHUNK_SIZE) {
+    chunks.push(folderIds.slice(i, i + DRIVE_QUERY_CHUNK_SIZE));
+  }
+  const results = await mapLimit(chunks, 3, async (chunk) => {
+    const q = `${driveParentsClause(chunk)} and (mimeType contains 'image/' or mimeType contains 'video/') and trashed=false`;
+    const url =
+      "https://www.googleapis.com/drive/v3/files?" +
+      "q=" +
+      encodeURIComponent(q) +
+      "&fields=files(id,name,mimeType)&pageSize=200&supportsAllDrives=true&includeItemsFromAllDrives=true";
+    try {
+      const res = await fetchWithTimeout(url, { headers: driveAuthHeaders(accessToken) }, 15_000);
+      const json = (await res.json()) as { files?: { id: string; name: string; mimeType: string }[] };
+      if (!res.ok) return [];
+      return (json.files ?? []).map(mapDriveApiFile);
+    } catch {
+      return [];
+    }
+  });
+  return results.flat();
 }
 
 async function fetchDriveMediaFiles(folderId: string, accessToken: string): Promise<DriveFile[]> {

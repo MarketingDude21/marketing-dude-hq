@@ -1827,6 +1827,237 @@ export const submitPublicReviewFeedback = createServerFn({ method: "POST" })
     return { ok: true };
   });
 
+// Public — full edit/AI-feedback/change-photo parity for the review page,
+// added 2026-09-29 (second same-day pass on this page) per Mike: "let's not
+// overthink it... everything on this review screen or the client facing
+// public link... should be identical [to the admin view]. Every aspect of
+// it." The first restyle pass only matched the CARD's look (photo, styling)
+// and kept the action set deliberately narrow (Approve/Flag only) — Mike
+// came back and explicitly overrode that scoping decision, so this now
+// mirrors PostCard's real feature set: direct text edit, AI "rewrite in
+// their voice" from typed/spoken feedback, and swapping the attached photo
+// from either the Media Library or Google Drive. Every function below is a
+// token-resolved twin of an existing authenticated one (updateMarketingPost,
+// rewritePostContent, listMarketingMedia, setPostMedia) — same logic, same
+// feedback_history logging, just resolving the agent from the review token
+// (resolveAgentIdFromReviewToken) instead of a Supabase session.
+
+// Public — direct content edit. Mirrors updateMarketingPost's edit path,
+// including logging the "edited" learning signal so fetchLearnedFeedback
+// picks up a client's own rewrite exactly like a team member's.
+export const updatePublicReviewPostContent = createServerFn({ method: "POST" })
+  .inputValidator((data: { token: string; postId: string; content: string }) => data)
+  .handler(async ({ data }): Promise<{ ok: true }> => {
+    const { agentId } = await resolveAgentIdFromReviewToken(data.token);
+    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+    const { data: existing, error: fetchErr } = await supabaseAdmin
+      .from("generated_posts")
+      .select("agent_id, content")
+      .eq("id", data.postId)
+      .maybeSingle();
+    if (fetchErr) throw fetchErr;
+    if (!existing || existing.agent_id !== agentId) throw new Error("Post not found for this agent.");
+
+    const { error } = await supabaseAdmin
+      .from("generated_posts")
+      .update({ content: data.content, updated_at: new Date().toISOString() })
+      .eq("id", data.postId);
+    if (error) throw error;
+
+    if (data.content !== existing.content) {
+      await supabaseAdmin.from("feedback_history").insert({
+        agent_id: agentId,
+        post_id: data.postId,
+        rating: "edited",
+        notes: `Manually rewritten via the public review link to: "${data.content}"`,
+      });
+    }
+    return { ok: true };
+  });
+
+// Public — AI "Rewrite in their voice," token-resolved twin of
+// rewritePostContent. Same prompt, same learned-feedback fold-in, same
+// feedback_history logging.
+export const rewritePublicReviewPost = createServerFn({ method: "POST" })
+  .inputValidator((data: { token: string; postId: string; feedback: string }) => data)
+  .handler(async ({ data }): Promise<{ ok: true; content: string }> => {
+    const { agentId } = await resolveAgentIdFromReviewToken(data.token);
+    const feedback = data.feedback.trim();
+    if (!feedback) throw new Error("Tell us what to fix first.");
+    const apiKey = process.env["ANTHROPIC_API_KEY"];
+    if (!apiKey) {
+      throw new Error("Rewriting isn't configured yet — add ANTHROPIC_API_KEY in Lovable Cloud → Secrets.");
+    }
+
+    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+    const { data: existing, error: fetchErr } = await supabaseAdmin
+      .from("generated_posts")
+      .select("agent_id, content, content_type, title")
+      .eq("id", data.postId)
+      .maybeSingle();
+    if (fetchErr) throw fetchErr;
+    if (!existing || existing.agent_id !== agentId) throw new Error("Post not found for this agent.");
+
+    const { data: agent, error: agentErr } = await supabaseAdmin
+      .from("agents")
+      .select("full_name, market_area, voice_summary")
+      .eq("id", agentId)
+      .maybeSingle();
+    if (agentErr) throw agentErr;
+    const agentName = agent?.full_name ?? "the agent";
+    const firstName = agentName.split(" ")[0] || agentName;
+    const agentCity = agent?.market_area ?? "their market";
+    const dna =
+      agent?.voice_summary ?? "Warm, conversational, authentic real estate agent. Short posts. Real human energy.";
+
+    const kind =
+      existing.content_type === "email"
+        ? "email"
+        : existing.content_type === "video"
+          ? "video script"
+          : "social media post";
+    const formatRule =
+      existing.content_type === "post"
+        ? "4. 2 to 4 sentences max\n"
+        : existing.content_type === "video"
+          ? "4. Keep the HOOK / BODY / CLOSE format, written to be spoken, 150 words maximum\n"
+          : "4. Keep the SUBJECT OPTIONS / EMAIL BODY format\n";
+    const learnedFeedback = await fetchLearnedFeedback(agentId);
+    const prompt =
+      `You are rewriting a ${kind} for ${agentName} in ${agentCity}.\n\n` +
+      `VOICE DNA (this is how they actually talk):\n${dna}\n\n` +
+      (existing.title ? `ORIGINAL CONCEPT: ${existing.title}\n` : "") +
+      `CURRENT VERSION:\n${existing.content}\n\n` +
+      `FEEDBACK FROM REVIEWER: ${feedback}${learnedFeedback}\n\n` +
+      "YOUR JOB:\n" +
+      "1. Keep the same concept and emotional core as the current version\n" +
+      "2. Apply the feedback exactly as described\n" +
+      `3. Write in ${firstName}'s voice based on their Voice DNA above\n` +
+      formatRule +
+      "5. No hyphens, no corporate language, sounds like a real person, not a brand\n" +
+      "6. Standard capitalization always — never write in all lowercase\n" +
+      `7. AUTHENTICITY TEST: would ${firstName} actually say this?\n\n` +
+      "Output ONLY the rewritten text. Nothing else. No explanation.";
+
+    const maxTokens = existing.content_type === "email" ? 2000 : existing.content_type === "video" ? 600 : 400;
+    const raw = await callClaude(apiKey, prompt, maxTokens);
+    if (!raw) throw new Error("Empty response from Claude — try again.");
+    const rewritten = cleanCopy(raw);
+
+    const { error } = await supabaseAdmin
+      .from("generated_posts")
+      .update({ content: rewritten, status: "pending", updated_at: new Date().toISOString() })
+      .eq("id", data.postId);
+    if (error) throw error;
+
+    await supabaseAdmin.from("feedback_history").insert({
+      agent_id: agentId,
+      post_id: data.postId,
+      rating: "rewritten",
+      notes: `Feedback: "${feedback}" — rewritten in ${agentName}'s voice.`,
+    });
+
+    return { ok: true, content: rewritten };
+  });
+
+// Public — Media Library options for the post-photo picker, "available"
+// status only (same default the admin picker uses), token-resolved.
+export const listPublicReviewMedia = createServerFn({ method: "POST" })
+  .inputValidator((data: { token: string }) => data)
+  .handler(async ({ data }): Promise<MediaRow[]> => {
+    const { agentId } = await resolveAgentIdFromReviewToken(data.token);
+    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+    const { data: rows, error } = await supabaseAdmin
+      .from("agent_photos")
+      .select("id, url, caption, tags, media_type, source, status, created_at, used_at")
+      .eq("agent_id", agentId)
+      .eq("status", "available")
+      .order("created_at", { ascending: false });
+    if (error) throw error;
+    return (rows ?? []) as MediaRow[];
+  });
+
+// Public — swap or remove the post's photo from the Media Library, token-
+// resolved twin of setPostMedia (same feedback_history "photo_changed" log).
+export const setPublicReviewPostMedia = createServerFn({ method: "POST" })
+  .inputValidator((data: { token: string; postId: string; mediaId: string | null }) => data)
+  .handler(async ({ data }): Promise<{ ok: true }> => {
+    const { agentId } = await resolveAgentIdFromReviewToken(data.token);
+    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+    const { data: existing, error: fetchErr } = await supabaseAdmin
+      .from("generated_posts")
+      .select("agent_id, metadata")
+      .eq("id", data.postId)
+      .maybeSingle();
+    if (fetchErr) throw fetchErr;
+    if (!existing || existing.agent_id !== agentId) throw new Error("Post not found for this agent.");
+    const prevMediaId = (existing.metadata as PostMetadata | null)?.media_id ?? null;
+
+    let mediaUrl: string | null = null;
+    let mediaType: string | null = null;
+    if (data.mediaId) {
+      const { data: media, error: mediaErr } = await supabaseAdmin
+        .from("agent_photos")
+        .select("id, url, media_type, agent_id")
+        .eq("id", data.mediaId)
+        .maybeSingle();
+      if (mediaErr) throw mediaErr;
+      if (!media || media.agent_id !== agentId) {
+        throw new Error("That media item doesn't belong to this agent.");
+      }
+      mediaUrl = media.url;
+      mediaType = media.media_type;
+    }
+
+    const nextMetadata = {
+      ...((existing.metadata as Record<string, unknown> | null) ?? {}),
+      media_id: data.mediaId,
+      media_url: mediaUrl,
+      media_type: mediaType,
+      drive_file_id: null,
+      drive_thumbnail_url: null,
+      unsplash_photographer: null,
+      unsplash_credit_url: null,
+    };
+
+    const { error } = await supabaseAdmin
+      .from("generated_posts")
+      .update({ metadata: nextMetadata, updated_at: new Date().toISOString() })
+      .eq("id", data.postId);
+    if (error) throw error;
+
+    if (data.mediaId !== prevMediaId) {
+      await supabaseAdmin.from("feedback_history").insert({
+        agent_id: agentId,
+        post_id: data.postId,
+        rating: "photo_changed",
+        notes: data.mediaId
+          ? `Photo changed to media ${data.mediaId}${prevMediaId ? ` (was ${prevMediaId})` : ""}.`
+          : `Photo removed${prevMediaId ? ` (was ${prevMediaId})` : ""}.`,
+      });
+    }
+
+    return { ok: true };
+  });
+
+// Public — cheap existence check for the picker's Google Drive tab (just
+// whether a folder is set, no Drive API round trip) — used so the tab only
+// shows up when there's actually a Drive folder to browse, same as the
+// admin side's driveFolderId prop.
+export const getPublicReviewDriveFolderId = createServerFn({ method: "POST" })
+  .inputValidator((data: { token: string }) => data)
+  .handler(async ({ data }): Promise<{ folderId: string | null }> => {
+    const { agentId } = await resolveAgentIdFromReviewToken(data.token);
+    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+    const { data: agent, error } = await supabaseAdmin
+      .from("agents")
+      .select("drive_folder_id")
+      .eq("id", agentId)
+      .maybeSingle();
+    if (error) throw error;
+    return { folderId: agent?.drive_folder_id ?? null };
+  });
+
 // ============================================================================
 // Google Drive tab — Phase 2, requested by Mike (2026-09-16) on top of the
 // native media library above. This is a LIVE, read-only view straight from
@@ -2301,6 +2532,79 @@ export const listAgentDriveMedia = createServerFn({ method: "GET" })
     // we can't move the real file without Drive write access — see below).
     const files = (await fetchDriveMediaFiles(folderId, accessToken)).filter((f) => !trackedUsed.has(f.id));
     return { folderId, files };
+  });
+
+// Public — Google Drive tab of the review page's photo picker, token-
+// resolved. Only ever the "available" listing (same as the picker's
+// default) — a public reviewer has no reason to browse the "used" folder.
+export const listPublicReviewDriveMedia = createServerFn({ method: "POST" })
+  .inputValidator((data: { token: string }) => data)
+  .handler(async ({ data }): Promise<{ folderId: string | null; files: DriveFile[] }> => {
+    const { agentId } = await resolveAgentIdFromReviewToken(data.token);
+    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+    const { data: agent, error: agentErr } = await supabaseAdmin
+      .from("agents")
+      .select("drive_folder_id")
+      .eq("id", agentId)
+      .maybeSingle();
+    if (agentErr) throw agentErr;
+    const folderId = agent?.drive_folder_id ?? null;
+    if (!folderId) return { folderId: null, files: [] };
+
+    const accessToken = await getDriveAccessToken();
+    await verifyDriveFolderAccessible(folderId, accessToken);
+
+    const { data: trackedRows, error: trackedErr } = await supabaseAdmin
+      .from("agent_drive_used_files")
+      .select("drive_file_id")
+      .eq("agent_id", agentId);
+    if (trackedErr) throw trackedErr;
+    const trackedUsed = new Set((trackedRows ?? []).map((r) => r.drive_file_id as string));
+
+    const files = (await fetchDriveMediaFiles(folderId, accessToken)).filter((f) => !trackedUsed.has(f.id));
+    return { folderId, files };
+  });
+
+// Public — swap the post's photo for one straight from Google Drive, token-
+// resolved twin of setPostDrivePhoto.
+export const setPublicReviewDrivePhoto = createServerFn({ method: "POST" })
+  .inputValidator((data: { token: string; postId: string; driveFileId: string; thumbnailUrl: string }) => data)
+  .handler(async ({ data }): Promise<{ ok: true }> => {
+    const { agentId } = await resolveAgentIdFromReviewToken(data.token);
+    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+    const { data: existing, error: fetchErr } = await supabaseAdmin
+      .from("generated_posts")
+      .select("agent_id, metadata")
+      .eq("id", data.postId)
+      .maybeSingle();
+    if (fetchErr) throw fetchErr;
+    if (!existing || existing.agent_id !== agentId) throw new Error("Post not found for this agent.");
+
+    const nextMetadata = {
+      ...((existing.metadata as Record<string, unknown> | null) ?? {}),
+      drive_file_id: data.driveFileId,
+      drive_thumbnail_url: data.thumbnailUrl,
+      media_id: null,
+      media_url: null,
+      media_type: null,
+      unsplash_photographer: null,
+      unsplash_credit_url: null,
+    };
+
+    const { error } = await supabaseAdmin
+      .from("generated_posts")
+      .update({ metadata: nextMetadata, updated_at: new Date().toISOString() })
+      .eq("id", data.postId);
+    if (error) throw error;
+
+    await supabaseAdmin.from("feedback_history").insert({
+      agent_id: agentId,
+      post_id: data.postId,
+      rating: "photo_changed",
+      notes: `Photo changed to Drive file ${data.driveFileId}.`,
+    });
+
+    return { ok: true };
   });
 
 // Added 2026-09-21 per Mike: "photos on the approve all did not move, they

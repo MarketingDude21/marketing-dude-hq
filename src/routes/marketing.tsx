@@ -875,16 +875,12 @@ function PostsTab({ agentId, isAdmin }: { agentId: string; isAdmin: boolean }) {
             {approvingAll ? "Approving…" : `Approve all${pendingCount ? ` (${pendingCount})` : ""}`}
           </Button>
         )}
-        {isAdmin && (
-          <Button
-            variant="secondary"
-            onClick={sendToAgent}
-            disabled={sending || !month}
-            title={month ? undefined : "Pick a specific month above first"}
-          >
-            {sending ? "Sending…" : "Send to Agent"}
-          </Button>
-        )}
+        {/* "Send to Agent" (GoHighLevel email) hidden 2026-09-29 per Mike:
+            "For the time being lets hide the send to agent button as we
+            will just use the share link and email it directly to them.
+            This way we avoid API errors etc for time being." sendToAgent()
+            itself is untouched below so this is a one-line flip back on,
+            not a rebuild, whenever GHL is trusted again. */}
       </div>
 
       {approveNote && <p className="text-xs text-muted-foreground">{approveNote}</p>}
@@ -1638,8 +1634,20 @@ function PostCard({
   onChanged: () => void;
 }) {
   const [draft, setDraft] = useState(post.content);
-  const [editing, setEditing] = useState(false);
-  const [feedbackOpen, setFeedbackOpen] = useState(false);
+  // Edit and Flag/feedback used to be two separate buttons with two
+  // separate panels — MERGED (2026-09-29) per Mike: "Make EDIT/FLAG
+  // FEEDBACK one button. so when you click it you can edit the words
+  // directly speak or type in Place the edit feature just above the A/I
+  // part where you can get it feedback. Regardless of whether they edit
+  // the post themselves and rewrite it or spek into the mic or A/I to give
+  // it feedback it needs to save and get smarter for the user of this
+  // profile." One button now opens one panel: a direct-edit box (with mic
+  // dictation) on top, the existing AI-feedback section right below it.
+  // All three paths — direct Save, AI Rewrite, and feedback-only Submit —
+  // write to feedback_history so fetchLearnedFeedback picks them up (the
+  // direct-edit path logs via updateMarketingPost itself, server-side, see
+  // marketing.ts).
+  const [editorOpen, setEditorOpen] = useState(false);
   const [notes, setNotes] = useState("");
   const [busy, setBusy] = useState(false);
   const [saveError, setSaveError] = useState<string | null>(null);
@@ -1704,7 +1712,10 @@ function PostCard({
     setSaveError(null);
     try {
       await updateMarketingPost({ data: { agentId, postId: post.id, content: draft } });
-      setEditing(false);
+      // Deliberately leave the panel open — Mike wants direct edit and AI
+      // feedback in the same place regardless of which one gets used, so
+      // saving a manual edit doesn't have to end the visit; "Done" below is
+      // what closes it.
       onChanged();
     } catch (e) {
       setSaveError(e instanceof Error ? e.message : String(e));
@@ -1723,7 +1734,6 @@ function PostCard({
         : { agentId, postId: post.id, rating: "flagged" };
       await submitMarketingFeedback({ data: payload });
       await updateMarketingPost({ data: { agentId, postId: post.id, status: "flagged" } });
-      setFeedbackOpen(false);
       setNotes("");
       onChanged();
     } catch (e) {
@@ -1886,16 +1896,7 @@ function PostCard({
             )}
           </div>
         )}
-        {editing ? (
-          <AutoResizeTextarea
-            value={draft}
-            onChange={setDraft}
-            minHeightPx={140}
-            className="w-full rounded-2xl bg-muted px-4 py-3 text-sm leading-relaxed outline-none ring-ring transition focus:ring-2"
-          />
-        ) : (
-          <p className="whitespace-pre-wrap text-sm leading-relaxed">{post.content}</p>
-        )}
+        <p className="whitespace-pre-wrap text-sm leading-relaxed">{post.content}</p>
 
         {post.metadata?.canva_link && (
           <>
@@ -1930,44 +1931,21 @@ function PostCard({
         {saveError && <p className="mt-2 text-xs text-destructive">{saveError}</p>}
 
         <div className="mt-4 flex flex-wrap gap-2">
-          {editing ? (
-            <>
-              <Button onClick={saveEdit} disabled={busy}>
-                Save
-              </Button>
-              <Button
-                variant="secondary"
-                onClick={() => {
-                  setDraft(post.content);
-                  setEditing(false);
-                }}
-                disabled={busy}
-              >
-                Cancel
-              </Button>
-            </>
-          ) : (
-            <>
-              <Button onClick={approve} disabled={busy || post.status === "approved"}>
-                {post.status === "approved" ? "Approved" : "Approve"}
-              </Button>
-              <Button variant="secondary" onClick={() => setEditing(true)} disabled={busy}>
-                Edit
-              </Button>
-              <Button variant="danger" onClick={() => setFeedbackOpen((v) => !v)} disabled={busy}>
-                Flag / feedback
-              </Button>
-              {post.content_type === "post" && (
-                <Button variant="secondary" onClick={openPicker} disabled={busy}>
-                  {photoUrl ? "Change photo" : "Add photo"}
-                </Button>
-              )}
-              {isPhotoScanPost && (
-                <Button variant="secondary" onClick={regenerateCaption} disabled={busy || regenerating}>
-                  {regenerating ? "Rescanning…" : "Rescan this photo"}
-                </Button>
-              )}
-            </>
+          <Button onClick={approve} disabled={busy || post.status === "approved"}>
+            {post.status === "approved" ? "Approved" : "Approve"}
+          </Button>
+          <Button variant="secondary" onClick={() => setEditorOpen((v) => !v)} disabled={busy}>
+            Edit / Feedback
+          </Button>
+          {post.content_type === "post" && (
+            <Button variant="secondary" onClick={openPicker} disabled={busy}>
+              {photoUrl ? "Change photo" : "Add photo"}
+            </Button>
+          )}
+          {isPhotoScanPost && (
+            <Button variant="secondary" onClick={regenerateCaption} disabled={busy || regenerating}>
+              {regenerating ? "Rescanning…" : "Rescan this photo"}
+            </Button>
           )}
         </div>
 
@@ -2084,53 +2062,83 @@ function PostCard({
           </div>
         )}
 
-        {feedbackOpen && (
-          <div className="mt-4 rounded-2xl border border-border bg-background/40 p-4">
-            <div className="flex items-center justify-between">
-              <p className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
-                What should change?
-              </p>
-              <MicButton value={notes} onChange={setNotes} />
-            </div>
-            {rewriteHistory.length > 0 && (
-              <div className="mt-2 space-y-2">
-                {rewriteHistory.map((h, i) => (
-                  <div key={i} className="rounded-xl bg-muted px-3 py-2 text-xs leading-relaxed">
-                    <p className="text-muted-foreground">You asked: "{h.feedback}"</p>
-                    <p className="mt-1 italic">Result: {h.result}</p>
-                  </div>
-                ))}
+        {editorOpen && (
+          <div className="mt-4 space-y-4 rounded-2xl border border-border bg-background/40 p-4">
+            {/* Direct edit — on top, per Mike: "Place the edit feature just
+                above the A/I part where you can get it feedback." Typing,
+                pasting, or dictating with the mic all just change `draft`;
+                Save writes it straight to the post (and, server-side in
+                updateMarketingPost, logs it to feedback_history as an
+                "edited" learning signal). */}
+            <div>
+              <div className="flex items-center justify-between">
+                <p className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">Edit directly</p>
+                <MicButton value={draft} onChange={setDraft} />
               </div>
-            )}
-            <textarea
-              value={notes}
-              onChange={(e) => setNotes(e.target.value)}
-              placeholder="What is off? Too formal, they never say this, make it shorter…"
-              className="mt-2 min-h-[80px] w-full rounded-2xl bg-muted px-4 py-3 text-sm outline-none ring-ring transition focus:ring-2"
-            />
-            <div className="mt-3 flex flex-wrap gap-2">
-              <Button onClick={rewrite} disabled={busy || rewriting}>
-                {rewriting ? "Rewriting…" : "Rewrite in their voice →"}
-              </Button>
-              <Button onClick={sendFeedback} variant="secondary" disabled={busy || rewriting}>
-                Submit feedback
-              </Button>
-              <Button
-                variant="secondary"
-                onClick={() => {
-                  setFeedbackOpen(false);
-                  setRewriteHistory([]);
-                }}
-                disabled={busy || rewriting}
-              >
-                Done
-              </Button>
+              <AutoResizeTextarea
+                value={draft}
+                onChange={setDraft}
+                minHeightPx={120}
+                className="mt-2 w-full rounded-2xl bg-muted px-4 py-3 text-sm leading-relaxed outline-none ring-ring transition focus:ring-2"
+              />
+              <div className="mt-2 flex flex-wrap gap-2">
+                <Button onClick={saveEdit} disabled={busy || draft === post.content}>
+                  {busy ? "Saving…" : "Save"}
+                </Button>
+              </div>
             </div>
-            {rewriteHistory.length > 0 && (
-              <p className="mt-2 text-xs text-muted-foreground">
-                Not right yet? Add more feedback above and rewrite again.
-              </p>
-            )}
+
+            {/* AI feedback — same rewrite/flag flow as before, just living
+                in the same panel now instead of behind its own button. */}
+            <div className="border-t border-border pt-4">
+              <div className="flex items-center justify-between">
+                <p className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
+                  Or tell the AI what to change
+                </p>
+                <MicButton value={notes} onChange={setNotes} />
+              </div>
+              {rewriteHistory.length > 0 && (
+                <div className="mt-2 space-y-2">
+                  {rewriteHistory.map((h, i) => (
+                    <div key={i} className="rounded-xl bg-muted px-3 py-2 text-xs leading-relaxed">
+                      <p className="text-muted-foreground">You asked: "{h.feedback}"</p>
+                      <p className="mt-1 italic">Result: {h.result}</p>
+                    </div>
+                  ))}
+                </div>
+              )}
+              <textarea
+                value={notes}
+                onChange={(e) => setNotes(e.target.value)}
+                placeholder="What is off? Too formal, they never say this, make it shorter…"
+                className="mt-2 min-h-[80px] w-full rounded-2xl bg-muted px-4 py-3 text-sm outline-none ring-ring transition focus:ring-2"
+              />
+              <div className="mt-3 flex flex-wrap gap-2">
+                <Button onClick={rewrite} disabled={busy || rewriting}>
+                  {rewriting ? "Rewriting…" : "Rewrite in their voice →"}
+                </Button>
+                <Button onClick={sendFeedback} variant="secondary" disabled={busy || rewriting}>
+                  Submit feedback
+                </Button>
+                <Button
+                  variant="secondary"
+                  onClick={() => {
+                    setEditorOpen(false);
+                    setDraft(post.content);
+                    setNotes("");
+                    setRewriteHistory([]);
+                  }}
+                  disabled={busy || rewriting}
+                >
+                  Done
+                </Button>
+              </div>
+              {rewriteHistory.length > 0 && (
+                <p className="mt-2 text-xs text-muted-foreground">
+                  Not right yet? Add more feedback above and rewrite again.
+                </p>
+              )}
+            </div>
           </div>
         )}
       </div>
@@ -3957,6 +3965,12 @@ function MonthWorkspace({
         {genError && <p className="mt-2 text-xs text-destructive">{genError}</p>}
       </Card>
 
+      {/* Moved here (right under Generate Now) 2026-09-29 per Mike: "Public
+          facing link for share should be at the top of each page under the
+          generate now button." Previously this sat below the Approve
+          All/Archive/Delete row further down the page. */}
+      {isAdmin && <PublicReviewLinkCard agentId={agentId} />}
+
       <PhotoScanPanel
         agentId={agentId}
         folderId={agentDriveFolderId}
@@ -3985,11 +3999,13 @@ function MonthWorkspace({
             <Button variant="secondary" onClick={approveAllAndDownload} disabled={approving || !batchPosts.length}>
               {approving ? "Working…" : allApproved ? "Approved! Download Here" : "Approve All & Download"}
             </Button>
-            {isAdmin && (
-              <Button onClick={sendToAgent} disabled={sending || !batchPosts.length}>
-                {sending ? "Sending…" : "Send to Agent"}
-              </Button>
-            )}
+            {/* "Send to Agent" (GoHighLevel email) hidden 2026-09-29 per
+                Mike: "For the time being lets hide the send to agent
+                button as we will just use the share link and email it
+                directly to them. This way we avoid API errors etc for time
+                being." sendToAgent() itself is untouched below so this is
+                a one-line flip back on, not a rebuild, whenever GHL is
+                trusted again. */}
             {/* Not gated on isAdmin — per Mike (2026-09-20): "the admin and or
                 the user needs the ability to archive." Reversible (a flag,
                 not a delete), so it needs no arm/confirm step the way Delete
@@ -4063,17 +4079,6 @@ function MonthWorkspace({
         )}
       </Card>
 
-      {/* Added 2026-09-29 per Mike: "Can we also put a client sharing link
-          here as well. This allows us to email the link to them ourselves.
-          Not all clients... will ever log into the app so we need an easy
-          way for them to review their content and send feedback without
-          logging in especially if this email to agent is buggy." Reuses the
-          exact same PublicReviewLinkCard already built and live on the Posts
-          tab (2026-09-22) — same token, same /review/$token page — just
-          rendered here too so it's available right where this month's
-          content and Send to Agent live. */}
-      {isAdmin && <PublicReviewLinkCard agentId={agentId} />}
-
       {CATEGORY_ORDER.map((cat) => {
         const group = batchPosts.filter((p) => categorizePost(p) === cat);
         if (!group.length) return null;
@@ -4142,28 +4147,37 @@ function BatchSection({
 // bigger closed-state call to action, since this was easy to miss as a
 // small secondary button before.
 //
-// REWORKED (2026-09-29) per Mike: "I want the UI to match the rest of the
-// content calendar. So have it scan photos and then lay them out the exact
-// same way the monthly content is laid out. Give it the same editing
-// feature and feedback tool with the same logic." Previously this scanned a
-// batch of photos into a local, unsaved preview list (checkboxes + a plain
-// Edit/Flag-skip) and only turned a photo into a real post once you
-// selected it and clicked "Add." Now every scanned photo is saved as a real
-// pending post the instant it's captioned — it shows up immediately as a
-// full PostCard, in the exact same list as the rest of this month's
-// content, with the exact same Approve / Edit / Flag+feedback+Rewrite /
-// Change photo actions (see PostCard above). PostCard also shows a
-// "Regenerate caption" button specifically for photo-scan posts — added the
-// same day per Mike ("you could rescan the photo"), it calls
-// regeneratePhotoScanCaption. There's no more separate "review suggestions,
-// then Add" step, and no silent local "skip" — not wanting one just means
-// flagging it, the same action Mike already uses for every other post. This
-// panel's own job is now just: fetch a handful of not-yet-scanned photos,
-// caption each, save it, and say how many were added — click it again for
-// another batch (that's the "click scan as one of the features" Mike asked
-// for; there's no separate "scan more" button anymore, this button IS the
-// repeatable action).
+// REWORKED (2026-09-29), then REVERTED-BACK-TO-PREVIEW the same day after
+// living with the reworked version. First pass, per Mike: "I want the UI to
+// match the rest of the content calendar... Give it the same editing
+// feature and feedback tool with the same logic" — that pass made every
+// scanned photo save itself as a real pending post the instant it was
+// captioned, no review step. Mike then tried it live and said: "when I
+// pressed scan my photos it automatically added that content to the posts.
+// It needs to show me the example first then add it to the post. I had no
+// idea what it decided to add. it also triggered an error message." So this
+// is now back to a preview-first flow — but keeping the visual upgrade he
+// asked for (styled like a real post card: photo + caption, not a cramped
+// checkbox row) instead of going back to the old tiny list. A scan fills
+// `suggestions` below with candidates that are NOT saved anywhere yet; each
+// one gets its own "Add to calendar" (calls addPhotoPostsToBatch for just
+// that one), "Edit" (tweak the caption before adding), and "Discard" (drops
+// it locally, no server call) — plus a bulk "Add all" for when they're all
+// good. Nothing touches generated_posts until you click Add. Once a photo
+// is added, it shows up as a real PostCard elsewhere on this page with the
+// exact same Approve / Edit+feedback / Change photo actions as everything
+// else (see PostCard above) — including its own "Rescan this photo" button
+// (regeneratePhotoScanCaption), which is unrelated to this panel and stays
+// exclusive to already-saved photo-scan posts.
 const SCAN_PANEL_TITLE = "Let Your Marketing Dude Scan Your Photos And Create Content That Makes You Human";
+
+type PhotoScanPreview = {
+  title: string;
+  content: string;
+  source: "drive" | "library";
+  sourceId: string;
+  thumbnailUrl: string;
+};
 
 function PhotoScanPanel({
   agentId,
@@ -4193,7 +4207,6 @@ function PhotoScanPanel({
   const [source, setSource] = useState<"drive" | "library">(folderId ? "drive" : "library");
   const [scanning, setScanning] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [note, setNote] = useState<string | null>(null);
   const [sessionScannedIds, setSessionScannedIds] = useState<string[]>([]);
   // Diagnostic counts from the last scan — added 2026-09-21 alongside the
   // Drive subfolder-recursion fix, so an empty result can say WHY it's
@@ -4205,17 +4218,23 @@ function PhotoScanPanel({
   // doesn't apply there.
   const [scanMeta, setScanMeta] = useState<{ totalPhotos: number; unsupportedFormatCount: number } | null>(null);
 
+  // Not-yet-saved candidates from the last scan(s) this session — see the
+  // big comment above. Cleared per-item as each is added or discarded.
+  const [suggestions, setSuggestions] = useState<PhotoScanPreview[]>([]);
+  const [editingIndex, setEditingIndex] = useState<number | null>(null);
+  const [editDraft, setEditDraft] = useState("");
+  const [savingIndex, setSavingIndex] = useState<number | null>(null);
+  const [savingAll, setSavingAll] = useState(false);
+
   function switchSource(next: "drive" | "library") {
     setSource(next);
     setError(null);
-    setNote(null);
     setScanMeta(null);
   }
 
   async function scan() {
     setScanning(true);
     setError(null);
-    setNote(null);
     try {
       const excludeFileIds = [...existingScannedFileIds, ...sessionScannedIds];
       const res =
@@ -4229,27 +4248,71 @@ function PhotoScanPanel({
         unsupportedFormatCount: (res as { unsupportedFormatCount?: number }).unsupportedFormatCount ?? 0,
       });
       if (res.suggestions.length > 0) {
-        const items = res.suggestions.map((s) => ({
-          title: s.description,
-          content: s.suggestedPost,
-          source: s.source,
-          sourceId: s.fileId,
-          thumbnailUrl: s.thumbnailUrl,
-        }));
-        await addPhotoPostsToBatch({ data: { agentId, month, batchId: batchId ?? undefined, items } });
+        setSuggestions((cur) => [
+          ...cur,
+          ...res.suggestions.map((s) => ({
+            title: s.description,
+            content: s.suggestedPost,
+            source: s.source,
+            sourceId: s.fileId,
+            thumbnailUrl: s.thumbnailUrl,
+          })),
+        ]);
         setSessionScannedIds((cur) => [...cur, ...res.suggestions.map((s) => s.fileId)]);
-        setNote(
-          `Added ${res.suggestions.length} new post${res.suggestions.length === 1 ? "" : "s"} from ${
-            source === "drive" ? "Google Drive" : "the Media Library"
-          } — scroll down to review them below, right alongside this month's other content. Click "Scan photos" again for more.`,
-        );
-        onAdded();
       }
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
       setScanning(false);
     }
+  }
+
+  async function addOne(index: number) {
+    const item = suggestions[index];
+    if (!item) return;
+    setSavingIndex(index);
+    setError(null);
+    try {
+      await addPhotoPostsToBatch({ data: { agentId, month, batchId: batchId ?? undefined, items: [item] } });
+      setSuggestions((cur) => cur.filter((_, i) => i !== index));
+      setEditingIndex((cur) => (cur === index ? null : cur !== null && cur > index ? cur - 1 : cur));
+      onAdded();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setSavingIndex(null);
+    }
+  }
+
+  async function addAll() {
+    if (suggestions.length === 0) return;
+    setSavingAll(true);
+    setError(null);
+    try {
+      await addPhotoPostsToBatch({ data: { agentId, month, batchId: batchId ?? undefined, items: suggestions } });
+      setSuggestions([]);
+      setEditingIndex(null);
+      onAdded();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setSavingAll(false);
+    }
+  }
+
+  function discard(index: number) {
+    setSuggestions((cur) => cur.filter((_, i) => i !== index));
+    setEditingIndex((cur) => (cur === index ? null : cur !== null && cur > index ? cur - 1 : cur));
+  }
+
+  function startEdit(index: number) {
+    setEditingIndex(index);
+    setEditDraft(suggestions[index]?.content ?? "");
+  }
+
+  function saveEditDraft(index: number) {
+    setSuggestions((cur) => cur.map((s, i) => (i === index ? { ...s, content: editDraft } : s)));
+    setEditingIndex(null);
   }
 
   if (!open) {
@@ -4260,8 +4323,8 @@ function PhotoScanPanel({
       >
         <p className="font-display text-base font-semibold">{SCAN_PANEL_TITLE}</p>
         <p className="mt-1 text-xs text-muted-foreground">
-          Pulls unused photos from Drive and your Media Library, writes a caption in their voice for each, and adds them
-          straight into this month's content below, ready to edit, approve, or flag. Click to get started →
+          Pulls unused photos from Drive and your Media Library, writes a caption in their voice for each, and shows you
+          exactly what it came up with before anything is added to your calendar. Click to get started →
         </p>
       </button>
     );
@@ -4276,8 +4339,8 @@ function PhotoScanPanel({
         </Button>
       </div>
       <p className="mt-1 text-xs text-muted-foreground">
-        Scans a handful of unused photos, writes a caption for each in their voice, and adds them straight into this
-        month's content below — same post cards, same Approve / Edit / Flag+feedback as everything else.
+        Scans a handful of unused photos and writes a caption for each in their voice. Nothing is added to this month's
+        content until you say so below — review, edit, or discard each one first.
       </p>
 
       <div className="mt-3 flex flex-wrap gap-2 border-b border-border pb-3">
@@ -4307,14 +4370,13 @@ function PhotoScanPanel({
 
       <div className="mt-3">
         <Button onClick={scan} disabled={scanning}>
-          {scanning ? "Scanning…" : "Scan photos"}
+          {scanning ? "Scanning…" : suggestions.length > 0 ? "Scan for more photos" : "Scan photos"}
         </Button>
       </div>
 
       {error && <p className="mt-2 text-xs text-destructive">{error}</p>}
-      {note && <p className="mt-2 text-xs text-muted-foreground">{note}</p>}
 
-      {scanMeta && !note && !error && (
+      {scanMeta && suggestions.length === 0 && !error && (
         <p className="mt-3 text-sm text-muted-foreground">
           {/* Distinguishes "genuinely nothing there" from "found photos but
               couldn't use any of them" — added 2026-09-21 after a report
@@ -4331,6 +4393,67 @@ function PhotoScanPanel({
                 ? `Found ${scanMeta.totalPhotos} photo${scanMeta.totalPhotos === 1 ? "" : "s"} in ${source === "drive" ? "this Drive folder" : "the Media Library"}, but they've already been used or scanned before — add new ones to scan more.`
                 : `No photos found in ${source === "drive" ? "this Drive folder (checked its subfolders too)" : "the Media Library"}.`}
         </p>
+      )}
+
+      {suggestions.length > 0 && (
+        <div className="mt-4 space-y-3 border-t border-border pt-4">
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <p className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
+              {suggestions.length} photo{suggestions.length === 1 ? "" : "s"} ready to review
+            </p>
+            <Button onClick={addAll} disabled={savingAll || savingIndex !== null}>
+              {savingAll ? "Adding…" : `Add all ${suggestions.length}`}
+            </Button>
+          </div>
+          {suggestions.map((s, i) => (
+            <div key={`${s.sourceId}-${i}`} className="overflow-hidden rounded-2xl border border-border bg-glass">
+              {s.thumbnailUrl && (
+                <div className="overflow-hidden bg-muted">
+                  <img src={s.thumbnailUrl} alt="" className="max-h-64 w-full object-contain" />
+                </div>
+              )}
+              <div className="p-4">
+                {s.title && <p className="text-sm font-semibold">{s.title}</p>}
+                {editingIndex === i ? (
+                  <AutoResizeTextarea
+                    value={editDraft}
+                    onChange={setEditDraft}
+                    minHeightPx={100}
+                    className="mt-2 w-full rounded-2xl bg-muted px-4 py-3 text-sm leading-relaxed outline-none ring-ring transition focus:ring-2"
+                  />
+                ) : (
+                  <p className="mt-1 whitespace-pre-wrap text-sm leading-relaxed">{s.content}</p>
+                )}
+                <div className="mt-3 flex flex-wrap gap-2">
+                  {editingIndex === i ? (
+                    <>
+                      <Button onClick={() => saveEditDraft(i)}>Save edit</Button>
+                      <Button variant="secondary" onClick={() => setEditingIndex(null)}>
+                        Cancel
+                      </Button>
+                    </>
+                  ) : (
+                    <>
+                      <Button onClick={() => addOne(i)} disabled={savingIndex !== null || savingAll}>
+                        {savingIndex === i ? "Adding…" : "Add to calendar"}
+                      </Button>
+                      <Button
+                        variant="secondary"
+                        onClick={() => startEdit(i)}
+                        disabled={savingIndex !== null || savingAll}
+                      >
+                        Edit
+                      </Button>
+                      <Button variant="danger" onClick={() => discard(i)} disabled={savingIndex !== null || savingAll}>
+                        Discard
+                      </Button>
+                    </>
+                  )}
+                </div>
+              </div>
+            </div>
+          ))}
+        </div>
       )}
     </Card>
   );

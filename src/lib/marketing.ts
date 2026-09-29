@@ -567,7 +567,7 @@ export const updateMarketingPost = createServerFn({ method: "POST" })
     // can never reach into a different agent's row.
     const { data: existing, error: fetchErr } = await supabaseAdmin
       .from("generated_posts")
-      .select("agent_id, metadata")
+      .select("agent_id, content, metadata")
       .eq("id", data.postId)
       .maybeSingle();
     if (fetchErr) throw fetchErr;
@@ -583,6 +583,25 @@ export const updateMarketingPost = createServerFn({ method: "POST" })
 
     const { error } = await supabaseAdmin.from("generated_posts").update(update).eq("id", data.postId);
     if (error) throw error;
+
+    // Log a direct manual edit as a learning signal too — added 2026-09-29
+    // per Mike: "Regardless of whether they edit the post themselves and
+    // rewrite it or speak into the mic or AI to give it feedback it needs to
+    // save and get smarter for the user of this profile." Before this, only
+    // a flag/feedback note or an AI rewrite ever wrote to feedback_history,
+    // so fetchLearnedFeedback (which folds past corrections into future
+    // generations) never saw a plain manual edit at all — this closes that
+    // gap. Only logs when the content actually changed (skips a no-op
+    // Edit → Save with nothing touched) and only for a genuine text edit,
+    // not a status-only change (approve/flag alone).
+    if (data.content !== undefined && data.content !== existing.content) {
+      await supabaseAdmin.from("feedback_history").insert({
+        agent_id: data.agentId,
+        post_id: data.postId,
+        rating: "edited",
+        notes: `Manually rewritten by the team to: "${data.content}"`,
+      });
+    }
 
     // Auto-mark the attached photo/video "used" the moment a post is
     // approved — the native equivalent of the old app's move-to-used, which
@@ -2383,23 +2402,24 @@ type GenerateContentInput = {
   useHashtags?: boolean | undefined;
 };
 
-// Pulls this agent's most recent reviewer feedback (flags and rewrite
-// requests — not photo-swap logging, that's not about the writing) and
-// formats it as a short block of "lessons" to fold into a generation prompt.
-// Added per Mike's explicit ask (2026-09-17): feedback was already being
-// SAVED to feedback_history (flag notes, rewrite requests), but nothing ever
-// read it back into future generations — so the "gets smarter over time"
-// part of the feedback loop wasn't actually happening yet. This is what
-// closes that loop: every new draft (native single-item generate, a
-// calendar batch, or an AI rewrite) now sees a digest of what reviewers have
-// corrected for this agent before and is told to apply those lessons too.
+// Pulls this agent's most recent reviewer feedback (flags, rewrite
+// requests, and — as of 2026-09-29 — direct manual edits too; not
+// photo-swap logging, that's not about the writing) and formats it as a
+// short block of "lessons" to fold into a generation prompt. Added per
+// Mike's explicit ask (2026-09-17): feedback was already being SAVED to
+// feedback_history (flag notes, rewrite requests), but nothing ever read it
+// back into future generations — so the "gets smarter over time" part of
+// the feedback loop wasn't actually happening yet. This is what closes that
+// loop: every new draft (native single-item generate, a calendar batch, or
+// an AI rewrite) now sees a digest of what reviewers have corrected for
+// this agent before and is told to apply those lessons too.
 async function fetchLearnedFeedback(agentId: string): Promise<string> {
   const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
   const { data, error } = await supabaseAdmin
     .from("feedback_history")
     .select("rating, notes")
     .eq("agent_id", agentId)
-    .in("rating", ["flagged", "rewritten"])
+    .in("rating", ["flagged", "rewritten", "edited"])
     .not("notes", "is", null)
     .order("created_at", { ascending: false })
     .limit(8);

@@ -19,18 +19,22 @@ import {
 // logged in." An admin can invalidate a link at any time (regenerate it via
 // getReviewLink/regenerateReviewLink in marketing.ts).
 //
-// Scoped narrowly on purpose: view + Approve/Flag only, matching exactly
-// what an agent could already do on the Posts tab after logging in. No
-// editing, no photo swapping, no AI-rewrite, no access to any other agent's
-// content, no nav, no AppShell — just this one agent's content for one
-// month at a time.
+// RESTYLED (2026-09-29) per Mike, after seeing this next to the admin view:
+// "The public review link looks terrible it should match the exact same
+// view we see. There should not be any difference in the screen we're
+// sharing." This card's markup/classes now mirror PostCard in marketing.tsx
+// (same Card look, same photo block, same Canva link/instructions) so an
+// agent reviewing here sees literally the same thing the admin does. Still
+// deliberately scoped to view + Approve/Flag only, matching exactly what an
+// agent could already do on the Posts tab after logging in — no editing, no
+// photo swapping, no AI-rewrite, no access to any other agent's content, no
+// nav, no AppShell. If Mike wants the edit/AI-feedback tools out here too,
+// that's a bigger trust/security/cost call for an unauthenticated public
+// link and should be confirmed with him first, not silently added.
 
 export const Route = createFileRoute("/review/$token")({
   head: () => ({
-    meta: [
-      { title: "Review your content — Your Marketing Dude" },
-      { name: "robots", content: "noindex, nofollow" },
-    ],
+    meta: [{ title: "Review your content — Your Marketing Dude" }, { name: "robots", content: "noindex, nofollow" }],
   }),
   component: PublicReviewPage,
 });
@@ -40,6 +44,28 @@ const CONTENT_TYPE_LABEL: Record<string, string> = {
   email: "Email",
   video: "Video script",
 };
+
+// Same reliable cross-origin download pattern PostCard uses in
+// marketing.tsx (a plain `download` attribute is unreliable cross-origin) —
+// duplicated here rather than imported since routes don't currently share a
+// components module.
+async function downloadRemoteFile(url: string, filename: string) {
+  try {
+    const res = await fetch(url);
+    if (!res.ok) throw new Error(`${res.status}`);
+    const blob = await res.blob();
+    const objectUrl = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = objectUrl;
+    link.download = filename;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    URL.revokeObjectURL(objectUrl);
+  } catch {
+    window.open(url, "_blank", "noreferrer");
+  }
+}
 
 function ReviewCard({
   post,
@@ -72,7 +98,9 @@ function ReviewCard({
     setBusy(true);
     setError(null);
     try {
-      await submitPublicReviewFeedback({ data: { token, postId: post.id, ...(notes.trim() ? { notes: notes.trim() } : {}) } });
+      await submitPublicReviewFeedback({
+        data: { token, postId: post.id, ...(notes.trim() ? { notes: notes.trim() } : {}) },
+      });
       setFlagging(false);
       setNotes("");
       onChanged(post.id, "flagged");
@@ -89,69 +117,127 @@ function ReviewCard({
       : post.status === "flagged"
         ? "bg-destructive/10 text-destructive"
         : "bg-muted text-muted-foreground";
-  const statusLabel = post.status === "approved" ? "Approved" : post.status === "flagged" ? "Flagged" : "Pending review";
+  const statusLabel =
+    post.status === "approved" ? "Approved" : post.status === "flagged" ? "Flagged" : "Pending review";
+  const typeLabel = CONTENT_TYPE_LABEL[post.content_type] ?? post.content_type;
+  const photoUrl = post.metadata?.media_url || post.metadata?.drive_thumbnail_url || null;
 
   return (
-    <div className="rounded-2xl border border-border bg-glass p-5">
-      <div className="flex flex-wrap items-center justify-between gap-2">
-        <span className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
-          {CONTENT_TYPE_LABEL[post.content_type] ?? post.content_type}
-        </span>
-        <span className={`rounded-full px-3 py-1 text-xs font-semibold ${statusStyles}`}>{statusLabel}</span>
-      </div>
-      {post.title && <p className="mt-2 text-sm font-semibold">{post.title}</p>}
-      <p className="mt-2 whitespace-pre-wrap text-sm text-foreground">{post.content}</p>
-
-      {error && <p className="mt-2 text-xs text-destructive">{error}</p>}
-
-      {post.status !== "approved" && !flagging && (
-        <div className="mt-4 flex gap-2">
-          <button
-            onClick={approve}
-            disabled={busy}
-            className="rounded-full bg-primary px-5 py-2 text-sm font-semibold text-primary-foreground shadow-lg shadow-primary/30 transition-all hover:-translate-y-0.5 disabled:cursor-not-allowed disabled:opacity-50"
-          >
-            {busy ? "Approving…" : "Approve"}
-          </button>
-          <button
-            onClick={() => setFlagging(true)}
-            disabled={busy}
-            className="rounded-full border border-destructive/40 px-5 py-2 text-sm font-semibold text-destructive transition-all hover:bg-destructive/10 disabled:cursor-not-allowed disabled:opacity-50"
-          >
-            Flag this one
-          </button>
+    <div className="rounded-3xl border border-border bg-glass p-6 backdrop-blur-2xl">
+      {/* Header — same layout PostCard uses: type/platform/month line, then
+          title, badge on the right. */}
+      <div className="flex w-full items-center justify-between gap-3 text-left">
+        <div>
+          <p className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
+            {typeLabel}
+            {post.platform ? ` · ${post.platform}` : ""}
+            {post.month ? ` · ${post.month}` : ""}
+          </p>
+          {post.title && <h3 className="mt-1 font-display text-base font-semibold">{post.title}</h3>}
         </div>
-      )}
+        <span className={`shrink-0 rounded-full px-3 py-1 text-xs font-semibold ${statusStyles}`}>{statusLabel}</span>
+      </div>
 
-      {flagging && (
-        <div className="mt-4 space-y-2">
-          <textarea
-            value={notes}
-            onChange={(e) => setNotes(e.target.value)}
-            placeholder="What should change? (optional, but helps us get it right next time)"
-            className="min-h-[70px] w-full rounded-xl border border-border bg-glass px-3 py-2 text-sm outline-none"
-          />
-          <div className="flex gap-2">
+      <div className="mt-4 border-t border-border pt-4">
+        {/* Photo — same block PostCard renders for a post, added here
+            2026-09-29 so this page is no longer plain text next to the
+            admin view that shows the actual photo. */}
+        {post.content_type === "post" && photoUrl && (
+          <div className="mb-3 overflow-hidden rounded-2xl border border-border bg-muted">
+            {post.metadata?.media_type === "video" ? (
+              <video src={photoUrl} controls className="max-h-64 w-full object-contain" />
+            ) : (
+              <img src={photoUrl} alt="" className="max-h-64 w-full object-contain" />
+            )}
             <button
-              onClick={sendFlag}
+              onClick={() => downloadRemoteFile(photoUrl, photoUrl.split("/").pop() || "photo")}
+              className="w-full border-t border-border bg-glass py-1 text-[11px] font-semibold text-muted-foreground transition-colors hover:bg-secondary hover:text-foreground"
+            >
+              ⬇ Download
+            </button>
+          </div>
+        )}
+        {post.content_type === "post" && photoUrl && post.metadata?.unsplash_photographer && (
+          <p className="-mt-2 mb-3 text-[11px] text-muted-foreground">
+            Photo by{" "}
+            <a
+              href={post.metadata.unsplash_credit_url ?? "https://unsplash.com"}
+              target="_blank"
+              rel="noreferrer"
+              className="underline hover:text-foreground"
+            >
+              {post.metadata.unsplash_photographer}
+            </a>{" "}
+            on Unsplash
+          </p>
+        )}
+
+        <p className="whitespace-pre-wrap text-sm leading-relaxed">{post.content}</p>
+
+        {post.metadata?.canva_link && (
+          <>
+            <a
+              href={post.metadata.canva_link}
+              target="_blank"
+              rel="noreferrer"
+              className="mt-2 inline-block text-xs font-semibold text-primary hover:underline"
+            >
+              Open Canva template →
+            </a>
+          </>
+        )}
+
+        {error && <p className="mt-2 text-xs text-destructive">{error}</p>}
+
+        {post.status !== "approved" && !flagging && (
+          <div className="mt-4 flex flex-wrap gap-2">
+            <button
+              onClick={approve}
+              disabled={busy}
+              className="rounded-full bg-primary px-5 py-2 text-sm font-semibold text-primary-foreground shadow-lg shadow-primary/30 transition-all hover:-translate-y-0.5 disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              {busy ? "Approving…" : "Approve"}
+            </button>
+            <button
+              onClick={() => setFlagging(true)}
               disabled={busy}
               className="rounded-full border border-destructive/40 px-5 py-2 text-sm font-semibold text-destructive transition-all hover:bg-destructive/10 disabled:cursor-not-allowed disabled:opacity-50"
             >
-              {busy ? "Sending…" : "Send flag"}
-            </button>
-            <button
-              onClick={() => {
-                setFlagging(false);
-                setNotes("");
-              }}
-              disabled={busy}
-              className="rounded-full border border-border bg-glass px-5 py-2 text-sm font-semibold transition-all hover:bg-secondary disabled:cursor-not-allowed disabled:opacity-50"
-            >
-              Cancel
+              Flag this one
             </button>
           </div>
-        </div>
-      )}
+        )}
+
+        {flagging && (
+          <div className="mt-4 space-y-2">
+            <textarea
+              value={notes}
+              onChange={(e) => setNotes(e.target.value)}
+              placeholder="What should change? (optional, but helps us get it right next time)"
+              className="min-h-[70px] w-full rounded-xl border border-border bg-glass px-3 py-2 text-sm outline-none"
+            />
+            <div className="flex gap-2">
+              <button
+                onClick={sendFlag}
+                disabled={busy}
+                className="rounded-full border border-destructive/40 px-5 py-2 text-sm font-semibold text-destructive transition-all hover:bg-destructive/10 disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                {busy ? "Sending…" : "Send flag"}
+              </button>
+              <button
+                onClick={() => {
+                  setFlagging(false);
+                  setNotes("");
+                }}
+                disabled={busy}
+                className="rounded-full border border-border bg-glass px-5 py-2 text-sm font-semibold transition-all hover:bg-secondary disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                Cancel
+              </button>
+            </div>
+          </div>
+        )}
+      </div>
     </div>
   );
 }
@@ -206,15 +292,13 @@ function PublicReviewPage() {
         {!linkError && agentName && (
           <>
             <p className="mt-1 text-sm text-muted-foreground">
-              Hey <span className="font-semibold text-foreground">{agentName}</span> — take a look below.
-              Approve what sounds like you, flag anything that doesn't. No account needed.
+              Hey <span className="font-semibold text-foreground">{agentName}</span> — take a look below. Approve what
+              sounds like you, flag anything that doesn't. No account needed.
             </p>
 
             {months && months.length > 1 && (
               <div className="mt-4 flex items-center gap-2">
-                <span className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
-                  Month
-                </span>
+                <span className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">Month</span>
                 <select
                   value={month}
                   onChange={(e) => setMonth(e.target.value)}
@@ -231,9 +315,9 @@ function PublicReviewPage() {
 
             {confirmNote && <p className="mt-4 text-sm font-semibold text-primary">{confirmNote}</p>}
 
-            <div className="mt-4 space-y-3">
+            <div className="mt-4 space-y-4">
               {months !== null && months.length === 0 && (
-                <div className="rounded-2xl border border-border bg-glass p-5">
+                <div className="rounded-3xl border border-border bg-glass p-6 backdrop-blur-2xl">
                   <p className="text-sm text-muted-foreground">Nothing here to review yet.</p>
                 </div>
               )}

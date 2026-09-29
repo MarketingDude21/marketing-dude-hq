@@ -45,6 +45,49 @@ const CONTENT_TYPE_LABEL: Record<string, string> = {
   video: "Video script",
 };
 
+// Same grouping the admin calendar view uses (marketing.tsx's CATEGORY_ORDER
+// / CATEGORY_META / categorizePost / BatchSection) — duplicated here rather
+// than imported since routes don't currently share a components module.
+// Added 2026-09-29, second pass, per Mike: "It needs to be identical to
+// exactly the view in the interface... Right now it's listed out one[-column
+// list]... it should be two by two." The first restyle pass (same day) fixed
+// each individual card's look (photo, styling) but still rendered every post
+// in one flat single-column list — this pass fixes the actual PAGE LAYOUT to
+// match: grouped by content type with the same icon/label headers, laid out
+// in the same responsive 2-column grid, in the same fixed order.
+type ContentCategory = "post" | "canva" | "email" | "video";
+
+const CATEGORY_ORDER: ContentCategory[] = ["post", "canva", "email", "video"];
+
+const CATEGORY_META: Record<ContentCategory, { label: string; icon: string; accent: string }> = {
+  post: {
+    label: "Posts",
+    icon: "📝",
+    accent: "border-sky-500/30 bg-sky-500/10 text-sky-700 dark:text-sky-300",
+  },
+  canva: {
+    label: "Canva Templates",
+    icon: "🎨",
+    accent: "border-violet-500/30 bg-violet-500/10 text-violet-700 dark:text-violet-300",
+  },
+  email: {
+    label: "Emails",
+    icon: "✉️",
+    accent: "border-emerald-500/30 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300",
+  },
+  video: {
+    label: "Video Scripts",
+    icon: "🎬",
+    accent: "border-amber-500/30 bg-amber-500/10 text-amber-700 dark:text-amber-300",
+  },
+};
+
+function categorizePost(post: PostRow): ContentCategory {
+  if (post.content_type === "email") return "email";
+  if (post.content_type === "video") return "video";
+  return post.metadata?.canva_link ? "canva" : "post";
+}
+
 // Same reliable cross-origin download pattern PostCard uses in
 // marketing.tsx (a plain `download` attribute is unreliable cross-origin) —
 // duplicated here rather than imported since routes don't currently share a
@@ -282,7 +325,11 @@ function PublicReviewPage() {
 
   return (
     <div className="min-h-screen bg-background px-4 py-10">
-      <div className="mx-auto w-full max-w-2xl">
+      {/* max-w-7xl matches AppShell's own content width (the admin app's
+          <main> wrapper) — widened from max-w-2xl 2026-09-29 alongside the
+          2-column grid below, so this page isn't artificially narrower than
+          the admin view it's supposed to be identical to. */}
+      <div className="mx-auto w-full max-w-7xl">
         <h1 className="font-display text-xl font-semibold">Review your content</h1>
 
         {linkError && <p className="mt-3 text-sm text-destructive">{linkError}</p>}
@@ -315,7 +362,7 @@ function PublicReviewPage() {
 
             {confirmNote && <p className="mt-4 text-sm font-semibold text-primary">{confirmNote}</p>}
 
-            <div className="mt-4 space-y-4">
+            <div className="mt-4 space-y-6">
               {months !== null && months.length === 0 && (
                 <div className="rounded-3xl border border-border bg-glass p-6 backdrop-blur-2xl">
                   <p className="text-sm text-muted-foreground">Nothing here to review yet.</p>
@@ -325,7 +372,29 @@ function PublicReviewPage() {
                 <p className="text-sm text-muted-foreground">Loading…</p>
               )}
               {posts !== null &&
-                posts.map((p) => <ReviewCard key={p.id} post={p} token={token} onChanged={handleChanged} />)}
+                CATEGORY_ORDER.map((cat) => {
+                  const group = posts.filter((p) => categorizePost(p) === cat);
+                  if (!group.length) return null;
+                  const meta = CATEGORY_META[cat];
+                  return (
+                    <div key={cat}>
+                      <div
+                        className={`mb-3 inline-flex items-center gap-2 rounded-full border px-3 py-1 text-xs font-semibold uppercase tracking-wider ${meta.accent}`}
+                      >
+                        <span aria-hidden="true">{meta.icon}</span>
+                        <span>{meta.label}</span>
+                        <span className="rounded-full bg-background/70 px-1.5 py-0.5 text-[10px] font-bold">
+                          {group.length}
+                        </span>
+                      </div>
+                      <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
+                        {group.map((p) => (
+                          <ReviewCard key={p.id} post={p} token={token} onChanged={handleChanged} />
+                        ))}
+                      </div>
+                    </div>
+                  );
+                })}
             </div>
 
             {posts !== null && posts.length > 0 && (

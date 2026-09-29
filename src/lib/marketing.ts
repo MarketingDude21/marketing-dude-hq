@@ -2479,6 +2479,82 @@ async function fetchDriveFilesByIds(fileIds: string[], accessToken: string): Pro
   return results.filter((f): f is DriveFile => Boolean(f));
 }
 
+// Added 2026-09-29 — root cause of Mike's "empty photo slots when you click
+// on the images" report. mapDriveApiFile's thumbnailUrl (`drive.google.com/
+// thumbnail?id=...`) is a raw, unauthenticated hotlink; the browser loads it
+// with whatever Google session it happens to have (usually none), not the
+// app's own connected Drive account. Since a folder is now shared privately
+// with that one OAuth account rather than "anyone with the link" (see the
+// OAuth rewrite comment above getDriveAccessToken), that hotlink 403s or
+// silently returns nothing for the vast majority of files — a blank image
+// box in a bordered button looks exactly like "an empty photo slot."
+//
+// Fix: fetch each thumbnail SERVER-SIDE with the real access token (files.get
+// for its thumbnailLink, then GET that link with the same auth header) and
+// hand the browser a data: URI it can always render, no session required.
+// Kept as a separate batched call rather than folded into the file-listing
+// functions above so opening the picker still shows filenames/grid instantly
+// while thumbnails fill in a beat later, instead of blocking the whole list
+// on N thumbnail round trips.
+async function fetchDriveThumbnailDataUrl(fileId: string, accessToken: string): Promise<string | null> {
+  try {
+    const metaUrl = `https://www.googleapis.com/drive/v3/files/${fileId}?fields=thumbnailLink&supportsAllDrives=true`;
+    const metaRes = await fetchWithTimeout(metaUrl, { headers: driveAuthHeaders(accessToken) }, 10_000);
+    if (!metaRes.ok) return null;
+    const meta = (await metaRes.json()) as { thumbnailLink?: string };
+    if (!meta.thumbnailLink) return null;
+    // thumbnailLink defaults to a small ~220px image — bump it up for a
+    // crisper picker grid (Drive honors a trailing =sNNN size override).
+    const link = meta.thumbnailLink.replace(/=s\d+$/, "=s400");
+    const imgRes = await fetchWithTimeout(link, { headers: driveAuthHeaders(accessToken) }, 10_000);
+    if (!imgRes.ok) return null;
+    const buf = await imgRes.arrayBuffer();
+    const contentType = imgRes.headers.get("content-type") || "image/jpeg";
+    return `data:${contentType};base64,${Buffer.from(buf).toString("base64")}`;
+  } catch {
+    return null;
+  }
+}
+
+// Capped so one card's picker can never trigger an unbounded burst of Drive
+// API calls (a folder with hundreds of files) — the grid still renders every
+// file's name/slot from the list call above; only thumbnails beyond the cap
+// fall back to the raw hotlink (rare, and better than none at all).
+const DRIVE_THUMBNAIL_BATCH_CAP = 60;
+
+async function fetchDriveThumbnailBatch(
+  fileIds: string[],
+  accessToken: string,
+): Promise<Record<string, string | null>> {
+  const capped = fileIds.slice(0, DRIVE_THUMBNAIL_BATCH_CAP);
+  const pairs = await mapLimit(
+    capped,
+    4,
+    async (id) => [id, await fetchDriveThumbnailDataUrl(id, accessToken)] as const,
+  );
+  return Object.fromEntries(pairs);
+}
+
+// Admin/agent-logged-in side.
+export const getDriveThumbnails = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator((data: { agentId: string; fileIds: string[] }) => data)
+  .handler(async ({ data, context }): Promise<{ thumbnails: Record<string, string | null> }> => {
+    const email = (context.claims as { email?: string } | undefined)?.email;
+    await requireAgentAccess(context.userId, email, data.agentId);
+    const accessToken = await getDriveAccessToken();
+    return { thumbnails: await fetchDriveThumbnailBatch(data.fileIds, accessToken) };
+  });
+
+// Public — token-resolved twin for the client review link's Drive tab.
+export const getPublicReviewDriveThumbnails = createServerFn({ method: "POST" })
+  .inputValidator((data: { token: string; fileIds: string[] }) => data)
+  .handler(async ({ data }): Promise<{ thumbnails: Record<string, string | null> }> => {
+    await resolveAgentIdFromReviewToken(data.token);
+    const accessToken = await getDriveAccessToken();
+    return { thumbnails: await fetchDriveThumbnailBatch(data.fileIds, accessToken) };
+  });
+
 export const listAgentDriveMedia = createServerFn({ method: "GET" })
   .middleware([requireSupabaseAuth])
   .inputValidator((data: { agentId: string; status?: "available" | "used" }) => data)
@@ -2605,6 +2681,194 @@ export const setPublicReviewDrivePhoto = createServerFn({ method: "POST" })
     });
 
     return { ok: true };
+  });
+
+// ============================================================================
+// Public — email multi-photo attachments, added 2026-09-29 per Mike: the
+// public review link had full edit/rewrite/photo parity for regular posts
+// but emails got no photo UI at all there (EmailPhotosPanel was admin-only).
+// Token-resolved twins of addEmailPhotoFromLibrary/addEmailPhotoFromDrive/
+// addEmailPhotoFromUnsplash/updateEmailPhotoInstructions/removeEmailPhoto —
+// reuse the same requireEmailPost/writeEmailPhotos helpers above, just
+// resolving the agent from the review token instead of a logged-in session.
+// ============================================================================
+
+export const addPublicReviewEmailPhotoFromLibrary = createServerFn({ method: "POST" })
+  .inputValidator((data: { token: string; postId: string; mediaId: string }) => data)
+  .handler(async ({ data }): Promise<{ photos: EmailPhoto[] }> => {
+    const { agentId } = await resolveAgentIdFromReviewToken(data.token);
+    const photos = await requireEmailPost(agentId, data.postId);
+    if (photos.length >= MAX_EMAIL_PHOTOS) {
+      throw new Error(`Emails can only carry up to ${MAX_EMAIL_PHOTOS} photos — remove one first.`);
+    }
+    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+    const { data: media, error: mediaErr } = await supabaseAdmin
+      .from("agent_photos")
+      .select("id, url, media_type, agent_id")
+      .eq("id", data.mediaId)
+      .maybeSingle();
+    if (mediaErr) throw mediaErr;
+    if (!media || media.agent_id !== agentId || !media.url) {
+      throw new Error("That media item doesn't belong to this agent.");
+    }
+    const next: EmailPhoto[] = [
+      ...photos,
+      {
+        id: crypto.randomUUID(),
+        source: "library",
+        url: media.url,
+        mediaType: media.media_type as "photo" | "video",
+        publishingInstructions: "",
+      },
+    ];
+    await writeEmailPhotos(data.postId, next);
+    await supabaseAdmin.from("feedback_history").insert({
+      agent_id: agentId,
+      post_id: data.postId,
+      rating: "photo_changed",
+      notes: `Email photo added from Media Library (${next.length}/${MAX_EMAIL_PHOTOS}).`,
+    });
+    return { photos: next };
+  });
+
+export const addPublicReviewEmailPhotoFromDrive = createServerFn({ method: "POST" })
+  .inputValidator((data: { token: string; postId: string; driveFileId: string; thumbnailUrl: string }) => data)
+  .handler(async ({ data }): Promise<{ photos: EmailPhoto[] }> => {
+    const { agentId } = await resolveAgentIdFromReviewToken(data.token);
+    const photos = await requireEmailPost(agentId, data.postId);
+    if (photos.length >= MAX_EMAIL_PHOTOS) {
+      throw new Error(`Emails can only carry up to ${MAX_EMAIL_PHOTOS} photos — remove one first.`);
+    }
+    const next: EmailPhoto[] = [
+      ...photos,
+      {
+        id: crypto.randomUUID(),
+        source: "drive",
+        url: data.thumbnailUrl,
+        mediaType: "photo",
+        driveFileId: data.driveFileId,
+        publishingInstructions: "",
+      },
+    ];
+    await writeEmailPhotos(data.postId, next);
+    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+    await supabaseAdmin.from("feedback_history").insert({
+      agent_id: agentId,
+      post_id: data.postId,
+      rating: "photo_changed",
+      notes: `Email photo added from Google Drive (${next.length}/${MAX_EMAIL_PHOTOS}).`,
+    });
+    return { photos: next };
+  });
+
+export const addPublicReviewEmailPhotoFromUnsplash = createServerFn({ method: "POST" })
+  .inputValidator(
+    (data: {
+      token: string;
+      postId: string;
+      photoUrl: string;
+      photographerName: string;
+      photographerProfileUrl: string;
+    }) => data,
+  )
+  .handler(async ({ data }): Promise<{ photos: EmailPhoto[] }> => {
+    const { agentId } = await resolveAgentIdFromReviewToken(data.token);
+    const photos = await requireEmailPost(agentId, data.postId);
+    if (photos.length >= MAX_EMAIL_PHOTOS) {
+      throw new Error(`Emails can only carry up to ${MAX_EMAIL_PHOTOS} photos — remove one first.`);
+    }
+    const next: EmailPhoto[] = [
+      ...photos,
+      {
+        id: crypto.randomUUID(),
+        source: "unsplash",
+        url: data.photoUrl,
+        mediaType: "photo",
+        unsplashPhotographer: data.photographerName,
+        unsplashCreditUrl: data.photographerProfileUrl,
+        publishingInstructions: "",
+      },
+    ];
+    await writeEmailPhotos(data.postId, next);
+    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+    await supabaseAdmin.from("feedback_history").insert({
+      agent_id: agentId,
+      post_id: data.postId,
+      rating: "photo_changed",
+      notes: `Email photo added from Unsplash (${next.length}/${MAX_EMAIL_PHOTOS}).`,
+    });
+    return { photos: next };
+  });
+
+export const updatePublicReviewEmailPhotoInstructions = createServerFn({ method: "POST" })
+  .inputValidator((data: { token: string; postId: string; photoId: string; publishingInstructions: string }) => data)
+  .handler(async ({ data }): Promise<{ photos: EmailPhoto[] }> => {
+    const { agentId } = await resolveAgentIdFromReviewToken(data.token);
+    const photos = await requireEmailPost(agentId, data.postId);
+    const next = photos.map((p) =>
+      p.id === data.photoId ? { ...p, publishingInstructions: data.publishingInstructions } : p,
+    );
+    await writeEmailPhotos(data.postId, next);
+    return { photos: next };
+  });
+
+export const removePublicReviewEmailPhoto = createServerFn({ method: "POST" })
+  .inputValidator((data: { token: string; postId: string; photoId: string }) => data)
+  .handler(async ({ data }): Promise<{ photos: EmailPhoto[] }> => {
+    const { agentId } = await resolveAgentIdFromReviewToken(data.token);
+    const photos = await requireEmailPost(agentId, data.postId);
+    const next = photos.filter((p) => p.id !== data.photoId);
+    await writeEmailPhotos(data.postId, next);
+    return { photos: next };
+  });
+
+// Public — token-resolved twin of searchUnsplashPhotos, so the public email
+// photo panel can offer the same Stock Photos tab admin has.
+export const searchPublicReviewUnsplashPhotos = createServerFn({ method: "POST" })
+  .inputValidator((data: { token: string; query: string }) => data)
+  .handler(async ({ data }): Promise<{ results: UnsplashResult[] }> => {
+    await resolveAgentIdFromReviewToken(data.token);
+    const key = process.env["UNSPLASH_ACCESS_KEY"]?.trim();
+    if (!key) {
+      throw new Error("Stock photos aren't connected yet.");
+    }
+    const query = data.query.trim() || "lifestyle";
+    const url =
+      "https://api.unsplash.com/search/photos?per_page=8&query=" + encodeURIComponent(query) + "&client_id=" + key;
+    const res = await fetch(url);
+    const bodyText = await res.text();
+    let json: {
+      results?: {
+        id: string;
+        urls?: { small?: string; regular?: string };
+        links?: { html?: string };
+        user?: { name?: string; links?: { html?: string } };
+      }[];
+      errors?: string[];
+    };
+    try {
+      json = JSON.parse(bodyText);
+    } catch {
+      if (res.status === 403 || res.status === 429) {
+        throw new Error("Unsplash is temporarily rate-limited — try again in a bit.");
+      }
+      throw new Error(`Unsplash returned an unexpected response (status ${res.status}).`);
+    }
+    if (!res.ok) {
+      throw new Error(json.errors?.[0] ?? `Unsplash API error (${res.status})`);
+    }
+    const results: UnsplashResult[] = (json.results ?? [])
+      .filter((r) => r.urls?.small && r.urls?.regular)
+      .slice(0, 8)
+      .map((r) => ({
+        id: r.id,
+        thumbUrl: r.urls!.small!,
+        fullUrl: r.urls!.regular!,
+        photographerName: r.user?.name ?? "Unsplash photographer",
+        photographerProfileUrl: r.user?.links?.html ?? "https://unsplash.com",
+        unsplashPageUrl: r.links?.html ?? "https://unsplash.com",
+      }));
+    return { results };
   });
 
 // Added 2026-09-21 per Mike: "photos on the approve all did not move, they
@@ -3772,7 +4036,12 @@ export const generateMonthlyBatch = createServerFn({ method: "POST" })
               `EMAIL GOAL:\n${ed.goal || ""}\n\n` +
               `FULL BRIEF:\n${instructions}\n\n` +
               "CRITICAL: Write this as three to four natural observations that flow into each other. Do NOT use headers. Do NOT use bullet lists. Do NOT structure this as a newsletter with named sections. Each observation transitions naturally into the next. The real estate mention is one short paragraph near the end, treated as a casual aside — not a featured section. End with one or two lines. No call to action. No pitch. " +
-              `This should read like a personal note from someone who lives in ${agentCity} and noticed a few things worth sharing. If it reads like a newsletter when done, it is wrong. Replace all [CITY], [NAME] placeholders with ${agentName} and ${agentCity}.\n` +
+              // Fixed 2026-09-29 per Mike: this list was backwards — [CITY]
+              // was being replaced with the agent's NAME and [NAME] with the
+              // agent's CITY, so every "Local Letter" style email came out
+              // with the agent's DNA profile fields swapped. Order here must
+              // match the [CITY], [NAME] order named just before it.
+              `This should read like a personal note from someone who lives in ${agentCity} and noticed a few things worth sharing. If it reads like a newsletter when done, it is wrong. Replace all [CITY], [NAME] placeholders with ${agentCity} and ${agentName}.\n` +
               "NO hyphens. NO corporate language. NO AI tell phrases. Standard capitalization always." +
               learnedFeedback +
               "\n\nOutput format:\nSUBJECT OPTIONS:\n1. [subject]\n2. [subject]\n3. [subject]\n\nEMAIL BODY:\n[full email — reads like a note, not a newsletter]";
@@ -3782,7 +4051,9 @@ export const generateMonthlyBatch = createServerFn({ method: "POST" })
               `VOICE DNA:\n${dna}\n\n` +
               `EMAIL GOAL:\n${ed.goal || ""}\n\n` +
               `BRIEF TO FOLLOW:\n${instructions}\n\n` +
-              `Write this email EXACTLY as ${agentName} would write it based on their Voice DNA above. Replace all [CITY], [NAME], [CITY, STATE] placeholders with ${agentName} and ${agentCity}.\n` +
+              // Same [CITY]/[NAME] swap fixed here (2026-09-29) — see the
+              // Local Letter branch above for the full explanation.
+              `Write this email EXACTLY as ${agentName} would write it based on their Voice DNA above. Replace all [CITY], [NAME], [CITY, STATE] placeholders with ${agentCity} and ${agentName}.\n` +
               "NO hyphens. NO corporate language. NO AI-tell phrases. Standard capitalization always." +
               learnedFeedback +
               "\n\n" +
@@ -3797,8 +4068,14 @@ export const generateMonthlyBatch = createServerFn({ method: "POST" })
             `You are personalizing a pre-written real estate email for ${agentName} in ${agentCity}.\n\n` +
             `VOICE DNA (use this to lightly align tone, do NOT rewrite the email):\n${dna}\n\n` +
             `PRE-WRITTEN EMAIL (keep this mostly intact — only replace placeholders and fix any [CITY]/[NAME] references):\n${instructions}\n\n` +
-            `Rules:\n- Do NOT rewrite or restructure this email\n- Replace [CITY], [NAME], [CITY, STATE] with ${agentName} and ${agentCity}\n- Fix any placeholder brackets that are still unfilled\n- NO hyphens. NO corporate language. Standard capitalization.\n\n` +
-            `Output format:\nSUBJECT OPTIONS:\n${subjectBlock}\n\nEMAIL BODY:\n[the personalized email]`;
+            // Same [CITY]/[NAME] swap fixed here (2026-09-29), plus this
+            // branch — pre-written emails that already have a complete body
+            // — was the one place learnedFeedback never got folded in, so
+            // reviewer-taught lessons silently never reached these emails
+            // while post/video/the other two email branches always got them.
+            `Rules:\n- Do NOT rewrite or restructure this email\n- Replace [CITY], [NAME], [CITY, STATE] with ${agentCity} and ${agentName}\n- Fix any placeholder brackets that are still unfilled\n- NO hyphens. NO corporate language. Standard capitalization.\n\n` +
+            learnedFeedback +
+            `\n\nOutput format:\nSUBJECT OPTIONS:\n${subjectBlock}\n\nEMAIL BODY:\n[the personalized email]`;
         }
 
         try {

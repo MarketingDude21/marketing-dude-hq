@@ -659,6 +659,30 @@ function PageHeader({
 
 function Workspace({ agentId, agentEmail, isAdmin }: { agentId: string; agentEmail: string | null; isAdmin: boolean }) {
   const [tab, setTab] = useState<"posts" | "calendar" | "media" | "drive">("posts");
+  // Which month's workspace is open on the calendar tab — LIFTED UP here
+  // from ContentCalendarTab (2026-09-29) per Mike: "anytime you click off or
+  // you move to another screen and you come back to the generate my monthly
+  // content calendar screen, you have to click on the month... it should
+  // stay open to what was generated on that one screen and not reset ever."
+  // Root cause: this whole tab body was only rendered while `tab ===
+  // "calendar"` below, so switching to Media/Drive/Posts and back fully
+  // UNMOUNTED ContentCalendarTab, wiping its local `activeMonth` state along
+  // with it — that's the "have to click the month again" bug. Living here
+  // instead, in the parent that never unmounts on a tab switch, means the
+  // open month survives switching tabs and back. Reset to null (back to the
+  // month picker) only happens on an actual agent change (see the key on
+  // Workspace's caller) or when ContentCalendarTab itself calls onBack.
+  const [activeMonth, setActiveMonth] = useState<CalendarMonth | null>(null);
+  // Reset which month is open when the agent actually changes (admin
+  // switching "Change agent") — Workspace itself is never unmounted by a
+  // tab switch, only re-rendered, so this only fires on a genuine agentId
+  // change, not on every tab click. ContentCalendarTab's own effect no
+  // longer resets activeMonth itself (that's what re-broke this every time
+  // it remounted on a tab switch) — this is the one place that does now.
+  useEffect(() => {
+    setActiveMonth(null);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [agentId]);
   return (
     <div className="mt-5">
       {/* Heading + mobile-centered nav, added 2026-09-23 per Mike: "it needs
@@ -692,7 +716,14 @@ function Workspace({ agentId, agentEmail, isAdmin }: { agentId: string; agentEma
       </div>
       <div className="mt-5">
         {tab === "posts" && <PostsTab agentId={agentId} isAdmin={isAdmin} />}
-        {tab === "calendar" && <ContentCalendarTab agentId={agentId} isAdmin={isAdmin} />}
+        {tab === "calendar" && (
+          <ContentCalendarTab
+            agentId={agentId}
+            isAdmin={isAdmin}
+            activeMonth={activeMonth}
+            setActiveMonth={setActiveMonth}
+          />
+        )}
         {tab === "media" && <MediaTab agentId={agentId} isAdmin={isAdmin} />}
         {tab === "drive" && <DriveTab agentId={agentId} agentEmail={agentEmail} isAdmin={isAdmin} />}
       </div>
@@ -3291,10 +3322,26 @@ function CalendarMonthItemsScreen({ month, onBack }: { month: CalendarMonth; onB
   );
 }
 
-function ContentCalendarTab({ agentId, isAdmin }: { agentId: string; isAdmin: boolean }) {
+function ContentCalendarTab({
+  agentId,
+  isAdmin,
+  activeMonth,
+  setActiveMonth,
+}: {
+  agentId: string;
+  isAdmin: boolean;
+  // Lifted up to Workspace (2026-09-29) so it survives this component being
+  // unmounted/remounted on every tab switch — see the comment on Workspace.
+  activeMonth: CalendarMonth | null;
+  setActiveMonth: (m: CalendarMonth | null) => void;
+}) {
   const [months, setMonths] = useState<CalendarMonth[] | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [activeMonth, setActiveMonth] = useState<CalendarMonth | null>(null);
+  // Only auto-opens the single active month ONCE per real mount of this
+  // component (see the effect below) — doesn't fight the "← All months"
+  // back button if the user explicitly clicked it and then switched tabs
+  // away and back before this component's next full remount.
+  const autoOpenedRef = useRef(false);
   // Added 2026-09-20 per Mike's follow-up screenshot: "On this screen for
   // both admin and agent view there should be an archive button that can be
   // clicked and that month can be archived." The archive/restore machinery
@@ -3349,13 +3396,25 @@ function ContentCalendarTab({ agentId, isAdmin }: { agentId: string; isAdmin: bo
   useEffect(() => {
     setMonths(null);
     setError(null);
-    setActiveMonth(null);
     setCounts({});
     setArchivedCounts({});
     listCalendarMonths()
       .then((m) => {
         setMonths(m);
         loadCountsFor(m);
+        // Auto-open the month instead of making every visit start at the
+        // picker — added 2026-09-29 per Mike: "once it's generated... it
+        // should stay open to what was generated on that one screen and not
+        // reset ever... unless someone archives or deletes that month's
+        // content." Combined with lifting activeMonth up to Workspace, this
+        // means: with the usual one-active-month setup, the workspace opens
+        // straight to it on first load and stays open across tab switches;
+        // with more than one month, the picker still shows (no way to guess
+        // which one is meant), same as before.
+        if (!activeMonth && !autoOpenedRef.current && m.length === 1) {
+          autoOpenedRef.current = true;
+          setActiveMonth(m[0]!);
+        }
       })
       .catch((e) => setError(e instanceof Error ? e.message : String(e)));
     // eslint-disable-next-line react-hooks/exhaustive-deps

@@ -1962,6 +1962,11 @@ export const rewritePublicReviewPost = createServerFn({ method: "POST" })
 
 // Public — Media Library options for the post-photo picker, "available"
 // status only (same default the admin picker uses), token-resolved.
+// WIDENED 2026-09-29 per Mike: "grey out photos that are already be used
+// or selected so everyone knows. This applies across board no matter who
+// is logged in" — used to only ever return "available" media (used ones
+// fully hidden); now returns every status so the picker can show used
+// photos greyed out instead, same as the admin picker.
 export const listPublicReviewMedia = createServerFn({ method: "POST" })
   .inputValidator((data: { token: string }) => data)
   .handler(async ({ data }): Promise<MediaRow[]> => {
@@ -1971,7 +1976,6 @@ export const listPublicReviewMedia = createServerFn({ method: "POST" })
       .from("agent_photos")
       .select("id, url, caption, tags, media_type, source, status, created_at, used_at")
       .eq("agent_id", agentId)
-      .eq("status", "available")
       .order("created_at", { ascending: false });
     if (error) throw error;
     return (rows ?? []) as MediaRow[];
@@ -2574,7 +2578,7 @@ export const getPublicReviewDriveThumbnails = createServerFn({ method: "POST" })
 
 export const listAgentDriveMedia = createServerFn({ method: "GET" })
   .middleware([requireSupabaseAuth])
-  .inputValidator((data: { agentId: string; status?: "available" | "used" }) => data)
+  .inputValidator((data: { agentId: string; status?: "available" | "used" | "all" }) => data)
   .handler(async ({ data, context }): Promise<{ folderId: string | null; files: DriveFile[] }> => {
     const email = (context.claims as { email?: string } | undefined)?.email;
     await requireAgentAccess(context.userId, email, data.agentId);
@@ -2601,37 +2605,57 @@ export const listAgentDriveMedia = createServerFn({ method: "GET" })
     if (trackedErr) throw trackedErr;
     const trackedUsed = new Map((trackedRows ?? []).map((r) => [r.drive_file_id as string, r.used_at as string]));
 
-    if ((data.status ?? "available") === "used") {
-      // Two sources, merged: (1) whatever's structurally sitting inside a
-      // real "used" subfolder in Drive right now (a legacy client's old
-      // workflow, or a manual move) — see listDriveUsedFolderIds — and
-      // (2) anything OUR app has marked used via approve/Mark used, which
-      // may or may not also be one of those structural files. De-duped by
-      // file id so something in both places only shows once.
-      const structural = await fetchDriveUsedFiles(folderId, accessToken);
+    // Two sources, merged: (1) whatever's structurally sitting inside a
+    // real "used" subfolder in Drive right now (a legacy client's old
+    // workflow, or a manual move) — see listDriveUsedFolderIds — and
+    // (2) anything OUR app has marked used via approve/Mark used, which
+    // may or may not also be one of those structural files. De-duped by
+    // file id so something in both places only shows once.
+    async function fetchUsed(): Promise<DriveFile[]> {
+      const structural = await fetchDriveUsedFiles(folderId as string, accessToken);
       const structuralIds = new Set(structural.map((f) => f.id));
       const onlyTrackedIds = Array.from(trackedUsed.keys()).filter((id) => !structuralIds.has(id));
       const trackedOnly = onlyTrackedIds.length ? await fetchDriveFilesByIds(onlyTrackedIds, accessToken) : [];
-      const files = [...structural, ...trackedOnly].map((f) => ({
-        ...f,
-        usedAt: trackedUsed.get(f.id) ?? null,
-      }));
-      return { folderId, files };
+      return [...structural, ...trackedOnly].map((f) => ({ ...f, usedAt: trackedUsed.get(f.id) ?? null }));
     }
 
-    // "available" — the normal active-tree listing, minus anything we've
-    // separately marked used ourselves (covers a file our app marked used
-    // that's still physically sitting in a normal, non-"used" folder, since
-    // we can't move the real file without Drive write access — see below).
+    if (data.status === "used") {
+      return { folderId, files: await fetchUsed() };
+    }
+
+    if (data.status === "all") {
+      // Everything in one list, so the picker can show used photos GREYED
+      // OUT instead of just hiding them — added 2026-09-29 per Mike: "grey
+      // out photos that are already be used or selected so everyone
+      // knows." Costs an extra full Drive tree-walk (fetchUsed does its own
+      // structural scan) on top of the normal listing, so this is only
+      // used where that visibility is actually wanted (the per-post/email
+      // picker), not the lighter default "available" call other callers
+      // still use.
+      const usedFiles = await fetchUsed();
+      const usedIds = new Set(usedFiles.map((f) => f.id));
+      const availableFiles = (await fetchDriveMediaFiles(folderId, accessToken)).filter((f) => !usedIds.has(f.id));
+      return { folderId, files: [...availableFiles, ...usedFiles] };
+    }
+
+    // "available" (the default) — the normal active-tree listing, minus
+    // anything we've separately marked used ourselves (covers a file our
+    // app marked used that's still physically sitting in a normal,
+    // non-"used" folder, since we can't move the real file without Drive
+    // write access — see above).
     const files = (await fetchDriveMediaFiles(folderId, accessToken)).filter((f) => !trackedUsed.has(f.id));
     return { folderId, files };
   });
 
 // Public — Google Drive tab of the review page's photo picker, token-
-// resolved. Only ever the "available" listing (same as the picker's
-// default) — a public reviewer has no reason to browse the "used" folder.
+// resolved. WIDENED 2026-09-29 per Mike: "grey out photos that are already
+// be used or selected so everyone knows. This applies across board no
+// matter who is logged in" — was previously only ever the "available"
+// listing; now supports the same merged "all" mode as listAgentDriveMedia
+// (admin) so the public picker can grey out used photos instead of just
+// hiding them, same as the logged-in view.
 export const listPublicReviewDriveMedia = createServerFn({ method: "POST" })
-  .inputValidator((data: { token: string }) => data)
+  .inputValidator((data: { token: string; status?: "available" | "all" }) => data)
   .handler(async ({ data }): Promise<{ folderId: string | null; files: DriveFile[] }> => {
     const { agentId } = await resolveAgentIdFromReviewToken(data.token);
     const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
@@ -2649,10 +2673,21 @@ export const listPublicReviewDriveMedia = createServerFn({ method: "POST" })
 
     const { data: trackedRows, error: trackedErr } = await supabaseAdmin
       .from("agent_drive_used_files")
-      .select("drive_file_id")
+      .select("drive_file_id, used_at")
       .eq("agent_id", agentId);
     if (trackedErr) throw trackedErr;
-    const trackedUsed = new Set((trackedRows ?? []).map((r) => r.drive_file_id as string));
+    const trackedUsed = new Map((trackedRows ?? []).map((r) => [r.drive_file_id as string, r.used_at as string]));
+
+    if (data.status === "all") {
+      const structural = await fetchDriveUsedFiles(folderId, accessToken);
+      const structuralIds = new Set(structural.map((f) => f.id));
+      const onlyTrackedIds = Array.from(trackedUsed.keys()).filter((id) => !structuralIds.has(id));
+      const trackedOnly = onlyTrackedIds.length ? await fetchDriveFilesByIds(onlyTrackedIds, accessToken) : [];
+      const usedFiles = [...structural, ...trackedOnly].map((f) => ({ ...f, usedAt: trackedUsed.get(f.id) ?? null }));
+      const usedIds = new Set(usedFiles.map((f) => f.id));
+      const availableFiles = (await fetchDriveMediaFiles(folderId, accessToken)).filter((f) => !usedIds.has(f.id));
+      return { folderId, files: [...availableFiles, ...usedFiles] };
+    }
 
     const files = (await fetchDriveMediaFiles(folderId, accessToken)).filter((f) => !trackedUsed.has(f.id));
     return { folderId, files };

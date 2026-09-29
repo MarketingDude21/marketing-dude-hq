@@ -1,3 +1,4 @@
+```ts
 import { createServerFn } from "@tanstack/react-start";
 import { requireSupabaseAuth } from "@/integrations/supabase/auth-middleware";
 import type { TablesInsert } from "@/integrations/supabase/types";
@@ -1357,9 +1358,7 @@ export const createMediaUploadUrl = createServerFn({ method: "POST" })
 // back about its own upload.
 export const finalizeMediaUpload = createServerFn({ method: "POST" })
   .middleware([requireSupabaseAuth])
-  .inputValidator(
-    (data: { agentId: string; storagePath: string; mediaType: "photo" | "video"; caption?: string }) => data,
-  )
+  .inputValidator((data: { agentId: string; storagePath: string; mediaType: "photo" | "video"; caption?: string }) => data)
   .handler(async ({ data, context }): Promise<{ ok: true; id: string }> => {
     const email = (context.claims as { email?: string } | undefined)?.email;
     await requireAgentAccess(context.userId, email, data.agentId);
@@ -2971,9 +2970,7 @@ export const listCalendarItems = createServerFn({ method: "GET" })
 
 export const addCalendarItem = createServerFn({ method: "POST" })
   .middleware([requireSupabaseAuth])
-  .inputValidator(
-    (data: { monthId: string; docType: "post" | "email" | "video"; title: string; rawText: string }) => data,
-  )
+  .inputValidator((data: { monthId: string; docType: "post" | "email" | "video"; title: string; rawText: string }) => data)
   .handler(async ({ data, context }): Promise<{ ok: true }> => {
     const email = (context.claims as { email?: string } | undefined)?.email;
     await requireAdmin(context.userId, email);
@@ -3755,12 +3752,31 @@ async function captionPhotoInVoice(
   // them more human since we already have a good balance of real estate
   // ones." The rest of the content plan already covers the real-estate side;
   // this scan is specifically the "make them look like a human, not an
-  // agent" lever, so rule 4 below is intentionally stricter than a generic
+  // agent" lever, so rule 4 below was intentionally stricter than a generic
   // caption prompt would be.
+  //
+  // TUNED (2026-09-29), second pass on the same lever — per Mike, after
+  // living with the above for a while: "it's doing a pretty good job of
+  // [playful storytelling]. Now let's add the real estate twist to it...
+  // the content just sort of needs to remind people they're in real
+  // estate. So constant storytelling, making fun, playful." He does NOT
+  // want to lose the playful/human tone (still rule 3's texted-a-friend
+  // energy, still no pitch language) — he wants a consistent, light nod
+  // that this person is in real estate worked into these captions even
+  // when the photo itself isn't a listing/closing/showing moment, instead
+  // of the old instruction to skip real estate entirely for anything that
+  // wasn't unmistakably a real estate photo. Rule 4 below changed from
+  // "only mention real estate if the photo demands it" to "always work in
+  // a light, natural real estate nod, but keep it a wink/aside, never the
+  // point of the post" — still explicitly never a pitch, still never
+  // "As a real estate professional" territory (banned elsewhere in the
+  // app's other prompts too).
   const prompt =
     `You are creating a social media post for a real estate agent named ${agentName ?? "the agent"} in ${agentCity ?? "their city"}.\n\n` +
     `VOICE DNA:\n${voiceDna ?? "Warm, authentic, conversational. Sounds like a real person, not a real estate agent."}\n\n` +
-    "Look at this photo and write a social media post that:\n1. Starts from what you actually see — the setting, the mood, the moment\n2. Sounds EXACTLY like this person based on their Voice DNA above\n3. Is 1-3 sentences max — short, human, texted-a-friend energy\n4. Leans playful, funny, or personality-driven by default — treat this as a chance to make them look like a real person with a life, not an agent. Only mention real estate at all if the photo is unmistakably a real estate moment (a listing, a closing, a sign, a showing); otherwise skip it entirely\n5. Does NOT mention any specific location, city, neighborhood, or place name\n6. NO hyphens, NO corporate language, NO AI-tell phrases\n7. Standard capitalization — never write in all lowercase\n\n" +
+    "Look at this photo and write a social media post that:\n1. Starts from what you actually see — the setting, the mood, the moment\n2. Sounds EXACTLY like this person based on their Voice DNA above\n3. Is 1-3 sentences max — short, human, texted-a-friend energy\n4. Leans playful, funny, or personality-driven by default — treat this as a chance to make them look like a real person with a life, not a corporate agent. But always work in a light, natural reminder that " +
+    `${agentName ?? "this person"} is in real estate — a quick aside, a joke, a callback, a one-liner — even when the photo has nothing to do with real estate (a coffee, a kid's game, a sunset). Keep the real estate nod small: a wink, never the whole point of the post, and never a pitch or a listing plug. If the photo IS an unmistakable real estate moment (a listing, a closing, a sign, a showing), let real estate be more central, same playful voice. Only skip the real estate nod entirely on the rare photo where working one in would be genuinely awkward or forced.\n` +
+    "5. Does NOT mention any specific location, city, neighborhood, or place name\n6. NO hyphens, NO corporate language, NO AI-tell phrases, no \"As a real estate professional\" or any version of that\n7. Standard capitalization — never write in all lowercase\n\n" +
     "Also describe what you see in the photo in one short sentence.\n\nOutput format:\nDESCRIPTION: [one sentence of what you see]\nPOST: [the social media caption]";
 
   const res = await fetch("https://api.anthropic.com/v1/messages", {
@@ -4029,6 +4045,81 @@ export const addPhotoPostsToBatch = createServerFn({ method: "POST" })
     return { ok: true, created: rows.length };
   });
 
+// Re-runs captionPhotoInVoice on the SAME photo behind an already-saved
+// Photo Scan post — added 2026-09-29 per Mike: "you could rescan the photo"
+// (a follow-up on the Photo Scan/content-calendar unification below). This
+// is deliberately separate from "Scan more" (which pulls in NEW, different
+// photos) — this re-fetches the exact same image bytes for the photo this
+// post already came from and asks Claude for a fresh caption, in case the
+// first one didn't land. Only works on a post that actually came from Photo
+// Scan (metadata.source is drive_photo_scan or library_photo_scan) — there's
+// no original photo to re-fetch for anything else.
+export const regeneratePhotoScanCaption = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator((data: { agentId: string; postId: string }) => data)
+  .handler(async ({ data, context }): Promise<{ ok: true; title: string; content: string }> => {
+    const email = (context.claims as { email?: string } | undefined)?.email;
+    await requireAgentAccess(context.userId, email, data.agentId);
+    const anthropicKey = process.env["ANTHROPIC_API_KEY"];
+    if (!anthropicKey)
+      throw new Error("Photo captioning isn't configured yet — add ANTHROPIC_API_KEY in Lovable Cloud → Secrets.");
+
+    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+    const { data: post, error } = await supabaseAdmin
+      .from("generated_posts")
+      .select("agent_id, metadata")
+      .eq("id", data.postId)
+      .maybeSingle();
+    if (error) throw error;
+    if (!post || post.agent_id !== data.agentId) throw new Error("Post not found for this agent.");
+    const metadata = (post.metadata ?? {}) as PostMetadata;
+    if (metadata.source !== "drive_photo_scan" && metadata.source !== "library_photo_scan") {
+      throw new Error("This post wasn't created from Photo Scan, so there's no original photo to re-caption.");
+    }
+
+    const { data: agent } = await supabaseAdmin
+      .from("agents")
+      .select("full_name, market_area, voice_summary")
+      .eq("id", data.agentId)
+      .maybeSingle();
+    const agentName = agent?.full_name ?? undefined;
+    const agentCity = agent?.market_area ?? undefined;
+    const voiceDna = agent?.voice_summary ?? undefined;
+
+    let arrayBuffer: ArrayBuffer;
+    let mediaType = "image/jpeg";
+    if (metadata.source === "drive_photo_scan") {
+      const fileId = metadata.drive_file_id;
+      if (!fileId) throw new Error("This post is missing its original Drive file — can't re-scan it.");
+      const accessToken = await getDriveAccessToken();
+      const imgUrl = "https://www.googleapis.com/drive/v3/files/" + fileId + "?alt=media&supportsAllDrives=true";
+      const imgRes = await fetchWithTimeout(imgUrl, { headers: driveAuthHeaders(accessToken) }, 15_000);
+      if (!imgRes.ok) {
+        throw new Error("Couldn't re-fetch this photo from Google Drive — it may have been moved or deleted there.");
+      }
+      arrayBuffer = await imgRes.arrayBuffer();
+      mediaType = imgRes.headers.get("content-type") || "image/jpeg";
+    } else {
+      const url = metadata.media_url;
+      if (!url) throw new Error("This post is missing its original photo — can't re-scan it.");
+      const imgRes = await fetchWithTimeout(url, {}, 15_000);
+      if (!imgRes.ok) throw new Error("Couldn't re-fetch this photo from the Media Library.");
+      arrayBuffer = await imgRes.arrayBuffer();
+      mediaType = imgRes.headers.get("content-type") || "image/jpeg";
+    }
+
+    const caption = await captionPhotoInVoice(arrayBuffer, mediaType, anthropicKey, agentName, agentCity, voiceDna);
+    if (!caption) throw new Error("Claude didn't return a usable caption for this photo — try again.");
+
+    const { error: updateErr } = await supabaseAdmin
+      .from("generated_posts")
+      .update({ title: caption.description, content: caption.suggestedPost, updated_at: new Date().toISOString() })
+      .eq("id", data.postId);
+    if (updateErr) throw updateErr;
+
+    return { ok: true, title: caption.description, content: caption.suggestedPost };
+  });
+
 // ── Send to Agent — admin-only, ported from send-review.js (GoHighLevel) ───
 // UPDATED 2026-09-22: the notification email now links to the public,
 // token-based review page (/review/$token, see the "Public, no-login review
@@ -4213,3 +4304,4 @@ export const sendContentToAgent = createServerFn({ method: "POST" })
       emailData.emailMessageId ?? emailData.messageId ?? emailData.id ?? emailData.conversationId ?? null;
     return { ok: true, ghlMessageId };
   });
+```

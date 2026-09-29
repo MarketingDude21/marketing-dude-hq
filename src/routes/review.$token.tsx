@@ -5,7 +5,6 @@ import {
   listPublicReviewMonths,
   listPublicReviewPosts,
   approvePublicReviewPost,
-  submitPublicReviewFeedback,
   updatePublicReviewPostContent,
   rewritePublicReviewPost,
   listPublicReviewMedia,
@@ -425,6 +424,11 @@ function PublicEmailPhotosPanel({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [token, photos.map((p) => p.driveFileId).join(",")]);
 
+  // WIDENED 2026-09-29 per Mike: "grey out photos that are already be used
+  // or selected so everyone knows. This applies across board no matter who
+  // is logged in" — listPublicReviewMedia now returns every status (was
+  // "available" only), and the Drive call below passes status "all", so
+  // used photos can show greyed out here too, same as admin.
   async function openPicker() {
     setPickerOpen(true);
     setPickerTab("library");
@@ -440,7 +444,7 @@ function PublicEmailPhotosPanel({
   async function openDriveTab() {
     setPickerTab("drive");
     try {
-      const res = await listPublicReviewDriveMedia({ data: { token } });
+      const res = await listPublicReviewDriveMedia({ data: { token, status: "all" } });
       setDriveOptions(res.files);
       setDriveOptionsError(null);
       if (res.files.length) {
@@ -646,12 +650,12 @@ function PublicEmailPhotosPanel({
         <div className="mt-3 rounded-2xl border border-border bg-background/40 p-4">
           <div className="flex items-center justify-between gap-3">
             <p className="text-sm font-semibold">Add a photo to this email</p>
-            <button
-              onClick={() => setPickerOpen(false)}
-              className="shrink-0 text-xs text-muted-foreground hover:text-foreground"
-            >
+            {/* Upgraded from a small muted text link to a real Button — per
+                Mike: "When change photo is selected there's no way to close
+                the photos" — mirrors admin's EmailPhotosPanel (2026-09-29). */}
+            <Button variant="secondary" onClick={() => setPickerOpen(false)}>
               Close
-            </button>
+            </Button>
           </div>
 
           <div className="mt-3 flex flex-wrap gap-2 border-b border-border pb-3">
@@ -704,34 +708,54 @@ function PublicEmailPhotosPanel({
                 <p className="text-xs text-muted-foreground">Nothing loaded yet — tap Retry above.</p>
               )}
               {mediaOptions !== null && mediaOptions.length === 0 && (
-                <p className="text-xs text-muted-foreground">No available photos or videos for this agent yet.</p>
+                <p className="text-xs text-muted-foreground">No photos or videos for this agent yet.</p>
               )}
               {mediaOptions !== null && mediaOptions.length > 0 && (
                 <div className="grid grid-cols-3 gap-2 sm:grid-cols-4">
-                  {mediaOptions.map((m) => (
-                    <button
-                      key={m.id}
-                      onClick={() => addFromLibrary(m.id)}
-                      disabled={busy}
-                      className="overflow-hidden rounded-xl border border-border transition-colors hover:border-primary disabled:opacity-50"
-                    >
-                      {m.media_type === "video" ? (
-                        m.url ? (
-                          <video src={m.url} className="aspect-square w-full object-cover" />
+                  {/* Greyed out for "used" or "already one of this email's
+                      photos" — per Mike: "grey out photos that are already
+                      be used or selected so everyone knows... applies
+                      across board no matter who is logged in" (2026-09-29). */}
+                  {mediaOptions.map((m) => {
+                    const isUsed = m.status === "used";
+                    const isSelected = photos.some((p) => p.source === "library" && p.url === m.url);
+                    const badge = isSelected ? "Added" : isUsed ? "Used" : null;
+                    return (
+                      <button
+                        key={m.id}
+                        onClick={() => addFromLibrary(m.id)}
+                        disabled={busy}
+                        className={`relative overflow-hidden rounded-xl border transition-colors disabled:opacity-50 ${
+                          isSelected
+                            ? "border-primary"
+                            : isUsed
+                              ? "border-border opacity-50 hover:opacity-80"
+                              : "border-border hover:border-primary"
+                        }`}
+                      >
+                        {m.media_type === "video" ? (
+                          m.url ? (
+                            <video src={m.url} className="aspect-square w-full object-cover" />
+                          ) : (
+                            <div className="flex aspect-square w-full items-center justify-center bg-muted text-[10px] text-muted-foreground">
+                              video
+                            </div>
+                          )
+                        ) : m.url ? (
+                          <img src={m.url} alt={m.caption ?? ""} className="aspect-square w-full object-cover" />
                         ) : (
                           <div className="flex aspect-square w-full items-center justify-center bg-muted text-[10px] text-muted-foreground">
-                            video
+                            photo
                           </div>
-                        )
-                      ) : m.url ? (
-                        <img src={m.url} alt={m.caption ?? ""} className="aspect-square w-full object-cover" />
-                      ) : (
-                        <div className="flex aspect-square w-full items-center justify-center bg-muted text-[10px] text-muted-foreground">
-                          photo
-                        </div>
-                      )}
-                    </button>
-                  ))}
+                        )}
+                        {badge && (
+                          <span className="absolute bottom-1 left-1 rounded-full bg-background/90 px-1.5 py-0.5 text-[9px] font-semibold uppercase tracking-wide text-foreground">
+                            {badge}
+                          </span>
+                        )}
+                      </button>
+                    );
+                  })}
                 </div>
               )}
             </div>
@@ -752,21 +776,28 @@ function PublicEmailPhotosPanel({
               )}
               {!driveOptionsError && driveOptions === null && <p className="text-xs text-muted-foreground">Loading…</p>}
               {!driveOptionsError && driveOptions !== null && driveOptions.length === 0 && (
-                <p className="text-xs text-muted-foreground">
-                  No unused photos or videos found in this agent's Drive folder.
-                </p>
+                <p className="text-xs text-muted-foreground">No photos or videos found in this agent's Drive folder.</p>
               )}
               {driveOptions !== null && driveOptions.length > 0 && (
                 <div className="grid grid-cols-3 gap-2 sm:grid-cols-4">
                   {driveOptions.map((f) => {
                     const thumbSrc = driveThumbs[f.id] ?? f.thumbnailUrl;
                     const thumbFailed = failedDriveThumbs.has(f.id);
+                    const isUsed = !!f.usedAt;
+                    const isSelected = photos.some((p) => p.source === "drive" && p.driveFileId === f.id);
+                    const badge = isSelected ? "Added" : isUsed ? "Used" : null;
                     return (
                       <button
                         key={f.id}
                         onClick={() => addFromDrive(f)}
                         disabled={busy}
-                        className="overflow-hidden rounded-xl border border-border transition-colors hover:border-primary disabled:opacity-50"
+                        className={`relative overflow-hidden rounded-xl border transition-colors disabled:opacity-50 ${
+                          isSelected
+                            ? "border-primary"
+                            : isUsed
+                              ? "border-border opacity-50 hover:opacity-80"
+                              : "border-border hover:border-primary"
+                        }`}
                       >
                         {f.isVideo ? (
                           <video src={thumbSrc} className="aspect-square w-full object-cover" />
@@ -782,6 +813,11 @@ function PublicEmailPhotosPanel({
                             className="aspect-square w-full object-cover"
                             onError={() => setFailedDriveThumbs((s) => new Set(s).add(f.id))}
                           />
+                        )}
+                        {badge && (
+                          <span className="absolute bottom-1 left-1 rounded-full bg-background/90 px-1.5 py-0.5 text-[9px] font-semibold uppercase tracking-wide text-foreground">
+                            {badge}
+                          </span>
                         )}
                       </button>
                     );
@@ -811,17 +847,30 @@ function PublicEmailPhotosPanel({
               )}
               {unsplashResults !== null && unsplashResults.length > 0 && (
                 <div className="mt-3 grid grid-cols-3 gap-2 sm:grid-cols-4">
-                  {unsplashResults.map((r) => (
-                    <button
-                      key={r.id}
-                      onClick={() => addFromUnsplash(r)}
-                      disabled={busy}
-                      title={`Photo by ${r.photographerName} on Unsplash`}
-                      className="overflow-hidden rounded-xl border border-border transition-colors hover:border-primary disabled:opacity-50"
-                    >
-                      <img src={r.thumbUrl} alt="" className="aspect-square w-full object-cover" />
-                    </button>
-                  ))}
+                  {/* Same "already selected" greying as the Library/Drive
+                      tabs above (2026-09-29) — mirrors admin's
+                      EmailPhotosPanel. */}
+                  {unsplashResults.map((r) => {
+                    const isSelected = photos.some((p) => p.source === "unsplash" && p.url === r.fullUrl);
+                    return (
+                      <button
+                        key={r.id}
+                        onClick={() => addFromUnsplash(r)}
+                        disabled={busy}
+                        title={`Photo by ${r.photographerName} on Unsplash`}
+                        className={`relative overflow-hidden rounded-xl border transition-colors disabled:opacity-50 ${
+                          isSelected ? "border-primary" : "border-border hover:border-primary"
+                        }`}
+                      >
+                        <img src={r.thumbUrl} alt="" className="aspect-square w-full object-cover" />
+                        {isSelected && (
+                          <span className="absolute bottom-1 left-1 rounded-full bg-background/90 px-1.5 py-0.5 text-[9px] font-semibold uppercase tracking-wide text-foreground">
+                            Added
+                          </span>
+                        )}
+                      </button>
+                    );
+                  })}
                 </div>
               )}
               <p className="mt-2 text-[11px] text-muted-foreground">
@@ -918,24 +967,13 @@ function PublicPostCard({
     }
   }
 
-  async function sendFeedback() {
-    setBusy(true);
-    setSaveError(null);
-    try {
-      const trimmedNotes = notes.trim();
-      await submitPublicReviewFeedback({
-        data: { token, postId: post.id, ...(trimmedNotes ? { notes: trimmedNotes } : {}) },
-      });
-      setNotes("");
-      onChanged(post.id, "flagged");
-    } catch (e) {
-      setSaveError(e instanceof Error ? e.message : String(e));
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  async function rewrite() {
+  // MERGED 2026-09-29 per Mike: "The rewrite in their voice and submit
+  // feedback button should be combined. When they submit feedback it
+  // should rewrite in their voice, as well." Mirrors the same merge in
+  // admin's PostCard (marketing.tsx) — rewritePublicReviewPost already
+  // logs the feedback text as part of doing the rewrite, so a separate
+  // flag-only submission had nothing left to add on its own.
+  async function submitFeedback() {
     const feedback = notes.trim();
     if (!feedback) {
       setSaveError("Tell us what to fix first.");
@@ -988,10 +1026,12 @@ function PublicPostCard({
   // Same always-refetch fix, plus fetches real (authenticated) Drive
   // thumbnails — see getDriveThumbnails' comment in marketing.ts for why the
   // raw drive.google.com hotlink was showing as an empty/broken image slot.
+  // status "all" (2026-09-29) so used files come back too, to grey out
+  // instead of hide — per Mike's "grey out ... already used or selected."
   async function openDriveTab() {
     setPickerTab("drive");
     try {
-      const res = await listPublicReviewDriveMedia({ data: { token } });
+      const res = await listPublicReviewDriveMedia({ data: { token, status: "all" } });
       setDriveOptions(res.files);
       setDriveOptionsError(null);
       if (res.files.length) {
@@ -1142,8 +1182,24 @@ function PublicPostCard({
           <Button onClick={approve} disabled={busy || post.status === "approved"}>
             {post.status === "approved" ? "Approved" : "Approve"}
           </Button>
-          <Button variant="secondary" onClick={() => setEditorOpen((v) => !v)} disabled={busy}>
-            Edit / Feedback
+          {/* Relabels to "Close" while open — mirrors the same fix in
+              admin's PostCard (marketing.tsx), per Mike: "The edit/feedback
+              button should change to close once selected." Replaces the
+              separate "Done" button that used to live at the bottom of the
+              panel (2026-09-29). */}
+          <Button
+            variant="secondary"
+            onClick={() => {
+              if (editorOpen) {
+                setDraft(post.content);
+                setNotes("");
+                setRewriteHistory([]);
+              }
+              setEditorOpen((v) => !v);
+            }}
+            disabled={busy}
+          >
+            {editorOpen ? "Close" : "Edit / Feedback"}
           </Button>
         </div>
 
@@ -1151,12 +1207,11 @@ function PublicPostCard({
           <div className="mt-4 rounded-2xl border border-border bg-background/40 p-4">
             <div className="flex items-center justify-between gap-3">
               <p className="text-sm font-semibold">Which photo do you want to use?</p>
-              <button
-                onClick={() => setPickerOpen(false)}
-                className="shrink-0 text-xs text-muted-foreground hover:text-foreground"
-              >
+              {/* Upgraded from a small muted text link to a real Button —
+                  mirrors admin's PostCard (2026-09-29). */}
+              <Button variant="secondary" onClick={() => setPickerOpen(false)}>
                 Close
-              </button>
+              </Button>
             </div>
 
             <div className="mt-3 flex flex-wrap gap-2 border-b border-border pb-3">
@@ -1202,34 +1257,55 @@ function PublicPostCard({
                   <p className="text-xs text-muted-foreground">Nothing loaded yet — tap Retry above.</p>
                 )}
                 {mediaOptions !== null && mediaOptions.length === 0 && (
-                  <p className="text-xs text-muted-foreground">No available photos or videos for this agent yet.</p>
+                  <p className="text-xs text-muted-foreground">No photos or videos for this agent yet.</p>
                 )}
                 {mediaOptions !== null && mediaOptions.length > 0 && (
                   <div className="grid grid-cols-3 gap-2 sm:grid-cols-4">
-                    {mediaOptions.map((m) => (
-                      <button
-                        key={m.id}
-                        onClick={() => pickMedia(m.id)}
-                        disabled={mediaBusy}
-                        className="overflow-hidden rounded-xl border border-border transition-colors hover:border-primary disabled:opacity-50"
-                      >
-                        {m.media_type === "video" ? (
-                          m.url ? (
-                            <video src={m.url} className="aspect-square w-full object-cover" />
+                    {/* Greyed out for "used" or "already the current photo
+                        on this post" — per Mike: "grey out photos that are
+                        already be used or selected so everyone knows...
+                        applies across board no matter who is logged in"
+                        (2026-09-29). */}
+                    {mediaOptions.map((m) => {
+                      const isUsed = m.status === "used";
+                      const isSelected = m.id === post.metadata?.media_id;
+                      const badge = isSelected ? "Current" : isUsed ? "Used" : null;
+                      return (
+                        <button
+                          key={m.id}
+                          onClick={() => pickMedia(m.id)}
+                          disabled={mediaBusy}
+                          className={`relative overflow-hidden rounded-xl border transition-colors disabled:opacity-50 ${
+                            isSelected
+                              ? "border-primary"
+                              : isUsed
+                                ? "border-border opacity-50 hover:opacity-80"
+                                : "border-border hover:border-primary"
+                          }`}
+                        >
+                          {m.media_type === "video" ? (
+                            m.url ? (
+                              <video src={m.url} className="aspect-square w-full object-cover" />
+                            ) : (
+                              <div className="flex aspect-square w-full items-center justify-center bg-muted text-[10px] text-muted-foreground">
+                                video
+                              </div>
+                            )
+                          ) : m.url ? (
+                            <img src={m.url} alt={m.caption ?? ""} className="aspect-square w-full object-cover" />
                           ) : (
                             <div className="flex aspect-square w-full items-center justify-center bg-muted text-[10px] text-muted-foreground">
-                              video
+                              photo
                             </div>
-                          )
-                        ) : m.url ? (
-                          <img src={m.url} alt={m.caption ?? ""} className="aspect-square w-full object-cover" />
-                        ) : (
-                          <div className="flex aspect-square w-full items-center justify-center bg-muted text-[10px] text-muted-foreground">
-                            photo
-                          </div>
-                        )}
-                      </button>
-                    ))}
+                          )}
+                          {badge && (
+                            <span className="absolute bottom-1 left-1 rounded-full bg-background/90 px-1.5 py-0.5 text-[9px] font-semibold uppercase tracking-wide text-foreground">
+                              {badge}
+                            </span>
+                          )}
+                        </button>
+                      );
+                    })}
                   </div>
                 )}
               </div>
@@ -1253,7 +1329,7 @@ function PublicPostCard({
                 )}
                 {!driveOptionsError && driveOptions !== null && driveOptions.length === 0 && (
                   <p className="text-xs text-muted-foreground">
-                    No unused photos or videos found in this agent's Drive folder.
+                    No photos or videos found in this agent's Drive folder.
                   </p>
                 )}
                 {driveOptions !== null && driveOptions.length > 0 && (
@@ -1261,12 +1337,21 @@ function PublicPostCard({
                     {driveOptions.map((f) => {
                       const thumbSrc = driveThumbs[f.id] ?? f.thumbnailUrl;
                       const thumbFailed = failedDriveThumbs.has(f.id);
+                      const isUsed = !!f.usedAt;
+                      const isSelected = f.id === post.metadata?.drive_file_id;
+                      const badge = isSelected ? "Current" : isUsed ? "Used" : null;
                       return (
                         <button
                           key={f.id}
                           onClick={() => pickDriveFile(f)}
                           disabled={mediaBusy}
-                          className="overflow-hidden rounded-xl border border-border transition-colors hover:border-primary disabled:opacity-50"
+                          className={`relative overflow-hidden rounded-xl border transition-colors disabled:opacity-50 ${
+                            isSelected
+                              ? "border-primary"
+                              : isUsed
+                                ? "border-border opacity-50 hover:opacity-80"
+                                : "border-border hover:border-primary"
+                          }`}
                         >
                           {f.isVideo ? (
                             <video src={thumbSrc} className="aspect-square w-full object-cover" />
@@ -1282,6 +1367,11 @@ function PublicPostCard({
                               className="aspect-square w-full object-cover"
                               onError={() => setFailedDriveThumbs((s) => new Set(s).add(f.id))}
                             />
+                          )}
+                          {badge && (
+                            <span className="absolute bottom-1 left-1 rounded-full bg-background/90 px-1.5 py-0.5 text-[9px] font-semibold uppercase tracking-wide text-foreground">
+                              {badge}
+                            </span>
                           )}
                         </button>
                       );
@@ -1350,29 +1440,17 @@ function PublicPostCard({
                 placeholder="What is off? Too formal, I never say this, make it shorter…"
                 className="mt-2 min-h-[80px] w-full rounded-2xl bg-muted px-4 py-3 text-sm outline-none ring-ring transition focus:ring-2"
               />
+              {/* Rewrite and Submit feedback MERGED into one action per
+                  Mike (2026-09-29) — see submitFeedback above. Closing now
+                  happens from the "Close" button at the top of the card. */}
               <div className="mt-3 flex flex-wrap gap-2">
-                <Button onClick={rewrite} disabled={busy || rewriting}>
-                  {rewriting ? "Rewriting…" : "Rewrite in my voice →"}
-                </Button>
-                <Button onClick={sendFeedback} variant="secondary" disabled={busy || rewriting}>
-                  Submit feedback
-                </Button>
-                <Button
-                  variant="secondary"
-                  onClick={() => {
-                    setEditorOpen(false);
-                    setDraft(post.content);
-                    setNotes("");
-                    setRewriteHistory([]);
-                  }}
-                  disabled={busy || rewriting}
-                >
-                  Done
+                <Button onClick={submitFeedback} disabled={busy || rewriting}>
+                  {rewriting ? "Submitting…" : "Submit feedback →"}
                 </Button>
               </div>
               {rewriteHistory.length > 0 && (
                 <p className="mt-2 text-xs text-muted-foreground">
-                  Not right yet? Add more feedback above and rewrite again.
+                  Not right yet? Add more feedback above and submit again.
                 </p>
               )}
             </div>

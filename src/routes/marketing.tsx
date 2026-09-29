@@ -1271,6 +1271,23 @@ function EmailPhotosPanel({
   const [unsplashLoading, setUnsplashLoading] = useState(false);
   const [unsplashError, setUnsplashError] = useState<string | null>(null);
 
+  // Authenticated thumbnails for photos ALREADY ATTACHED to this email, not
+  // just the picker grid (which openDriveTab below already covers) — same
+  // fix, same reason as PostCard's equivalent effect: the raw drive.google.com
+  // hotlink stored on each attached photo 403s now that folders are
+  // privately shared. Added 2026-09-29.
+  useEffect(() => {
+    const ids = photos.filter((p) => p.source === "drive" && p.driveFileId).map((p) => p.driveFileId as string);
+    const missing = ids.filter((id) => driveThumbs[id] === undefined);
+    if (!missing.length) return;
+    getDriveThumbnails({ data: { agentId, fileIds: missing } })
+      .then((res) => setDriveThumbs((cur) => ({ ...cur, ...res.thumbnails })))
+      .catch(() => {
+        /* leave unset — falls back to the raw hotlink below */
+      });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [agentId, photos.map((p) => p.driveFileId).join(",")]);
+
   // Same fix as PostCard's openPicker (2026-09-29) — always refetch on open
   // instead of once-ever, and don't blank an already-loaded list to []
   // just because one refresh failed.
@@ -1451,59 +1468,77 @@ function EmailPhotosPanel({
 
       {photos.length > 0 && (
         <div className="mb-3 grid gap-3 sm:grid-cols-3">
-          {photos.map((p) => (
-            <div key={p.id} className="rounded-2xl border border-border bg-muted p-2">
-              <div className="overflow-hidden rounded-xl border border-border">
-                {p.mediaType === "video" ? (
-                  <video src={p.url} controls className="aspect-square w-full object-cover" />
-                ) : (
-                  <img src={p.url} alt="" className="aspect-square w-full object-cover" />
-                )}
-              </div>
-              <p className="mt-1 text-[10px] uppercase tracking-wide text-muted-foreground">
-                {p.source === "library" ? "Media Library" : p.source === "drive" ? "Google Drive" : "Stock photo"}
-              </p>
-              {p.source === "unsplash" && p.unsplashPhotographer && (
-                <p className="text-[10px] text-muted-foreground">
-                  Photo by{" "}
-                  <a
-                    href={p.unsplashCreditUrl ?? "https://unsplash.com"}
-                    target="_blank"
-                    rel="noreferrer"
-                    className="underline hover:text-foreground"
-                  >
-                    {p.unsplashPhotographer}
-                  </a>{" "}
-                  on Unsplash
+          {photos.map((p) => {
+            const displayUrl = p.driveFileId ? (driveThumbs[p.driveFileId] ?? p.url) : p.url;
+            const thisPhotoFailed = !!p.driveFileId && failedDriveThumbs.has(p.driveFileId);
+            return (
+              <div key={p.id} className="rounded-2xl border border-border bg-muted p-2">
+                <div className="overflow-hidden rounded-xl border border-border">
+                  {p.mediaType === "video" ? (
+                    <video src={p.url} controls className="aspect-square w-full object-cover" />
+                  ) : thisPhotoFailed ? (
+                    <div className="flex aspect-square w-full flex-col items-center justify-center gap-1 p-2 text-center text-[10px] text-muted-foreground">
+                      <span>Couldn't load this photo from Drive</span>
+                    </div>
+                  ) : (
+                    <img
+                      src={displayUrl}
+                      alt=""
+                      className="aspect-square w-full object-cover"
+                      onError={() => p.driveFileId && setFailedDriveThumbs((s) => new Set(s).add(p.driveFileId!))}
+                    />
+                  )}
+                </div>
+                <p className="mt-1 text-[10px] uppercase tracking-wide text-muted-foreground">
+                  {p.source === "library" ? "Media Library" : p.source === "drive" ? "Google Drive" : "Stock photo"}
                 </p>
-              )}
-              <textarea
-                value={drafts[p.id] ?? p.publishingInstructions}
-                onChange={(e) => setDrafts((d) => ({ ...d, [p.id]: e.target.value }))}
-                onBlur={() => saveInstructions(p.id)}
-                placeholder="Publishing instructions (optional) — e.g. use as header image"
-                className="mt-2 min-h-[50px] w-full rounded-lg border border-border bg-glass px-2 py-1.5 text-xs outline-none"
-                disabled={busy}
-              />
-              <div className="mt-1 flex items-center justify-between gap-2">
-                {p.url && (
-                  <button
-                    onClick={() => downloadRemoteFile(p.url!, p.url!.split("/").pop() || `${p.id}`)}
-                    className="text-[11px] font-semibold text-muted-foreground hover:text-foreground hover:underline"
-                  >
-                    ⬇ Download
-                  </button>
+                {p.source === "unsplash" && p.unsplashPhotographer && (
+                  <p className="text-[10px] text-muted-foreground">
+                    Photo by{" "}
+                    <a
+                      href={p.unsplashCreditUrl ?? "https://unsplash.com"}
+                      target="_blank"
+                      rel="noreferrer"
+                      className="underline hover:text-foreground"
+                    >
+                      {p.unsplashPhotographer}
+                    </a>{" "}
+                    on Unsplash
+                  </p>
                 )}
-                <button
-                  onClick={() => removePhoto(p.id)}
+                <textarea
+                  value={drafts[p.id] ?? p.publishingInstructions}
+                  onChange={(e) => setDrafts((d) => ({ ...d, [p.id]: e.target.value }))}
+                  onBlur={() => saveInstructions(p.id)}
+                  placeholder="Publishing instructions (optional) — e.g. use as header image"
+                  className="mt-2 min-h-[50px] w-full rounded-lg border border-border bg-glass px-2 py-1.5 text-xs outline-none"
                   disabled={busy}
-                  className="text-[11px] font-semibold text-destructive hover:underline disabled:opacity-50"
-                >
-                  Remove photo
-                </button>
+                />
+                <div className="mt-1 flex items-center justify-between gap-2">
+                  {p.url && (
+                    <button
+                      onClick={() =>
+                        downloadRemoteFile(
+                          displayUrl ?? p.url!,
+                          displayUrl?.startsWith("data:") ? "photo.jpg" : p.url!.split("/").pop() || `${p.id}`,
+                        )
+                      }
+                      className="text-[11px] font-semibold text-muted-foreground hover:text-foreground hover:underline"
+                    >
+                      ⬇ Download
+                    </button>
+                  )}
+                  <button
+                    onClick={() => removePhoto(p.id)}
+                    disabled={busy}
+                    className="text-[11px] font-semibold text-destructive hover:underline disabled:opacity-50"
+                  >
+                    Remove photo
+                  </button>
+                </div>
               </div>
-            </div>
-          ))}
+            );
+          })}
         </div>
       )}
 
@@ -1764,19 +1799,39 @@ function PostCard({
   const [failedDriveThumbs, setFailedDriveThumbs] = useState<Set<string>>(new Set());
   const [rewriting, setRewriting] = useState(false);
   const [rewriteHistory, setRewriteHistory] = useState<{ feedback: string; result: string }[]>([]);
-  // Only relevant for posts Photo Scan created (metadata.source
-  // drive_photo_scan/library_photo_scan) — added 2026-09-29 alongside the
-  // Photo Scan/content-calendar unification, per Mike: "you could rescan
-  // the photo." Re-fetches the SAME photo this post came from and asks for
-  // a fresh caption, separate from Scan photos' own "get new photos"
-  // action above.
+  // Added 2026-09-29 per Mike: "you could rescan the photo." Re-fetches
+  // whatever photo is currently on this post and asks for a fresh caption,
+  // separate from Scan photos' own "get new photos" action above. WIDENED
+  // same day, follow-up per Mike ("scan photo featur is missing form
+  // this" on a regular content-calendar post) — this originally only
+  // showed on posts Photo Scan itself created; now it shows for any post
+  // that has a photo attached at all, however that photo got there.
   const [regenerating, setRegenerating] = useState(false);
-  const isPhotoScanPost =
-    post.metadata?.source === "drive_photo_scan" || post.metadata?.source === "library_photo_scan";
+  const hasRescannablePhoto = !!(post.metadata?.drive_file_id || post.metadata?.media_url);
 
   useEffect(() => {
     setDraft(post.content);
   }, [post.content]);
+
+  // Fetches an authenticated thumbnail for the photo ALREADY ATTACHED to
+  // this post, not just the ones in the picker grid — added 2026-09-29.
+  // The picker-grid fix above (driveThumbs/getDriveThumbnails) only ever
+  // ran once the picker was opened, so the main photo shown on the card
+  // itself — rendered directly from post.metadata.drive_thumbnail_url,
+  // the same raw drive.google.com hotlink that 403s now that folders are
+  // privately shared — was still a blank box. Found while widening the
+  // Rescan/HEIC fixes above, which are drive_file_id-driven and would
+  // otherwise still show an empty photo for the exact posts they just
+  // fixed the caption for.
+  useEffect(() => {
+    const fileId = post.metadata?.drive_file_id;
+    if (!fileId || driveThumbs[fileId] !== undefined) return;
+    getDriveThumbnails({ data: { agentId, fileIds: [fileId] } })
+      .then((res) => setDriveThumbs((cur) => ({ ...cur, ...res.thumbnails })))
+      .catch(() => {
+        /* leave it unset — falls back to the raw hotlink below */
+      });
+  }, [post.metadata?.drive_file_id, agentId]);
 
   async function regenerateCaption() {
     setRegenerating(true);
@@ -1940,6 +1995,13 @@ function PostCard({
 
   const typeLabel = post.content_type === "email" ? "Email" : post.content_type === "video" ? "Video script" : "Post";
   const photoUrl = post.metadata?.media_url || post.metadata?.drive_thumbnail_url || null;
+  // The IMAGE actually rendered for a Drive-sourced photo — prefers the
+  // authenticated thumbnail fetched above over the raw (now-broken) hotlink
+  // in photoUrl. Videos aren't included: a video needs its real stream URL,
+  // not a still-frame thumbnail, so photoUrl is used as-is for those.
+  const driveFileId = post.metadata?.drive_file_id;
+  const mainPhotoFailed = !!driveFileId && failedDriveThumbs.has(driveFileId);
+  const displayPhotoUrl = driveFileId ? (driveThumbs[driveFileId] ?? photoUrl) : photoUrl;
 
   return (
     <Card>
@@ -1976,11 +2038,25 @@ function PostCard({
               <div className="overflow-hidden rounded-2xl border border-border bg-muted">
                 {post.metadata?.media_type === "video" ? (
                   <video src={photoUrl} controls className="max-h-64 w-full object-contain" />
+                ) : mainPhotoFailed ? (
+                  <div className="flex h-40 w-full flex-col items-center justify-center gap-1 p-2 text-center text-xs text-muted-foreground">
+                    <span>Couldn't load this photo from Drive</span>
+                  </div>
                 ) : (
-                  <img src={photoUrl} alt="" className="max-h-64 w-full object-contain" />
+                  <img
+                    src={displayPhotoUrl ?? undefined}
+                    alt=""
+                    className="max-h-64 w-full object-contain"
+                    onError={() => driveFileId && setFailedDriveThumbs((s) => new Set(s).add(driveFileId))}
+                  />
                 )}
                 <button
-                  onClick={() => downloadRemoteFile(photoUrl, photoUrl.split("/").pop() || "photo")}
+                  onClick={() =>
+                    downloadRemoteFile(
+                      displayPhotoUrl ?? photoUrl,
+                      displayPhotoUrl?.startsWith("data:") ? "photo.jpg" : photoUrl.split("/").pop() || "photo",
+                    )
+                  }
                   className="w-full border-t border-border bg-glass py-1 text-[11px] font-semibold text-muted-foreground transition-colors hover:bg-secondary hover:text-foreground"
                 >
                   ⬇ Download
@@ -2005,7 +2081,7 @@ function PostCard({
               <Button variant="secondary" onClick={openPicker} disabled={busy}>
                 {photoUrl ? "Change photo" : "Add photo"}
               </Button>
-              {isPhotoScanPost && (
+              {hasRescannablePhoto && (
                 <Button variant="secondary" onClick={regenerateCaption} disabled={busy || regenerating}>
                   {regenerating ? "Rescanning…" : "Rescan this photo"}
                 </Button>
@@ -4364,8 +4440,8 @@ function BatchSection({
 // is added, it shows up as a real PostCard elsewhere on this page with the
 // exact same Approve / Edit+feedback / Change photo actions as everything
 // else (see PostCard above) — including its own "Rescan this photo" button
-// (regeneratePhotoScanCaption), which is unrelated to this panel and stays
-// exclusive to already-saved photo-scan posts.
+// (regeneratePhotoScanCaption), which is unrelated to this panel and shows
+// on any post with a photo, not just ones this panel created.
 const SCAN_PANEL_TITLE = "Let Your Marketing Dude Scan Your Photos And Create Content That Makes You Human";
 
 type PhotoScanPreview = {
@@ -4408,12 +4484,15 @@ function PhotoScanPanel({
   // Diagnostic counts from the last scan — added 2026-09-21 alongside the
   // Drive subfolder-recursion fix, so an empty result can say WHY it's
   // empty instead of a flat "no unused photos" that reads as a bug even
-  // when it's telling the truth. Only Drive scans currently return
-  // unsupportedFormatCount (HEIC/HEIF, an iPhone's default format, which
-  // Drive can list but Claude's vision API can't read) — a Library scan's
-  // uploads are always converted to JPEG at upload time, so that case
-  // doesn't apply there.
-  const [scanMeta, setScanMeta] = useState<{ totalPhotos: number; unsupportedFormatCount: number } | null>(null);
+  // when it's telling the truth. heicFallbackCount (Drive scans only —
+  // added 2026-09-29, replacing the old unsupportedFormatCount, which used
+  // to mean "skipped") counts HEIC/HEIF photos (an iPhone's default format)
+  // that were captioned from Drive's own rendered JPEG preview instead of
+  // the original bytes, which Claude's vision API can't read directly —
+  // these are no longer skipped, so this is purely informational. A Library
+  // scan's uploads are always converted to JPEG at upload time, so that
+  // case doesn't apply there.
+  const [scanMeta, setScanMeta] = useState<{ totalPhotos: number; heicFallbackCount: number } | null>(null);
 
   // Not-yet-saved candidates from the last scan(s) this session — see the
   // big comment above. Cleared per-item as each is added or discarded.
@@ -4442,7 +4521,7 @@ function PhotoScanPanel({
           : await scanAgentLibraryPhotos({ data: { agentId, maxPhotos: 5, excludeFileIds } });
       setScanMeta({
         totalPhotos: res.totalPhotos,
-        unsupportedFormatCount: (res as { unsupportedFormatCount?: number }).unsupportedFormatCount ?? 0,
+        heicFallbackCount: (res as { heicFallbackCount?: number }).heicFallbackCount ?? 0,
       });
       if (res.suggestions.length > 0) {
         setSuggestions((cur) => [
@@ -4576,19 +4655,15 @@ function PhotoScanPanel({
       {scanMeta && suggestions.length === 0 && !error && (
         <p className="mt-3 text-sm text-muted-foreground">
           {/* Distinguishes "genuinely nothing there" from "found photos but
-              couldn't use any of them" — added 2026-09-21 after a report
+              they'd already been used" — added 2026-09-21 after a report
               that this said "no photos" for a Drive folder that visibly had
-              photos in it. A flat "no unused photos" is only ever accurate
-              for the first case; the other two have their own real, fixable
-              cause and deserve their own message instead of looking like a
-              bug. */}
-          {scanMeta.unsupportedFormatCount > 0 && scanMeta.totalPhotos === scanMeta.unsupportedFormatCount
-            ? `Found ${scanMeta.totalPhotos} photo${scanMeta.totalPhotos === 1 ? "" : "s"} in this Drive folder, but ${scanMeta.totalPhotos === 1 ? "it's" : "all of them are"} HEIC/HEIF (an iPhone's default photo format), which can't be scanned yet. Save them as JPEG first (Photos app → Share → "Options" → JPEG), or switch the phone's camera to the more compatible format in Settings → Camera → Formats → "Most Compatible."`
-            : scanMeta.unsupportedFormatCount > 0
-              ? `Found ${scanMeta.totalPhotos} photos in this Drive folder — ${scanMeta.unsupportedFormatCount} of them are HEIC/HEIF and got skipped (see above), and the rest have already been used or scanned. Try again once new photos are added.`
-              : scanMeta.totalPhotos > 0
-                ? `Found ${scanMeta.totalPhotos} photo${scanMeta.totalPhotos === 1 ? "" : "s"} in ${source === "drive" ? "this Drive folder" : "the Media Library"}, but they've already been used or scanned before — add new ones to scan more.`
-                : `No photos found in ${source === "drive" ? "this Drive folder (checked its subfolders too)" : "the Media Library"}.`}
+              photos in it. HEIC/HEIF photos used to be a third case here
+              ("found some but they're all a format we can't scan") — as of
+              2026-09-29 those are captioned from Drive's own rendered JPEG
+              instead of being skipped, so that case no longer exists. */}
+          {scanMeta.totalPhotos > 0
+            ? `Found ${scanMeta.totalPhotos} photo${scanMeta.totalPhotos === 1 ? "" : "s"} in ${source === "drive" ? "this Drive folder" : "the Media Library"}, but they've already been used or scanned before — add new ones to scan more.`
+            : `No photos found in ${source === "drive" ? "this Drive folder (checked its subfolders too)" : "the Media Library"}.`}
         </p>
       )}
 
@@ -4602,6 +4677,15 @@ function PhotoScanPanel({
               {savingAll ? "Adding…" : `Add all ${suggestions.length}`}
             </Button>
           </div>
+          {/* Confirms iPhone (HEIC/HEIF) photos actually went through, since
+              nothing else on this screen otherwise shows that — added
+              2026-09-29 alongside the fix that stopped skipping them. */}
+          {!!scanMeta?.heicFallbackCount && (
+            <p className="text-xs text-muted-foreground">
+              {scanMeta.heicFallbackCount} of these {scanMeta.heicFallbackCount === 1 ? "was an" : "were"} iPhone photo
+              {scanMeta.heicFallbackCount === 1 ? "" : "s"} (HEIC) — scanned fine, using Drive's preview image.
+            </p>
+          )}
           {suggestions.map((s, i) => (
             <div key={`${s.sourceId}-${i}`} className="overflow-hidden rounded-2xl border border-border bg-glass">
               {s.thumbnailUrl && (

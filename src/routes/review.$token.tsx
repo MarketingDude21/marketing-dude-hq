@@ -13,9 +13,18 @@ import {
   listPublicReviewDriveMedia,
   setPublicReviewDrivePhoto,
   getPublicReviewDriveFolderId,
+  getPublicReviewDriveThumbnails,
+  addPublicReviewEmailPhotoFromLibrary,
+  addPublicReviewEmailPhotoFromDrive,
+  addPublicReviewEmailPhotoFromUnsplash,
+  updatePublicReviewEmailPhotoInstructions,
+  removePublicReviewEmailPhoto,
+  searchPublicReviewUnsplashPhotos,
   type PostRow,
   type MediaRow,
   type DriveFile,
+  type EmailPhoto,
+  type UnsplashResult,
 } from "@/lib/marketing";
 
 // Public, unauthenticated review page — added 2026-09-22 per Mike: "it is
@@ -364,6 +373,435 @@ function MicButton({ value, onChange }: { value: string; onChange: (v: string) =
   );
 }
 
+// Public twin of admin's EmailPhotosPanel (marketing.tsx) — added 2026-09-29
+// per Mike: the public review link had full edit/rewrite/photo parity for
+// regular posts, but emails got no photo UI here at all. Same up-to-3-photo
+// flow (Media Library / Google Drive / Stock Photos), each with its own
+// publishing instructions, using the token-resolved public twins of the
+// admin functions (addPublicReviewEmailPhotoFrom*, etc).
+function PublicEmailPhotosPanel({
+  post,
+  token,
+  driveFolderId,
+  onChanged,
+}: {
+  post: PostRow;
+  token: string;
+  driveFolderId: string | null;
+  onChanged: () => void;
+}) {
+  const MAX_PHOTOS = 3;
+  const photos = post.metadata?.email_photos ?? [];
+  const legacyUrl = photos.length === 0 ? post.metadata?.media_url || post.metadata?.drive_thumbnail_url || null : null;
+
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [drafts, setDrafts] = useState<Record<string, string>>({});
+  const [pickerOpen, setPickerOpen] = useState(false);
+  const [pickerTab, setPickerTab] = useState<"library" | "drive" | "unsplash">("library");
+  const [mediaOptions, setMediaOptions] = useState<MediaRow[] | null>(null);
+  const [mediaError, setMediaError] = useState<string | null>(null);
+  const [driveOptions, setDriveOptions] = useState<DriveFile[] | null>(null);
+  const [driveOptionsError, setDriveOptionsError] = useState<string | null>(null);
+  const [driveThumbs, setDriveThumbs] = useState<Record<string, string | null>>({});
+  const [failedDriveThumbs, setFailedDriveThumbs] = useState<Set<string>>(new Set());
+  const [unsplashQuery, setUnsplashQuery] = useState(post.title || "lifestyle real estate");
+  const [unsplashResults, setUnsplashResults] = useState<UnsplashResult[] | null>(null);
+  const [unsplashLoading, setUnsplashLoading] = useState(false);
+  const [unsplashError, setUnsplashError] = useState<string | null>(null);
+
+  async function openPicker() {
+    setPickerOpen(true);
+    setPickerTab("library");
+    setError(null);
+    setMediaError(null);
+    try {
+      setMediaOptions(await listPublicReviewMedia({ data: { token } }));
+    } catch (e) {
+      setMediaError(e instanceof Error ? e.message : String(e));
+    }
+  }
+
+  async function openDriveTab() {
+    setPickerTab("drive");
+    try {
+      const res = await listPublicReviewDriveMedia({ data: { token } });
+      setDriveOptions(res.files);
+      setDriveOptionsError(null);
+      if (res.files.length) {
+        getPublicReviewDriveThumbnails({ data: { token, fileIds: res.files.map((f) => f.id) } })
+          .then((r) => setDriveThumbs((prev) => ({ ...prev, ...r.thumbnails })))
+          .catch(() => {});
+      }
+    } catch (e) {
+      setDriveOptions([]);
+      setDriveOptionsError(e instanceof Error ? e.message : String(e));
+    }
+  }
+
+  async function runUnsplashSearch(query: string) {
+    setUnsplashLoading(true);
+    setUnsplashError(null);
+    try {
+      const res = await searchPublicReviewUnsplashPhotos({ data: { token, query } });
+      setUnsplashResults(res.results);
+    } catch (e) {
+      setUnsplashResults([]);
+      setUnsplashError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setUnsplashLoading(false);
+    }
+  }
+
+  function openUnsplashTab() {
+    setPickerTab("unsplash");
+    if (!unsplashResults) runUnsplashSearch(unsplashQuery);
+  }
+
+  async function addFromLibrary(mediaId: string) {
+    setBusy(true);
+    setError(null);
+    try {
+      await addPublicReviewEmailPhotoFromLibrary({ data: { token, postId: post.id, mediaId } });
+      setPickerOpen(false);
+      onChanged();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function addFromDrive(file: DriveFile) {
+    setBusy(true);
+    setError(null);
+    try {
+      await addPublicReviewEmailPhotoFromDrive({
+        data: { token, postId: post.id, driveFileId: file.id, thumbnailUrl: file.thumbnailUrl },
+      });
+      setPickerOpen(false);
+      onChanged();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function addFromUnsplash(r: UnsplashResult) {
+    setBusy(true);
+    setError(null);
+    try {
+      await addPublicReviewEmailPhotoFromUnsplash({
+        data: {
+          token,
+          postId: post.id,
+          photoUrl: r.fullUrl,
+          photographerName: r.photographerName,
+          photographerProfileUrl: r.photographerProfileUrl,
+        },
+      });
+      setPickerOpen(false);
+      onChanged();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function removePhoto(photoId: string) {
+    setBusy(true);
+    setError(null);
+    try {
+      await removePublicReviewEmailPhoto({ data: { token, postId: post.id, photoId } });
+      onChanged();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function saveInstructions(photoId: string) {
+    const value = drafts[photoId];
+    if (value === undefined) return;
+    setBusy(true);
+    setError(null);
+    try {
+      await updatePublicReviewEmailPhotoInstructions({
+        data: { token, postId: post.id, photoId, publishingInstructions: value },
+      });
+      onChanged();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className="mb-3">
+      {legacyUrl && (
+        <div className="mb-3 rounded-2xl border border-border bg-muted p-3">
+          <p className="mb-2 text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
+            Photo (added before multi-photo support)
+          </p>
+          <div className="overflow-hidden rounded-xl border border-border">
+            {post.metadata?.media_type === "video" ? (
+              <video src={legacyUrl} controls className="max-h-56 w-full object-contain" />
+            ) : (
+              <img src={legacyUrl} alt="" className="max-h-56 w-full object-contain" />
+            )}
+          </div>
+        </div>
+      )}
+
+      {photos.length > 0 && (
+        <div className="mb-3 grid gap-3 sm:grid-cols-3">
+          {photos.map((p) => (
+            <div key={p.id} className="rounded-2xl border border-border bg-muted p-2">
+              <div className="overflow-hidden rounded-xl border border-border">
+                {p.mediaType === "video" ? (
+                  <video src={p.url} controls className="aspect-square w-full object-cover" />
+                ) : (
+                  <img src={p.url} alt="" className="aspect-square w-full object-cover" />
+                )}
+              </div>
+              <p className="mt-1 text-[10px] uppercase tracking-wide text-muted-foreground">
+                {p.source === "library" ? "Media Library" : p.source === "drive" ? "Google Drive" : "Stock photo"}
+              </p>
+              <textarea
+                value={drafts[p.id] ?? p.publishingInstructions}
+                onChange={(e) => setDrafts((d) => ({ ...d, [p.id]: e.target.value }))}
+                onBlur={() => saveInstructions(p.id)}
+                placeholder="Publishing instructions (optional)"
+                className="mt-2 min-h-[50px] w-full rounded-lg border border-border bg-glass px-2 py-1.5 text-xs outline-none"
+                disabled={busy}
+              />
+              <div className="mt-1 flex items-center justify-between gap-2">
+                {p.url && (
+                  <button
+                    onClick={() => downloadRemoteFile(p.url!, p.url!.split("/").pop() || `${p.id}`)}
+                    className="text-[11px] font-semibold text-muted-foreground hover:text-foreground hover:underline"
+                  >
+                    ⬇ Download
+                  </button>
+                )}
+                <button
+                  onClick={() => removePhoto(p.id)}
+                  disabled={busy}
+                  className="text-[11px] font-semibold text-destructive hover:underline disabled:opacity-50"
+                >
+                  Remove photo
+                </button>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {error && <p className="mb-2 text-xs text-destructive">{error}</p>}
+
+      {photos.length < MAX_PHOTOS && (
+        <Button variant="secondary" onClick={openPicker} disabled={busy}>
+          {photos.length === 0 && !legacyUrl ? "Add photo" : "Add another photo"} ({photos.length}/{MAX_PHOTOS})
+        </Button>
+      )}
+
+      {pickerOpen && (
+        <div className="mt-3 rounded-2xl border border-border bg-background/40 p-4">
+          <div className="flex items-center justify-between gap-3">
+            <p className="text-sm font-semibold">Add a photo to this email</p>
+            <button
+              onClick={() => setPickerOpen(false)}
+              className="shrink-0 text-xs text-muted-foreground hover:text-foreground"
+            >
+              Close
+            </button>
+          </div>
+
+          <div className="mt-3 flex flex-wrap gap-2 border-b border-border pb-3">
+            <button
+              onClick={() => setPickerTab("library")}
+              className={`rounded-full px-3 py-1 text-xs font-semibold transition-colors ${
+                pickerTab === "library"
+                  ? "bg-primary text-primary-foreground"
+                  : "bg-muted text-muted-foreground hover:text-foreground"
+              }`}
+            >
+              Media Library
+            </button>
+            {driveFolderId && (
+              <button
+                onClick={openDriveTab}
+                className={`rounded-full px-3 py-1 text-xs font-semibold transition-colors ${
+                  pickerTab === "drive"
+                    ? "bg-primary text-primary-foreground"
+                    : "bg-muted text-muted-foreground hover:text-foreground"
+                }`}
+              >
+                Google Drive
+              </button>
+            )}
+            <button
+              onClick={openUnsplashTab}
+              className={`rounded-full px-3 py-1 text-xs font-semibold transition-colors ${
+                pickerTab === "unsplash"
+                  ? "bg-primary text-primary-foreground"
+                  : "bg-muted text-muted-foreground hover:text-foreground"
+              }`}
+            >
+              Stock Photos
+            </button>
+          </div>
+
+          {pickerTab === "library" && (
+            <div className="mt-3">
+              {mediaError && (
+                <div className="mb-2 flex items-center justify-between gap-2 rounded-lg bg-destructive/10 px-3 py-2">
+                  <p className="text-xs text-destructive">Couldn't load the photo library — {mediaError}</p>
+                  <button onClick={openPicker} className="shrink-0 text-xs font-semibold text-primary hover:underline">
+                    Retry
+                  </button>
+                </div>
+              )}
+              {mediaOptions === null && !mediaError && <p className="text-xs text-muted-foreground">Loading…</p>}
+              {mediaOptions === null && mediaError && (
+                <p className="text-xs text-muted-foreground">Nothing loaded yet — tap Retry above.</p>
+              )}
+              {mediaOptions !== null && mediaOptions.length === 0 && (
+                <p className="text-xs text-muted-foreground">No available photos or videos for this agent yet.</p>
+              )}
+              {mediaOptions !== null && mediaOptions.length > 0 && (
+                <div className="grid grid-cols-3 gap-2 sm:grid-cols-4">
+                  {mediaOptions.map((m) => (
+                    <button
+                      key={m.id}
+                      onClick={() => addFromLibrary(m.id)}
+                      disabled={busy}
+                      className="overflow-hidden rounded-xl border border-border transition-colors hover:border-primary disabled:opacity-50"
+                    >
+                      {m.media_type === "video" ? (
+                        m.url ? (
+                          <video src={m.url} className="aspect-square w-full object-cover" />
+                        ) : (
+                          <div className="flex aspect-square w-full items-center justify-center bg-muted text-[10px] text-muted-foreground">
+                            video
+                          </div>
+                        )
+                      ) : m.url ? (
+                        <img src={m.url} alt={m.caption ?? ""} className="aspect-square w-full object-cover" />
+                      ) : (
+                        <div className="flex aspect-square w-full items-center justify-center bg-muted text-[10px] text-muted-foreground">
+                          photo
+                        </div>
+                      )}
+                    </button>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
+
+          {pickerTab === "drive" && (
+            <div className="mt-3">
+              {driveOptionsError && (
+                <div className="mb-2 flex items-center justify-between gap-2 rounded-lg bg-destructive/10 px-3 py-2">
+                  <p className="text-xs text-destructive">{driveOptionsError}</p>
+                  <button
+                    onClick={openDriveTab}
+                    className="shrink-0 text-xs font-semibold text-primary hover:underline"
+                  >
+                    Retry
+                  </button>
+                </div>
+              )}
+              {!driveOptionsError && driveOptions === null && <p className="text-xs text-muted-foreground">Loading…</p>}
+              {!driveOptionsError && driveOptions !== null && driveOptions.length === 0 && (
+                <p className="text-xs text-muted-foreground">
+                  No unused photos or videos found in this agent's Drive folder.
+                </p>
+              )}
+              {driveOptions !== null && driveOptions.length > 0 && (
+                <div className="grid grid-cols-3 gap-2 sm:grid-cols-4">
+                  {driveOptions.map((f) => {
+                    const thumbSrc = driveThumbs[f.id] ?? f.thumbnailUrl;
+                    const thumbFailed = failedDriveThumbs.has(f.id);
+                    return (
+                      <button
+                        key={f.id}
+                        onClick={() => addFromDrive(f)}
+                        disabled={busy}
+                        className="overflow-hidden rounded-xl border border-border transition-colors hover:border-primary disabled:opacity-50"
+                      >
+                        {f.isVideo ? (
+                          <video src={thumbSrc} className="aspect-square w-full object-cover" />
+                        ) : thumbFailed ? (
+                          <div className="flex aspect-square w-full flex-col items-center justify-center gap-1 bg-muted p-1 text-center text-[10px] text-muted-foreground">
+                            <span>photo</span>
+                            <span className="max-h-6 overflow-hidden">{f.name}</span>
+                          </div>
+                        ) : (
+                          <img
+                            src={thumbSrc}
+                            alt={f.name}
+                            className="aspect-square w-full object-cover"
+                            onError={() => setFailedDriveThumbs((s) => new Set(s).add(f.id))}
+                          />
+                        )}
+                      </button>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+          )}
+
+          {pickerTab === "unsplash" && (
+            <div className="mt-3">
+              <div className="flex gap-2">
+                <input
+                  value={unsplashQuery}
+                  onChange={(e) => setUnsplashQuery(e.target.value)}
+                  onKeyDown={(e) => e.key === "Enter" && runUnsplashSearch(unsplashQuery)}
+                  placeholder="Search stock photos — coffee, fall, neighborhood…"
+                  className="flex-1 rounded-xl border border-border bg-glass px-3 py-1.5 text-sm outline-none"
+                />
+                <Button variant="secondary" onClick={() => runUnsplashSearch(unsplashQuery)} disabled={unsplashLoading}>
+                  {unsplashLoading ? "Searching…" : "Search"}
+                </Button>
+              </div>
+              {unsplashError && <p className="mt-2 text-xs text-destructive">{unsplashError}</p>}
+              {!unsplashError && unsplashResults !== null && unsplashResults.length === 0 && !unsplashLoading && (
+                <p className="mt-2 text-xs text-muted-foreground">No results — try a different search.</p>
+              )}
+              {unsplashResults !== null && unsplashResults.length > 0 && (
+                <div className="mt-3 grid grid-cols-3 gap-2 sm:grid-cols-4">
+                  {unsplashResults.map((r) => (
+                    <button
+                      key={r.id}
+                      onClick={() => addFromUnsplash(r)}
+                      disabled={busy}
+                      title={`Photo by ${r.photographerName} on Unsplash`}
+                      className="overflow-hidden rounded-xl border border-border transition-colors hover:border-primary disabled:opacity-50"
+                    >
+                      <img src={r.thumbUrl} alt="" className="aspect-square w-full object-cover" />
+                    </button>
+                  ))}
+                </div>
+              )}
+              <p className="mt-2 text-[11px] text-muted-foreground">
+                Photos via Unsplash — credit is added automatically.
+              </p>
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function PublicPostCard({
   post,
   token,
@@ -392,9 +830,12 @@ function PublicPostCard({
   const [pickerOpen, setPickerOpen] = useState(false);
   const [pickerTab, setPickerTab] = useState<"library" | "drive">("library");
   const [mediaOptions, setMediaOptions] = useState<MediaRow[] | null>(null);
+  const [mediaError, setMediaError] = useState<string | null>(null);
   const [mediaBusy, setMediaBusy] = useState(false);
   const [driveOptions, setDriveOptions] = useState<DriveFile[] | null>(null);
   const [driveOptionsError, setDriveOptionsError] = useState<string | null>(null);
+  const [driveThumbs, setDriveThumbs] = useState<Record<string, string | null>>({});
+  const [failedDriveThumbs, setFailedDriveThumbs] = useState<Set<string>>(new Set());
 
   useEffect(() => {
     setDraft(post.content);
@@ -465,16 +906,19 @@ function PublicPostCard({
     }
   }
 
+  // Fixed 2026-09-29, same bug as admin's PostCard: this used to fetch once
+  // ever and blank the list to [] (indistinguishable from "really empty")
+  // on any failure, never retrying. Now always refetches on open and keeps
+  // whatever was already loaded on screen if a refresh fails.
   async function openPicker() {
     setPickerOpen(true);
     setPickerTab("library");
-    if (!mediaOptions) {
-      try {
-        const list = await listPublicReviewMedia({ data: { token } });
-        setMediaOptions(list);
-      } catch {
-        setMediaOptions([]);
-      }
+    setMediaError(null);
+    try {
+      const list = await listPublicReviewMedia({ data: { token } });
+      setMediaOptions(list);
+    } catch (e) {
+      setMediaError(e instanceof Error ? e.message : String(e));
     }
   }
 
@@ -492,17 +936,23 @@ function PublicPostCard({
     }
   }
 
+  // Same always-refetch fix, plus fetches real (authenticated) Drive
+  // thumbnails — see getDriveThumbnails' comment in marketing.ts for why the
+  // raw drive.google.com hotlink was showing as an empty/broken image slot.
   async function openDriveTab() {
     setPickerTab("drive");
-    if (!driveOptions && driveFolderId) {
-      try {
-        const res = await listPublicReviewDriveMedia({ data: { token } });
-        setDriveOptions(res.files);
-        setDriveOptionsError(null);
-      } catch (e) {
-        setDriveOptions([]);
-        setDriveOptionsError(e instanceof Error ? e.message : String(e));
+    try {
+      const res = await listPublicReviewDriveMedia({ data: { token } });
+      setDriveOptions(res.files);
+      setDriveOptionsError(null);
+      if (res.files.length) {
+        getPublicReviewDriveThumbnails({ data: { token, fileIds: res.files.map((f) => f.id) } })
+          .then((r) => setDriveThumbs((prev) => ({ ...prev, ...r.thumbnails })))
+          .catch(() => {});
       }
+    } catch (e) {
+      setDriveOptions([]);
+      setDriveOptionsError(e instanceof Error ? e.message : String(e));
     }
   }
 
@@ -548,34 +998,55 @@ function PublicPostCard({
       </div>
 
       <div className="mt-4 border-t border-border pt-4">
-        {post.content_type === "post" && photoUrl && (
-          <div className="mb-3 overflow-hidden rounded-2xl border border-border bg-muted">
-            {post.metadata?.media_type === "video" ? (
-              <video src={photoUrl} controls className="max-h-64 w-full object-contain" />
-            ) : (
-              <img src={photoUrl} alt="" className="max-h-64 w-full object-contain" />
+        {/* Photo + its own controls together as one block, matching admin's
+              PostCard (2026-09-29) — "look at the photo and either change it
+              or give feedback," not a photo up top and a Change-photo button
+              buried in an unrelated row below the caption. */}
+        {post.content_type === "post" && (
+          <div className="mb-3">
+            {photoUrl && (
+              <div className="overflow-hidden rounded-2xl border border-border bg-muted">
+                {post.metadata?.media_type === "video" ? (
+                  <video src={photoUrl} controls className="max-h-64 w-full object-contain" />
+                ) : (
+                  <img src={photoUrl} alt="" className="max-h-64 w-full object-contain" />
+                )}
+                <button
+                  onClick={() => downloadRemoteFile(photoUrl, photoUrl.split("/").pop() || "photo")}
+                  className="w-full border-t border-border bg-glass py-1 text-[11px] font-semibold text-muted-foreground transition-colors hover:bg-secondary hover:text-foreground"
+                >
+                  ⬇ Download
+                </button>
+              </div>
             )}
-            <button
-              onClick={() => downloadRemoteFile(photoUrl, photoUrl.split("/").pop() || "photo")}
-              className="w-full border-t border-border bg-glass py-1 text-[11px] font-semibold text-muted-foreground transition-colors hover:bg-secondary hover:text-foreground"
-            >
-              ⬇ Download
-            </button>
+            {photoUrl && post.metadata?.unsplash_photographer && (
+              <p className="mt-1 text-[11px] text-muted-foreground">
+                Photo by{" "}
+                <a
+                  href={post.metadata.unsplash_credit_url ?? "https://unsplash.com"}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="underline hover:text-foreground"
+                >
+                  {post.metadata.unsplash_photographer}
+                </a>{" "}
+                on Unsplash
+              </p>
+            )}
+            <div className="mt-2 flex flex-wrap gap-2">
+              <Button variant="secondary" onClick={openPicker} disabled={busy}>
+                {photoUrl ? "Change photo" : "Add photo"}
+              </Button>
+            </div>
           </div>
         )}
-        {post.content_type === "post" && photoUrl && post.metadata?.unsplash_photographer && (
-          <p className="-mt-2 mb-3 text-[11px] text-muted-foreground">
-            Photo by{" "}
-            <a
-              href={post.metadata.unsplash_credit_url ?? "https://unsplash.com"}
-              target="_blank"
-              rel="noreferrer"
-              className="underline hover:text-foreground"
-            >
-              {post.metadata.unsplash_photographer}
-            </a>{" "}
-            on Unsplash
-          </p>
+        {post.content_type === "email" && (
+          <PublicEmailPhotosPanel
+            post={post}
+            token={token}
+            driveFolderId={driveFolderId}
+            onChanged={() => onChanged(post.id)}
+          />
         )}
 
         <p className="whitespace-pre-wrap text-sm leading-relaxed">{post.content}</p>
@@ -608,11 +1079,6 @@ function PublicPostCard({
           <Button variant="secondary" onClick={() => setEditorOpen((v) => !v)} disabled={busy}>
             Edit / Feedback
           </Button>
-          {post.content_type === "post" && (
-            <Button variant="secondary" onClick={openPicker} disabled={busy}>
-              {photoUrl ? "Change photo" : "Add photo"}
-            </Button>
-          )}
         </div>
 
         {post.content_type === "post" && pickerOpen && (
@@ -654,7 +1120,21 @@ function PublicPostCard({
 
             {pickerTab === "library" && (
               <div className="mt-3">
-                {mediaOptions === null && <p className="text-xs text-muted-foreground">Loading…</p>}
+                {mediaError && (
+                  <div className="mb-2 flex items-center justify-between gap-2 rounded-lg bg-destructive/10 px-3 py-2">
+                    <p className="text-xs text-destructive">Couldn't load the photo library — {mediaError}</p>
+                    <button
+                      onClick={openPicker}
+                      className="shrink-0 text-xs font-semibold text-primary hover:underline"
+                    >
+                      Retry
+                    </button>
+                  </div>
+                )}
+                {mediaOptions === null && !mediaError && <p className="text-xs text-muted-foreground">Loading…</p>}
+                {mediaOptions === null && mediaError && (
+                  <p className="text-xs text-muted-foreground">Nothing loaded yet — tap Retry above.</p>
+                )}
                 {mediaOptions !== null && mediaOptions.length === 0 && (
                   <p className="text-xs text-muted-foreground">No available photos or videos for this agent yet.</p>
                 )}
@@ -667,11 +1147,21 @@ function PublicPostCard({
                         disabled={mediaBusy}
                         className="overflow-hidden rounded-xl border border-border transition-colors hover:border-primary disabled:opacity-50"
                       >
-                        {m.media_type === "video"
-                          ? m.url && <video src={m.url} className="aspect-square w-full object-cover" />
-                          : m.url && (
-                              <img src={m.url} alt={m.caption ?? ""} className="aspect-square w-full object-cover" />
-                            )}
+                        {m.media_type === "video" ? (
+                          m.url ? (
+                            <video src={m.url} className="aspect-square w-full object-cover" />
+                          ) : (
+                            <div className="flex aspect-square w-full items-center justify-center bg-muted text-[10px] text-muted-foreground">
+                              video
+                            </div>
+                          )
+                        ) : m.url ? (
+                          <img src={m.url} alt={m.caption ?? ""} className="aspect-square w-full object-cover" />
+                        ) : (
+                          <div className="flex aspect-square w-full items-center justify-center bg-muted text-[10px] text-muted-foreground">
+                            photo
+                          </div>
+                        )}
                       </button>
                     ))}
                   </div>
@@ -681,7 +1171,17 @@ function PublicPostCard({
 
             {pickerTab === "drive" && (
               <div className="mt-3">
-                {driveOptionsError && <p className="text-xs text-destructive">{driveOptionsError}</p>}
+                {driveOptionsError && (
+                  <div className="mb-2 flex items-center justify-between gap-2 rounded-lg bg-destructive/10 px-3 py-2">
+                    <p className="text-xs text-destructive">{driveOptionsError}</p>
+                    <button
+                      onClick={openDriveTab}
+                      className="shrink-0 text-xs font-semibold text-primary hover:underline"
+                    >
+                      Retry
+                    </button>
+                  </div>
+                )}
                 {!driveOptionsError && driveOptions === null && (
                   <p className="text-xs text-muted-foreground">Loading…</p>
                 )}
@@ -692,20 +1192,34 @@ function PublicPostCard({
                 )}
                 {driveOptions !== null && driveOptions.length > 0 && (
                   <div className="grid grid-cols-3 gap-2 sm:grid-cols-4">
-                    {driveOptions.map((f) => (
-                      <button
-                        key={f.id}
-                        onClick={() => pickDriveFile(f)}
-                        disabled={mediaBusy}
-                        className="overflow-hidden rounded-xl border border-border transition-colors hover:border-primary disabled:opacity-50"
-                      >
-                        {f.isVideo ? (
-                          <video src={f.thumbnailUrl} className="aspect-square w-full object-cover" />
-                        ) : (
-                          <img src={f.thumbnailUrl} alt={f.name} className="aspect-square w-full object-cover" />
-                        )}
-                      </button>
-                    ))}
+                    {driveOptions.map((f) => {
+                      const thumbSrc = driveThumbs[f.id] ?? f.thumbnailUrl;
+                      const thumbFailed = failedDriveThumbs.has(f.id);
+                      return (
+                        <button
+                          key={f.id}
+                          onClick={() => pickDriveFile(f)}
+                          disabled={mediaBusy}
+                          className="overflow-hidden rounded-xl border border-border transition-colors hover:border-primary disabled:opacity-50"
+                        >
+                          {f.isVideo ? (
+                            <video src={thumbSrc} className="aspect-square w-full object-cover" />
+                          ) : thumbFailed ? (
+                            <div className="flex aspect-square w-full flex-col items-center justify-center gap-1 bg-muted p-1 text-center text-[10px] text-muted-foreground">
+                              <span>photo</span>
+                              <span className="max-h-6 overflow-hidden">{f.name}</span>
+                            </div>
+                          ) : (
+                            <img
+                              src={thumbSrc}
+                              alt={f.name}
+                              className="aspect-square w-full object-cover"
+                              onError={() => setFailedDriveThumbs((s) => new Set(s).add(f.id))}
+                            />
+                          )}
+                        </button>
+                      );
+                    })}
                   </div>
                 )}
               </div>

@@ -1357,7 +1357,9 @@ export const createMediaUploadUrl = createServerFn({ method: "POST" })
 // back about its own upload.
 export const finalizeMediaUpload = createServerFn({ method: "POST" })
   .middleware([requireSupabaseAuth])
-  .inputValidator((data: { agentId: string; storagePath: string; mediaType: "photo" | "video"; caption?: string }) => data)
+  .inputValidator(
+    (data: { agentId: string; storagePath: string; mediaType: "photo" | "video"; caption?: string }) => data,
+  )
   .handler(async ({ data, context }): Promise<{ ok: true; id: string }> => {
     const email = (context.claims as { email?: string } | undefined)?.email;
     await requireAgentAccess(context.userId, email, data.agentId);
@@ -2969,7 +2971,9 @@ export const listCalendarItems = createServerFn({ method: "GET" })
 
 export const addCalendarItem = createServerFn({ method: "POST" })
   .middleware([requireSupabaseAuth])
-  .inputValidator((data: { monthId: string; docType: "post" | "email" | "video"; title: string; rawText: string }) => data)
+  .inputValidator(
+    (data: { monthId: string; docType: "post" | "email" | "video"; title: string; rawText: string }) => data,
+  )
   .handler(async ({ data, context }): Promise<{ ok: true }> => {
     const email = (context.claims as { email?: string } | undefined)?.email;
     await requireAdmin(context.userId, email);
@@ -4039,7 +4043,7 @@ export const addPhotoPostsToBatch = createServerFn({ method: "POST" })
 export const sendContentToAgent = createServerFn({ method: "POST" })
   .middleware([requireSupabaseAuth])
   .inputValidator((data: { agentId: string; month: string }) => data)
-  .handler(async ({ data, context }): Promise<{ ok: true }> => {
+  .handler(async ({ data, context }): Promise<{ ok: true; ghlMessageId: string | null }> => {
     const email = (context.claims as { email?: string } | undefined)?.email;
     const access = await resolveAccess(context.userId, email);
     if (access.role !== "admin") {
@@ -4074,42 +4078,57 @@ export const sendContentToAgent = createServerFn({ method: "POST" })
       if (tokenErr) throw tokenErr;
     }
 
-    // NOTE (2026-09-18): this used to send Version: "2021-04-15" on every
-    // call here, which is not a version GoHighLevel's v2/LeadConnector API
-    // recognizes for either the contacts endpoints or conversations/messages
-    // — that mismatch is almost certainly why Send to Agent's email was
-    // silently failing even after GHL_API_KEY/GHL_LOCATION_ID were set
-    // correctly. 2021-07-28 is the current stable version for both.
+    // FIXED (2026-09-29): "Send to Agent" started throwing "GoHighLevel
+    // contact search failed (400): unknown error" again ("worked fine before
+    // the switch" — Mike). Checked GoHighLevel's current official docs
+    // (marketplace.gohighlevel.com/docs/ghl/contacts/{search,
+    // get-duplicate-contact,create-contact} and
+    // .../conversations/send-a-new-message) — all four now list
+    // `Version: v3` as required. 2021-07-28 (set in the 2026-09-18 pass, and
+    // correct at the time) is apparently no longer accepted — this is a
+    // GoHighLevel-side API version deprecation, not a regression in this
+    // app's own code. Switched every call in this function to v3.
     const headers = {
       Authorization: "Bearer " + ghlKey,
       "Content-Type": "application/json",
-      Version: "2021-07-28",
+      Version: "v3",
     };
-    // FIXED (2026-09-22): this used to silently swallow whatever GoHighLevel
-    // actually said on a failed search or create call — a 401 from a bad
-    // key, a validation error, a locationId mismatch, all collapsed into
-    // the same generic "could not find or create a contact" message, which
-    // is exactly what Mike hit and reported (no way to tell from that
-    // message what was actually wrong). Both calls below now check
-    // response.ok and surface GHL's own error text when either one fails,
-    // instead of only checking "did we end up with a contactId."
-    const searchRes = await fetch(
-      "https://services.leadconnectorhq.com/contacts/search?locationId=" +
-        ghlLocation +
-        "&query=" +
-        encodeURIComponent(agent.email),
-      { headers },
-    );
-    const searchData = (await searchRes.json()) as {
-      contacts?: { id: string }[];
-      message?: string;
-    };
-    if (!searchRes.ok) {
-      throw new Error(
-        `GoHighLevel contact search failed (${searchRes.status}): ${searchData.message ?? "unknown error"}. Check that GHL_API_KEY has contacts access and GHL_LOCATION_ID matches the key's sub-account.`,
+    // FIXED (2026-09-29): the old lookup used GET /contacts/search with
+    // ?locationId=&query= — under GoHighLevel's current (v3) contract,
+    // /contacts/search is POST-only and expects an advanced `filters` array,
+    // not a plain query string, which is almost certainly the real 400
+    // (separately from the Version mismatch above). Swapped it for
+    // GoHighLevel's dedicated "Get Duplicate Contact" endpoint — GET
+    // /contacts/search/duplicate?locationId=&email= — which is documented
+    // (v3) for exactly this "does a contact with this email already exist"
+    // check. This app can't confirm GoHighLevel's exact response shape for
+    // "no duplicate found" without a live account to test against, so this
+    // lookup is treated as best-effort: any failure or unrecognized shape
+    // just falls through to the create-contact call below, which already
+    // recovers the existing contact's id from GoHighLevel's own "duplicated
+    // contact" error (see the dupeId handling a few lines down) — so Send to
+    // Agent can no longer be fully blocked by this lookup alone.
+    let contactId: string | null = null;
+    try {
+      const dupeRes = await fetch(
+        "https://services.leadconnectorhq.com/contacts/search/duplicate?locationId=" +
+          ghlLocation +
+          "&email=" +
+          encodeURIComponent(agent.email),
+        { headers },
       );
+      if (dupeRes.ok) {
+        const dupeData = (await dupeRes.json().catch(() => ({}))) as {
+          contact?: { id?: string };
+          contactId?: string;
+          id?: string;
+        };
+        contactId = dupeData.contact?.id ?? dupeData.contactId ?? dupeData.id ?? null;
+      }
+    } catch {
+      // Network hiccup on the lookup — fall through to create+recover below
+      // rather than failing "Send to Agent" outright over a dedupe check.
     }
-    let contactId = searchData.contacts?.[0]?.id ?? null;
     if (!contactId) {
       const createRes = await fetch("https://services.leadconnectorhq.com/contacts/", {
         method: "POST",
@@ -4166,12 +4185,31 @@ export const sendContentToAgent = createServerFn({ method: "POST" })
         emailTo: agent.email,
         subject: `${firstName} — Your ${data.month} Content Is Ready To Review`,
         html: emailHtml,
-        body: emailHtml,
+        // GoHighLevel's documented field for the message body is `message`,
+        // not `body` — sending `body` was a schema mismatch found in an
+        // earlier pass. Keeping both isn't necessary once `message` is
+        // present, but there's no harm in it either, so `html` (the
+        // rendered content) stays and `body` was dropped in favor of the
+        // documented `message` field.
+        message: emailHtml,
       }),
     });
+    // A 200 here only confirms GoHighLevel logged the message — it does not
+    // confirm the email actually reached the agent's inbox (their own docs
+    // say so explicitly). Surfacing GoHighLevel's own message id lets Mike
+    // look this exact send up in that agent's Conversations tab in GHL to
+    // see its real delivery status, instead of guessing from silence.
+    const emailData = (await emailRes.json().catch(() => ({}))) as {
+      message?: string;
+      id?: string;
+      conversationId?: string;
+      messageId?: string;
+      emailMessageId?: string;
+    };
     if (!emailRes.ok) {
-      const emailData = (await emailRes.json()) as { message?: string };
       throw new Error(emailData.message ?? "GoHighLevel email send failed.");
     }
-    return { ok: true };
+    const ghlMessageId =
+      emailData.emailMessageId ?? emailData.messageId ?? emailData.id ?? emailData.conversationId ?? null;
+    return { ok: true, ghlMessageId };
   });

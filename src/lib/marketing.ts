@@ -2369,9 +2369,11 @@ async function listDriveUsedFolderIds(rootFolderId: string, accessToken: string)
 }
 
 // A HEIC/HEIF photo (the default format on an iPhone camera) can be listed
-// and thumbnailed by Drive just fine, but Claude's vision API can't read
-// its bytes — captioning it just fails. Callers filter these out up front
-// so a batch of iPhone photos doesn't silently look like "no photos found."
+// and thumbnailed by Drive just fine, but Claude's vision API can't read its
+// raw bytes directly. scanAgentDrivePhotos below uses this to know when to
+// caption Drive's rendered JPEG thumbnail instead of the original file —
+// see its heicFallbackCount comment for the full story (this no longer
+// causes anything to be skipped, as of 2026-09-29).
 function isHeicDriveFile(f: { name: string; mimeType: string }): boolean {
   return (
     f.mimeType === "image/heif" || f.mimeType === "image/heic" || /\.heic$/i.test(f.name) || /\.heif$/i.test(f.name)
@@ -2496,24 +2498,39 @@ async function fetchDriveFilesByIds(fileIds: string[], accessToken: string): Pro
 // functions above so opening the picker still shows filenames/grid instantly
 // while thumbnails fill in a beat later, instead of blocking the whole list
 // on N thumbnail round trips.
-async function fetchDriveThumbnailDataUrl(fileId: string, accessToken: string): Promise<string | null> {
+// Pulled out of fetchDriveThumbnailDataUrl below so the Photo Scan HEIC
+// workaround (see isHeicDriveFile's callers) can reuse the exact same
+// files.get→thumbnailLink→GET round trip, just asking Drive for a bigger
+// image (a vision caption needs more detail than a picker-grid thumbnail
+// does) instead of always requesting the ~400px picker size.
+async function fetchDriveThumbnailBytes(
+  fileId: string,
+  accessToken: string,
+  sizePx: number,
+): Promise<{ arrayBuffer: ArrayBuffer; contentType: string } | null> {
   try {
     const metaUrl = `https://www.googleapis.com/drive/v3/files/${fileId}?fields=thumbnailLink&supportsAllDrives=true`;
     const metaRes = await fetchWithTimeout(metaUrl, { headers: driveAuthHeaders(accessToken) }, 10_000);
     if (!metaRes.ok) return null;
     const meta = (await metaRes.json()) as { thumbnailLink?: string };
     if (!meta.thumbnailLink) return null;
-    // thumbnailLink defaults to a small ~220px image — bump it up for a
-    // crisper picker grid (Drive honors a trailing =sNNN size override).
-    const link = meta.thumbnailLink.replace(/=s\d+$/, "=s400");
+    // thumbnailLink defaults to a small ~220px image — bump it up (Drive
+    // honors a trailing =sNNN size override).
+    const link = meta.thumbnailLink.replace(/=s\d+$/, `=s${sizePx}`);
     const imgRes = await fetchWithTimeout(link, { headers: driveAuthHeaders(accessToken) }, 10_000);
     if (!imgRes.ok) return null;
-    const buf = await imgRes.arrayBuffer();
+    const arrayBuffer = await imgRes.arrayBuffer();
     const contentType = imgRes.headers.get("content-type") || "image/jpeg";
-    return `data:${contentType};base64,${Buffer.from(buf).toString("base64")}`;
+    return { arrayBuffer, contentType };
   } catch {
     return null;
   }
+}
+
+async function fetchDriveThumbnailDataUrl(fileId: string, accessToken: string): Promise<string | null> {
+  const thumb = await fetchDriveThumbnailBytes(fileId, accessToken, 400);
+  if (!thumb) return null;
+  return `data:${thumb.contentType};base64,${Buffer.from(thumb.arrayBuffer).toString("base64")}`;
 }
 
 // Capped so one card's picker can never trigger an unbounded burst of Drive
@@ -4421,7 +4438,7 @@ export const scanAgentDrivePhotos = createServerFn({ method: "POST" })
     async ({
       data,
       context,
-    }): Promise<{ suggestions: PhotoScanSuggestion[]; totalPhotos: number; unsupportedFormatCount: number }> => {
+    }): Promise<{ suggestions: PhotoScanSuggestion[]; totalPhotos: number; heicFallbackCount: number }> => {
       const email = (context.claims as { email?: string } | undefined)?.email;
       await requireAgentAccess(context.userId, email, data.agentId);
       const anthropicKey = process.env["ANTHROPIC_API_KEY"];
@@ -4461,30 +4478,45 @@ export const scanAgentDrivePhotos = createServerFn({ method: "POST" })
       if (!listRes.ok) throw new Error(listData.error?.message ?? "Drive list failed");
       const allFiles = listData.files ?? [];
 
-      // HEIC/HEIF (an iPhone's default photo format) can be listed and
-      // thumbnailed by Drive, but Claude's vision API can't read its bytes —
-      // captioning it always fails. Pulled out up front (instead of
-      // discovered one-by-one inside the caption loop below) so the response
-      // can tell the difference between "this folder is genuinely empty" and
-      // "found photos, but they're all a format we can't scan yet" — added
-      // 2026-09-21 after Mike reported photos that are visibly in Drive
-      // showing up here as if there were none at all.
-      const unsupportedFormatCount = allFiles.filter(isHeicDriveFile).length;
-      const usableFiles = allFiles.filter((f) => !isHeicDriveFile(f));
-
+      // HEIC/HEIF (an iPhone's default photo format) used to be skipped
+      // entirely here, because Claude's vision API can't read raw HEIC
+      // bytes. WIDENED 2026-09-29 per Mike: "need to be able to pull any" —
+      // Drive already generates a real JPEG preview for every image it
+      // stores (the same thumbnailLink the picker grids use), so instead of
+      // skipping a HEIC photo, fetch that Drive-rendered JPEG and caption
+      // THAT. Nothing gets excluded up front anymore; heicFallbackCount
+      // below just tracks how many of the successful captions came from a
+      // Drive-rendered fallback instead of the original bytes, for the
+      // "why did some get skipped" messaging below.
       const excludeIds = new Set(data.excludeFileIds ?? []);
       const maxPhotos = data.maxPhotos ?? 5;
-      const toProcess = usableFiles.filter((f) => !excludeIds.has(f.id)).slice(0, maxPhotos);
+      const toProcess = allFiles.filter((f) => !excludeIds.has(f.id)).slice(0, maxPhotos);
 
+      let heicFallbackCount = 0;
       const results = await Promise.all(
         toProcess.map(async (f): Promise<PhotoScanSuggestion | null> => {
           try {
-            const imgUrl = "https://www.googleapis.com/drive/v3/files/" + f.id + "?alt=media&supportsAllDrives=true";
-            const imgRes = await fetchWithTimeout(imgUrl, { headers: driveAuthHeaders(accessToken) }, 15_000);
-            if (!imgRes.ok) return null;
-            const arrayBuffer = await imgRes.arrayBuffer();
+            const isHeic = isHeicDriveFile(f);
+            let arrayBuffer: ArrayBuffer;
+            let mediaType: string;
+            if (isHeic) {
+              // 1600px is plenty for a vision caption (it only needs to
+              // describe the scene, not reproduce the photo) and keeps this
+              // fast — the same call also doubles as this suggestion's
+              // on-screen preview image below, so no second Drive round trip.
+              const thumb = await fetchDriveThumbnailBytes(f.id, accessToken, 1600);
+              if (!thumb) return null; // Drive hasn't finished rendering a preview yet (very recent upload) — try again shortly
+              arrayBuffer = thumb.arrayBuffer;
+              mediaType = thumb.contentType;
+              heicFallbackCount++;
+            } else {
+              const imgUrl = "https://www.googleapis.com/drive/v3/files/" + f.id + "?alt=media&supportsAllDrives=true";
+              const imgRes = await fetchWithTimeout(imgUrl, { headers: driveAuthHeaders(accessToken) }, 15_000);
+              if (!imgRes.ok) return null;
+              arrayBuffer = await imgRes.arrayBuffer();
+              mediaType = f.mimeType || "image/jpeg";
+            }
 
-            const mediaType = f.mimeType || "image/jpeg";
             const caption = await captionPhotoInVoice(
               arrayBuffer,
               mediaType,
@@ -4495,12 +4527,23 @@ export const scanAgentDrivePhotos = createServerFn({ method: "POST" })
             );
             if (!caption) return null;
             const { description, suggestedPost } = caption;
+            // The raw drive.google.com/thumbnail hotlink 403s now that
+            // folders are privately shared with one OAuth account instead of
+            // "anyone with the link" (same root cause as the picker-grid fix
+            // above) — use an authenticated data: URI for this preview
+            // instead so the scan results aren't a wall of empty boxes. For
+            // a HEIC file, the bytes we already fetched above ARE that
+            // authenticated thumbnail — reuse them instead of fetching again.
+            const thumbnailUrl = isHeic
+              ? `data:${mediaType};base64,${Buffer.from(arrayBuffer).toString("base64")}`
+              : ((await fetchDriveThumbnailDataUrl(f.id, accessToken)) ??
+                `https://drive.google.com/thumbnail?id=${f.id}&sz=w400`);
             return {
               source: "drive" as const,
               fileId: f.id,
               fileName: f.name,
               driveUrl: `https://drive.google.com/file/d/${f.id}/view`,
-              thumbnailUrl: `https://drive.google.com/thumbnail?id=${f.id}&sz=w400`,
+              thumbnailUrl,
               description,
               suggestedPost,
             };
@@ -4513,7 +4556,7 @@ export const scanAgentDrivePhotos = createServerFn({ method: "POST" })
       return {
         suggestions: results.filter((r): r is PhotoScanSuggestion => Boolean(r)),
         totalPhotos: allFiles.length,
-        unsupportedFormatCount,
+        heicFallbackCount,
       };
     },
   );
@@ -4649,15 +4692,22 @@ export const addPhotoPostsToBatch = createServerFn({ method: "POST" })
     return { ok: true, created: rows.length };
   });
 
-// Re-runs captionPhotoInVoice on the SAME photo behind an already-saved
-// Photo Scan post — added 2026-09-29 per Mike: "you could rescan the photo"
-// (a follow-up on the Photo Scan/content-calendar unification below). This
-// is deliberately separate from "Scan more" (which pulls in NEW, different
-// photos) — this re-fetches the exact same image bytes for the photo this
-// post already came from and asks Claude for a fresh caption, in case the
-// first one didn't land. Only works on a post that actually came from Photo
-// Scan (metadata.source is drive_photo_scan or library_photo_scan) — there's
-// no original photo to re-fetch for anything else.
+// Re-runs captionPhotoInVoice on the CURRENT photo attached to a post —
+// added 2026-09-29 per Mike: "you could rescan the photo" (a follow-up on
+// the Photo Scan/content-calendar unification below). This is deliberately
+// separate from "Scan more" (which pulls in NEW, different photos) — this
+// re-fetches the image bytes for whatever photo is on the post right now
+// and asks Claude for a fresh caption, in case the first one didn't land.
+// WIDENED 2026-09-29 (same day, follow-up per Mike: "scan photo featur is
+// missing form this" on a regular content-calendar post): this used to
+// only work on a post that came from Photo Scan (metadata.source ===
+// drive_photo_scan/library_photo_scan), because that was the only case
+// this originally shipped for. But every post's photo — however it got
+// attached (Drive picker, Media Library, Unsplash, or the original Photo
+// Scan flow) — is stored the same way (drive_file_id+drive_thumbnail_url,
+// or media_url), so there's no technical reason to restrict this to
+// Photo-Scan-sourced posts. The gate below is now "is there a photo on
+// this post at all," not "how did the photo get here."
 export const regeneratePhotoScanCaption = createServerFn({ method: "POST" })
   .middleware([requireSupabaseAuth])
   .inputValidator((data: { agentId: string; postId: string }) => data)
@@ -4677,8 +4727,10 @@ export const regeneratePhotoScanCaption = createServerFn({ method: "POST" })
     if (error) throw error;
     if (!post || post.agent_id !== data.agentId) throw new Error("Post not found for this agent.");
     const metadata = (post.metadata ?? {}) as PostMetadata;
-    if (metadata.source !== "drive_photo_scan" && metadata.source !== "library_photo_scan") {
-      throw new Error("This post wasn't created from Photo Scan, so there's no original photo to re-caption.");
+    const hasDrivePhoto = !!metadata.drive_file_id;
+    const hasOtherPhoto = !!metadata.media_url;
+    if (!hasDrivePhoto && !hasOtherPhoto) {
+      throw new Error("This post doesn't have a photo attached yet — add one first, then rescan.");
     }
 
     const { data: agent } = await supabaseAdmin
@@ -4692,9 +4744,8 @@ export const regeneratePhotoScanCaption = createServerFn({ method: "POST" })
 
     let arrayBuffer: ArrayBuffer;
     let mediaType = "image/jpeg";
-    if (metadata.source === "drive_photo_scan") {
-      const fileId = metadata.drive_file_id;
-      if (!fileId) throw new Error("This post is missing its original Drive file — can't re-scan it.");
+    if (hasDrivePhoto) {
+      const fileId = metadata.drive_file_id as string;
       const accessToken = await getDriveAccessToken();
       const imgUrl = "https://www.googleapis.com/drive/v3/files/" + fileId + "?alt=media&supportsAllDrives=true";
       const imgRes = await fetchWithTimeout(imgUrl, { headers: driveAuthHeaders(accessToken) }, 15_000);
@@ -4704,10 +4755,9 @@ export const regeneratePhotoScanCaption = createServerFn({ method: "POST" })
       arrayBuffer = await imgRes.arrayBuffer();
       mediaType = imgRes.headers.get("content-type") || "image/jpeg";
     } else {
-      const url = metadata.media_url;
-      if (!url) throw new Error("This post is missing its original photo — can't re-scan it.");
+      const url = metadata.media_url as string;
       const imgRes = await fetchWithTimeout(url, {}, 15_000);
-      if (!imgRes.ok) throw new Error("Couldn't re-fetch this photo from the Media Library.");
+      if (!imgRes.ok) throw new Error("Couldn't re-fetch this photo — the link may be broken.");
       arrayBuffer = await imgRes.arrayBuffer();
       mediaType = imgRes.headers.get("content-type") || "image/jpeg";
     }

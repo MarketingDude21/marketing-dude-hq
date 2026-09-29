@@ -48,6 +48,7 @@ import {
   scanAgentDrivePhotos,
   scanAgentLibraryPhotos,
   addPhotoPostsToBatch,
+  regeneratePhotoScanCaption,
   approveBatch,
   approveAllPending,
   sendContentToAgent,
@@ -63,7 +64,6 @@ import {
   type CalendarMonth,
   type CalendarItem,
   type CalendarDoc,
-  type PhotoScanSuggestion,
   type PostMetadata,
   type UnsplashResult,
   type EmailPhoto,
@@ -1659,10 +1659,32 @@ function PostCard({
   const [driveOptionsError, setDriveOptionsError] = useState<string | null>(null);
   const [rewriting, setRewriting] = useState(false);
   const [rewriteHistory, setRewriteHistory] = useState<{ feedback: string; result: string }[]>([]);
+  // Only relevant for posts Photo Scan created (metadata.source
+  // drive_photo_scan/library_photo_scan) — added 2026-09-29 alongside the
+  // Photo Scan/content-calendar unification, per Mike: "you could rescan
+  // the photo." Re-fetches the SAME photo this post came from and asks for
+  // a fresh caption, separate from Scan photos' own "get new photos"
+  // action above.
+  const [regenerating, setRegenerating] = useState(false);
+  const isPhotoScanPost =
+    post.metadata?.source === "drive_photo_scan" || post.metadata?.source === "library_photo_scan";
 
   useEffect(() => {
     setDraft(post.content);
   }, [post.content]);
+
+  async function regenerateCaption() {
+    setRegenerating(true);
+    setSaveError(null);
+    try {
+      await regeneratePhotoScanCaption({ data: { agentId, postId: post.id } });
+      onChanged();
+    } catch (e) {
+      setSaveError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setRegenerating(false);
+    }
+  }
 
   async function approve() {
     setBusy(true);
@@ -1938,6 +1960,11 @@ function PostCard({
               {post.content_type === "post" && (
                 <Button variant="secondary" onClick={openPicker} disabled={busy}>
                   {photoUrl ? "Change photo" : "Add photo"}
+                </Button>
+              )}
+              {isPhotoScanPost && (
+                <Button variant="secondary" onClick={regenerateCaption} disabled={busy || regenerating}>
+                  {regenerating ? "Rescanning…" : "Rescan this photo"}
                 </Button>
               )}
             </>
@@ -3935,6 +3962,9 @@ function MonthWorkspace({
         folderId={agentDriveFolderId}
         month={folder.month}
         batchId={activeBatchId}
+        existingScannedFileIds={batchPosts
+          .map((p) => p.metadata?.drive_file_id ?? p.metadata?.media_id ?? null)
+          .filter((id): id is string => Boolean(id))}
         open={photosOpen}
         onOpen={() => setPhotosOpen(true)}
         onClose={() => setPhotosOpen(false)}
@@ -4033,6 +4063,17 @@ function MonthWorkspace({
         )}
       </Card>
 
+      {/* Added 2026-09-29 per Mike: "Can we also put a client sharing link
+          here as well. This allows us to email the link to them ourselves.
+          Not all clients... will ever log into the app so we need an easy
+          way for them to review their content and send feedback without
+          logging in especially if this email to agent is buggy." Reuses the
+          exact same PublicReviewLinkCard already built and live on the Posts
+          tab (2026-09-22) — same token, same /review/$token page — just
+          rendered here too so it's available right where this month's
+          content and Send to Agent live. */}
+      {isAdmin && <PublicReviewLinkCard agentId={agentId} />}
+
       {CATEGORY_ORDER.map((cat) => {
         const group = batchPosts.filter((p) => categorizePost(p) === cat);
         if (!group.length) return null;
@@ -4099,8 +4140,29 @@ function BatchSection({
 // but it's only scanning google drive. It needs to scan the media library
 // too and all photos"). Also given the prominent title he asked for and a
 // bigger closed-state call to action, since this was easy to miss as a
-// small secondary button before. Selected suggestions become pending posts
-// in the same batch via addPhotoPostsToBatch.
+// small secondary button before.
+//
+// REWORKED (2026-09-29) per Mike: "I want the UI to match the rest of the
+// content calendar. So have it scan photos and then lay them out the exact
+// same way the monthly content is laid out. Give it the same editing
+// feature and feedback tool with the same logic." Previously this scanned a
+// batch of photos into a local, unsaved preview list (checkboxes + a plain
+// Edit/Flag-skip) and only turned a photo into a real post once you
+// selected it and clicked "Add." Now every scanned photo is saved as a real
+// pending post the instant it's captioned — it shows up immediately as a
+// full PostCard, in the exact same list as the rest of this month's
+// content, with the exact same Approve / Edit / Flag+feedback+Rewrite /
+// Change photo actions (see PostCard above). PostCard also shows a
+// "Regenerate caption" button specifically for photo-scan posts — added the
+// same day per Mike ("you could rescan the photo"), it calls
+// regeneratePhotoScanCaption. There's no more separate "review suggestions,
+// then Add" step, and no silent local "skip" — not wanting one just means
+// flagging it, the same action Mike already uses for every other post. This
+// panel's own job is now just: fetch a handful of not-yet-scanned photos,
+// caption each, save it, and say how many were added — click it again for
+// another batch (that's the "click scan as one of the features" Mike asked
+// for; there's no separate "scan more" button anymore, this button IS the
+// repeatable action).
 const SCAN_PANEL_TITLE = "Let Your Marketing Dude Scan Your Photos And Create Content That Makes You Human";
 
 function PhotoScanPanel({
@@ -4108,6 +4170,7 @@ function PhotoScanPanel({
   folderId,
   month,
   batchId,
+  existingScannedFileIds,
   open,
   onOpen,
   onClose,
@@ -4117,13 +4180,21 @@ function PhotoScanPanel({
   folderId: string | null;
   month: string;
   batchId: string | null;
+  // Drive file ids / media ids already turned into photo-scan posts for
+  // this month (derived from batchPosts in MonthWorkspace) — keeps a fresh
+  // page load from re-suggesting a photo that was already scanned and saved
+  // in an earlier visit, same as sessionScannedIds does within one visit.
+  existingScannedFileIds: string[];
   open: boolean;
   onOpen: () => void;
   onClose: () => void;
   onAdded: () => void;
 }) {
   const [source, setSource] = useState<"drive" | "library">(folderId ? "drive" : "library");
-  const [suggestions, setSuggestions] = useState<PhotoScanSuggestion[] | null>(null);
+  const [scanning, setScanning] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [note, setNote] = useState<string | null>(null);
+  const [sessionScannedIds, setSessionScannedIds] = useState<string[]>([]);
   // Diagnostic counts from the last scan — added 2026-09-21 alongside the
   // Drive subfolder-recursion fix, so an empty result can say WHY it's
   // empty instead of a flat "no unused photos" that reads as a bug even
@@ -4133,120 +4204,51 @@ function PhotoScanPanel({
   // uploads are always converted to JPEG at upload time, so that case
   // doesn't apply there.
   const [scanMeta, setScanMeta] = useState<{ totalPhotos: number; unsupportedFormatCount: number } | null>(null);
-  const [error, setError] = useState<string | null>(null);
-  const [scanning, setScanning] = useState(false);
-  const [scanningMore, setScanningMore] = useState(false);
-  const [selected, setSelected] = useState<Set<string>>(new Set());
-  const [adding, setAdding] = useState(false);
-  // Per-suggestion caption overrides from the inline Edit control below —
-  // keyed by fileId, only set once the user actually edits one. Added
-  // 2026-09-18 per Mike: "need ability to add edits to these types of posts
-  // too... Use the same UI as others." A suggestion isn't a real post yet
-  // (no id in generated_posts until it's added to the batch), so there's
-  // nothing to save an edit *to* until then — this just holds the edited
-  // text client-side and addSelected() uses it instead of the original
-  // suggestedPost when present.
-  const [edits, setEdits] = useState<Record<string, string>>({});
-  const [editingId, setEditingId] = useState<string | null>(null);
 
   function switchSource(next: "drive" | "library") {
     setSource(next);
-    setSuggestions(null);
-    setScanMeta(null);
-    setSelected(new Set());
-    setEdits({});
-    setEditingId(null);
     setError(null);
+    setNote(null);
+    setScanMeta(null);
   }
 
-  async function scan(more = false) {
-    if (more) setScanningMore(true);
-    else setScanning(true);
+  async function scan() {
+    setScanning(true);
     setError(null);
+    setNote(null);
     try {
-      // On "scan more," exclude every fileId already shown so far (not just
-      // the current list — skipped/removed ones stay excluded too) so the
-      // next batch is genuinely new photos, not a repeat of the same 5.
-      const excludeFileIds = more ? (suggestions ?? []).map((s) => s.fileId) : [];
+      const excludeFileIds = [...existingScannedFileIds, ...sessionScannedIds];
       const res =
         source === "drive"
           ? await scanAgentDrivePhotos({
               data: { agentId, folderId: folderId as string, maxPhotos: 5, excludeFileIds },
             })
           : await scanAgentLibraryPhotos({ data: { agentId, maxPhotos: 5, excludeFileIds } });
-      setSuggestions((cur) => (more && cur ? [...cur, ...res.suggestions] : res.suggestions));
       setScanMeta({
         totalPhotos: res.totalPhotos,
         unsupportedFormatCount: (res as { unsupportedFormatCount?: number }).unsupportedFormatCount ?? 0,
       });
-      setSelected((cur) => {
-        const next = more ? new Set(cur) : new Set<string>();
-        res.suggestions.forEach((s) => next.add(s.fileId));
-        return next;
-      });
+      if (res.suggestions.length > 0) {
+        const items = res.suggestions.map((s) => ({
+          title: s.description,
+          content: s.suggestedPost,
+          source: s.source,
+          sourceId: s.fileId,
+          thumbnailUrl: s.thumbnailUrl,
+        }));
+        await addPhotoPostsToBatch({ data: { agentId, month, batchId: batchId ?? undefined, items } });
+        setSessionScannedIds((cur) => [...cur, ...res.suggestions.map((s) => s.fileId)]);
+        setNote(
+          `Added ${res.suggestions.length} new post${res.suggestions.length === 1 ? "" : "s"} from ${
+            source === "drive" ? "Google Drive" : "the Media Library"
+          } — scroll down to review them below, right alongside this month's other content. Click "Scan photos" again for more.`,
+        );
+        onAdded();
+      }
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
       setScanning(false);
-      setScanningMore(false);
-    }
-  }
-
-  function toggle(id: string) {
-    setSelected((cur) => {
-      const next = new Set(cur);
-      if (next.has(id)) next.delete(id);
-      else next.add(id);
-      return next;
-    });
-  }
-
-  // "Flag / skip" on a suggestion — matches the same button Mike asked to
-  // reuse from PostCard, but there's no real post row yet to attach
-  // feedback_history to, so this just drops it from the list instead of
-  // pretending to record feedback somewhere. If they want it gone, gone is
-  // the honest behavior.
-  function skip(id: string) {
-    setSuggestions((cur) => (cur ? cur.filter((s) => s.fileId !== id) : cur));
-    setSelected((cur) => {
-      const next = new Set(cur);
-      next.delete(id);
-      return next;
-    });
-    setEdits((cur) => {
-      if (!(id in cur)) return cur;
-      const { [id]: _drop, ...rest } = cur;
-      return rest;
-    });
-    if (editingId === id) setEditingId(null);
-  }
-
-  async function addSelected() {
-    if (!suggestions) return;
-    const items = suggestions
-      .filter((s) => selected.has(s.fileId))
-      .map((s) => ({
-        title: s.description,
-        content: edits[s.fileId] ?? s.suggestedPost,
-        source: s.source,
-        sourceId: s.fileId,
-        thumbnailUrl: s.thumbnailUrl,
-      }));
-    if (!items.length) return;
-    setAdding(true);
-    setError(null);
-    try {
-      await addPhotoPostsToBatch({ data: { agentId, month, batchId: batchId ?? undefined, items } });
-      setSuggestions(null);
-      setSelected(new Set());
-      setEdits({});
-      setEditingId(null);
-      onClose();
-      onAdded();
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
-    } finally {
-      setAdding(false);
     }
   }
 
@@ -4258,8 +4260,8 @@ function PhotoScanPanel({
       >
         <p className="font-display text-base font-semibold">{SCAN_PANEL_TITLE}</p>
         <p className="mt-1 text-xs text-muted-foreground">
-          Pulls unused photos from Drive and your Media Library, writes a caption in their voice for each, and lets you
-          pick the ones worth turning into posts. Click to get started →
+          Pulls unused photos from Drive and your Media Library, writes a caption in their voice for each, and adds them
+          straight into this month's content below, ready to edit, approve, or flag. Click to get started →
         </p>
       </button>
     );
@@ -4274,8 +4276,8 @@ function PhotoScanPanel({
         </Button>
       </div>
       <p className="mt-1 text-xs text-muted-foreground">
-        Scans a handful of unused photos and writes a caption for each, in their voice. Pick the ones worth turning into
-        posts.
+        Scans a handful of unused photos, writes a caption for each in their voice, and adds them straight into this
+        month's content below — same post cards, same Approve / Edit / Flag+feedback as everything else.
       </p>
 
       <div className="mt-3 flex flex-wrap gap-2 border-b border-border pb-3">
@@ -4303,17 +4305,16 @@ function PhotoScanPanel({
         </button>
       </div>
 
-      {!suggestions && (
-        <div className="mt-3">
-          <Button onClick={() => scan(false)} disabled={scanning}>
-            {scanning ? "Scanning…" : "Scan photos"}
-          </Button>
-        </div>
-      )}
+      <div className="mt-3">
+        <Button onClick={scan} disabled={scanning}>
+          {scanning ? "Scanning…" : "Scan photos"}
+        </Button>
+      </div>
 
       {error && <p className="mt-2 text-xs text-destructive">{error}</p>}
+      {note && <p className="mt-2 text-xs text-muted-foreground">{note}</p>}
 
-      {suggestions && suggestions.length === 0 && (
+      {scanMeta && !note && !error && (
         <p className="mt-3 text-sm text-muted-foreground">
           {/* Distinguishes "genuinely nothing there" from "found photos but
               couldn't use any of them" — added 2026-09-21 after a report
@@ -4322,65 +4323,14 @@ function PhotoScanPanel({
               for the first case; the other two have their own real, fixable
               cause and deserve their own message instead of looking like a
               bug. */}
-          {scanMeta && scanMeta.unsupportedFormatCount > 0 && scanMeta.totalPhotos === scanMeta.unsupportedFormatCount
+          {scanMeta.unsupportedFormatCount > 0 && scanMeta.totalPhotos === scanMeta.unsupportedFormatCount
             ? `Found ${scanMeta.totalPhotos} photo${scanMeta.totalPhotos === 1 ? "" : "s"} in this Drive folder, but ${scanMeta.totalPhotos === 1 ? "it's" : "all of them are"} HEIC/HEIF (an iPhone's default photo format), which can't be scanned yet. Save them as JPEG first (Photos app → Share → "Options" → JPEG), or switch the phone's camera to the more compatible format in Settings → Camera → Formats → "Most Compatible."`
-            : scanMeta && scanMeta.unsupportedFormatCount > 0
-              ? `Found ${scanMeta.totalPhotos} photos in this Drive folder — ${scanMeta.unsupportedFormatCount} of them are HEIC/HEIF and got skipped (see above), and the rest are already used or were already shown. Try "Scan more" or add new photos.`
-              : scanMeta && scanMeta.totalPhotos > 0
-                ? `Found ${scanMeta.totalPhotos} photo${scanMeta.totalPhotos === 1 ? "" : "s"} in ${source === "drive" ? "this Drive folder" : "the Media Library"}, but they're already used or already shown here — add new ones to scan more.`
+            : scanMeta.unsupportedFormatCount > 0
+              ? `Found ${scanMeta.totalPhotos} photos in this Drive folder — ${scanMeta.unsupportedFormatCount} of them are HEIC/HEIF and got skipped (see above), and the rest have already been used or scanned. Try again once new photos are added.`
+              : scanMeta.totalPhotos > 0
+                ? `Found ${scanMeta.totalPhotos} photo${scanMeta.totalPhotos === 1 ? "" : "s"} in ${source === "drive" ? "this Drive folder" : "the Media Library"}, but they've already been used or scanned before — add new ones to scan more.`
                 : `No photos found in ${source === "drive" ? "this Drive folder (checked its subfolders too)" : "the Media Library"}.`}
         </p>
-      )}
-
-      {suggestions && suggestions.length > 0 && (
-        <div className="mt-3 space-y-3">
-          {suggestions.map((s) => (
-            <div key={s.fileId} className="flex gap-3 rounded-2xl border border-border bg-glass p-3 text-sm">
-              <input
-                type="checkbox"
-                checked={selected.has(s.fileId)}
-                onChange={() => toggle(s.fileId)}
-                className="mt-1 shrink-0"
-              />
-              <img src={s.thumbnailUrl} alt={s.description} className="h-16 w-16 shrink-0 rounded-xl object-cover" />
-              <div className="min-w-0 flex-1">
-                <p className="text-xs text-muted-foreground">{s.description}</p>
-                {editingId === s.fileId ? (
-                  <AutoResizeTextarea
-                    value={edits[s.fileId] ?? s.suggestedPost}
-                    onChange={(v) => setEdits((cur) => ({ ...cur, [s.fileId]: v }))}
-                    minHeightPx={90}
-                    className="mt-1 w-full rounded-xl bg-muted px-3 py-2 text-sm leading-relaxed outline-none ring-ring transition focus:ring-2"
-                  />
-                ) : (
-                  <p className="mt-1 whitespace-pre-wrap">{edits[s.fileId] ?? s.suggestedPost}</p>
-                )}
-                <div className="mt-2 flex flex-wrap gap-2">
-                  {editingId === s.fileId ? (
-                    <Button variant="secondary" onClick={() => setEditingId(null)}>
-                      Done editing
-                    </Button>
-                  ) : (
-                    <Button variant="secondary" onClick={() => setEditingId(s.fileId)}>
-                      Edit
-                    </Button>
-                  )}
-                  <Button variant="danger" onClick={() => skip(s.fileId)}>
-                    Flag / skip
-                  </Button>
-                </div>
-              </div>
-            </div>
-          ))}
-          <div className="flex flex-wrap gap-2">
-            <Button onClick={addSelected} disabled={adding || selected.size === 0}>
-              {adding ? "Adding…" : `Add ${selected.size} selected`}
-            </Button>
-            <Button variant="secondary" onClick={() => scan(true)} disabled={scanningMore}>
-              {scanningMore ? "Scanning…" : "Want to scan more? Click here"}
-            </Button>
-          </div>
-        </div>
       )}
     </Card>
   );

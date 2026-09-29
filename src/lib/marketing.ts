@@ -1357,7 +1357,9 @@ export const createMediaUploadUrl = createServerFn({ method: "POST" })
 // back about its own upload.
 export const finalizeMediaUpload = createServerFn({ method: "POST" })
   .middleware([requireSupabaseAuth])
-  .inputValidator((data: { agentId: string; storagePath: string; mediaType: "photo" | "video"; caption?: string }) => data)
+  .inputValidator(
+    (data: { agentId: string; storagePath: string; mediaType: "photo" | "video"; caption?: string }) => data,
+  )
   .handler(async ({ data, context }): Promise<{ ok: true; id: string }> => {
     const email = (context.claims as { email?: string } | undefined)?.email;
     await requireAgentAccess(context.userId, email, data.agentId);
@@ -2969,7 +2971,9 @@ export const listCalendarItems = createServerFn({ method: "GET" })
 
 export const addCalendarItem = createServerFn({ method: "POST" })
   .middleware([requireSupabaseAuth])
-  .inputValidator((data: { monthId: string; docType: "post" | "email" | "video"; title: string; rawText: string }) => data)
+  .inputValidator(
+    (data: { monthId: string; docType: "post" | "email" | "video"; title: string; rawText: string }) => data,
+  )
   .handler(async ({ data, context }): Promise<{ ok: true }> => {
     const email = (context.claims as { email?: string } | undefined)?.email;
     await requireAdmin(context.userId, email);
@@ -3775,7 +3779,7 @@ async function captionPhotoInVoice(
     `VOICE DNA:\n${voiceDna ?? "Warm, authentic, conversational. Sounds like a real person, not a real estate agent."}\n\n` +
     "Look at this photo and write a social media post that:\n1. Starts from what you actually see — the setting, the mood, the moment\n2. Sounds EXACTLY like this person based on their Voice DNA above\n3. Is 1-3 sentences max — short, human, texted-a-friend energy\n4. Leans playful, funny, or personality-driven by default — treat this as a chance to make them look like a real person with a life, not a corporate agent. But always work in a light, natural reminder that " +
     `${agentName ?? "this person"} is in real estate — a quick aside, a joke, a callback, a one-liner — even when the photo has nothing to do with real estate (a coffee, a kid's game, a sunset). Keep the real estate nod small: a wink, never the whole point of the post, and never a pitch or a listing plug. If the photo IS an unmistakable real estate moment (a listing, a closing, a sign, a showing), let real estate be more central, same playful voice. Only skip the real estate nod entirely on the rare photo where working one in would be genuinely awkward or forced.\n` +
-    "5. Does NOT mention any specific location, city, neighborhood, or place name\n6. NO hyphens, NO corporate language, NO AI-tell phrases, no \"As a real estate professional\" or any version of that\n7. Standard capitalization — never write in all lowercase\n\n" +
+    '5. Does NOT mention any specific location, city, neighborhood, or place name\n6. NO hyphens, NO corporate language, NO AI-tell phrases, no "As a real estate professional" or any version of that\n7. Standard capitalization — never write in all lowercase\n\n' +
     "Also describe what you see in the photo in one short sentence.\n\nOutput format:\nDESCRIPTION: [one sentence of what you see]\nPOST: [the social media caption]";
 
   const res = await fetch("https://api.anthropic.com/v1/messages", {

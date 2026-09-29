@@ -410,6 +410,21 @@ function PublicEmailPhotosPanel({
   const [unsplashLoading, setUnsplashLoading] = useState(false);
   const [unsplashError, setUnsplashError] = useState<string | null>(null);
 
+  // Authenticated thumbnails for photos ALREADY ATTACHED to this email —
+  // mirrors admin's EmailPhotosPanel (marketing.tsx) and PublicPostCard's
+  // own version of this same fix, just below. Added 2026-09-29.
+  useEffect(() => {
+    const ids = photos.filter((p) => p.source === "drive" && p.driveFileId).map((p) => p.driveFileId as string);
+    const missing = ids.filter((id) => driveThumbs[id] === undefined);
+    if (!missing.length) return;
+    getPublicReviewDriveThumbnails({ data: { token, fileIds: missing } })
+      .then((res) => setDriveThumbs((cur) => ({ ...cur, ...res.thumbnails })))
+      .catch(() => {
+        /* leave unset — falls back to the raw hotlink below */
+      });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [token, photos.map((p) => p.driveFileId).join(",")]);
+
   async function openPicker() {
     setPickerOpen(true);
     setPickerTab("library");
@@ -559,45 +574,63 @@ function PublicEmailPhotosPanel({
 
       {photos.length > 0 && (
         <div className="mb-3 grid gap-3 sm:grid-cols-3">
-          {photos.map((p) => (
-            <div key={p.id} className="rounded-2xl border border-border bg-muted p-2">
-              <div className="overflow-hidden rounded-xl border border-border">
-                {p.mediaType === "video" ? (
-                  <video src={p.url} controls className="aspect-square w-full object-cover" />
-                ) : (
-                  <img src={p.url} alt="" className="aspect-square w-full object-cover" />
-                )}
-              </div>
-              <p className="mt-1 text-[10px] uppercase tracking-wide text-muted-foreground">
-                {p.source === "library" ? "Media Library" : p.source === "drive" ? "Google Drive" : "Stock photo"}
-              </p>
-              <textarea
-                value={drafts[p.id] ?? p.publishingInstructions}
-                onChange={(e) => setDrafts((d) => ({ ...d, [p.id]: e.target.value }))}
-                onBlur={() => saveInstructions(p.id)}
-                placeholder="Publishing instructions (optional)"
-                className="mt-2 min-h-[50px] w-full rounded-lg border border-border bg-glass px-2 py-1.5 text-xs outline-none"
-                disabled={busy}
-              />
-              <div className="mt-1 flex items-center justify-between gap-2">
-                {p.url && (
-                  <button
-                    onClick={() => downloadRemoteFile(p.url!, p.url!.split("/").pop() || `${p.id}`)}
-                    className="text-[11px] font-semibold text-muted-foreground hover:text-foreground hover:underline"
-                  >
-                    ⬇ Download
-                  </button>
-                )}
-                <button
-                  onClick={() => removePhoto(p.id)}
+          {photos.map((p) => {
+            const displayUrl = p.driveFileId ? (driveThumbs[p.driveFileId] ?? p.url) : p.url;
+            const thisPhotoFailed = !!p.driveFileId && failedDriveThumbs.has(p.driveFileId);
+            return (
+              <div key={p.id} className="rounded-2xl border border-border bg-muted p-2">
+                <div className="overflow-hidden rounded-xl border border-border">
+                  {p.mediaType === "video" ? (
+                    <video src={p.url} controls className="aspect-square w-full object-cover" />
+                  ) : thisPhotoFailed ? (
+                    <div className="flex aspect-square w-full flex-col items-center justify-center gap-1 p-2 text-center text-[10px] text-muted-foreground">
+                      <span>Couldn't load this photo from Drive</span>
+                    </div>
+                  ) : (
+                    <img
+                      src={displayUrl}
+                      alt=""
+                      className="aspect-square w-full object-cover"
+                      onError={() => p.driveFileId && setFailedDriveThumbs((s) => new Set(s).add(p.driveFileId!))}
+                    />
+                  )}
+                </div>
+                <p className="mt-1 text-[10px] uppercase tracking-wide text-muted-foreground">
+                  {p.source === "library" ? "Media Library" : p.source === "drive" ? "Google Drive" : "Stock photo"}
+                </p>
+                <textarea
+                  value={drafts[p.id] ?? p.publishingInstructions}
+                  onChange={(e) => setDrafts((d) => ({ ...d, [p.id]: e.target.value }))}
+                  onBlur={() => saveInstructions(p.id)}
+                  placeholder="Publishing instructions (optional)"
+                  className="mt-2 min-h-[50px] w-full rounded-lg border border-border bg-glass px-2 py-1.5 text-xs outline-none"
                   disabled={busy}
-                  className="text-[11px] font-semibold text-destructive hover:underline disabled:opacity-50"
-                >
-                  Remove photo
-                </button>
+                />
+                <div className="mt-1 flex items-center justify-between gap-2">
+                  {p.url && (
+                    <button
+                      onClick={() =>
+                        downloadRemoteFile(
+                          displayUrl ?? p.url!,
+                          displayUrl?.startsWith("data:") ? "photo.jpg" : p.url!.split("/").pop() || `${p.id}`,
+                        )
+                      }
+                      className="text-[11px] font-semibold text-muted-foreground hover:text-foreground hover:underline"
+                    >
+                      ⬇ Download
+                    </button>
+                  )}
+                  <button
+                    onClick={() => removePhoto(p.id)}
+                    disabled={busy}
+                    className="text-[11px] font-semibold text-destructive hover:underline disabled:opacity-50"
+                  >
+                    Remove photo
+                  </button>
+                </div>
               </div>
-            </div>
-          ))}
+            );
+          })}
         </div>
       )}
 
@@ -841,6 +874,22 @@ function PublicPostCard({
     setDraft(post.content);
   }, [post.content]);
 
+  // Authenticated thumbnail for the photo ALREADY ATTACHED to this post —
+  // mirrors the same fix in admin's PostCard (marketing.tsx). Without this,
+  // a Drive-sourced photo's main image on the public review page renders
+  // from the raw drive.google.com hotlink, which 403s now that folders are
+  // privately shared with one OAuth account instead of "anyone with the
+  // link" — added 2026-09-29.
+  useEffect(() => {
+    const fileId = post.metadata?.drive_file_id;
+    if (!fileId || driveThumbs[fileId] !== undefined) return;
+    getPublicReviewDriveThumbnails({ data: { token, fileIds: [fileId] } })
+      .then((res) => setDriveThumbs((cur) => ({ ...cur, ...res.thumbnails })))
+      .catch(() => {
+        /* leave it unset — falls back to the raw hotlink below */
+      });
+  }, [post.metadata?.drive_file_id, token]);
+
   async function approve() {
     setBusy(true);
     setSaveError(null);
@@ -982,6 +1031,9 @@ function PublicPostCard({
     post.status === "approved" ? "Approved" : post.status === "flagged" ? "Flagged" : "Pending review";
   const typeLabel = CONTENT_TYPE_LABEL[post.content_type] ?? post.content_type;
   const photoUrl = post.metadata?.media_url || post.metadata?.drive_thumbnail_url || null;
+  const driveFileId = post.metadata?.drive_file_id;
+  const mainPhotoFailed = !!driveFileId && failedDriveThumbs.has(driveFileId);
+  const displayPhotoUrl = driveFileId ? (driveThumbs[driveFileId] ?? photoUrl) : photoUrl;
 
   return (
     <div className="rounded-3xl border border-border bg-glass p-6 backdrop-blur-2xl">
@@ -1008,11 +1060,25 @@ function PublicPostCard({
               <div className="overflow-hidden rounded-2xl border border-border bg-muted">
                 {post.metadata?.media_type === "video" ? (
                   <video src={photoUrl} controls className="max-h-64 w-full object-contain" />
+                ) : mainPhotoFailed ? (
+                  <div className="flex h-40 w-full flex-col items-center justify-center gap-1 p-2 text-center text-xs text-muted-foreground">
+                    <span>Couldn't load this photo from Drive</span>
+                  </div>
                 ) : (
-                  <img src={photoUrl} alt="" className="max-h-64 w-full object-contain" />
+                  <img
+                    src={displayPhotoUrl ?? undefined}
+                    alt=""
+                    className="max-h-64 w-full object-contain"
+                    onError={() => driveFileId && setFailedDriveThumbs((s) => new Set(s).add(driveFileId))}
+                  />
                 )}
                 <button
-                  onClick={() => downloadRemoteFile(photoUrl, photoUrl.split("/").pop() || "photo")}
+                  onClick={() =>
+                    downloadRemoteFile(
+                      displayPhotoUrl ?? photoUrl,
+                      displayPhotoUrl?.startsWith("data:") ? "photo.jpg" : photoUrl.split("/").pop() || "photo",
+                    )
+                  }
                   className="w-full border-t border-border bg-glass py-1 text-[11px] font-semibold text-muted-foreground transition-colors hover:bg-secondary hover:text-foreground"
                 >
                   ⬇ Download

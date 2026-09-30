@@ -4464,6 +4464,10 @@ export type PhotoScanSuggestion = {
 
 // Shared with scanAgentLibraryPhotos below — one Claude vision call per
 // photo, writing a caption in the agent's voice from the raw image bytes.
+// The four image types Claude's vision API can actually decode. Shared so
+// every caller checks against the exact same list rather than duplicating it.
+const CLAUDE_SUPPORTED_IMAGE_TYPES = ["image/jpeg", "image/png", "image/gif", "image/webp"];
+
 async function captionPhotoInVoice(
   imageBytes: ArrayBuffer,
   mediaType: string,
@@ -4473,9 +4477,28 @@ async function captionPhotoInVoice(
   voiceDna: string | undefined,
 ): Promise<{ description: string; suggestedPost: string } | null> {
   const base64 = Buffer.from(imageBytes).toString("base64");
-  const safeMediaType = ["image/jpeg", "image/png", "image/gif", "image/webp"].includes(mediaType)
-    ? mediaType
-    : "image/jpeg";
+  // FIXED (2026-09-30) — per Mike: "when I rescan image it gives error,"
+  // screenshotted "Could not process image." Root cause: this used to
+  // silently RELABEL any unsupported media type as "image/jpeg" instead of
+  // actually converting the bytes — so a real HEIC/HEIF photo (an iPhone's
+  // default format, and the exact photo in Mike's screenshot displays fine
+  // in-browser because macOS/Safari decode HEIC natively, which is why it
+  // looked like a normal photo) got its raw, undecodable-as-JPEG bytes sent
+  // to Claude's vision API labeled as if they were a JPEG. Claude correctly
+  // rejected that with its own "Could not process image" error, which then
+  // surfaced verbatim as the save error. Mislabeling bytes can never
+  // actually make them decodable, so this now throws a clear, specific
+  // error instead of quietly guaranteeing a failure — callers (see
+  // regeneratePhotoScanCaption below) are responsible for handing this a
+  // type Claude can actually read, converting first if needed (Drive already
+  // has a real fallback for this, using its own rendered JPEG preview — see
+  // fetchDriveThumbnailBytes and scanAgentDrivePhotos' HEIC handling).
+  if (!CLAUDE_SUPPORTED_IMAGE_TYPES.includes(mediaType)) {
+    throw new Error(
+      `This photo is a format Claude can't read directly (${mediaType || "unknown"} — likely HEIC/HEIF from an iPhone). Convert it to JPEG or PNG first, then try again.`,
+    );
+  }
+  const safeMediaType = mediaType;
   // Leans deliberately playful/personality-driven rather than real-estate-y —
   // per Mike's request (2026-09-18): "These should be more fun and playful
   // real estate reminders and just personality driven content that makes
@@ -4863,12 +4886,42 @@ export const regeneratePhotoScanCaption = createServerFn({ method: "POST" })
       }
       arrayBuffer = await imgRes.arrayBuffer();
       mediaType = imgRes.headers.get("content-type") || "image/jpeg";
+      // FIXED (2026-09-30) per Mike's "Could not process image" report —
+      // this fetches the ORIGINAL Drive file, which for an iPhone photo is
+      // very often real HEIC/HEIF bytes; Claude's vision API can't decode
+      // those no matter what they're labeled as. scanAgentDrivePhotos
+      // already solved exactly this by falling back to Drive's own
+      // rendered JPEG preview (thumbnailLink) instead of the original —
+      // applying that same fallback here, for any unsupported type, not
+      // just ones matching the isHeicDriveFile name/mimeType heuristic
+      // (this checks the ACTUAL fetched content-type, so it also catches a
+      // HEIC file Drive happens to report as some other mimeType).
+      if (!CLAUDE_SUPPORTED_IMAGE_TYPES.includes(mediaType)) {
+        const thumb = await fetchDriveThumbnailBytes(fileId, accessToken, 1600);
+        if (!thumb) {
+          throw new Error(
+            "This photo is a format Claude can't read directly (likely HEIC/HEIF from an iPhone), and Drive hasn't finished rendering a preview for it yet — try again in a minute, or change the photo to a JPEG/PNG.",
+          );
+        }
+        arrayBuffer = thumb.arrayBuffer;
+        mediaType = thumb.contentType;
+      }
     } else {
       const url = metadata.media_url as string;
       const imgRes = await fetchWithTimeout(url, {}, 15_000);
       if (!imgRes.ok) throw new Error("Couldn't re-fetch this photo — the link may be broken.");
       arrayBuffer = await imgRes.arrayBuffer();
       mediaType = imgRes.headers.get("content-type") || "image/jpeg";
+      // Same root cause as the Drive branch above, but there's no Drive
+      // preview to fall back to for an arbitrary uploaded/library URL —
+      // give a clear, actionable error instead of forwarding undecodable
+      // bytes to Claude labeled as a type they aren't (which is what used
+      // to happen, and is exactly what produced "Could not process image").
+      if (!CLAUDE_SUPPORTED_IMAGE_TYPES.includes(mediaType)) {
+        throw new Error(
+          `This photo is a format Claude can't read directly (${mediaType || "unknown"} — likely HEIC/HEIF from an iPhone). Re-upload it as a JPEG or PNG on the Media tab, then rescan.`,
+        );
+      }
     }
 
     const caption = await captionPhotoInVoice(arrayBuffer, mediaType, anthropicKey, agentName, agentCity, voiceDna);

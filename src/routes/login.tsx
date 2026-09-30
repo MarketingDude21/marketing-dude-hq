@@ -50,17 +50,26 @@ function LoginPage() {
     setBusy(true);
     setError(null);
     setNotice(null);
+    // Normalized 2026-09-30 per Mike's "duplicate accounts" investigation —
+    // every other place that treats email as an identity (admin_allowlist
+    // lookups, the handle_new_user trigger, account.tsx's save) now
+    // compares lower(trim(email)), so signing up/in has to store and send
+    // that exact same normalized form. Otherwise "Mark@Foo.com" and
+    // "mark@foo.com" can end up as two different Supabase Auth users, each
+    // getting their own separate `agents` row — that mismatch is the root
+    // cause behind at least some of the duplicate rows Mike found.
+    const cleanEmail = email.trim().toLowerCase();
     try {
       if (mode === "signin") {
         const { error } = await supabase.auth.signInWithPassword({
-          email,
+          email: cleanEmail,
           password,
         });
         if (error) throw error;
         navigate({ to: "/" });
       } else {
         const { data, error } = await supabase.auth.signUp({
-          email,
+          email: cleanEmail,
           password,
           options: {
             emailRedirectTo: `${window.location.origin}/`,
@@ -68,6 +77,18 @@ function LoginPage() {
           },
         });
         if (error) throw error;
+        // Supabase's own anti-enumeration behavior: signing up again with
+        // an email that already has a confirmed account does NOT return an
+        // error (that would leak which emails are registered) — it returns
+        // a "successful" response whose user object has an EMPTY
+        // `identities` array. That's the documented signal for "this
+        // already exists," so this is the one place that can actually catch
+        // a duplicate signup attempt before it confuses anyone, per Mike
+        // (2026-09-30): "there should only be one account created."
+        if (data.user && data.user.identities && data.user.identities.length === 0) {
+          setError("An account already exists for this email — sign in instead, or use “Forgot password?” below.");
+          return;
+        }
         if (!data.session) {
           setNotice("Check your inbox and click the confirmation link to finish setting up your account.");
         } else {
@@ -98,7 +119,7 @@ function LoginPage() {
     }
     setResetBusy(true);
     try {
-      const { error } = await supabase.auth.resetPasswordForEmail(email.trim(), {
+      const { error } = await supabase.auth.resetPasswordForEmail(email.trim().toLowerCase(), {
         redirectTo: `${window.location.origin}/reset-password`,
       });
       if (error) throw error;

@@ -3037,9 +3037,12 @@ function PostCard({
                 immediately instead of leaving it open with a "You asked /
                 Result" transcript the user then has to close themselves. */}
             <div className="border-t border-border pt-4">
-              <p className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
-                Or tell the AI what to change
-              </p>
+              <div className="flex items-center justify-between">
+                <p className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
+                  Or tell the AI what to change
+                </p>
+                <MicButton value={notes} onChange={setNotes} />
+              </div>
               <textarea
                 value={notes}
                 onChange={(e) => setNotes(e.target.value)}

@@ -508,30 +508,93 @@ export const listMarketingPosts = createServerFn({ method: "GET" })
 // they need to move to the used folder in both media library and google
 // drive as well" — previously only the media_id half of this existed here;
 // a Drive-sourced photo on an approved post was never marked used at all.
+// Walks every place a post can carry a photo/video — the older single-photo
+// fields (media_id/drive_file_id) AND the newer email_photos/reel_photos
+// multi-photo arrays — and returns the Media Library ids and Drive file ids
+// that need marking "used". Added 2026-09-30 per Mike: "make sure photos are
+// being moved to the used folder in both google drive and media library
+// within our app" — before this, approving a post only ever looked at the
+// single-photo fields, so a multi-photo email or Reel's attached photos
+// never got marked used no matter how many times it was approved. Relies on
+// EmailPhoto/ReelPhoto's mediaId field (added the same day) to trace a
+// library-sourced array entry back to its agent_photos row.
+function collectUsedMedia(metadata: unknown): { mediaIds: string[]; driveFileIds: string[] } {
+  const meta = (metadata as PostMetadata | null) ?? null;
+  const mediaIds: string[] = [];
+  const driveFileIds: string[] = [];
+  if (meta?.media_id) mediaIds.push(meta.media_id);
+  if (meta?.drive_file_id) driveFileIds.push(meta.drive_file_id);
+
+  const multiPhotos: (EmailPhoto | ReelPhoto)[] = [
+    ...(Array.isArray(meta?.email_photos) ? (meta!.email_photos as EmailPhoto[]) : []),
+    ...(Array.isArray(meta?.reel_photos) ? (meta!.reel_photos as ReelPhoto[]) : []),
+  ];
+  for (const photo of multiPhotos) {
+    if (photo.source === "library" && photo.mediaId) mediaIds.push(photo.mediaId);
+    if (photo.source === "drive" && photo.driveFileId) driveFileIds.push(photo.driveFileId);
+  }
+
+  return { mediaIds: Array.from(new Set(mediaIds)), driveFileIds: Array.from(new Set(driveFileIds)) };
+}
+
+// Single-post version — used by updateMarketingPost and both single-post
+// approve paths (admin and public/client-facing). Attributes used_in_post_id
+// since there's exactly one post to credit.
+async function markPostMediaUsed(
+  supabaseAdmin: (typeof import("@/integrations/supabase/client.server"))["supabaseAdmin"],
+  agentId: string,
+  postId: string,
+  metadata: unknown,
+): Promise<void> {
+  const { mediaIds, driveFileIds } = collectUsedMedia(metadata);
+  if (mediaIds.length) {
+    await supabaseAdmin
+      .from("agent_photos")
+      .update({ status: "used", used_at: new Date().toISOString(), used_in_post_id: postId })
+      .in("id", mediaIds)
+      .eq("status", "available");
+  }
+  if (driveFileIds.length) {
+    await supabaseAdmin.from("agent_drive_used_files").upsert(
+      driveFileIds.map((driveFileId) => ({
+        agent_id: agentId,
+        drive_file_id: driveFileId,
+        used_at: new Date().toISOString(),
+        used_in_post_id: postId,
+      })),
+      { onConflict: "agent_id,drive_file_id" },
+    );
+  }
+}
+
+// Batch version — used by approveBatch/approveAllPending and their public
+// approve-all twin. Same photo collection as markPostMediaUsed, just pooled
+// across every row in one pass (kept as a single .in()/upsert call each,
+// same shape this helper already had, rather than one query per row).
 async function markAttachedMediaUsedForBatch(
   supabaseAdmin: (typeof import("@/integrations/supabase/client.server"))["supabaseAdmin"],
   agentId: string,
   rows: { id: string; metadata: unknown }[],
 ): Promise<void> {
-  const mediaIds = Array.from(
-    new Set(rows.map((r) => (r.metadata as PostMetadata | null)?.media_id).filter((id): id is string => Boolean(id))),
-  );
-  if (mediaIds.length) {
+  const mediaIds = new Set<string>();
+  const driveFileIds = new Set<string>();
+  for (const row of rows) {
+    const collected = collectUsedMedia(row.metadata);
+    collected.mediaIds.forEach((id) => mediaIds.add(id));
+    collected.driveFileIds.forEach((id) => driveFileIds.add(id));
+  }
+
+  if (mediaIds.size) {
     await supabaseAdmin
       .from("agent_photos")
       .update({ status: "used", used_at: new Date().toISOString() })
-      .in("id", mediaIds)
+      .in("id", Array.from(mediaIds))
       .eq("status", "available");
   }
 
-  const driveFileIds = Array.from(
-    new Set(
-      rows.map((r) => (r.metadata as PostMetadata | null)?.drive_file_id).filter((id): id is string => Boolean(id)),
-    ),
-  );
-  if (driveFileIds.length) {
+  if (driveFileIds.size) {
     await supabaseAdmin.from("agent_drive_used_files").upsert(
-      driveFileIds.map((driveFileId) => ({
+      Array.from(driveFileIds).map((driveFileId) => ({
         agent_id: agentId,
         drive_file_id: driveFileId,
         used_at: new Date().toISOString(),
@@ -672,31 +735,13 @@ export const updateMarketingPost = createServerFn({ method: "POST" })
     // Auto-mark the attached photo/video "used" the moment a post is
     // approved — the native equivalent of the old app's move-to-used, which
     // also only ever fired once content was actually approved, never at
-    // suggestion time. As of 2026-09-21, this covers a Drive-sourced photo
-    // too, not just a Media Library one — see markDriveFileUsed above for
-    // why Drive's version is a DB flag rather than an actual Drive move.
+    // suggestion time. Covers a Drive-sourced photo too, not just a Media
+    // Library one (see markDriveFileUsed above for why Drive's version is a
+    // DB flag rather than an actual Drive move), and — as of 2026-09-30 —
+    // covers every photo in an email_photos/reel_photos multi-photo array
+    // too, not just a post's single-photo fields. See markPostMediaUsed.
     if (data.status === "approved") {
-      const meta = existing.metadata as PostMetadata | null;
-      const mediaId = meta?.media_id;
-      if (mediaId) {
-        await supabaseAdmin
-          .from("agent_photos")
-          .update({ status: "used", used_at: new Date().toISOString(), used_in_post_id: data.postId })
-          .eq("id", mediaId)
-          .eq("status", "available");
-      }
-      const driveFileId = meta?.drive_file_id;
-      if (driveFileId) {
-        await supabaseAdmin.from("agent_drive_used_files").upsert(
-          {
-            agent_id: data.agentId,
-            drive_file_id: driveFileId,
-            used_at: new Date().toISOString(),
-            used_in_post_id: data.postId,
-          },
-          { onConflict: "agent_id,drive_file_id" },
-        );
-      }
+      await markPostMediaUsed(supabaseAdmin, data.agentId, data.postId, existing.metadata);
     }
 
     return { ok: true };
@@ -1015,6 +1060,13 @@ export type EmailPhoto = {
   url: string;
   mediaType: "photo" | "video";
   publishingInstructions: string;
+  // The agent_photos.id this entry was added from, set only when
+  // source === "library". Added 2026-09-30 alongside the "mark used on
+  // approve" fix — without it there was no way to trace a multi-photo
+  // library entry back to the Media Library row it came from, so approving
+  // a post never marked that photo used. driveFileId (below) is the
+  // Drive-source equivalent and already existed.
+  mediaId?: string | null | undefined;
   driveFileId?: string | null | undefined;
   unsplashPhotographer?: string | null | undefined;
   unsplashCreditUrl?: string | null | undefined;
@@ -1097,6 +1149,7 @@ export const addEmailPhotoFromLibrary = createServerFn({ method: "POST" })
         url: media.url,
         mediaType: media.media_type as "photo" | "video",
         publishingInstructions: "",
+        mediaId: media.id,
       },
     ];
     await writeEmailPhotos(data.postId, next);
@@ -1251,6 +1304,8 @@ export type ReelPhoto = {
   url: string;
   mediaType: "photo" | "video";
   publishingInstructions: string;
+  // Same addition as EmailPhoto.mediaId, same day/reason — see its comment.
+  mediaId?: string | null | undefined;
   driveFileId?: string | null | undefined;
 };
 
@@ -1325,6 +1380,7 @@ export const addReelPhotoFromLibrary = createServerFn({ method: "POST" })
         url: media.url,
         mediaType: media.media_type as "photo" | "video",
         publishingInstructions: "",
+        mediaId: media.id,
       },
     ];
     await writeReelPhotos(data.postId, next);
@@ -2028,14 +2084,56 @@ export const approvePublicReviewPost = createServerFn({ method: "POST" })
     const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
     const { data: existing, error: fetchErr } = await supabaseAdmin
       .from("generated_posts")
-      .select("agent_id")
+      .select("agent_id, metadata")
       .eq("id", data.postId)
       .maybeSingle();
     if (fetchErr) throw fetchErr;
     if (!existing || existing.agent_id !== agentId) throw new Error("Post not found for this agent.");
     const { error } = await supabaseAdmin.from("generated_posts").update({ status: "approved" }).eq("id", data.postId);
     if (error) throw error;
+
+    // Added 2026-09-30 — this was the one approve path with NO used-marking
+    // logic at all, single-photo or multi-photo, since a client approving on
+    // the public link never went through updateMarketingPost. Per Mike:
+    // "make sure photos are being moved to the used folder in both google
+    // drive and media library within our app" — that has to hold for a
+    // client's own approval too, not just an admin's.
+    await markPostMediaUsed(supabaseAdmin, agentId, data.postId, existing.metadata);
+
     return { ok: true };
+  });
+
+// Public — approve every not-yet-approved post for this month, token-
+// resolved twin of approveAllPending. Added 2026-09-30 per Mike: "On the
+// client facing links need an approval all button on the top of tis screen
+// as well at the very bottom." Scoped to one month (data.month, required)
+// since that's all the public review page ever shows at once, and to
+// non-archived posts only, matching what listPublicReviewPosts actually
+// shows the client — nothing gets approved that the client couldn't see.
+export const approveAllPublicReviewPending = createServerFn({ method: "POST" })
+  .inputValidator((data: { token: string; month: string }) => data)
+  .handler(async ({ data }): Promise<{ ok: true; updated: number }> => {
+    const { agentId } = await resolveAgentIdFromReviewToken(data.token);
+    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+    const { data: rows, error: fetchErr } = await supabaseAdmin
+      .from("generated_posts")
+      .select("id, metadata")
+      .eq("agent_id", agentId)
+      .eq("month", data.month)
+      .eq("archived", false)
+      .neq("status", "approved");
+    if (fetchErr) throw fetchErr;
+    const ids = (rows ?? []).map((r) => r.id);
+    if (!ids.length) return { ok: true, updated: 0 };
+    const { error } = await supabaseAdmin
+      .from("generated_posts")
+      .update({ status: "approved", updated_at: new Date().toISOString() })
+      .in("id", ids);
+    if (error) throw error;
+
+    await markAttachedMediaUsedForBatch(supabaseAdmin, agentId, rows ?? []);
+
+    return { ok: true, updated: ids.length };
   });
 
 // Public — flag a post with a note, same as submitMarketingFeedback but
@@ -3014,6 +3112,7 @@ export const addPublicReviewEmailPhotoFromLibrary = createServerFn({ method: "PO
         url: media.url,
         mediaType: media.media_type as "photo" | "video",
         publishingInstructions: "",
+        mediaId: media.id,
       },
     ];
     await writeEmailPhotos(data.postId, next);
@@ -3152,6 +3251,7 @@ export const addPublicReviewReelPhotoFromLibrary = createServerFn({ method: "POS
         url: media.url,
         mediaType: media.media_type as "photo" | "video",
         publishingInstructions: "",
+        mediaId: media.id,
       },
     ];
     await writeReelPhotos(data.postId, next);

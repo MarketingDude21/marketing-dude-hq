@@ -94,7 +94,12 @@ function AccountPage() {
     if (!user) return;
     setSaving(true);
     setStatus(null);
-    const { error } = await supabase.from("agents").upsert({ id: user.id, email: user.email ?? null, ...profile });
+    // Normalized 2026-09-30 per Mike's "duplicate accounts" investigation —
+    // matches the same lower(trim(email)) form the signup trigger and
+    // admin_allowlist lookups already use, so this can never re-introduce a
+    // casing mismatch on an existing agent's row.
+    const cleanEmail = user.email ? user.email.trim().toLowerCase() : null;
+    const { error } = await supabase.from("agents").upsert({ id: user.id, email: cleanEmail, ...profile });
     setSaving(false);
     setStatus(error ? error.message : "Profile saved.");
   };

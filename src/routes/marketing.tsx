@@ -5,6 +5,7 @@ import { supabase } from "@/integrations/supabase/client";
 import {
   getMarketingAccess,
   listMarketingAgents,
+  deleteAgent,
   listMarketingPosts,
   listMarketingMonths,
   updateMarketingPost,
@@ -98,7 +99,13 @@ export const Route = createFileRoute("/marketing")({
   component: MarketingPage,
 });
 
-type AgentOption = { id: string; name: string; email: string | null };
+// hasVoiceDna added 2026-09-30 (per Mike's "duplicate accounts"
+// investigation) — optional because the "agent" branch below (a
+// non-admin's own login) constructs one of these without it; only the
+// admin "Choose an agent" picker actually needs it, to show which of a
+// pair of duplicate-looking rows has actually completed the Voice DNA
+// interview and which is the empty leftover.
+type AgentOption = { id: string; name: string; email: string | null; hasVoiceDna?: boolean };
 
 type Post = {
   id: string;
@@ -492,6 +499,14 @@ function MarketingPage() {
   const [agents, setAgents] = useState<AgentOption[]>([]);
   const [selected, setSelected] = useState<AgentOption | null>(null);
   const [showCalendarAdmin, setShowCalendarAdmin] = useState(false);
+  // Delete-agent state (2026-09-30, per Mike's "duplicate accounts"
+  // investigation) — confirmDeleteId gates a real click behind an inline
+  // "are you sure" step rather than a native confirm() dialog (this app
+  // avoids those elsewhere), deletingId disables the button mid-request,
+  // deleteError surfaces a failed delete right on the card grid.
+  const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
+  const [deletingId, setDeletingId] = useState<string | null>(null);
+  const [deleteError, setDeleteError] = useState<string | null>(null);
 
   useEffect(() => {
     getMarketingAccess()
@@ -504,6 +519,7 @@ function MarketingPage() {
               id: ag.id,
               name: ag.full_name ?? ag.email ?? "Unnamed agent",
               email: ag.email ?? null,
+              hasVoiceDna: !!ag.voice_summary,
             })),
           );
         } else if (a.role === "agent") {
@@ -512,6 +528,24 @@ function MarketingPage() {
       })
       .catch((e) => setAccessError(e instanceof Error ? e.message : String(e)));
   }, []);
+
+  // 2026-09-30, per Mike's "duplicate accounts" investigation — hard,
+  // permanent delete (his explicit choice) of an agent and everything
+  // scoped to them. See deleteAgent in marketing.ts for exactly what this
+  // removes.
+  async function handleDeleteAgent(id: string) {
+    setDeletingId(id);
+    setDeleteError(null);
+    try {
+      await deleteAgent({ data: { agentId: id } });
+      setAgents((prev) => prev.filter((a) => a.id !== id));
+      setConfirmDeleteId(null);
+    } catch (e) {
+      setDeleteError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setDeletingId(null);
+    }
+  }
 
   if (accessError) {
     return (
@@ -578,6 +612,7 @@ function MarketingPage() {
           <p className="mt-1 text-sm text-muted-foreground">
             Pick who you're working on behalf of. Every action you take here is logged against their account, not yours.
           </p>
+          {deleteError && <p className="mt-2 text-xs text-destructive">{deleteError}</p>}
           <div className="mt-4 grid gap-2 sm:grid-cols-2 lg:grid-cols-3">
             {agents.map((a) => {
               // Flags a duplicate display name — added 2026-09-18 while
@@ -592,25 +627,68 @@ function MarketingPage() {
               // invisible, so each one now also shows its email — and any
               // name shared by more than one row gets a visible flag.
               const isDuplicateName = agents.filter((o) => o.name === a.name).length > 1;
+              const isConfirming = confirmDeleteId === a.id;
+              const isDeleting = deletingId === a.id;
               return (
-                <button
+                <div
                   key={a.id}
-                  onClick={() => setSelected(a)}
-                  className="rounded-2xl border border-border bg-glass px-4 py-3 text-left text-sm font-medium transition-colors hover:bg-secondary"
+                  className="relative rounded-2xl border border-border bg-glass px-4 py-3 text-sm font-medium transition-colors hover:bg-secondary"
                 >
-                  <span className="flex items-center gap-1.5">
-                    {a.name}
-                    {isDuplicateName && (
-                      <span
-                        title="Another agent also has this exact name — double check the email below before connecting anything to this one."
-                        className="rounded-full bg-amber-500/20 px-1.5 py-0.5 text-[10px] font-semibold text-amber-600 dark:text-amber-400"
-                      >
-                        ⚠ duplicate name
-                      </span>
+                  <button type="button" onClick={() => setSelected(a)} className="block w-full pr-14 text-left">
+                    <span className="flex items-center gap-1.5">
+                      {a.name}
+                      {isDuplicateName && (
+                        <span
+                          title="Another agent also has this exact name — double check the email below before connecting anything to this one."
+                          className="rounded-full bg-amber-500/20 px-1.5 py-0.5 text-[10px] font-semibold text-amber-600 dark:text-amber-400"
+                        >
+                          ⚠ duplicate name
+                        </span>
+                      )}
+                    </span>
+                    {a.email && (
+                      <span className="mt-0.5 block text-xs font-normal text-muted-foreground">{a.email}</span>
                     )}
-                  </span>
-                  {a.email && <span className="mt-0.5 block text-xs font-normal text-muted-foreground">{a.email}</span>}
-                </button>
+                    {/* Voice DNA completion signal — added 2026-09-30 so Mike
+                        can tell which of a pair of duplicate-looking rows is
+                        the one actually in use (has taken the interview)
+                        versus an empty leftover, before deleting either. */}
+                    <span className="mt-1 block text-[10px] font-normal text-muted-foreground">
+                      {a.hasVoiceDna ? "✓ Voice DNA complete" : "— Voice DNA not started"}
+                    </span>
+                  </button>
+                  <div className="absolute right-2 top-2">
+                    {isConfirming ? (
+                      <div className="flex w-40 flex-col items-end gap-1.5 rounded-xl border border-destructive/40 bg-background p-2 shadow-lg">
+                        <p className="text-right text-[10px] leading-snug text-destructive">
+                          Permanently delete {a.name}? Their posts, photos, and Voice DNA go too — this can't be undone.
+                        </p>
+                        <div className="flex gap-1">
+                          <Button variant="danger" disabled={isDeleting} onClick={() => handleDeleteAgent(a.id)}>
+                            {isDeleting ? "Deleting…" : "Yes, delete"}
+                          </Button>
+                          <button
+                            type="button"
+                            disabled={isDeleting}
+                            onClick={() => setConfirmDeleteId(null)}
+                            className="rounded-full border border-border px-3 py-1 text-xs disabled:opacity-50"
+                          >
+                            Cancel
+                          </button>
+                        </div>
+                      </div>
+                    ) : (
+                      <button
+                        type="button"
+                        title="Delete this agent"
+                        onClick={() => setConfirmDeleteId(a.id)}
+                        className="rounded-full px-2 py-1 text-xs text-muted-foreground hover:text-destructive"
+                      >
+                        Delete
+                      </button>
+                    )}
+                  </div>
+                </div>
               );
             })}
             {agents.length === 0 && <p className="text-sm text-muted-foreground">No agents yet.</p>}

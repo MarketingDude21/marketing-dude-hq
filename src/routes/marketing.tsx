@@ -17,6 +17,10 @@ import {
   addEmailPhotoFromUnsplash,
   updateEmailPhotoInstructions,
   removeEmailPhoto,
+  addReelPhotoFromLibrary,
+  addReelPhotoFromDrive,
+  updateReelPhotoInstructions,
+  removeReelPhoto,
   rewritePostContent,
   listMarketingMedia,
   createMediaUploadUrl,
@@ -68,6 +72,7 @@ import {
   type PostMetadata,
   type UnsplashResult,
   type EmailPhoto,
+  type ReelPhoto,
   type ArchivedBatchSummary,
   type ChatMode,
   type ChatMessageRow,
@@ -147,8 +152,12 @@ const CATEGORY_META: Record<ContentCategory, { label: string; icon: string; acce
     icon: "📝",
     accent: "border-sky-500/30 bg-sky-500/10 text-sky-700 dark:text-sky-300",
   },
+  // Relabeled "Canva Templates" -> "Reels" 2026-09-30 per Mike: "Lets list
+  // canva posts 'Reels' too since we are creating videos with them." The
+  // internal category key ("canva") is unchanged — only the label shown to
+  // people changes, so this doesn't touch any stored data.
   canva: {
-    label: "Canva Templates",
+    label: "Reels",
     icon: "🎨",
     accent: "border-violet-500/30 bg-violet-500/10 text-violet-700 dark:text-violet-300",
   },
@@ -1885,6 +1894,448 @@ function EmailPhotosPanel({
   );
 }
 
+// Multi-photo attachments for REELS (Canva-linked posts) — added 2026-09-30
+// per Mike: "Canva posts should have ability to add multiple posts to it
+// since it's a reel." Near-identical structure to EmailPhotosPanel just
+// above — same up-to-N-photos flow, same legacy-single-photo migration path
+// — deliberately kept as its own component (rather than sharing one generic
+// component) so each stays obviously correct on its own, same reasoning
+// EmailPhotosPanel's own comment gives for not sharing logic across
+// add/edit/remove calls. Two differences from Email's version: no Stock
+// Photos/Unsplash tab (Reels only draw from this agent's own Media
+// Library/Drive, per Mike's decision to keep Unsplash email-only), and a
+// higher cap (MAX_PHOTOS = 6, vs. email's 3) since a Reel typically wants
+// more source photos than a single email graphic.
+//
+// A Canva/Reel post generated before this feature existed only has the old
+// single-photo fields (media_url/drive_thumbnail_url) — those still display
+// read-only below as a "legacy" photo until removed, exactly like Email's
+// own legacy-photo handling.
+function ReelPhotosPanel({
+  post,
+  agentId,
+  driveFolderId,
+  onChanged,
+}: {
+  post: Post;
+  agentId: string;
+  driveFolderId: string | null;
+  onChanged: () => void;
+}) {
+  // Kept in sync with MAX_REEL_PHOTOS in marketing.ts.
+  const MAX_PHOTOS = 6;
+  const photos = post.metadata?.reel_photos ?? [];
+  const legacyUrl = photos.length === 0 ? post.metadata?.media_url || post.metadata?.drive_thumbnail_url || null : null;
+
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [drafts, setDrafts] = useState<Record<string, string>>({});
+  const [pickerOpen, setPickerOpen] = useState(false);
+  const [pickerTab, setPickerTab] = useState<"library" | "drive">("library");
+  const [mediaOptions, setMediaOptions] = useState<MediaRow[] | null>(null);
+  const [mediaError, setMediaError] = useState<string | null>(null);
+  const [driveOptions, setDriveOptions] = useState<DriveFile[] | null>(null);
+  const [driveOptionsError, setDriveOptionsError] = useState<string | null>(null);
+  const [driveThumbs, setDriveThumbs] = useState<Record<string, string | null>>({});
+  const [failedDriveThumbs, setFailedDriveThumbs] = useState<Set<string>>(new Set());
+  const [failedLibraryThumbs, setFailedLibraryThumbs] = useState<Set<string>>(new Set());
+
+  // Authenticated thumbnails for photos ALREADY ATTACHED to this Reel — same
+  // fix, same reason as EmailPhotosPanel's equivalent effect.
+  useEffect(() => {
+    const ids = photos.filter((p) => p.source === "drive" && p.driveFileId).map((p) => p.driveFileId as string);
+    const missing = ids.filter((id) => driveThumbs[id] === undefined);
+    if (!missing.length) return;
+    getDriveThumbnails({ data: { agentId, fileIds: missing } })
+      .then((res) => setDriveThumbs((cur) => ({ ...cur, ...res.thumbnails })))
+      .catch(() => {
+        /* leave unset — falls back to the raw hotlink below */
+      });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [agentId, photos.map((p) => p.driveFileId).join(",")]);
+
+  async function openPicker() {
+    setPickerOpen(true);
+    setPickerTab("library");
+    setError(null);
+    setMediaError(null);
+    try {
+      setMediaOptions(await listMarketingMedia({ data: { agentId } }));
+    } catch (e) {
+      setMediaError(e instanceof Error ? e.message : String(e));
+    }
+  }
+
+  async function openDriveTab() {
+    setPickerTab("drive");
+    try {
+      const res = await listAgentDriveMedia({ data: { agentId, status: "all" } });
+      setDriveOptions(res.files);
+      setDriveOptionsError(null);
+      if (res.files.length) {
+        getDriveThumbnails({ data: { agentId, fileIds: res.files.map((f) => f.id) } })
+          .then((r) => setDriveThumbs((prev) => ({ ...prev, ...r.thumbnails })))
+          .catch(() => {});
+      }
+    } catch (e) {
+      setDriveOptions([]);
+      setDriveOptionsError(e instanceof Error ? e.message : String(e));
+    }
+  }
+
+  async function addFromLibrary(mediaId: string) {
+    setBusy(true);
+    setError(null);
+    try {
+      await addReelPhotoFromLibrary({ data: { agentId, postId: post.id, mediaId } });
+      setPickerOpen(false);
+      onChanged();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function addFromDrive(file: DriveFile) {
+    setBusy(true);
+    setError(null);
+    try {
+      await addReelPhotoFromDrive({
+        data: { agentId, postId: post.id, driveFileId: file.id, thumbnailUrl: file.thumbnailUrl },
+      });
+      setPickerOpen(false);
+      onChanged();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function removePhoto(photoId: string) {
+    setBusy(true);
+    setError(null);
+    try {
+      await removeReelPhoto({ data: { agentId, postId: post.id, photoId } });
+      onChanged();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function saveInstructions(photoId: string) {
+    const value = drafts[photoId];
+    if (value === undefined) return;
+    setBusy(true);
+    setError(null);
+    try {
+      await updateReelPhotoInstructions({
+        data: { agentId, postId: post.id, photoId, publishingInstructions: value },
+      });
+      onChanged();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function removeLegacyPhoto() {
+    setBusy(true);
+    setError(null);
+    try {
+      await setPostMedia({ data: { agentId, postId: post.id, mediaId: null } });
+      onChanged();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className="mb-3">
+      {legacyUrl && (
+        <div className="mb-3 rounded-2xl border border-border bg-muted p-3">
+          <p className="mb-2 text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
+            Photo (added before multi-photo support)
+          </p>
+          <div className="overflow-hidden rounded-xl border border-border">
+            {post.metadata?.media_type === "video" ? (
+              <video src={legacyUrl} controls className="max-h-56 w-full object-contain" />
+            ) : (
+              <img src={legacyUrl} alt="" className="max-h-56 w-full object-contain" />
+            )}
+          </div>
+          <button
+            onClick={removeLegacyPhoto}
+            disabled={busy}
+            className="mt-2 text-xs font-semibold text-destructive hover:underline disabled:opacity-50"
+          >
+            Remove — I'll add new photos below instead
+          </button>
+        </div>
+      )}
+
+      {photos.length > 0 && (
+        <div className="mb-3 grid gap-3 sm:grid-cols-3">
+          {photos.map((p) => {
+            const displayUrl = p.driveFileId ? (driveThumbs[p.driveFileId] ?? p.url) : p.url;
+            const thisPhotoFailed = !!p.driveFileId && failedDriveThumbs.has(p.driveFileId);
+            const libraryFailed = p.source === "library" && failedLibraryThumbs.has(p.id);
+            return (
+              <div key={p.id} className="rounded-2xl border border-border bg-muted p-2">
+                <div className="overflow-hidden rounded-xl border border-border">
+                  {p.mediaType === "video" ? (
+                    <video src={p.url} controls className="aspect-square w-full object-cover" />
+                  ) : thisPhotoFailed ? (
+                    <div className="flex aspect-square w-full flex-col items-center justify-center gap-1 p-2 text-center text-[10px] text-muted-foreground">
+                      <span>Couldn't load this photo from Drive</span>
+                    </div>
+                  ) : libraryFailed ? (
+                    <div className="flex aspect-square w-full flex-col items-center justify-center gap-1 p-2 text-center text-[10px] text-muted-foreground">
+                      <span>Couldn't preview this photo</span>
+                    </div>
+                  ) : (
+                    <img
+                      src={displayUrl}
+                      alt=""
+                      className="aspect-square w-full object-cover"
+                      onError={() => {
+                        if (p.driveFileId) setFailedDriveThumbs((s) => new Set(s).add(p.driveFileId!));
+                        else setFailedLibraryThumbs((s) => new Set(s).add(p.id));
+                      }}
+                    />
+                  )}
+                </div>
+                <p className="mt-1 text-[10px] uppercase tracking-wide text-muted-foreground">
+                  {p.source === "library" ? "Media Library" : "Google Drive"}
+                </p>
+                <textarea
+                  value={drafts[p.id] ?? p.publishingInstructions}
+                  onChange={(e) => setDrafts((d) => ({ ...d, [p.id]: e.target.value }))}
+                  onBlur={() => saveInstructions(p.id)}
+                  placeholder="Publishing instructions (optional) — e.g. use as slide 2"
+                  className="mt-2 min-h-[50px] w-full rounded-lg border border-border bg-glass px-2 py-1.5 text-xs outline-none"
+                  disabled={busy}
+                />
+                <div className="mt-1 flex items-center justify-between gap-2">
+                  {p.url && (
+                    <button
+                      onClick={() =>
+                        downloadRemoteFile(
+                          displayUrl ?? p.url!,
+                          displayUrl?.startsWith("data:") ? "photo.jpg" : p.url!.split("/").pop() || `${p.id}`,
+                        )
+                      }
+                      className="text-[11px] font-semibold text-muted-foreground hover:text-foreground hover:underline"
+                    >
+                      ⬇ Download
+                    </button>
+                  )}
+                  <button
+                    onClick={() => removePhoto(p.id)}
+                    disabled={busy}
+                    className="text-[11px] font-semibold text-destructive hover:underline disabled:opacity-50"
+                  >
+                    Remove photo
+                  </button>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      )}
+
+      {error && <p className="mb-2 text-xs text-destructive">{error}</p>}
+
+      {photos.length < MAX_PHOTOS && (
+        <Button variant="secondary" onClick={openPicker} disabled={busy}>
+          {photos.length === 0 && !legacyUrl ? "Add photo" : "Add another photo"} ({photos.length}/{MAX_PHOTOS})
+        </Button>
+      )}
+
+      {pickerOpen && (
+        <div className="mt-3 rounded-2xl border border-border bg-background/40 p-4">
+          <div className="flex items-center justify-between gap-3">
+            <p className="text-sm font-semibold">Add a photo to this Reel</p>
+            <Button variant="secondary" onClick={() => setPickerOpen(false)}>
+              Close
+            </Button>
+          </div>
+
+          <div className="mt-3 flex flex-wrap gap-2 border-b border-border pb-3">
+            <button
+              onClick={() => setPickerTab("library")}
+              className={`rounded-full px-3 py-1 text-xs font-semibold transition-colors ${
+                pickerTab === "library"
+                  ? "bg-primary text-primary-foreground"
+                  : "bg-muted text-muted-foreground hover:text-foreground"
+              }`}
+            >
+              Media Library
+            </button>
+            {driveFolderId && (
+              <button
+                onClick={openDriveTab}
+                className={`rounded-full px-3 py-1 text-xs font-semibold transition-colors ${
+                  pickerTab === "drive"
+                    ? "bg-primary text-primary-foreground"
+                    : "bg-muted text-muted-foreground hover:text-foreground"
+                }`}
+              >
+                Google Drive
+              </button>
+            )}
+          </div>
+
+          {pickerTab === "library" && (
+            <div className="mt-3">
+              {mediaError && (
+                <div className="mb-2 flex items-center justify-between gap-2 rounded-lg bg-destructive/10 px-3 py-2">
+                  <p className="text-xs text-destructive">Couldn't load your library — {mediaError}</p>
+                  <button onClick={openPicker} className="shrink-0 text-xs font-semibold text-primary hover:underline">
+                    Retry
+                  </button>
+                </div>
+              )}
+              {mediaOptions === null && !mediaError && <p className="text-xs text-muted-foreground">Loading…</p>}
+              {mediaOptions === null && mediaError && (
+                <p className="text-xs text-muted-foreground">Nothing loaded yet — tap Retry above.</p>
+              )}
+              {mediaOptions !== null && mediaOptions.length === 0 && (
+                <p className="text-xs text-muted-foreground">
+                  No photos or videos uploaded for this agent yet — add some on the Media tab.
+                </p>
+              )}
+              {mediaOptions !== null && mediaOptions.length > 0 && (
+                <div className="grid grid-cols-3 gap-2 sm:grid-cols-4">
+                  {mediaOptions.map((m) => {
+                    const isUsed = m.status === "used";
+                    const isSelected = photos.some((p) => p.source === "library" && p.url === m.url);
+                    const badge = isSelected ? "Added" : isUsed ? "Used" : null;
+                    const failed = failedLibraryThumbs.has(m.id);
+                    return (
+                      <button
+                        key={m.id}
+                        onClick={() => addFromLibrary(m.id)}
+                        disabled={busy}
+                        className={`relative overflow-hidden rounded-xl border transition-colors disabled:opacity-50 ${
+                          isSelected
+                            ? "border-primary"
+                            : isUsed
+                              ? "border-border opacity-50 hover:opacity-80"
+                              : "border-border hover:border-primary"
+                        }`}
+                      >
+                        {m.media_type === "video" ? (
+                          m.url ? (
+                            <video src={m.url} className="aspect-square w-full object-cover" />
+                          ) : (
+                            <div className="flex aspect-square w-full items-center justify-center bg-muted text-[10px] text-muted-foreground">
+                              video
+                            </div>
+                          )
+                        ) : m.url && !failed ? (
+                          <img
+                            src={m.url}
+                            alt={m.caption ?? ""}
+                            className="aspect-square w-full object-cover"
+                            onError={() => setFailedLibraryThumbs((s) => new Set(s).add(m.id))}
+                          />
+                        ) : (
+                          <div className="flex aspect-square w-full flex-col items-center justify-center gap-1 bg-muted p-1 text-center text-[10px] text-muted-foreground">
+                            <span>photo</span>
+                            {m.caption && <span className="max-h-6 overflow-hidden">{m.caption}</span>}
+                          </div>
+                        )}
+                        {badge && (
+                          <span className="absolute bottom-1 left-1 rounded-full bg-background/90 px-1.5 py-0.5 text-[9px] font-semibold uppercase tracking-wide text-foreground">
+                            {badge}
+                          </span>
+                        )}
+                      </button>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+          )}
+
+          {pickerTab === "drive" && (
+            <div className="mt-3">
+              {driveOptionsError && (
+                <div className="mb-2 flex items-center justify-between gap-2 rounded-lg bg-destructive/10 px-3 py-2">
+                  <p className="text-xs text-destructive">{driveOptionsError}</p>
+                  <button
+                    onClick={openDriveTab}
+                    className="shrink-0 text-xs font-semibold text-primary hover:underline"
+                  >
+                    Retry
+                  </button>
+                </div>
+              )}
+              {!driveOptionsError && driveOptions === null && <p className="text-xs text-muted-foreground">Loading…</p>}
+              {!driveOptionsError && driveOptions !== null && driveOptions.length === 0 && (
+                <p className="text-xs text-muted-foreground">No photos or videos found in this agent's Drive folder.</p>
+              )}
+              {driveOptions !== null && driveOptions.length > 0 && (
+                <div className="grid grid-cols-3 gap-2 sm:grid-cols-4">
+                  {driveOptions.map((f) => {
+                    const thumbSrc = driveThumbs[f.id] ?? f.thumbnailUrl;
+                    const thumbFailed = failedDriveThumbs.has(f.id);
+                    const isUsed = !!f.usedAt;
+                    const isSelected = photos.some((p) => p.driveFileId === f.id);
+                    const badge = isSelected ? "Added" : isUsed ? "Used" : null;
+                    return (
+                      <button
+                        key={f.id}
+                        onClick={() => addFromDrive(f)}
+                        disabled={busy}
+                        className={`relative overflow-hidden rounded-xl border transition-colors disabled:opacity-50 ${
+                          isSelected
+                            ? "border-primary"
+                            : isUsed
+                              ? "border-border opacity-50 hover:opacity-80"
+                              : "border-border hover:border-primary"
+                        }`}
+                      >
+                        {f.isVideo ? (
+                          <video src={thumbSrc} className="aspect-square w-full object-cover" />
+                        ) : thumbFailed ? (
+                          <div className="flex aspect-square w-full flex-col items-center justify-center gap-1 bg-muted p-1 text-center text-[10px] text-muted-foreground">
+                            <span>photo</span>
+                            <span className="max-h-6 overflow-hidden">{f.name}</span>
+                          </div>
+                        ) : (
+                          <img
+                            src={thumbSrc}
+                            alt={f.name}
+                            className="aspect-square w-full object-cover"
+                            onError={() => setFailedDriveThumbs((s) => new Set(s).add(f.id))}
+                          />
+                        )}
+                        {badge && (
+                          <span className="absolute bottom-1 left-1 rounded-full bg-background/90 px-1.5 py-0.5 text-[9px] font-semibold uppercase tracking-wide text-foreground">
+                            {badge}
+                          </span>
+                        )}
+                      </button>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function PostCard({
   post,
   agentId,
@@ -1947,7 +2398,6 @@ function PostCard({
   // placeholder instead of a blank box.
   const [failedLibraryThumbs, setFailedLibraryThumbs] = useState<Set<string>>(new Set());
   const [rewriting, setRewriting] = useState(false);
-  const [rewriteHistory, setRewriteHistory] = useState<{ feedback: string; result: string }[]>([]);
   // Added 2026-09-29 per Mike: "you could rescan the photo." Re-fetches
   // whatever photo is currently on this post and asks for a fresh caption,
   // separate from Scan photos' own "get new photos" action above. WIDENED
@@ -2035,6 +2485,13 @@ function PostCard({
   // "rewritten") as part of doing the rewrite, so there's nothing left
   // for a separate flag-only submission to add — it was just a second
   // button for a subset of the same information.
+  // REWORKED 2026-09-30 per Mike: "once I submit feedback, it should all
+  // close and be good to go automatically" — a successful rewrite now closes
+  // the whole Edit/Feedback panel immediately (same as clicking the top
+  // "Close" button would) instead of leaving it open showing a "You asked /
+  // Result" transcript. A failure leaves the panel open with the typed
+  // feedback still in the box and a visible error, so retrying is just
+  // editing and hitting submit again.
   async function submitFeedback() {
     const feedback = notes.trim();
     if (!feedback) {
@@ -2044,9 +2501,9 @@ function PostCard({
     setRewriting(true);
     setSaveError(null);
     try {
-      const res = await rewritePostContent({ data: { agentId, postId: post.id, feedback } });
-      setRewriteHistory((h) => [...h, { feedback, result: res.content }]);
+      await rewritePostContent({ data: { agentId, postId: post.id, feedback } });
       setNotes("");
+      setEditorOpen(false);
       onChanged();
     } catch (e) {
       setSaveError(e instanceof Error ? e.message : String(e));
@@ -2141,6 +2598,12 @@ function PostCard({
   }
 
   const typeLabel = post.content_type === "email" ? "Email" : post.content_type === "video" ? "Video script" : "Post";
+  // A Reel is a content_type "post" row with a canva_link (same test as
+  // categorizePost above) — it gets its own multi-photo flow (see
+  // ReelPhotosPanel) instead of the single-photo block just below, added
+  // 2026-09-30 per Mike: "Canva posts should have ability to add multiple
+  // posts to it since it's a reel."
+  const isReel = post.content_type === "post" && !!post.metadata?.canva_link;
   const photoUrl = post.metadata?.media_url || post.metadata?.drive_thumbnail_url || null;
   // The IMAGE actually rendered for a Drive-sourced photo — prefers the
   // authenticated thumbnail fetched above over the raw (now-broken) hotlink
@@ -2179,7 +2642,10 @@ function PostCard({
               Mike: "look at the photo and either change it or give feedback,"
               not a photo up top and a "Change photo" button buried in an
               unrelated row of buttons below the caption (2026-09-29). */}
-        {post.content_type === "post" && (
+        {isReel && (
+          <ReelPhotosPanel post={post} agentId={agentId} driveFolderId={driveFolderId} onChanged={onChanged} />
+        )}
+        {post.content_type === "post" && !isReel && (
           <div className="mb-3">
             {photoUrl && (
               <div className="overflow-hidden rounded-2xl border border-border bg-muted">
@@ -2523,7 +2989,6 @@ function PostCard({
               if (editorOpen) {
                 setDraft(post.content);
                 setNotes("");
-                setRewriteHistory([]);
               }
               setEditorOpen((v) => !v);
             }}
@@ -2542,10 +3007,13 @@ function PostCard({
                 updateMarketingPost, logs it to feedback_history as an
                 "edited" learning signal). */}
             <div>
-              <div className="flex items-center justify-between">
-                <p className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">Edit directly</p>
-                <MicButton value={draft} onChange={setDraft} />
-              </div>
+              {/* Mic dropped here 2026-09-30 per Mike: "we do not need a
+                  microphone above edit directly because they're just going
+                  to change the text themselves" — dictation earns its keep
+                  on the conversational feedback box below, not on a plain
+                  text edit. Applies everywhere this panel appears (admin,
+                  public review link). */}
+              <p className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">Edit directly</p>
               <AutoResizeTextarea
                 value={draft}
                 onChange={setDraft}
@@ -2560,44 +3028,35 @@ function PostCard({
             </div>
 
             {/* AI feedback — same rewrite/flag flow as before, just living
-                in the same panel now instead of behind its own button. */}
+                in the same panel now instead of behind its own button.
+                REWORKED 2026-09-30 per Mike: "this needs to feel and act
+                just like ChatGPT or Claude... once I submit feedback, it
+                should all close and be good to go automatically." Enter
+                submits (Shift+Enter for a new line, same as a real chat
+                box), and a successful submit now closes the whole panel
+                immediately instead of leaving it open with a "You asked /
+                Result" transcript the user then has to close themselves. */}
             <div className="border-t border-border pt-4">
-              <div className="flex items-center justify-between">
-                <p className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
-                  Or tell the AI what to change
-                </p>
-                <MicButton value={notes} onChange={setNotes} />
-              </div>
-              {rewriteHistory.length > 0 && (
-                <div className="mt-2 space-y-2">
-                  {rewriteHistory.map((h, i) => (
-                    <div key={i} className="rounded-xl bg-muted px-3 py-2 text-xs leading-relaxed">
-                      <p className="text-muted-foreground">You asked: "{h.feedback}"</p>
-                      <p className="mt-1 italic">Result: {h.result}</p>
-                    </div>
-                  ))}
-                </div>
-              )}
+              <p className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
+                Or tell the AI what to change
+              </p>
               <textarea
                 value={notes}
                 onChange={(e) => setNotes(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter" && !e.shiftKey) {
+                    e.preventDefault();
+                    submitFeedback();
+                  }
+                }}
                 placeholder="What is off? Too formal, they never say this, make it shorter…"
                 className="mt-2 min-h-[80px] w-full rounded-2xl bg-muted px-4 py-3 text-sm outline-none ring-ring transition focus:ring-2"
               />
-              {/* Rewrite and Submit feedback MERGED into one action per
-                  Mike (2026-09-29) — see submitFeedback above. Closing now
-                  happens from the "Close" button at the top of the card
-                  (was setEditorOpen(false) here as a separate "Done"). */}
               <div className="mt-3 flex flex-wrap gap-2">
-                <Button onClick={submitFeedback} disabled={busy || rewriting}>
+                <Button onClick={submitFeedback} disabled={busy || rewriting || !notes.trim()}>
                   {rewriting ? "Submitting…" : "Submit feedback →"}
                 </Button>
               </div>
-              {rewriteHistory.length > 0 && (
-                <p className="mt-2 text-xs text-muted-foreground">
-                  Not right yet? Add more feedback above and submit again.
-                </p>
-              )}
             </div>
           </div>
         )}
@@ -3986,7 +4445,7 @@ function ContentCalendarTab({
 // so this replaces that doc's format rather than inventing a new one.
 const DOCX_SECTION_TITLE: Record<ContentCategory, string> = {
   post: "SOCIAL POSTS",
-  canva: "CANVA TEMPLATES",
+  canva: "REELS", // relabeled from "CANVA TEMPLATES" 2026-09-30, see CATEGORY_META above
   email: "EMAILS",
   video: "VIDEO SCRIPTS",
 };
@@ -4606,7 +5065,7 @@ function MonthWorkspace({
 // review grid. Per Mike's request (2026-09-18), the header used to collapse
 // a card on click, but that offered no value and just made content vanish
 // unexpectedly, so PostCard's header is no longer clickable at all now.
-// Grouped and icon-labeled by content kind (Posts / Canva Templates /
+// Grouped and icon-labeled by content kind (Posts / Reels /
 // Emails / Video Scripts, in that fixed order) per Mike's request
 // (2026-09-18) so the four different pieces of content are never visually
 // indistinguishable from each other.

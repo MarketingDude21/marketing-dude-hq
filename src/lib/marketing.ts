@@ -72,12 +72,70 @@ export const listMarketingAgents = createServerFn({ method: "GET" })
       throw new Error("Only team members can view the agent list.");
     }
     const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+    // voice_summary added 2026-09-30 per Mike's "duplicate accounts"
+    // investigation — the admin picker shows whether each agent has
+    // completed their Voice DNA interview, which is the main signal for
+    // telling a real duplicate (a leftover, never-used legacy row) apart
+    // from the one that's actually in use.
     const { data, error } = await supabaseAdmin
       .from("agents")
-      .select("id, full_name, market_area, email")
+      .select("id, full_name, market_area, email, voice_summary")
       .order("full_name", { ascending: true });
     if (error) throw error;
     return data;
+  });
+
+// Admin-only hard delete of a full agent record (2026-09-30, per Mike's
+// "duplicate accounts" investigation — he needs a way to remove a leftover
+// duplicate or an agent who's quit, and explicitly chose a real, permanent
+// delete over an archive/soft-delete for this).
+//
+// Deletes every row scoped to this agent_id across every table that has
+// one, then the `agents` row itself, then the underlying Supabase Auth
+// login — done as explicit deletes in this order rather than relying only
+// on each table's own ON DELETE CASCADE, because two of these tables
+// (agent_chat_messages, agent_drive_used_files) were created directly in
+// Supabase Studio and never got a migration file committed to this repo,
+// so their cascade behavior in the live database can't be confirmed by
+// reading the code. This way the delete is correct either way. Storage
+// objects (uploaded photos in the `media` bucket) are not removed here —
+// their DB rows are gone, so they stop appearing anywhere in the app, but
+// the underlying files are left in storage rather than risk a wrong
+// deletion there; a follow-up storage-cleanup pass can be added later if
+// the leftover files ever become a real cost.
+export const deleteAgent = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator((data: { agentId: string }) => data)
+  .handler(async ({ data, context }): Promise<{ ok: true }> => {
+    const email = (context.claims as { email?: string } | undefined)?.email;
+    const access = await resolveAccess(context.userId, email);
+    if (access.role !== "admin") {
+      throw new Error("Only team members can delete an agent.");
+    }
+    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+    const agentId = data.agentId;
+
+    await supabaseAdmin.from("agent_chat_messages").delete().eq("agent_id", agentId);
+    await supabaseAdmin.from("agent_drive_used_files").delete().eq("agent_id", agentId);
+    await supabaseAdmin.from("feedback_history").delete().eq("agent_id", agentId);
+    await supabaseAdmin.from("generated_posts").delete().eq("agent_id", agentId);
+    await supabaseAdmin.from("agent_photos").delete().eq("agent_id", agentId);
+
+    const { error: agentDeleteErr } = await supabaseAdmin.from("agents").delete().eq("id", agentId);
+    if (agentDeleteErr) throw agentDeleteErr;
+
+    // Also removes the Supabase Auth login itself, not just the agents row
+    // — otherwise the person could still sign in (they'd just land on
+    // "not set up in Monthly Marketing yet"), and the email stays tied up
+    // so it can't be reused if this was, say, an old duplicate for someone
+    // who needs to sign up fresh. Not treated as fatal if the auth user is
+    // already gone some other way — everything that matters is already
+    // deleted at this point regardless.
+    const { error: authErr } = await supabaseAdmin.auth.admin.deleteUser(agentId);
+    if (authErr && !/not.*found/i.test(authErr.message ?? "")) {
+      throw authErr;
+    }
+    return { ok: true };
   });
 
 // Shared guard used by every per-agent action below — re-resolves the
@@ -3980,8 +4038,24 @@ export const generateMonthlyBatch = createServerFn({ method: "POST" })
     if (agentErr) throw agentErr;
     const agentName = agent?.full_name ?? "the agent";
     const agentCity = agent?.market_area ?? "their market";
-    const dna =
-      agent?.voice_summary ?? "Warm, conversational, authentic real estate agent. Short posts. Real human energy.";
+
+    // Hard requirement per Mike (2026-09-30): "the prerequisite to start
+    // generating their monthly content — they have to take the interview
+    // first. That's one hundred percent has to be the case." voice_summary
+    // is only ever populated by generateVoiceDnaProfile once someone
+    // finishes the Voice DNA interview (see voice-dna.ts), so its presence
+    // IS "has this agent taken the interview" — checking it here doesn't
+    // care whether it was filled in through today's interview flow or was
+    // already there from before (an existing agent who's been generating
+    // content for months already has this field populated, so this gate
+    // changes nothing for them; it only blocks someone who has never had a
+    // Voice DNA profile built at all).
+    if (!agent?.voice_summary) {
+      throw new Error(
+        `${agentName} hasn't completed the Voice DNA interview yet — monthly content can't be generated until that's done. Complete the interview in Voice DNA first, then come back and generate this month's content.`,
+      );
+    }
+    const dna = agent.voice_summary;
     const learnedFeedback = await fetchLearnedFeedback(data.agentId);
 
     const docs = await fetchNativeCalendarDocs(data.monthId);

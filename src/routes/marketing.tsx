@@ -1343,6 +1343,12 @@ function EmailPhotosPanel({
   const [driveOptionsError, setDriveOptionsError] = useState<string | null>(null);
   const [driveThumbs, setDriveThumbs] = useState<Record<string, string | null>>({});
   const [failedDriveThumbs, setFailedDriveThumbs] = useState<Set<string>>(new Set());
+  // Same as PostCard's failedLibraryThumbs (2026-09-30) — a plain <img>
+  // with no onError just renders blank for a Library photo the browser
+  // can't decode (almost always an iPhone HEIC photo), even though it's a
+  // real, selectable photo. Tracks which ones failed so the grid can show
+  // a clear placeholder instead of a blank box.
+  const [failedLibraryThumbs, setFailedLibraryThumbs] = useState<Set<string>>(new Set());
   const [unsplashQuery, setUnsplashQuery] = useState(post.title || "lifestyle real estate");
   const [unsplashResults, setUnsplashResults] = useState<UnsplashResult[] | null>(null);
   const [unsplashLoading, setUnsplashLoading] = useState(false);
@@ -1707,6 +1713,7 @@ function EmailPhotosPanel({
                     const isUsed = m.status === "used";
                     const isSelected = photos.some((p) => p.source === "library" && p.url === m.url);
                     const badge = isSelected ? "Added" : isUsed ? "Used" : null;
+                    const failed = failedLibraryThumbs.has(m.id);
                     return (
                       <button
                         key={m.id}
@@ -1728,11 +1735,17 @@ function EmailPhotosPanel({
                               video
                             </div>
                           )
-                        ) : m.url ? (
-                          <img src={m.url} alt={m.caption ?? ""} className="aspect-square w-full object-cover" />
+                        ) : m.url && !failed ? (
+                          <img
+                            src={m.url}
+                            alt={m.caption ?? ""}
+                            className="aspect-square w-full object-cover"
+                            onError={() => setFailedLibraryThumbs((s) => new Set(s).add(m.id))}
+                          />
                         ) : (
-                          <div className="flex aspect-square w-full items-center justify-center bg-muted text-[10px] text-muted-foreground">
-                            photo
+                          <div className="flex aspect-square w-full flex-col items-center justify-center gap-1 bg-muted p-1 text-center text-[10px] text-muted-foreground">
+                            <span>photo</span>
+                            {m.caption && <span className="max-h-6 overflow-hidden">{m.caption}</span>}
                           </div>
                         )}
                         {badge && (
@@ -1924,6 +1937,15 @@ function PostCard({
   // placeholder (failedDriveThumbs) if even that fails.
   const [driveThumbs, setDriveThumbs] = useState<Record<string, string | null>>({});
   const [failedDriveThumbs, setFailedDriveThumbs] = useState<Set<string>>(new Set());
+  // Same idea as failedDriveThumbs, for the Media Library grid — added
+  // 2026-09-30 per Mike: "in the photo library, you see some photos
+  // missing... I clicked on one and it changed out the image." The photo
+  // was always real and selectable; a plain <img> with no onError just
+  // renders blank when the browser can't decode it (almost always an
+  // iPhone HEIC photo — Chrome can't display HEIC in an <img> the way
+  // Safari can), so this tracks which ones failed to show a clear
+  // placeholder instead of a blank box.
+  const [failedLibraryThumbs, setFailedLibraryThumbs] = useState<Set<string>>(new Set());
   const [rewriting, setRewriting] = useState(false);
   const [rewriteHistory, setRewriteHistory] = useState<{ feedback: string; result: string }[]>([]);
   // Added 2026-09-29 per Mike: "you could rescan the photo." Re-fetches
@@ -2212,6 +2234,229 @@ function PostCard({
                 </Button>
               )}
             </div>
+
+            {/* RELOCATED 2026-09-30 per Mike, pointing at a screenshot with
+                an arrow at this exact spot: "the photos, when you click
+                change photos, all the photos in that tab needs to open up
+                directly beneath that button... I didn't even realize that
+                the photo button was down as far as it was." This picker
+                used to render much further down the card — after the brief
+                bullets, the caption, and the Approve/Edit row — which is
+                exactly what made it easy to miss. Same picker, same state,
+                just moved to sit immediately under the button that opens
+                it. */}
+            {pickerOpen && (
+              <div className="mt-3 rounded-2xl border border-border bg-background/40 p-4">
+                <div className="flex items-center justify-between gap-3">
+                  <p className="text-sm font-semibold">
+                    Which image or video do you want to use dude? Click and I will make it happen.
+                  </p>
+                  <Button variant="secondary" onClick={() => setPickerOpen(false)}>
+                    Close
+                  </Button>
+                </div>
+
+                <div className="mt-3 flex flex-wrap gap-2 border-b border-border pb-3">
+                  <button
+                    onClick={() => setPickerTab("library")}
+                    className={`rounded-full px-3 py-1 text-xs font-semibold transition-colors ${
+                      pickerTab === "library"
+                        ? "bg-primary text-primary-foreground"
+                        : "bg-muted text-muted-foreground hover:text-foreground"
+                    }`}
+                  >
+                    Media Library
+                  </button>
+                  {driveFolderId && (
+                    <button
+                      onClick={openDriveTab}
+                      className={`rounded-full px-3 py-1 text-xs font-semibold transition-colors ${
+                        pickerTab === "drive"
+                          ? "bg-primary text-primary-foreground"
+                          : "bg-muted text-muted-foreground hover:text-foreground"
+                      }`}
+                    >
+                      Google Drive
+                    </button>
+                  )}
+                </div>
+
+                {pickerTab === "library" && (
+                  <div className="mt-3">
+                    {mediaError && (
+                      <div className="mb-2 flex items-center justify-between gap-2 rounded-lg bg-destructive/10 px-3 py-2">
+                        <p className="text-xs text-destructive">Couldn't load your library — {mediaError}</p>
+                        <button
+                          onClick={openPicker}
+                          className="shrink-0 text-xs font-semibold text-primary hover:underline"
+                        >
+                          Retry
+                        </button>
+                      </div>
+                    )}
+                    {mediaOptions === null && !mediaError && <p className="text-xs text-muted-foreground">Loading…</p>}
+                    {mediaOptions === null && mediaError && (
+                      <p className="text-xs text-muted-foreground">Nothing loaded yet — tap Retry above.</p>
+                    )}
+                    {mediaOptions !== null && mediaOptions.length === 0 && (
+                      <p className="text-xs text-muted-foreground">
+                        No photos or videos uploaded for this agent yet — add some on the Media tab, then come back
+                        here.
+                      </p>
+                    )}
+                    {mediaOptions !== null && mediaOptions.length > 0 && (
+                      <div className="grid grid-cols-3 gap-2 sm:grid-cols-4">
+                        {/* Greyed out for "used" or "already the current photo
+                            on this post" — per Mike: "grey out photos that are
+                            already be used or selected so everyone knows"
+                            (2026-09-29). Still clickable — reusing a photo is a
+                            real thing agents do, this is just a visual heads-up,
+                            not a block. */}
+                        {mediaOptions.map((m) => {
+                          const isUsed = m.status === "used";
+                          const isSelected = m.id === post.metadata?.media_id;
+                          const badge = isSelected ? "Current" : isUsed ? "Used" : null;
+                          // FIXED 2026-09-30 per Mike: "in the photo library,
+                          // you see some photos missing... I clicked on one
+                          // and it changed out the image" — the record and
+                          // url were always valid, but a plain <img> with no
+                          // onError just renders blank when the browser
+                          // can't decode it (this is almost always an
+                          // iPhone-format HEIC photo — Chrome, unlike
+                          // Safari, cannot display HEIC in an <img> at all).
+                          // Added the same load-failure fallback the Drive
+                          // grid below already had, so a thumbnail that
+                          // can't render shows a clear, still-clickable
+                          // placeholder instead of a blank box.
+                          const failed = failedLibraryThumbs.has(m.id);
+                          return (
+                            <button
+                              key={m.id}
+                              onClick={() => pickMedia(m.id)}
+                              disabled={mediaBusy}
+                              className={`relative overflow-hidden rounded-xl border transition-colors disabled:opacity-50 ${
+                                isSelected
+                                  ? "border-primary"
+                                  : isUsed
+                                    ? "border-border opacity-50 hover:opacity-80"
+                                    : "border-border hover:border-primary"
+                              }`}
+                            >
+                              {m.media_type === "video" ? (
+                                m.url ? (
+                                  <video src={m.url} className="aspect-square w-full object-cover" />
+                                ) : (
+                                  <div className="flex aspect-square w-full items-center justify-center bg-muted text-[10px] text-muted-foreground">
+                                    video
+                                  </div>
+                                )
+                              ) : m.url && !failed ? (
+                                <img
+                                  src={m.url}
+                                  alt={m.caption ?? ""}
+                                  className="aspect-square w-full object-cover"
+                                  onError={() => setFailedLibraryThumbs((s) => new Set(s).add(m.id))}
+                                />
+                              ) : (
+                                <div className="flex aspect-square w-full flex-col items-center justify-center gap-1 bg-muted p-1 text-center text-[10px] text-muted-foreground">
+                                  <span>photo</span>
+                                  {m.caption && <span className="max-h-6 overflow-hidden">{m.caption}</span>}
+                                </div>
+                              )}
+                              {badge && (
+                                <span className="absolute bottom-1 left-1 rounded-full bg-background/90 px-1.5 py-0.5 text-[9px] font-semibold uppercase tracking-wide text-foreground">
+                                  {badge}
+                                </span>
+                              )}
+                            </button>
+                          );
+                        })}
+                      </div>
+                    )}
+                  </div>
+                )}
+
+                {pickerTab === "drive" && (
+                  <div className="mt-3">
+                    {driveOptionsError && (
+                      <div className="mb-2 flex items-center justify-between gap-2 rounded-lg bg-destructive/10 px-3 py-2">
+                        <p className="text-xs text-destructive">{driveOptionsError}</p>
+                        <button
+                          onClick={openDriveTab}
+                          className="shrink-0 text-xs font-semibold text-primary hover:underline"
+                        >
+                          Retry
+                        </button>
+                      </div>
+                    )}
+                    {!driveOptionsError && driveOptions === null && (
+                      <p className="text-xs text-muted-foreground">Loading…</p>
+                    )}
+                    {!driveOptionsError && driveOptions !== null && driveOptions.length === 0 && (
+                      <p className="text-xs text-muted-foreground">
+                        No photos or videos found in this agent's Drive folder.
+                      </p>
+                    )}
+                    {driveOptions !== null && driveOptions.length > 0 && (
+                      <div className="grid grid-cols-3 gap-2 sm:grid-cols-4">
+                        {driveOptions.map((f) => {
+                          const thumbSrc = driveThumbs[f.id] ?? f.thumbnailUrl;
+                          const thumbFailed = failedDriveThumbs.has(f.id);
+                          const isUsed = !!f.usedAt;
+                          const isSelected = f.id === post.metadata?.drive_file_id;
+                          const badge = isSelected ? "Current" : isUsed ? "Used" : null;
+                          return (
+                            <button
+                              key={f.id}
+                              onClick={() => pickDriveFile(f)}
+                              disabled={mediaBusy}
+                              className={`relative overflow-hidden rounded-xl border transition-colors disabled:opacity-50 ${
+                                isSelected
+                                  ? "border-primary"
+                                  : isUsed
+                                    ? "border-border opacity-50 hover:opacity-80"
+                                    : "border-border hover:border-primary"
+                              }`}
+                            >
+                              {f.isVideo ? (
+                                <video src={thumbSrc} className="aspect-square w-full object-cover" />
+                              ) : thumbFailed ? (
+                                <div className="flex aspect-square w-full flex-col items-center justify-center gap-1 bg-muted p-1 text-center text-[10px] text-muted-foreground">
+                                  <span>photo</span>
+                                  <span className="max-h-6 overflow-hidden">{f.name}</span>
+                                </div>
+                              ) : (
+                                <img
+                                  src={thumbSrc}
+                                  alt={f.name}
+                                  className="aspect-square w-full object-cover"
+                                  onError={() => setFailedDriveThumbs((s) => new Set(s).add(f.id))}
+                                />
+                              )}
+                              {badge && (
+                                <span className="absolute bottom-1 left-1 rounded-full bg-background/90 px-1.5 py-0.5 text-[9px] font-semibold uppercase tracking-wide text-foreground">
+                                  {badge}
+                                </span>
+                              )}
+                            </button>
+                          );
+                        })}
+                      </div>
+                    )}
+                  </div>
+                )}
+
+                {photoUrl && (
+                  <button
+                    onClick={() => pickMedia(null)}
+                    disabled={mediaBusy}
+                    className="mt-3 text-xs font-semibold text-destructive hover:underline disabled:opacity-50"
+                  >
+                    Remove photo
+                  </button>
+                )}
+              </div>
+            )}
           </div>
         )}
         {post.content_type === "email" && (
@@ -2287,201 +2532,6 @@ function PostCard({
             {editorOpen ? "Close" : "Edit / Feedback"}
           </Button>
         </div>
-
-        {post.content_type === "post" && pickerOpen && (
-          <div className="mt-4 rounded-2xl border border-border bg-background/40 p-4">
-            <div className="flex items-center justify-between gap-3">
-              <p className="text-sm font-semibold">
-                Which image or video do you want to use dude? Click and I will make it happen.
-              </p>
-              {/* Upgraded from a small muted text link to a real Button — see
-                  EmailPhotosPanel's matching comment above (2026-09-29). */}
-              <Button variant="secondary" onClick={() => setPickerOpen(false)}>
-                Close
-              </Button>
-            </div>
-
-            <div className="mt-3 flex flex-wrap gap-2 border-b border-border pb-3">
-              <button
-                onClick={() => setPickerTab("library")}
-                className={`rounded-full px-3 py-1 text-xs font-semibold transition-colors ${
-                  pickerTab === "library"
-                    ? "bg-primary text-primary-foreground"
-                    : "bg-muted text-muted-foreground hover:text-foreground"
-                }`}
-              >
-                Media Library
-              </button>
-              {driveFolderId && (
-                <button
-                  onClick={openDriveTab}
-                  className={`rounded-full px-3 py-1 text-xs font-semibold transition-colors ${
-                    pickerTab === "drive"
-                      ? "bg-primary text-primary-foreground"
-                      : "bg-muted text-muted-foreground hover:text-foreground"
-                  }`}
-                >
-                  Google Drive
-                </button>
-              )}
-            </div>
-
-            {pickerTab === "library" && (
-              <div className="mt-3">
-                {mediaError && (
-                  <div className="mb-2 flex items-center justify-between gap-2 rounded-lg bg-destructive/10 px-3 py-2">
-                    <p className="text-xs text-destructive">Couldn't load your library — {mediaError}</p>
-                    <button
-                      onClick={openPicker}
-                      className="shrink-0 text-xs font-semibold text-primary hover:underline"
-                    >
-                      Retry
-                    </button>
-                  </div>
-                )}
-                {mediaOptions === null && !mediaError && <p className="text-xs text-muted-foreground">Loading…</p>}
-                {mediaOptions === null && mediaError && (
-                  <p className="text-xs text-muted-foreground">Nothing loaded yet — tap Retry above.</p>
-                )}
-                {mediaOptions !== null && mediaOptions.length === 0 && (
-                  <p className="text-xs text-muted-foreground">
-                    No photos or videos uploaded for this agent yet — add some on the Media tab, then come back here.
-                  </p>
-                )}
-                {mediaOptions !== null && mediaOptions.length > 0 && (
-                  <div className="grid grid-cols-3 gap-2 sm:grid-cols-4">
-                    {/* Greyed out for "used" or "already the current photo
-                        on this post" — per Mike: "grey out photos that are
-                        already be used or selected so everyone knows"
-                        (2026-09-29). Still clickable — reusing a photo is a
-                        real thing agents do, this is just a visual heads-up,
-                        not a block. */}
-                    {mediaOptions.map((m) => {
-                      const isUsed = m.status === "used";
-                      const isSelected = m.id === post.metadata?.media_id;
-                      const badge = isSelected ? "Current" : isUsed ? "Used" : null;
-                      return (
-                        <button
-                          key={m.id}
-                          onClick={() => pickMedia(m.id)}
-                          disabled={mediaBusy}
-                          className={`relative overflow-hidden rounded-xl border transition-colors disabled:opacity-50 ${
-                            isSelected
-                              ? "border-primary"
-                              : isUsed
-                                ? "border-border opacity-50 hover:opacity-80"
-                                : "border-border hover:border-primary"
-                          }`}
-                        >
-                          {m.media_type === "video" ? (
-                            m.url ? (
-                              <video src={m.url} className="aspect-square w-full object-cover" />
-                            ) : (
-                              <div className="flex aspect-square w-full items-center justify-center bg-muted text-[10px] text-muted-foreground">
-                                video
-                              </div>
-                            )
-                          ) : m.url ? (
-                            <img src={m.url} alt={m.caption ?? ""} className="aspect-square w-full object-cover" />
-                          ) : (
-                            <div className="flex aspect-square w-full items-center justify-center bg-muted text-[10px] text-muted-foreground">
-                              photo
-                            </div>
-                          )}
-                          {badge && (
-                            <span className="absolute bottom-1 left-1 rounded-full bg-background/90 px-1.5 py-0.5 text-[9px] font-semibold uppercase tracking-wide text-foreground">
-                              {badge}
-                            </span>
-                          )}
-                        </button>
-                      );
-                    })}
-                  </div>
-                )}
-              </div>
-            )}
-
-            {pickerTab === "drive" && (
-              <div className="mt-3">
-                {driveOptionsError && (
-                  <div className="mb-2 flex items-center justify-between gap-2 rounded-lg bg-destructive/10 px-3 py-2">
-                    <p className="text-xs text-destructive">{driveOptionsError}</p>
-                    <button
-                      onClick={openDriveTab}
-                      className="shrink-0 text-xs font-semibold text-primary hover:underline"
-                    >
-                      Retry
-                    </button>
-                  </div>
-                )}
-                {!driveOptionsError && driveOptions === null && (
-                  <p className="text-xs text-muted-foreground">Loading…</p>
-                )}
-                {!driveOptionsError && driveOptions !== null && driveOptions.length === 0 && (
-                  <p className="text-xs text-muted-foreground">
-                    No photos or videos found in this agent's Drive folder.
-                  </p>
-                )}
-                {driveOptions !== null && driveOptions.length > 0 && (
-                  <div className="grid grid-cols-3 gap-2 sm:grid-cols-4">
-                    {driveOptions.map((f) => {
-                      const thumbSrc = driveThumbs[f.id] ?? f.thumbnailUrl;
-                      const thumbFailed = failedDriveThumbs.has(f.id);
-                      const isUsed = !!f.usedAt;
-                      const isSelected = f.id === post.metadata?.drive_file_id;
-                      const badge = isSelected ? "Current" : isUsed ? "Used" : null;
-                      return (
-                        <button
-                          key={f.id}
-                          onClick={() => pickDriveFile(f)}
-                          disabled={mediaBusy}
-                          className={`relative overflow-hidden rounded-xl border transition-colors disabled:opacity-50 ${
-                            isSelected
-                              ? "border-primary"
-                              : isUsed
-                                ? "border-border opacity-50 hover:opacity-80"
-                                : "border-border hover:border-primary"
-                          }`}
-                        >
-                          {f.isVideo ? (
-                            <video src={thumbSrc} className="aspect-square w-full object-cover" />
-                          ) : thumbFailed ? (
-                            <div className="flex aspect-square w-full flex-col items-center justify-center gap-1 bg-muted p-1 text-center text-[10px] text-muted-foreground">
-                              <span>photo</span>
-                              <span className="max-h-6 overflow-hidden">{f.name}</span>
-                            </div>
-                          ) : (
-                            <img
-                              src={thumbSrc}
-                              alt={f.name}
-                              className="aspect-square w-full object-cover"
-                              onError={() => setFailedDriveThumbs((s) => new Set(s).add(f.id))}
-                            />
-                          )}
-                          {badge && (
-                            <span className="absolute bottom-1 left-1 rounded-full bg-background/90 px-1.5 py-0.5 text-[9px] font-semibold uppercase tracking-wide text-foreground">
-                              {badge}
-                            </span>
-                          )}
-                        </button>
-                      );
-                    })}
-                  </div>
-                )}
-              </div>
-            )}
-
-            {photoUrl && (
-              <button
-                onClick={() => pickMedia(null)}
-                disabled={mediaBusy}
-                className="mt-3 text-xs font-semibold text-destructive hover:underline disabled:opacity-50"
-              >
-                Remove photo
-              </button>
-            )}
-          </div>
-        )}
 
         {editorOpen && (
           <div className="mt-4 space-y-4 rounded-2xl border border-border bg-background/40 p-4">
@@ -2839,6 +2889,11 @@ function MediaTab({ agentId, isAdmin }: { agentId: string; isAdmin: boolean }) {
   const [uploading, setUploading] = useState(false);
   const [uploadNote, setUploadNote] = useState<string | null>(null);
   const [busyId, setBusyId] = useState<string | null>(null);
+  // Added 2026-09-30 — same fix as the post/email pickers' Library grid: a
+  // plain <img> with no onError just renders blank for a photo the browser
+  // can't decode (almost always an iPhone HEIC upload), even though it's a
+  // perfectly real, working photo underneath.
+  const [failedThumbs, setFailedThumbs] = useState<Set<string>>(new Set());
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   function reload() {
@@ -3018,9 +3073,20 @@ function MediaTab({ agentId, isAdmin }: { agentId: string; isAdmin: boolean }) {
         <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-4">
           {media.map((m) => (
             <div key={m.id} className="overflow-hidden rounded-2xl border border-border bg-glass">
-              {m.media_type === "video"
-                ? m.url && <video src={m.url} controls className="aspect-square w-full object-cover" />
-                : m.url && <img src={m.url} alt={m.caption ?? ""} className="aspect-square w-full object-cover" />}
+              {m.media_type === "video" ? (
+                m.url && <video src={m.url} controls className="aspect-square w-full object-cover" />
+              ) : m.url && !failedThumbs.has(m.id) ? (
+                <img
+                  src={m.url}
+                  alt={m.caption ?? ""}
+                  className="aspect-square w-full object-cover"
+                  onError={() => setFailedThumbs((s) => new Set(s).add(m.id))}
+                />
+              ) : (
+                <div className="flex aspect-square w-full flex-col items-center justify-center gap-1 bg-muted p-2 text-center text-[10px] text-muted-foreground">
+                  <span>Couldn't preview this photo (likely an iPhone HEIC file)</span>
+                </div>
+              )}
               <div className="flex items-center justify-between gap-1 px-2 pt-2">
                 <span className="rounded-full bg-muted px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">
                   {m.media_type}

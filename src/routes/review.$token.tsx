@@ -5,6 +5,7 @@ import {
   listPublicReviewMonths,
   listPublicReviewPosts,
   approvePublicReviewPost,
+  approveAllPublicReviewPending,
   updatePublicReviewPostContent,
   rewritePublicReviewPost,
   listPublicReviewMedia,
@@ -1897,9 +1898,12 @@ function PublicPostCard({
                 submit now closes the whole panel immediately instead of
                 leaving it open with a "You asked / Result" transcript. */}
             <div className="border-t border-border pt-4">
-              <p className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
-                Or tell us what to change
-              </p>
+              <div className="flex items-center justify-between">
+                <p className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
+                  Or tell us what to change
+                </p>
+                <MicButton value={notes} onChange={setNotes} />
+              </div>
               <textarea
                 value={notes}
                 onChange={(e) => setNotes(e.target.value)}
@@ -1936,6 +1940,11 @@ function PublicReviewPage() {
   // For the Change/Add photo picker's Google Drive tab — same role
   // agentDriveFolderId plays in the admin's MonthWorkspace.
   const [driveFolderId, setDriveFolderId] = useState<string | null>(null);
+  // "Approve All" button state — added 2026-09-30 per Mike: "On the client
+  // facing links need an approval all button on the top of tis screen as
+  // well at the very bottom."
+  const [approvingAll, setApprovingAll] = useState(false);
+  const [approveAllError, setApproveAllError] = useState<string | null>(null);
 
   useEffect(() => {
     getPublicReviewAgent({ data: { token } })
@@ -1979,6 +1988,28 @@ function PublicReviewPage() {
   }
 
   const pendingCount = (posts ?? []).filter((p) => p.status !== "approved").length;
+  const allApproved = (posts ?? []).length > 0 && pendingCount === 0;
+
+  // Approves everything still pending for the month currently on screen —
+  // same "harmless no-op on an already-approved post" behavior the admin
+  // side's Approve All already relies on, so clicking this again after
+  // everything's approved (before the button disables itself) can't cause
+  // any harm.
+  async function approveAll() {
+    if (!month) return;
+    setApprovingAll(true);
+    setApproveAllError(null);
+    try {
+      await approveAllPublicReviewPending({ data: { token, month } });
+      const p = await listPublicReviewPosts({ data: { token, month } });
+      setPosts(p);
+      setConfirmNote("Approved — thanks!");
+    } catch (e) {
+      setApproveAllError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setApprovingAll(false);
+    }
+  }
 
   return (
     <div className="min-h-screen bg-background px-4 py-10">
@@ -2013,6 +2044,15 @@ function PublicReviewPage() {
                     </option>
                   ))}
                 </select>
+              </div>
+            )}
+
+            {posts !== null && posts.length > 0 && (
+              <div className="mt-4 flex flex-wrap items-center gap-3">
+                <Button onClick={approveAll} disabled={approvingAll || allApproved}>
+                  {approvingAll ? "Approving…" : allApproved ? "Approved" : "Approve All"}
+                </Button>
+                {approveAllError && <p className="text-xs text-destructive">{approveAllError}</p>}
               </div>
             )}
 
@@ -2060,11 +2100,19 @@ function PublicReviewPage() {
             </div>
 
             {posts !== null && posts.length > 0 && (
-              <p className="mt-4 text-xs text-muted-foreground">
-                {pendingCount > 0
-                  ? `${pendingCount} still need a look.`
-                  : "Everything here is approved — thanks for reviewing!"}
-              </p>
+              <>
+                <p className="mt-4 text-xs text-muted-foreground">
+                  {pendingCount > 0
+                    ? `${pendingCount} still need a look.`
+                    : "Everything here is approved — thanks for reviewing!"}
+                </p>
+                <div className="mt-4 flex flex-wrap items-center gap-3">
+                  <Button onClick={approveAll} disabled={approvingAll || allApproved}>
+                    {approvingAll ? "Approving…" : allApproved ? "Approved" : "Approve All"}
+                  </Button>
+                  {approveAllError && <p className="text-xs text-destructive">{approveAllError}</p>}
+                </div>
+              </>
             )}
           </>
         )}

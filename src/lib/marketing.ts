@@ -202,7 +202,15 @@ export type PostMetadata = {
   // addEmailPhotoFrom.../updateEmailPhotoInstructions/removeEmailPhoto
   // functions below.
   email_photos?: EmailPhoto[] | undefined;
-  [key: string]: string | number | boolean | null | undefined | EmailPhoto[];
+  // Up to MAX_REEL_PHOTOS photos attached to a REEL specifically (a
+  // content_type "post" row with a canva_link) — added 2026-09-30 per Mike:
+  // "Canva posts should have ability to add multiple posts to it since it's
+  // a reel." Same idea as email_photos above, deliberately its own array so
+  // it never collides with a plain post's single-photo fields or an email's
+  // own photos. See the ReelPhoto type and the addReelPhotoFrom.../
+  // updateReelPhotoInstructions/removeReelPhoto functions below.
+  reel_photos?: ReelPhoto[] | undefined;
+  [key: string]: string | number | boolean | null | undefined | EmailPhoto[] | ReelPhoto[];
 };
 
 // Fixed tag vocabulary for the native Media library, ported from the old
@@ -1210,6 +1218,183 @@ export const removeEmailPhoto = createServerFn({ method: "POST" })
     const photos = await requireEmailPost(data.agentId, data.postId);
     const next = photos.filter((p) => p.id !== data.photoId);
     await writeEmailPhotos(data.postId, next);
+    return { photos: next };
+  });
+
+// ============================================================================
+// Reel (Canva-template) multi-photo attachments — added 2026-09-30 per Mike:
+// "Canva posts should have ability to add multiple posts to it since it's a
+// reel... we are creating videos with them." A Canva/Reel item is really a
+// content_type "post" row with a canva_link in its metadata (see
+// categorizePost in marketing.tsx) — those have always shared the exact same
+// single-photo fields (media_id/drive_file_id/unsplash_*) as a plain post,
+// which only ever holds one photo. A Reel is actually built in Canva from
+// SEVERAL source photos/clips stitched together, so that one-photo model
+// doesn't fit it — this mirrors the email multi-photo pattern above almost
+// exactly (same shape, same read-modify-write style), just:
+//   - its own metadata.reel_photos array, so it never collides with a plain
+//     post's or an email's own photo fields,
+//   - no Stock Photos/Unsplash tab — per Mike, stock photos stay email-only,
+//     Reels only draw from this agent's own Media Library/Drive, same as a
+//     regular post's picker already does,
+//   - a higher cap (6, vs. email's 3) since a Reel typically wants more
+//     source material than a single email graphic.
+// ============================================================================
+
+const MAX_REEL_PHOTOS = 6;
+
+// A single photo attached to a Reel. `id` is a small server-generated key,
+// same role as EmailPhoto's — not the Media Library id or Drive file id.
+export type ReelPhoto = {
+  id: string;
+  source: "library" | "drive";
+  url: string;
+  mediaType: "photo" | "video";
+  publishingInstructions: string;
+  driveFileId?: string | null | undefined;
+};
+
+// Fetches a post, confirms it belongs to this agent AND is actually a
+// Canva/Reel item (content_type "post" with a canva_link — see
+// categorizePost in marketing.tsx), and returns its current reel_photos
+// array (empty if none yet). Every function below calls this first.
+async function requireReelPost(agentId: string, postId: string): Promise<ReelPhoto[]> {
+  const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+  const { data: existing, error } = await supabaseAdmin
+    .from("generated_posts")
+    .select("agent_id, content_type, metadata")
+    .eq("id", postId)
+    .maybeSingle();
+  if (error) throw error;
+  if (!existing || existing.agent_id !== agentId) {
+    throw new Error("Post not found for this agent.");
+  }
+  const metadata = (existing.metadata as Record<string, unknown> | null) ?? {};
+  if (existing.content_type !== "post" || !metadata["canva_link"]) {
+    throw new Error("Multi-photo attachments are only available for Reels (Canva-linked posts).");
+  }
+  return Array.isArray(metadata["reel_photos"]) ? (metadata["reel_photos"] as ReelPhoto[]) : [];
+}
+
+// Writes a full replacement reel_photos array — same shape as
+// writeEmailPhotos above.
+async function writeReelPhotos(postId: string, photos: ReelPhoto[]): Promise<void> {
+  const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+  const { data: existing, error: fetchErr } = await supabaseAdmin
+    .from("generated_posts")
+    .select("metadata")
+    .eq("id", postId)
+    .maybeSingle();
+  if (fetchErr) throw fetchErr;
+  const nextMetadata = {
+    ...((existing?.metadata as Record<string, unknown> | null) ?? {}),
+    reel_photos: photos,
+  };
+  const { error } = await supabaseAdmin
+    .from("generated_posts")
+    .update({ metadata: nextMetadata, updated_at: new Date().toISOString() })
+    .eq("id", postId);
+  if (error) throw error;
+}
+
+export const addReelPhotoFromLibrary = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator((data: { agentId: string; postId: string; mediaId: string }) => data)
+  .handler(async ({ data, context }): Promise<{ photos: ReelPhoto[] }> => {
+    const email = (context.claims as { email?: string } | undefined)?.email;
+    await requireAgentAccess(context.userId, email, data.agentId);
+    const photos = await requireReelPost(data.agentId, data.postId);
+    if (photos.length >= MAX_REEL_PHOTOS) {
+      throw new Error(`Reels can only carry up to ${MAX_REEL_PHOTOS} photos — remove one first.`);
+    }
+    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+    const { data: media, error: mediaErr } = await supabaseAdmin
+      .from("agent_photos")
+      .select("id, url, media_type, agent_id")
+      .eq("id", data.mediaId)
+      .maybeSingle();
+    if (mediaErr) throw mediaErr;
+    if (!media || media.agent_id !== data.agentId || !media.url) {
+      throw new Error("That media item doesn't belong to this agent.");
+    }
+    const next: ReelPhoto[] = [
+      ...photos,
+      {
+        id: crypto.randomUUID(),
+        source: "library",
+        url: media.url,
+        mediaType: media.media_type as "photo" | "video",
+        publishingInstructions: "",
+      },
+    ];
+    await writeReelPhotos(data.postId, next);
+    await supabaseAdmin.from("feedback_history").insert({
+      agent_id: data.agentId,
+      post_id: data.postId,
+      rating: "photo_changed",
+      notes: `Reel photo added from Media Library (${next.length}/${MAX_REEL_PHOTOS}).`,
+    });
+    return { photos: next };
+  });
+
+export const addReelPhotoFromDrive = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator((data: { agentId: string; postId: string; driveFileId: string; thumbnailUrl: string }) => data)
+  .handler(async ({ data, context }): Promise<{ photos: ReelPhoto[] }> => {
+    const email = (context.claims as { email?: string } | undefined)?.email;
+    await requireAgentAccess(context.userId, email, data.agentId);
+    const photos = await requireReelPost(data.agentId, data.postId);
+    if (photos.length >= MAX_REEL_PHOTOS) {
+      throw new Error(`Reels can only carry up to ${MAX_REEL_PHOTOS} photos — remove one first.`);
+    }
+    const next: ReelPhoto[] = [
+      ...photos,
+      {
+        id: crypto.randomUUID(),
+        source: "drive",
+        url: data.thumbnailUrl,
+        mediaType: "photo",
+        driveFileId: data.driveFileId,
+        publishingInstructions: "",
+      },
+    ];
+    await writeReelPhotos(data.postId, next);
+    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+    await supabaseAdmin.from("feedback_history").insert({
+      agent_id: data.agentId,
+      post_id: data.postId,
+      rating: "photo_changed",
+      notes: `Reel photo added from Google Drive (${next.length}/${MAX_REEL_PHOTOS}).`,
+    });
+    return { photos: next };
+  });
+
+// Edits one already-attached Reel photo's publishing instructions without
+// touching the others.
+export const updateReelPhotoInstructions = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator((data: { agentId: string; postId: string; photoId: string; publishingInstructions: string }) => data)
+  .handler(async ({ data, context }): Promise<{ photos: ReelPhoto[] }> => {
+    const email = (context.claims as { email?: string } | undefined)?.email;
+    await requireAgentAccess(context.userId, email, data.agentId);
+    const photos = await requireReelPost(data.agentId, data.postId);
+    const next = photos.map((p) =>
+      p.id === data.photoId ? { ...p, publishingInstructions: data.publishingInstructions } : p,
+    );
+    await writeReelPhotos(data.postId, next);
+    return { photos: next };
+  });
+
+// Removes one attached Reel photo, leaving the others as-is.
+export const removeReelPhoto = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator((data: { agentId: string; postId: string; photoId: string }) => data)
+  .handler(async ({ data, context }): Promise<{ photos: ReelPhoto[] }> => {
+    const email = (context.claims as { email?: string } | undefined)?.email;
+    await requireAgentAccess(context.userId, email, data.agentId);
+    const photos = await requireReelPost(data.agentId, data.postId);
+    const next = photos.filter((p) => p.id !== data.photoId);
+    await writeReelPhotos(data.postId, next);
     return { photos: next };
   });
 
@@ -2929,6 +3114,105 @@ export const removePublicReviewEmailPhoto = createServerFn({ method: "POST" })
     const photos = await requireEmailPost(agentId, data.postId);
     const next = photos.filter((p) => p.id !== data.photoId);
     await writeEmailPhotos(data.postId, next);
+    return { photos: next };
+  });
+
+// ============================================================================
+// Public — token-resolved twins of addReelPhotoFromLibrary/
+// addReelPhotoFromDrive/updateReelPhotoInstructions/removeReelPhoto — reuse
+// the same requireReelPost/writeReelPhotos helpers above, just resolving the
+// agent from the review token instead of a logged-in session. No Unsplash
+// twin — Reels don't offer Stock Photos (see the big comment above
+// requireReelPost).
+// ============================================================================
+
+export const addPublicReviewReelPhotoFromLibrary = createServerFn({ method: "POST" })
+  .inputValidator((data: { token: string; postId: string; mediaId: string }) => data)
+  .handler(async ({ data }): Promise<{ photos: ReelPhoto[] }> => {
+    const { agentId } = await resolveAgentIdFromReviewToken(data.token);
+    const photos = await requireReelPost(agentId, data.postId);
+    if (photos.length >= MAX_REEL_PHOTOS) {
+      throw new Error(`Reels can only carry up to ${MAX_REEL_PHOTOS} photos — remove one first.`);
+    }
+    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+    const { data: media, error: mediaErr } = await supabaseAdmin
+      .from("agent_photos")
+      .select("id, url, media_type, agent_id")
+      .eq("id", data.mediaId)
+      .maybeSingle();
+    if (mediaErr) throw mediaErr;
+    if (!media || media.agent_id !== agentId || !media.url) {
+      throw new Error("That media item doesn't belong to this agent.");
+    }
+    const next: ReelPhoto[] = [
+      ...photos,
+      {
+        id: crypto.randomUUID(),
+        source: "library",
+        url: media.url,
+        mediaType: media.media_type as "photo" | "video",
+        publishingInstructions: "",
+      },
+    ];
+    await writeReelPhotos(data.postId, next);
+    await supabaseAdmin.from("feedback_history").insert({
+      agent_id: agentId,
+      post_id: data.postId,
+      rating: "photo_changed",
+      notes: `Reel photo added from Media Library (${next.length}/${MAX_REEL_PHOTOS}).`,
+    });
+    return { photos: next };
+  });
+
+export const addPublicReviewReelPhotoFromDrive = createServerFn({ method: "POST" })
+  .inputValidator((data: { token: string; postId: string; driveFileId: string; thumbnailUrl: string }) => data)
+  .handler(async ({ data }): Promise<{ photos: ReelPhoto[] }> => {
+    const { agentId } = await resolveAgentIdFromReviewToken(data.token);
+    const photos = await requireReelPost(agentId, data.postId);
+    if (photos.length >= MAX_REEL_PHOTOS) {
+      throw new Error(`Reels can only carry up to ${MAX_REEL_PHOTOS} photos — remove one first.`);
+    }
+    const next: ReelPhoto[] = [
+      ...photos,
+      {
+        id: crypto.randomUUID(),
+        source: "drive",
+        url: data.thumbnailUrl,
+        mediaType: "photo",
+        driveFileId: data.driveFileId,
+        publishingInstructions: "",
+      },
+    ];
+    await writeReelPhotos(data.postId, next);
+    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+    await supabaseAdmin.from("feedback_history").insert({
+      agent_id: agentId,
+      post_id: data.postId,
+      rating: "photo_changed",
+      notes: `Reel photo added from Google Drive (${next.length}/${MAX_REEL_PHOTOS}).`,
+    });
+    return { photos: next };
+  });
+
+export const updatePublicReviewReelPhotoInstructions = createServerFn({ method: "POST" })
+  .inputValidator((data: { token: string; postId: string; photoId: string; publishingInstructions: string }) => data)
+  .handler(async ({ data }): Promise<{ photos: ReelPhoto[] }> => {
+    const { agentId } = await resolveAgentIdFromReviewToken(data.token);
+    const photos = await requireReelPost(agentId, data.postId);
+    const next = photos.map((p) =>
+      p.id === data.photoId ? { ...p, publishingInstructions: data.publishingInstructions } : p,
+    );
+    await writeReelPhotos(data.postId, next);
+    return { photos: next };
+  });
+
+export const removePublicReviewReelPhoto = createServerFn({ method: "POST" })
+  .inputValidator((data: { token: string; postId: string; photoId: string }) => data)
+  .handler(async ({ data }): Promise<{ photos: ReelPhoto[] }> => {
+    const { agentId } = await resolveAgentIdFromReviewToken(data.token);
+    const photos = await requireReelPost(agentId, data.postId);
+    const next = photos.filter((p) => p.id !== data.photoId);
+    await writeReelPhotos(data.postId, next);
     return { photos: next };
   });
 

@@ -404,6 +404,11 @@ function PublicEmailPhotosPanel({
   const [driveOptionsError, setDriveOptionsError] = useState<string | null>(null);
   const [driveThumbs, setDriveThumbs] = useState<Record<string, string | null>>({});
   const [failedDriveThumbs, setFailedDriveThumbs] = useState<Set<string>>(new Set());
+  // Mirrors admin's EmailPhotosPanel fix (2026-09-30) — a plain <img> with
+  // no onError just renders blank for a Library photo the browser can't
+  // decode (almost always an iPhone HEIC upload), even though it's a real,
+  // working photo underneath.
+  const [failedLibraryThumbs, setFailedLibraryThumbs] = useState<Set<string>>(new Set());
   const [unsplashQuery, setUnsplashQuery] = useState(post.title || "lifestyle real estate");
   const [unsplashResults, setUnsplashResults] = useState<UnsplashResult[] | null>(null);
   const [unsplashLoading, setUnsplashLoading] = useState(false);
@@ -720,6 +725,7 @@ function PublicEmailPhotosPanel({
                     const isUsed = m.status === "used";
                     const isSelected = photos.some((p) => p.source === "library" && p.url === m.url);
                     const badge = isSelected ? "Added" : isUsed ? "Used" : null;
+                    const failed = failedLibraryThumbs.has(m.id);
                     return (
                       <button
                         key={m.id}
@@ -741,11 +747,17 @@ function PublicEmailPhotosPanel({
                               video
                             </div>
                           )
-                        ) : m.url ? (
-                          <img src={m.url} alt={m.caption ?? ""} className="aspect-square w-full object-cover" />
+                        ) : m.url && !failed ? (
+                          <img
+                            src={m.url}
+                            alt={m.caption ?? ""}
+                            className="aspect-square w-full object-cover"
+                            onError={() => setFailedLibraryThumbs((s) => new Set(s).add(m.id))}
+                          />
                         ) : (
-                          <div className="flex aspect-square w-full items-center justify-center bg-muted text-[10px] text-muted-foreground">
-                            photo
+                          <div className="flex aspect-square w-full flex-col items-center justify-center gap-1 bg-muted p-1 text-center text-[10px] text-muted-foreground">
+                            <span>photo</span>
+                            {m.caption && <span className="max-h-6 overflow-hidden">{m.caption}</span>}
                           </div>
                         )}
                         {badge && (
@@ -918,6 +930,9 @@ function PublicPostCard({
   const [driveOptionsError, setDriveOptionsError] = useState<string | null>(null);
   const [driveThumbs, setDriveThumbs] = useState<Record<string, string | null>>({});
   const [failedDriveThumbs, setFailedDriveThumbs] = useState<Set<string>>(new Set());
+  // Mirrors admin's PostCard fix (2026-09-30) — see PublicEmailPhotosPanel's
+  // matching comment above.
+  const [failedLibraryThumbs, setFailedLibraryThumbs] = useState<Set<string>>(new Set());
 
   useEffect(() => {
     setDraft(post.content);
@@ -1144,6 +1159,209 @@ function PublicPostCard({
                 {photoUrl ? "Change photo" : "Add photo"}
               </Button>
             </div>
+
+            {/* RELOCATED 2026-09-30 — Mike: "when you click change photos,
+                all the photos in that tab needs to open up directly beneath
+                that button. Otherwise, people will get lost." Mirrors the
+                identical fix in admin's PostCard (marketing.tsx). Drops the
+                redundant `post.content_type === "post" &&` prefix since this
+                is already nested inside that same conditional. */}
+            {pickerOpen && (
+              <div className="mt-3 rounded-2xl border border-border bg-background/40 p-4">
+                <div className="flex items-center justify-between gap-3">
+                  <p className="text-sm font-semibold">Which photo do you want to use?</p>
+                  {/* Upgraded from a small muted text link to a real Button —
+                      mirrors admin's PostCard (2026-09-29). */}
+                  <Button variant="secondary" onClick={() => setPickerOpen(false)}>
+                    Close
+                  </Button>
+                </div>
+
+                <div className="mt-3 flex flex-wrap gap-2 border-b border-border pb-3">
+                  <button
+                    onClick={() => setPickerTab("library")}
+                    className={`rounded-full px-3 py-1 text-xs font-semibold transition-colors ${
+                      pickerTab === "library"
+                        ? "bg-primary text-primary-foreground"
+                        : "bg-muted text-muted-foreground hover:text-foreground"
+                    }`}
+                  >
+                    Media Library
+                  </button>
+                  {driveFolderId && (
+                    <button
+                      onClick={openDriveTab}
+                      className={`rounded-full px-3 py-1 text-xs font-semibold transition-colors ${
+                        pickerTab === "drive"
+                          ? "bg-primary text-primary-foreground"
+                          : "bg-muted text-muted-foreground hover:text-foreground"
+                      }`}
+                    >
+                      Google Drive
+                    </button>
+                  )}
+                </div>
+
+                {pickerTab === "library" && (
+                  <div className="mt-3">
+                    {mediaError && (
+                      <div className="mb-2 flex items-center justify-between gap-2 rounded-lg bg-destructive/10 px-3 py-2">
+                        <p className="text-xs text-destructive">Couldn't load the photo library — {mediaError}</p>
+                        <button
+                          onClick={openPicker}
+                          className="shrink-0 text-xs font-semibold text-primary hover:underline"
+                        >
+                          Retry
+                        </button>
+                      </div>
+                    )}
+                    {mediaOptions === null && !mediaError && <p className="text-xs text-muted-foreground">Loading…</p>}
+                    {mediaOptions === null && mediaError && (
+                      <p className="text-xs text-muted-foreground">Nothing loaded yet — tap Retry above.</p>
+                    )}
+                    {mediaOptions !== null && mediaOptions.length === 0 && (
+                      <p className="text-xs text-muted-foreground">No photos or videos for this agent yet.</p>
+                    )}
+                    {mediaOptions !== null && mediaOptions.length > 0 && (
+                      <div className="grid grid-cols-3 gap-2 sm:grid-cols-4">
+                        {/* Greyed out for "used" or "already the current photo
+                            on this post" — per Mike: "grey out photos that are
+                            already be used or selected so everyone knows...
+                            applies across board no matter who is logged in"
+                            (2026-09-29). */}
+                        {mediaOptions.map((m) => {
+                          const isUsed = m.status === "used";
+                          const isSelected = m.id === post.metadata?.media_id;
+                          const badge = isSelected ? "Current" : isUsed ? "Used" : null;
+                          const failed = failedLibraryThumbs.has(m.id);
+                          return (
+                            <button
+                              key={m.id}
+                              onClick={() => pickMedia(m.id)}
+                              disabled={mediaBusy}
+                              className={`relative overflow-hidden rounded-xl border transition-colors disabled:opacity-50 ${
+                                isSelected
+                                  ? "border-primary"
+                                  : isUsed
+                                    ? "border-border opacity-50 hover:opacity-80"
+                                    : "border-border hover:border-primary"
+                              }`}
+                            >
+                              {m.media_type === "video" ? (
+                                m.url ? (
+                                  <video src={m.url} className="aspect-square w-full object-cover" />
+                                ) : (
+                                  <div className="flex aspect-square w-full items-center justify-center bg-muted text-[10px] text-muted-foreground">
+                                    video
+                                  </div>
+                                )
+                              ) : m.url && !failed ? (
+                                <img
+                                  src={m.url}
+                                  alt={m.caption ?? ""}
+                                  className="aspect-square w-full object-cover"
+                                  onError={() => setFailedLibraryThumbs((s) => new Set(s).add(m.id))}
+                                />
+                              ) : (
+                                <div className="flex aspect-square w-full flex-col items-center justify-center gap-1 bg-muted p-1 text-center text-[10px] text-muted-foreground">
+                                  <span>photo</span>
+                                  {m.caption && <span className="max-h-6 overflow-hidden">{m.caption}</span>}
+                                </div>
+                              )}
+                              {badge && (
+                                <span className="absolute bottom-1 left-1 rounded-full bg-background/90 px-1.5 py-0.5 text-[9px] font-semibold uppercase tracking-wide text-foreground">
+                                  {badge}
+                                </span>
+                              )}
+                            </button>
+                          );
+                        })}
+                      </div>
+                    )}
+                  </div>
+                )}
+
+                {pickerTab === "drive" && (
+                  <div className="mt-3">
+                    {driveOptionsError && (
+                      <div className="mb-2 flex items-center justify-between gap-2 rounded-lg bg-destructive/10 px-3 py-2">
+                        <p className="text-xs text-destructive">{driveOptionsError}</p>
+                        <button
+                          onClick={openDriveTab}
+                          className="shrink-0 text-xs font-semibold text-primary hover:underline"
+                        >
+                          Retry
+                        </button>
+                      </div>
+                    )}
+                    {!driveOptionsError && driveOptions === null && (
+                      <p className="text-xs text-muted-foreground">Loading…</p>
+                    )}
+                    {!driveOptionsError && driveOptions !== null && driveOptions.length === 0 && (
+                      <p className="text-xs text-muted-foreground">
+                        No photos or videos found in this agent's Drive folder.
+                      </p>
+                    )}
+                    {driveOptions !== null && driveOptions.length > 0 && (
+                      <div className="grid grid-cols-3 gap-2 sm:grid-cols-4">
+                        {driveOptions.map((f) => {
+                          const thumbSrc = driveThumbs[f.id] ?? f.thumbnailUrl;
+                          const thumbFailed = failedDriveThumbs.has(f.id);
+                          const isUsed = !!f.usedAt;
+                          const isSelected = f.id === post.metadata?.drive_file_id;
+                          const badge = isSelected ? "Current" : isUsed ? "Used" : null;
+                          return (
+                            <button
+                              key={f.id}
+                              onClick={() => pickDriveFile(f)}
+                              disabled={mediaBusy}
+                              className={`relative overflow-hidden rounded-xl border transition-colors disabled:opacity-50 ${
+                                isSelected
+                                  ? "border-primary"
+                                  : isUsed
+                                    ? "border-border opacity-50 hover:opacity-80"
+                                    : "border-border hover:border-primary"
+                              }`}
+                            >
+                              {f.isVideo ? (
+                                <video src={thumbSrc} className="aspect-square w-full object-cover" />
+                              ) : thumbFailed ? (
+                                <div className="flex aspect-square w-full flex-col items-center justify-center gap-1 bg-muted p-1 text-center text-[10px] text-muted-foreground">
+                                  <span>photo</span>
+                                  <span className="max-h-6 overflow-hidden">{f.name}</span>
+                                </div>
+                              ) : (
+                                <img
+                                  src={thumbSrc}
+                                  alt={f.name}
+                                  className="aspect-square w-full object-cover"
+                                  onError={() => setFailedDriveThumbs((s) => new Set(s).add(f.id))}
+                                />
+                              )}
+                              {badge && (
+                                <span className="absolute bottom-1 left-1 rounded-full bg-background/90 px-1.5 py-0.5 text-[9px] font-semibold uppercase tracking-wide text-foreground">
+                                  {badge}
+                                </span>
+                              )}
+                            </button>
+                          );
+                        })}
+                      </div>
+                    )}
+                  </div>
+                )}
+
+                {photoUrl && (
+                  <button
+                    onClick={() => pickMedia(null)}
+                    disabled={mediaBusy}
+                    className="mt-3 text-xs font-semibold text-destructive hover:underline disabled:opacity-50"
+                  >
+                    Remove photo
+                  </button>
+                )}
+              </div>
+            )}
           </div>
         )}
         {post.content_type === "email" && (
@@ -1202,196 +1420,6 @@ function PublicPostCard({
             {editorOpen ? "Close" : "Edit / Feedback"}
           </Button>
         </div>
-
-        {post.content_type === "post" && pickerOpen && (
-          <div className="mt-4 rounded-2xl border border-border bg-background/40 p-4">
-            <div className="flex items-center justify-between gap-3">
-              <p className="text-sm font-semibold">Which photo do you want to use?</p>
-              {/* Upgraded from a small muted text link to a real Button —
-                  mirrors admin's PostCard (2026-09-29). */}
-              <Button variant="secondary" onClick={() => setPickerOpen(false)}>
-                Close
-              </Button>
-            </div>
-
-            <div className="mt-3 flex flex-wrap gap-2 border-b border-border pb-3">
-              <button
-                onClick={() => setPickerTab("library")}
-                className={`rounded-full px-3 py-1 text-xs font-semibold transition-colors ${
-                  pickerTab === "library"
-                    ? "bg-primary text-primary-foreground"
-                    : "bg-muted text-muted-foreground hover:text-foreground"
-                }`}
-              >
-                Media Library
-              </button>
-              {driveFolderId && (
-                <button
-                  onClick={openDriveTab}
-                  className={`rounded-full px-3 py-1 text-xs font-semibold transition-colors ${
-                    pickerTab === "drive"
-                      ? "bg-primary text-primary-foreground"
-                      : "bg-muted text-muted-foreground hover:text-foreground"
-                  }`}
-                >
-                  Google Drive
-                </button>
-              )}
-            </div>
-
-            {pickerTab === "library" && (
-              <div className="mt-3">
-                {mediaError && (
-                  <div className="mb-2 flex items-center justify-between gap-2 rounded-lg bg-destructive/10 px-3 py-2">
-                    <p className="text-xs text-destructive">Couldn't load the photo library — {mediaError}</p>
-                    <button
-                      onClick={openPicker}
-                      className="shrink-0 text-xs font-semibold text-primary hover:underline"
-                    >
-                      Retry
-                    </button>
-                  </div>
-                )}
-                {mediaOptions === null && !mediaError && <p className="text-xs text-muted-foreground">Loading…</p>}
-                {mediaOptions === null && mediaError && (
-                  <p className="text-xs text-muted-foreground">Nothing loaded yet — tap Retry above.</p>
-                )}
-                {mediaOptions !== null && mediaOptions.length === 0 && (
-                  <p className="text-xs text-muted-foreground">No photos or videos for this agent yet.</p>
-                )}
-                {mediaOptions !== null && mediaOptions.length > 0 && (
-                  <div className="grid grid-cols-3 gap-2 sm:grid-cols-4">
-                    {/* Greyed out for "used" or "already the current photo
-                        on this post" — per Mike: "grey out photos that are
-                        already be used or selected so everyone knows...
-                        applies across board no matter who is logged in"
-                        (2026-09-29). */}
-                    {mediaOptions.map((m) => {
-                      const isUsed = m.status === "used";
-                      const isSelected = m.id === post.metadata?.media_id;
-                      const badge = isSelected ? "Current" : isUsed ? "Used" : null;
-                      return (
-                        <button
-                          key={m.id}
-                          onClick={() => pickMedia(m.id)}
-                          disabled={mediaBusy}
-                          className={`relative overflow-hidden rounded-xl border transition-colors disabled:opacity-50 ${
-                            isSelected
-                              ? "border-primary"
-                              : isUsed
-                                ? "border-border opacity-50 hover:opacity-80"
-                                : "border-border hover:border-primary"
-                          }`}
-                        >
-                          {m.media_type === "video" ? (
-                            m.url ? (
-                              <video src={m.url} className="aspect-square w-full object-cover" />
-                            ) : (
-                              <div className="flex aspect-square w-full items-center justify-center bg-muted text-[10px] text-muted-foreground">
-                                video
-                              </div>
-                            )
-                          ) : m.url ? (
-                            <img src={m.url} alt={m.caption ?? ""} className="aspect-square w-full object-cover" />
-                          ) : (
-                            <div className="flex aspect-square w-full items-center justify-center bg-muted text-[10px] text-muted-foreground">
-                              photo
-                            </div>
-                          )}
-                          {badge && (
-                            <span className="absolute bottom-1 left-1 rounded-full bg-background/90 px-1.5 py-0.5 text-[9px] font-semibold uppercase tracking-wide text-foreground">
-                              {badge}
-                            </span>
-                          )}
-                        </button>
-                      );
-                    })}
-                  </div>
-                )}
-              </div>
-            )}
-
-            {pickerTab === "drive" && (
-              <div className="mt-3">
-                {driveOptionsError && (
-                  <div className="mb-2 flex items-center justify-between gap-2 rounded-lg bg-destructive/10 px-3 py-2">
-                    <p className="text-xs text-destructive">{driveOptionsError}</p>
-                    <button
-                      onClick={openDriveTab}
-                      className="shrink-0 text-xs font-semibold text-primary hover:underline"
-                    >
-                      Retry
-                    </button>
-                  </div>
-                )}
-                {!driveOptionsError && driveOptions === null && (
-                  <p className="text-xs text-muted-foreground">Loading…</p>
-                )}
-                {!driveOptionsError && driveOptions !== null && driveOptions.length === 0 && (
-                  <p className="text-xs text-muted-foreground">
-                    No photos or videos found in this agent's Drive folder.
-                  </p>
-                )}
-                {driveOptions !== null && driveOptions.length > 0 && (
-                  <div className="grid grid-cols-3 gap-2 sm:grid-cols-4">
-                    {driveOptions.map((f) => {
-                      const thumbSrc = driveThumbs[f.id] ?? f.thumbnailUrl;
-                      const thumbFailed = failedDriveThumbs.has(f.id);
-                      const isUsed = !!f.usedAt;
-                      const isSelected = f.id === post.metadata?.drive_file_id;
-                      const badge = isSelected ? "Current" : isUsed ? "Used" : null;
-                      return (
-                        <button
-                          key={f.id}
-                          onClick={() => pickDriveFile(f)}
-                          disabled={mediaBusy}
-                          className={`relative overflow-hidden rounded-xl border transition-colors disabled:opacity-50 ${
-                            isSelected
-                              ? "border-primary"
-                              : isUsed
-                                ? "border-border opacity-50 hover:opacity-80"
-                                : "border-border hover:border-primary"
-                          }`}
-                        >
-                          {f.isVideo ? (
-                            <video src={thumbSrc} className="aspect-square w-full object-cover" />
-                          ) : thumbFailed ? (
-                            <div className="flex aspect-square w-full flex-col items-center justify-center gap-1 bg-muted p-1 text-center text-[10px] text-muted-foreground">
-                              <span>photo</span>
-                              <span className="max-h-6 overflow-hidden">{f.name}</span>
-                            </div>
-                          ) : (
-                            <img
-                              src={thumbSrc}
-                              alt={f.name}
-                              className="aspect-square w-full object-cover"
-                              onError={() => setFailedDriveThumbs((s) => new Set(s).add(f.id))}
-                            />
-                          )}
-                          {badge && (
-                            <span className="absolute bottom-1 left-1 rounded-full bg-background/90 px-1.5 py-0.5 text-[9px] font-semibold uppercase tracking-wide text-foreground">
-                              {badge}
-                            </span>
-                          )}
-                        </button>
-                      );
-                    })}
-                  </div>
-                )}
-              </div>
-            )}
-
-            {photoUrl && (
-              <button
-                onClick={() => pickMedia(null)}
-                disabled={mediaBusy}
-                className="mt-3 text-xs font-semibold text-destructive hover:underline disabled:opacity-50"
-              >
-                Remove photo
-              </button>
-            )}
-          </div>
-        )}
 
         {editorOpen && (
           <div className="mt-4 space-y-4 rounded-2xl border border-border bg-background/40 p-4">

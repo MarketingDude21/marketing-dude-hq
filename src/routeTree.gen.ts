@@ -16,6 +16,7 @@ import { Route as LoginRouteImport } from './routes/login'
 import { Route as MarketingRouteImport } from './routes/marketing'
 import { Route as ResetPasswordRouteImport } from './routes/reset-password'
 import { Route as SuiteAssistRouteImport } from './routes/suite-assist'
+import { Route as SweetAssistRouteImport } from './routes/sweet-assist'
 import { Route as VoiceRouteImport } from './routes/voice'
 import { Route as MediaUploadTokenRouteImport } from './routes/media-upload.$token'
 import { Route as ReviewTokenRouteImport } from './routes/review.$token'
@@ -55,6 +56,11 @@ const SuiteAssistRoute = SuiteAssistRouteImport.update({
   path: '/suite-assist',
   getParentRoute: () => rootRouteImport,
 } as any)
+const SweetAssistRoute = SweetAssistRouteImport.update({
+  id: '/sweet-assist',
+  path: '/sweet-assist',
+  getParentRoute: () => rootRouteImport,
+} as any)
 const VoiceRoute = VoiceRouteImport.update({
   id: '/voice',
   path: '/voice',
@@ -79,6 +85,7 @@ export interface FileRoutesByFullPath {
   '/marketing': typeof MarketingRoute
   '/reset-password': typeof ResetPasswordRoute
   '/suite-assist': typeof SuiteAssistRoute
+  '/sweet-assist': typeof SweetAssistRoute
   '/voice': typeof VoiceRoute
   '/media-upload/$token': typeof MediaUploadTokenRoute
   '/review/$token': typeof ReviewTokenRoute
@@ -91,6 +98,7 @@ export interface FileRoutesByTo {
   '/marketing': typeof MarketingRoute
   '/reset-password': typeof ResetPasswordRoute
   '/suite-assist': typeof SuiteAssistRoute
+  '/sweet-assist': typeof SweetAssistRoute
   '/voice': typeof VoiceRoute
   '/media-upload/$token': typeof MediaUploadTokenRoute
   '/review/$token': typeof ReviewTokenRoute
@@ -104,6 +112,7 @@ export interface FileRoutesById {
   '/marketing': typeof MarketingRoute
   '/reset-password': typeof ResetPasswordRoute
   '/suite-assist': typeof SuiteAssistRoute
+  '/sweet-assist': typeof SweetAssistRoute
   '/voice': typeof VoiceRoute
   '/media-upload/$token': typeof MediaUploadTokenRoute
   '/review/$token': typeof ReviewTokenRoute
@@ -118,6 +127,7 @@ export interface FileRouteTypes {
     | '/marketing'
     | '/reset-password'
     | '/suite-assist'
+    | '/sweet-assist'
     | '/voice'
     | '/media-upload/$token'
     | '/review/$token'
@@ -130,6 +140,7 @@ export interface FileRouteTypes {
     | '/marketing'
     | '/reset-password'
     | '/suite-assist'
+    | '/sweet-assist'
     | '/voice'
     | '/media-upload/$token'
     | '/review/$token'
@@ -142,6 +153,7 @@ export interface FileRouteTypes {
     | '/marketing'
     | '/reset-password'
     | '/suite-assist'
+    | '/sweet-assist'
     | '/voice'
     | '/media-upload/$token'
     | '/review/$token'
@@ -155,6 +167,7 @@ export interface RootRouteChildren {
   MarketingRoute: typeof MarketingRoute
   ResetPasswordRoute: typeof ResetPasswordRoute
   SuiteAssistRoute: typeof SuiteAssistRoute
+  SweetAssistRoute: typeof SweetAssistRoute
   VoiceRoute: typeof VoiceRoute
   MediaUploadTokenRoute: typeof MediaUploadTokenRoute
   ReviewTokenRoute: typeof ReviewTokenRoute
@@ -211,6 +224,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof SuiteAssistRouteImport
       parentRoute: typeof rootRouteImport
     }
+    '/sweet-assist': {
+      id: '/sweet-assist'
+      path: '/sweet-assist'
+      fullPath: '/sweet-assist'
+      preLoaderRoute: typeof SweetAssistRouteImport
+      parentRoute: typeof rootRouteImport
+    }
     '/voice': {
       id: '/voice'
       path: '/voice'
@@ -243,6 +263,7 @@ const rootRouteChildren: RootRouteChildren = {
   MarketingRoute: MarketingRoute,
   ResetPasswordRoute: ResetPasswordRoute,
   SuiteAssistRoute: SuiteAssistRoute,
+  SweetAssistRoute: SweetAssistRoute,
   VoiceRoute: VoiceRoute,
   MediaUploadTokenRoute: MediaUploadTokenRoute,
   ReviewTokenRoute: ReviewTokenRoute,

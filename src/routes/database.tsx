@@ -1212,6 +1212,7 @@ function FinalCombinedListStep({ clientId }: { clientId: string }) {
   const [loadError, setLoadError] = useState<string | null>(null);
   const [downloading, setDownloading] = useState<string | null>(null);
   const [search, setSearch] = useState("");
+  const [selectAllBusy, setSelectAllBusy] = useState(false);
 
   useEffect(() => {
     setView("summary");
@@ -1252,6 +1253,25 @@ function FinalCombinedListStep({ clientId }: { clientId: string }) {
     await setSoiReviewFlag({ data: { clientId, contactId, reviewType: "datazap_append", flagged: next } });
   }
 
+  // Bulk version of toggleSelected, added 2026-10-12 per Mike's "select all
+  // button" request on this screen — applies to whichever rows are
+  // currently visible (so it respects the search box: searching first, then
+  // "Select all" only checks off the filtered matches, not the whole list).
+  // Only fires a setSoiReviewFlag call for rows that actually need to
+  // change, same no-op-skipping care toggleSelected's callers already rely
+  // on elsewhere in this file.
+  async function toggleAllVisible(contacts: NeedsDataContact[], next: boolean) {
+    const ids = new Set(contacts.map((c) => c.id));
+    setNeedsData((cur) => (cur ? cur.map((c) => (ids.has(c.id) ? { ...c, already_selected: next } : c)) : cur));
+    await Promise.all(
+      contacts
+        .filter((c) => c.already_selected !== next)
+        .map((c) =>
+          setSoiReviewFlag({ data: { clientId, contactId: c.id, reviewType: "datazap_append", flagged: next } }),
+        ),
+    );
+  }
+
   if (loadError) {
     return (
       <Card className="mt-4">
@@ -1276,6 +1296,19 @@ function FinalCombinedListStep({ clientId }: { clientId: string }) {
         )
       : needsData;
     const selectedCount = needsData.filter((c) => c.already_selected).length;
+    // Drives the header button's label/behavior — respects the search box,
+    // same as toggleAllVisible itself: with no search typed, "filtered" is
+    // just everyone, so this is a plain select-all; with a search typed, it
+    // only covers the visible matches.
+    const allFilteredSelected = filtered.length > 0 && filtered.every((c) => c.already_selected);
+    async function onSelectAllClick() {
+      setSelectAllBusy(true);
+      try {
+        await toggleAllVisible(filtered, !allFilteredSelected);
+      } finally {
+        setSelectAllBusy(false);
+      }
+    }
     return (
       <div className="mt-4">
         <div className="flex flex-wrap items-center justify-between gap-3">
@@ -1325,7 +1358,23 @@ function FinalCombinedListStep({ clientId }: { clientId: string }) {
                   <th className="whitespace-nowrap pb-2 pr-4">Zip</th>
                   <th className="whitespace-nowrap pb-2 pr-4">Missing</th>
                   <th className="sticky right-0 z-10 whitespace-nowrap border-l border-border bg-background pb-2 pl-3">
-                    Select
+                    {/* "Select all" button, added 2026-10-12 per Mike's
+                        request on this exact screen — toggles every
+                        currently-visible (filtered) row at once instead of
+                        making someone click each checkbox by hand. Flips to
+                        "Clear all" once everything visible is already
+                        checked, so it's reversible with the same button. */}
+                    <div className="flex items-center gap-2">
+                      <span>Select</span>
+                      <button
+                        type="button"
+                        onClick={onSelectAllClick}
+                        disabled={selectAllBusy || filtered.length === 0}
+                        className="text-xs font-medium normal-case text-primary underline-offset-2 transition-colors hover:underline disabled:opacity-60"
+                      >
+                        {selectAllBusy ? "Working…" : allFilteredSelected ? "Clear all" : "Select all"}
+                      </button>
+                    </div>
                   </th>
                 </tr>
               </thead>

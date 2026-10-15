@@ -571,7 +571,11 @@ function Workspace({ clientId, clientName }: { clientId: string; clientName: str
 // Formats SheetJS can read directly, browser-side, with no server round trip.
 const SPREADSHEET_EXTENSIONS = [".xlsx", ".xls", ".xlsm", ".xlsb", ".ods", ".tsv"];
 
-type BatchItem = { file: File; status: "pending" | "uploading" | "done" | "error"; error?: string };
+type BatchItem = {
+  file: File;
+  status: "pending" | "uploading" | "done" | "error" | "needs_conversion";
+  error?: string;
+};
 
 function UploadTab({
   clientId,
@@ -623,14 +627,6 @@ function UploadTab({
   async function uploadOneFile(file: File): Promise<void> {
     const lowerName = file.name.toLowerCase();
     const sourceLabel = file.name.replace(/\.[^.]+$/, "");
-    if (lowerName.endsWith(".numbers")) {
-      // Apple's .numbers format is a proprietary bundle, not a spreadsheet
-      // format any browser-side library can parse — there's no safe way to
-      // read this directly. Numbers itself exports to CSV/Excel in one click.
-      throw new Error(
-        "Apple Numbers files (.numbers) can't be read directly — use File > Export To > CSV (or Excel) in Numbers first.",
-      );
-    }
     if (lowerName.endsWith(".vcf")) {
       const content = await fileToBase64(file);
       await uploadSoiFile({ data: { clientId, fileName: file.name, sourceLabel, kind: "vcf", content } });
@@ -672,6 +668,19 @@ function UploadTab({
     for (let i = 0; i < items.length; i++) {
       const item = items[i];
       if (!item) continue;
+      // Caught here, before ever attempting an upload, rather than as a
+      // thrown error from uploadOneFile - Apple's .numbers format is a
+      // proprietary bundle no browser-side library can parse, so this isn't
+      // a failure to report, it's a known, expected limitation with a clear
+      // one-click fix. Rendered as its own full-width callout below (see
+      // the batch list JSX) instead of squeezed into the same single-line
+      // status text every other row uses, after Mike said he saw this but
+      // it clearly didn't land: "it does not allow numbers files to be
+      // uploaded. Is there a reason for that?"
+      if (item.file.name.toLowerCase().endsWith(".numbers")) {
+        setBatch((cur) => cur.map((it, idx) => (idx === i ? { ...it, status: "needs_conversion" } : it)));
+        continue;
+      }
       setBatch((cur) => cur.map((it, idx) => (idx === i ? { ...it, status: "uploading" } : it)));
       try {
         await uploadOneFile(item.file);
@@ -753,26 +762,45 @@ function UploadTab({
           />
         </label>
         {batch.length > 0 && (
-          <ul className="mt-4 space-y-1.5">
-            {batch.map((item, idx) => (
-              <li key={idx} className="flex items-center justify-between gap-2 text-sm">
-                <span className="truncate">{item.file.name}</span>
-                <span
-                  className={
-                    item.status === "done"
-                      ? "text-xs font-medium text-primary"
-                      : item.status === "error"
-                        ? "text-xs font-medium text-destructive"
-                        : "text-xs text-muted-foreground"
-                  }
-                >
-                  {item.status === "pending" && "Waiting…"}
-                  {item.status === "uploading" && "Uploading…"}
-                  {item.status === "done" && "Uploaded ✓"}
-                  {item.status === "error" && (item.error ?? "Failed")}
-                </span>
-              </li>
-            ))}
+          <ul className="mt-4 space-y-2">
+            {batch.map((item, idx) =>
+              item.status === "needs_conversion" ? (
+                // Full-width callout, not squeezed into the same one-line
+                // status text every other row uses below — the whole point
+                // is that this gets seen and understood as "a quick export
+                // step, not an error," not missed as small inline text.
+                <li key={idx} className="rounded-2xl border border-border bg-secondary/40 px-4 py-3 text-sm">
+                  <p className="truncate font-medium">{item.file.name}</p>
+                  <p className="mt-1 font-medium text-foreground">
+                    This is an Apple Numbers file — it needs a quick one-click export first, same as any other app that
+                    isn't Numbers itself:
+                  </p>
+                  <ol className="mt-1 list-decimal space-y-0.5 pl-5 text-muted-foreground">
+                    <li>Open the file in Numbers on your Mac.</li>
+                    <li>File &gt; Export To &gt; CSV (or Excel) &mdash; one click, no data is lost.</li>
+                    <li>Come back here and upload that exported file instead.</li>
+                  </ol>
+                </li>
+              ) : (
+                <li key={idx} className="flex items-center justify-between gap-2 text-sm">
+                  <span className="truncate">{item.file.name}</span>
+                  <span
+                    className={
+                      item.status === "done"
+                        ? "text-xs font-medium text-primary"
+                        : item.status === "error"
+                          ? "text-xs font-medium text-destructive"
+                          : "text-xs text-muted-foreground"
+                    }
+                  >
+                    {item.status === "pending" && "Waiting…"}
+                    {item.status === "uploading" && "Uploading…"}
+                    {item.status === "done" && "Uploaded ✓"}
+                    {item.status === "error" && (item.error ?? "Failed")}
+                  </span>
+                </li>
+              ),
+            )}
           </ul>
         )}
         {error && <p className="mt-3 text-sm text-destructive">{error}</p>}

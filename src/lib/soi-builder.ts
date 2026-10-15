@@ -1050,6 +1050,16 @@ type DatazappMatchResult = {
   lastName: string;
   phone: string;
   originalEmail: string;
+  // The raw email DataZapp appended, regardless of tier - added 2026-10-15
+  // for Stage 2 ("Email List") below, which trusts it even on a mismatch/
+  // no_data row, unlike `finalFields.email` (still tier-gated, used only by
+  // Stage 1/"Appended Full Data", which stays exactly as cautious as before
+  // about not attaching a mismatched identity's email to a direct mail
+  // record). Mike, on Stage 2 specifically: "The people who direct mail does
+  // not match does NOT mean we throw away their email because they will
+  // just go on email list" - a mismatch row not being trustworthy enough for
+  // a mailing address doesn't mean its appended email is worthless too.
+  dzEmail: string;
   appendedName: string;
   finalFields: { email: string; address: string; address_2: string; city: string; state: string; zip: string };
   doNotCall: boolean;
@@ -1095,6 +1105,7 @@ function matchDatazappRow(row: DatazappRawRow): DatazappMatchResult {
       lastName,
       phone,
       originalEmail,
+      dzEmail,
       appendedName: "",
       finalFields: emptyFields,
       doNotCall,
@@ -1119,6 +1130,7 @@ function matchDatazappRow(row: DatazappRawRow): DatazappMatchResult {
       lastName,
       phone,
       originalEmail,
+      dzEmail,
       appendedName,
       // Keep whatever original email this row already had (it may have one
       // if it was only missing an address) - only fall back to DataZapp's
@@ -1151,6 +1163,7 @@ function matchDatazappRow(row: DatazappRawRow): DatazappMatchResult {
       lastName,
       phone,
       originalEmail,
+      dzEmail,
       appendedName,
       finalFields: {
         email: originalEmail,
@@ -1171,6 +1184,7 @@ function matchDatazappRow(row: DatazappRawRow): DatazappMatchResult {
     lastName,
     phone,
     originalEmail,
+    dzEmail,
     appendedName,
     finalFields: emptyFields,
     doNotCall,
@@ -1502,19 +1516,34 @@ export const finalizeDatazappAppend = createServerFn({ method: "POST" })
 // the remaining contacts to clean up next because we can still create an
 // email list out of it... if there was an email appended it should be added
 // in and we want to create a final list of people that have first name last
-// name and email as bare fields." Deliberately only ever offers each row's
-// OWN original email (the one already in the uploaded file before DataZapp
-// touched it) - never DataZapp's appended email for a household/mismatch
-// row, since that's exactly the kind of untrusted identity match Mike built
-// Stage 1's whole tier system to guard against; re-litigating that trust
-// question for Stage 2 isn't worth it when the row's own pre-existing email
-// is always safe to offer.
+// name and email as bare fields."
+//
+// REVISED the same day, from Mike testing this live and getting a blank
+// email list: the first version only ever offered each row's OWN original
+// email, never DataZapp's appended one, for any row outside the
+// confirmed/household tiers - trying to avoid attaching a mismatched
+// identity's email to someone. Mike corrected that directly: "The people
+// who direct tmail do not match DOES not mean we throw away their email
+// because they will just go on email list... Just want to make sure that
+// even if their direct amil did not match we dont remove them if they have
+// an email and or phone here. We want them still included." So "usable
+// email" here is now `originalEmail || dzEmail` for EVERY row not kept in
+// Stage 1, regardless of tier - a mismatch/no_data row not being trustworthy
+// enough for a mailing address doesn't mean its appended email is worthless
+// too, same reasoning Mike already applied to the household tier's mailing
+// address in Stage 1.
 type DatazappEmailReviewRow = {
   rowIndex: number;
   firstName: string;
   lastName: string;
   email: string;
+  phone: string;
+  originalTier: DatazappMatchTier;
 };
+
+function bestStage2Email(r: DatazappMatchResult): string {
+  return r.originalEmail || r.dzEmail;
+}
 
 export const previewDatazappEmailList = createServerFn({ method: "POST" })
   .middleware([requireSupabaseAuth])
@@ -1527,14 +1556,36 @@ export const previewDatazappEmailList = createServerFn({ method: "POST" })
     const results = data.rows.map((row) => matchDatazappRow(row));
     const kept = new Set(data.keptRowIndexes);
 
+    // Visibility into what happens to everyone NOT on the email list below,
+    // broken down by their Stage 1 tier - added per Mike: "What happens to
+    // the bottom 2 rows of 275 and 287 people... I'd like to be able to see
+    // the data on those." `remainingByTier` counts everyone not kept in
+    // Stage 1, by tier; `noEmailByTier` is the subset of each that still had
+    // no usable email at all (truly nothing to work with, not just withheld
+    // out of caution).
+    const remainingByTier = emptyTierCounts();
+    const noEmailByTier = emptyTierCounts();
+
     const reviewRows: DatazappEmailReviewRow[] = [];
     results.forEach((r, rowIndex) => {
       if (kept.has(rowIndex)) return; // already on the Stage 1 "Appended Full Data" list
-      if (!r.originalEmail) return; // nothing usable - this is the "rest would be incomplete" group
-      reviewRows.push({ rowIndex, firstName: r.firstName, lastName: r.lastName, email: r.originalEmail });
+      remainingByTier[r.tier]++;
+      const usableEmail = bestStage2Email(r);
+      if (!usableEmail) {
+        noEmailByTier[r.tier]++;
+        return;
+      }
+      reviewRows.push({
+        rowIndex,
+        firstName: r.firstName,
+        lastName: r.lastName,
+        email: usableEmail,
+        phone: r.phone,
+        originalTier: r.tier,
+      });
     });
 
-    return { total: reviewRows.length, reviewRows };
+    return { total: reviewRows.length, reviewRows, remainingByTier, noEmailByTier };
   });
 
 function buildDatazappEmailCsv(rows: { first_name: string; last_name: string; email: string }[]): string {
@@ -1559,8 +1610,9 @@ export const finalizeDatazappEmailList = createServerFn({ method: "POST" })
 
     const keptRows: { first_name: string; last_name: string; email: string; phone: string }[] = [];
     results.forEach((r, rowIndex) => {
-      if (!included.has(rowIndex) || !r.originalEmail) return;
-      keptRows.push({ first_name: r.firstName, last_name: r.lastName, email: r.originalEmail, phone: r.phone });
+      const usableEmail = bestStage2Email(r);
+      if (!included.has(rowIndex) || !usableEmail) return;
+      keptRows.push({ first_name: r.firstName, last_name: r.lastName, email: usableEmail, phone: r.phone });
     });
 
     const written = await upsertAppendedContacts(

@@ -315,6 +315,66 @@ export const deleteSoiUpload = createServerFn({ method: "POST" })
     return { deleted: upload.file_name };
   });
 
+// Full "start over" for a client, added 2026-10-15 per Mike: "There should
+// be a reset button on the Upload screen anytime you want to rerun a new
+// database. People may come back and add contacts to it or clean their
+// list." Wipes every uploaded file AND every contact this client has, so
+// the next upload starts completely clean rather than deduping/merging
+// against leftover data from a previous round. Irreversible, on purpose -
+// the frontend gates this behind a type-the-client's-name confirmation
+// before ever calling it.
+export const resetSoiDatabase = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator((data: { clientId: string }) => data)
+  .handler(async ({ data, context }) => {
+    const admin = getSoiAdminClient();
+    const email = (context.claims as { email?: string } | undefined)?.email;
+    await requireClientAccess(admin, email, data.clientId);
+
+    // 1. Remove every uploaded file's Storage object(s) + row - same cleanup
+    // deleteSoiUpload above already does one file at a time.
+    const { data: uploads, error: uploadsErr } = await admin
+      .from("uploads")
+      .select("id, storage_path")
+      .eq("client_id", data.clientId);
+    if (uploadsErr) throw uploadsErr;
+    for (const u of uploads ?? []) {
+      await admin.storage.from("uploads").remove([u.storage_path, `${u.storage_path}.mapped.json`]);
+    }
+    const { error: deleteUploadsErr } = await admin.from("uploads").delete().eq("client_id", data.clientId);
+    if (deleteUploadsErr) throw deleteUploadsErr;
+
+    // 2. Delete every review flag tied to this client's contacts FIRST -
+    // review_flags has no client_id column of its own (it's keyed off
+    // contact_id, same note as setSoiReviewFlag below), so this isn't
+    // something to leave to an assumed cascade on the contacts delete next.
+    let contactIds: string[] = [];
+    for (let from = 0; ; from += PAGE_SIZE) {
+      const { data: rows, error } = await admin
+        .from("contacts")
+        .select("id")
+        .eq("client_id", data.clientId)
+        .range(from, from + PAGE_SIZE - 1);
+      if (error) throw error;
+      contactIds = contactIds.concat((rows ?? []).map((r) => r.id as string));
+      if (!rows || rows.length < PAGE_SIZE) break;
+    }
+    for (let i = 0; i < contactIds.length; i += 500) {
+      const { error } = await admin
+        .from("review_flags")
+        .delete()
+        .in("contact_id", contactIds.slice(i, i + 500));
+      if (error) throw error;
+    }
+
+    // 3. Delete every contact for this client - the actual reset. One
+    // request regardless of row count; Postgrest matches server-side.
+    const { error: deleteContactsErr } = await admin.from("contacts").delete().eq("client_id", data.clientId);
+    if (deleteContactsErr) throw deleteContactsErr;
+
+    return { deletedContacts: contactIds.length, deletedUploads: (uploads ?? []).length };
+  });
+
 type ProcessUploadReport = {
   raw_total: number;
   unique_total: number;

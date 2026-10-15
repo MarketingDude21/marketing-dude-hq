@@ -658,18 +658,6 @@ export const exportSoiList = createServerFn({ method: "POST" })
 // everything that appends matches the names... Mike and Michael, Kate and
 // Catherine... we need to know that's probably the same person."
 //
-// Deliberately a SEPARATE path from processSoiUploads/process-upload above,
-// not a variant of it - that function's job is segmenting freshly uploaded
-// raw list rows, and its weakest dedupe key (exact first+last name, used
-// only when a row has neither email nor phone) is exactly the kind of
-// mismatch this guards against, not something to lean on harder here. A
-// DataZapp return file already carries one unambiguous key straight back to
-// an existing contact - the very phone number Mike sent them - so finding
-// the right contact is a plain phone lookup, never a fuzzy one. The only
-// real judgment call is whether DataZapp's OWN appended name agrees with the
-// original name on that same row, which decides whether its appended
-// email/address gets trusted enough to write back.
-//
 // Built against two real sample files Mike sent (DataZapp's actual export
 // format - 44 columns, 927 rows), not guessed. What they showed:
 //   - DataZapp returns SOME data (at minimum an address) for 640 of 927 rows
@@ -684,15 +672,38 @@ export const exportSoiList = createServerFn({ method: "POST" })
 //     secondary "Donald Blevins" [Don's own formal name]), and outright
 //     wrong-address matches sharing no name at all with the original.
 //
-// REDESIGNED same day, after Mike tested the first version live and got
-// "Applied: Updated 0 of 927 contacts" - and separately told us the
-// no-review auto-apply design itself was wrong even once that's fixed: "just
-// because the data is appended doesn't mean they're going to keep them." See
-// the comment on previewDatazappAppend/applyDatazappAppend below for what
-// changed - the matching logic above (nickname clusters, confirmed/
-// household/mismatch tiers) is unchanged and still verified against the same
-// real 927-row file; only what happens with a match changed, from "write it
-// automatically" to "show it to Mike's team and let them decide."
+// REDESIGNED TWICE the same day this first went out, both times from real
+// usage, not guessing again:
+//   1. First redesign: the very first version auto-applied confirmed/
+//      household matches straight into the client's existing `contacts`
+//      (looked up by phone) with no review step. Mike tested it live and got
+//      "Applied: Updated 0 of 927 contacts," and separately said the
+//      no-review design was wrong regardless: "just because the data is
+//      appended doesn't mean they're going to keep them."
+//   2. Second redesign (this one): Mike then said the whole premise of
+//      looking anything up in `contacts` was wrong - "The append data should
+//      have nothing to do with the prior contacts... I'm uploading an
+//      appended list that's still showing me zero results because I don't
+//      have that data from the original upload, so it doesn't make sense."
+//      His own words for the actual process: upload the DataZapp file, see
+//      every match and mismatch, clean it up, decide who to keep - and the
+//      result is its own standalone list, same kind of thing as "Final Full
+//      Contact," not written into any contact record. That's what finally
+//      explains the "0 of 927" - the old version needed a phone match
+//      against stored contacts to find anything at all, and this client's
+//      didn't produce one, which should never have been able to block
+//      anything in the first place.
+//
+// What this means structurally: this whole feature no longer reads or
+// writes the `contacts` table at all. A DataZapp return file already
+// carries its own original First Name/Last Name/Phone/Email columns
+// (that's exactly what Mike sent DataZapp to begin with) right alongside
+// DataZapp's appended DataZapp_* columns - so confirming a match is purely a
+// same-row comparison inside the uploaded file itself, nothing to look up
+// anywhere. The nickname-cluster matching logic below is UNCHANGED from the
+// very first version and still verified against the same real 927-row file;
+// only what the tiers get used for changed - straight into a downloadable
+// list, never into any contact record.
 // ============================================================================
 
 // Clusters of common American first-name nicknames/formal-name pairs, so
@@ -845,35 +856,31 @@ function sameLastName(a: string, b: string): boolean {
   return !!na && !!nb && na === nb;
 }
 
-// Same last-10-digits normalization process-upload's own phoneKey() uses
-// (see the recovered source) - comparing raw phone strings directly misses
-// matches over formatting differences alone ("(859) 948-5464" vs
-// "8599485464").
-function normalizePhone(phone: string): string {
-  return phone.replace(/\D/g, "").slice(-10);
-}
-
 // One row of a DataZapp return file, exactly as DataZapp's own export names
 // its columns (confirmed against two real sample files Mike sent 2026-10-15,
 // not guessed). Never user-mapped like the normal Upload tab's files are -
 // this is always the same tool's fixed export format, so the frontend reads
-// these exact headers directly.
+// these exact headers directly. Critically, this file already carries the
+// ORIGINAL First Name/Last Name/Phone/Email columns Mike sent DataZapp,
+// right alongside DataZapp's own appended DataZapp_* columns - so every
+// comparison below is a same-row, same-file comparison, nothing looked up
+// anywhere else.
 type DatazappRawRow = Record<string, string>;
 
 function dzField(row: DatazappRawRow, header: string): string {
   return (row[header] ?? "").trim();
 }
 
-type DatazappMatchTier = "confirmed" | "household" | "mismatch" | "no_data" | "no_contact";
-
-type FullContactRow = SoiContactRow & { address_2: string | null };
+type DatazappMatchTier = "confirmed" | "household" | "mismatch" | "no_data";
 
 type DatazappMatchResult = {
   tier: DatazappMatchTier;
-  contactId: string | null;
-  originalName: string;
+  firstName: string;
+  lastName: string;
+  phone: string;
+  originalEmail: string;
   appendedName: string;
-  appliedFields: Partial<Record<"email" | "address" | "address_2" | "city" | "state" | "zip", string>>;
+  finalFields: { email: string; address: string; address_2: string; city: string; state: string; zip: string };
   doNotCall: boolean;
   possibleBusiness: string | null;
 };
@@ -883,42 +890,17 @@ function formatZip(zip: string, zip4: string): string {
   return zip4 ? `${zip}-${zip4}` : zip;
 }
 
-// The actual matching logic, run against one row of a parsed DataZapp file
-// plus a phone -> existing-contact(s) index already built for this client.
-// See the file-header comment above for why phone (not name) is the right
-// key back to an existing contact, and why the name comparison that follows
-// is purely about whether to TRUST the appended data, not about finding who
-// it belongs to.
-function matchDatazappRow(row: DatazappRawRow, contactsByPhone: Map<string, FullContactRow[]>): DatazappMatchResult {
-  const originalFirst = dzField(row, "First Name");
-  const originalLast = dzField(row, "Last Name");
-  const rawPhone = dzField(row, "FORMATTED_PHONE_Phone 1") || dzField(row, "Phone 1");
-  const phoneKeyVal = normalizePhone(rawPhone);
-  const originalName = [originalFirst, originalLast].filter(Boolean).join(" ") || "(no name)";
-
-  const candidates = phoneKeyVal ? (contactsByPhone.get(phoneKeyVal) ?? []) : [];
-  let contact: FullContactRow | undefined;
-  if (candidates.length === 1) {
-    contact = candidates[0];
-  } else if (candidates.length > 1) {
-    // A shared phone (e.g. a landline on two spouses' separate contact rows)
-    // - disambiguate using the original name this exact row was built from,
-    // since that's guaranteed to be the contact Mike actually exported.
-    contact = candidates.find(
-      (c) => sameLastName(c.last_name ?? "", originalLast) && firstNamesEquivalent(c.first_name ?? "", originalFirst),
-    );
-  }
-  if (!contact) {
-    return {
-      tier: "no_contact",
-      contactId: null,
-      originalName,
-      appendedName: "",
-      appliedFields: {},
-      doNotCall: false,
-      possibleBusiness: null,
-    };
-  }
+// The actual matching logic - purely a within-the-row comparison between
+// the original name DataZapp was given (First Name/Last Name, right there
+// in the file) and the name DataZapp handed back (DataZapp_First/Last, or
+// the secondary DataZapp_FIRST2/LAST2 resident slot). Nothing here reads or
+// writes any contact record - see this section's header comment for why
+// that's the point of this redesign, not an oversight.
+function matchDatazappRow(row: DatazappRawRow): DatazappMatchResult {
+  const firstName = dzField(row, "First Name");
+  const lastName = dzField(row, "Last Name");
+  const phone = dzField(row, "FORMATTED_PHONE_Phone 1") || dzField(row, "Phone 1");
+  const originalEmail = dzField(row, "Email 1");
 
   const dzFirst = dzField(row, "DataZapp_First");
   const dzLast = dzField(row, "DataZapp_Last");
@@ -933,13 +915,17 @@ function matchDatazappRow(row: DatazappRawRow, contactsByPhone: Map<string, Full
   const doNotCall = dzField(row, "DataZapp_DoNotCall").toUpperCase() === "Y";
   const possibleBusiness = dzField(row, "DataZapp_COMPANY_NAME") || null;
 
+  const emptyFields = { email: "", address: "", address_2: "", city: "", state: "", zip: "" };
+
   if (!dzFirst && !dzLast && !dzAddress) {
     return {
       tier: "no_data",
-      contactId: contact.id,
-      originalName,
+      firstName,
+      lastName,
+      phone,
+      originalEmail,
       appendedName: "",
-      appliedFields: {},
+      finalFields: emptyFields,
       doNotCall,
       possibleBusiness: null,
     };
@@ -948,21 +934,26 @@ function matchDatazappRow(row: DatazappRawRow, contactsByPhone: Map<string, Full
   const appendedName = [dzFirst, dzLast].filter(Boolean).join(" ");
 
   // Primary slot: exact or nickname-equivalent first name, exact last name.
-  const primaryConfirmed = sameLastName(dzLast, originalLast) && firstNamesEquivalent(dzFirst, originalFirst);
+  const primaryConfirmed = sameLastName(dzLast, lastName) && firstNamesEquivalent(dzFirst, firstName);
   // Secondary resident (DataZapp_FIRST2/LAST2) catches the real match when
   // DataZapp's primary slot handed back a spouse/other household member
   // instead - confirmed against Mike's real sample data, see this section's
   // header comment for a concrete example.
-  const secondaryConfirmed = sameLastName(dzLast2, originalLast) && firstNamesEquivalent(dzFirst2, originalFirst);
+  const secondaryConfirmed = sameLastName(dzLast2, lastName) && firstNamesEquivalent(dzFirst2, firstName);
 
   if (primaryConfirmed || secondaryConfirmed) {
     return {
       tier: "confirmed",
-      contactId: contact.id,
-      originalName,
+      firstName,
+      lastName,
+      phone,
+      originalEmail,
       appendedName,
-      appliedFields: {
-        email: dzEmail,
+      // Keep whatever original email this row already had (it may have one
+      // if it was only missing an address) - only fall back to DataZapp's
+      // appended email when there wasn't one.
+      finalFields: {
+        email: originalEmail || dzEmail,
         address: dzAddress,
         address_2: dzAddress2,
         city: dzCity,
@@ -981,14 +972,23 @@ function matchDatazappRow(row: DatazappRawRow, contactsByPhone: Map<string, Full
   // direct mail from us") doesn't depend on the first name being exact. The
   // appended EMAIL is deliberately withheld in this tier: sending under the
   // wrong identity is a real risk an address isn't.
-  const householdMatch = sameLastName(dzLast, originalLast) || sameLastName(dzLast2, originalLast);
+  const householdMatch = sameLastName(dzLast, lastName) || sameLastName(dzLast2, lastName);
   if (householdMatch) {
     return {
       tier: "household",
-      contactId: contact.id,
-      originalName,
+      firstName,
+      lastName,
+      phone,
+      originalEmail,
       appendedName,
-      appliedFields: { address: dzAddress, address_2: dzAddress2, city: dzCity, state: dzState, zip: dzZip },
+      finalFields: {
+        email: originalEmail,
+        address: dzAddress,
+        address_2: dzAddress2,
+        city: dzCity,
+        state: dzState,
+        zip: dzZip,
+      },
       doNotCall,
       possibleBusiness,
     };
@@ -996,109 +996,75 @@ function matchDatazappRow(row: DatazappRawRow, contactsByPhone: Map<string, Full
 
   return {
     tier: "mismatch",
-    contactId: contact.id,
-    originalName,
+    firstName,
+    lastName,
+    phone,
+    originalEmail,
     appendedName,
-    appliedFields: {},
+    finalFields: emptyFields,
     doNotCall,
     possibleBusiness: null,
   };
 }
 
-async function fetchAllContactsForClient(admin: SupabaseClient, clientId: string): Promise<FullContactRow[]> {
-  let rows: FullContactRow[] = [];
-  for (let from = 0; ; from += PAGE_SIZE) {
-    const { data, error } = await admin
-      .from("contacts")
-      .select(
-        "id, first_name, last_name, email, phone, address, address_2, city, state, zip, notes, sources, list_assignment",
-      )
-      .eq("client_id", clientId)
-      .range(from, from + PAGE_SIZE - 1);
-    if (error) throw error;
-    rows = rows.concat((data ?? []) as FullContactRow[]);
-    if (!data || data.length < PAGE_SIZE) break;
-  }
-  return rows;
-}
-
-function buildPhoneIndex(contacts: FullContactRow[]): Map<string, FullContactRow[]> {
-  const map = new Map<string, FullContactRow[]>();
-  for (const c of contacts) {
-    if (!c.phone) continue;
-    const key = normalizePhone(c.phone);
-    if (!key) continue;
-    const list = map.get(key);
-    if (list) list.push(c);
-    else map.set(key, [c]);
-  }
-  return map;
-}
-
 function emptyTierCounts(): Record<DatazappMatchTier, number> {
-  return { confirmed: 0, household: 0, mismatch: 0, no_data: 0, no_contact: 0 };
+  return { confirmed: 0, household: 0, mismatch: 0, no_data: 0 };
 }
 
-// REDESIGNED 2026-10-15, same day as the first build. Mike tested the
-// original version (auto-apply confirmed+household, no review) live and it
-// came back "Applied: Updated 0 of 927 contacts" - and even once that's
-// fixed, he was clear the auto-apply design itself was wrong: "just because
-// the data is appended doesn't mean they're going to keep them... it needs
-// to pop up the wizard the same way we did before... take them through the
-// same exercise as the first part where they said, okay, who here do you
-// want to keep? And then you just start slowly start removing people."
-// "The same exercise as the first part" is this exact tab's own "Needs Data
-// — select who to research" screen (the datazap_append review step further
-// up this file) - a table of rows, a checkbox per row defaulted to checked,
-// a Select all/Clear all toggle, search. This redesign mirrors that pattern
-// instead of silently writing to contacts on upload.
+// REDESIGNED TWICE the same day this first went out - see this section's
+// header comment for the full story. This second pass is the one Mike
+// actually asked for: "The append data should have nothing to do with the
+// prior contacts... I'm uploading an appended list that's still showing me
+// zero results because I don't have that data from the original upload, so
+// it doesn't make sense." His description of the process, in his own words:
+// "you upload the appended data file. It's going to give you all the
+// matches. It's going to give you all the mismatches, and then it's going
+// to clean that list up so that we could only take the correct data at the
+// end of the day, and it's going to ask us who we're keeping." That's
+// exactly what previewDatazappAppend/finalizeDatazappAppend below do - the
+// review table UI itself (checkbox per row, defaulted checked, Select
+// all/Clear all, search) is unchanged from the first redesign, since Mike
+// confirmed that part was right; what's gone is any read or write against
+// the `contacts` table.
 //
 // One row of what the review wizard shows and lets Mike's team check/uncheck
 // - only ever built for the confirmed/household tiers, since mismatch/
-// no_data/no_contact rows have nothing to apply either way (they still show
-// up in `counts` for visibility, just not as reviewable rows). `rowIndex` is
-// this row's position in the uploaded file - the stable key the frontend's
-// checkboxes use, and what applyDatazappAppend's `includedRowIndexes` refers
-// back to, since a DataZapp file can have two rows pointing at the same
-// contactId (e.g. a landline shared by spouses, each with their own row).
+// no_data rows have nothing worth keeping either way (they still show up in
+// `counts` for visibility, just not as reviewable rows). `rowIndex` is this
+// row's position in the uploaded file - the stable key the frontend's
+// checkboxes use, and what finalizeDatazappAppend's `includedRowIndexes`
+// refers back to.
 type DatazappReviewRow = {
   rowIndex: number;
-  contactId: string;
-  firstName: string | null;
-  lastName: string | null;
-  phone: string | null;
+  firstName: string;
+  lastName: string;
+  phone: string;
   tier: "confirmed" | "household";
-  currentEmail: string | null;
-  currentAddress: string | null;
-  currentCity: string | null;
-  currentState: string | null;
-  currentZip: string | null;
-  appendedEmail: string | null;
-  appendedAddress: string | null;
-  appendedAddress2: string | null;
-  appendedCity: string | null;
-  appendedState: string | null;
-  appendedZip: string | null;
+  originalEmail: string;
+  finalEmail: string;
+  finalAddress: string;
+  finalAddress2: string;
+  finalCity: string;
+  finalState: string;
+  finalZip: string;
   doNotCall: boolean;
   possibleBusiness: string | null;
 };
 
 // Read-only dry run: parses + matches a just-uploaded DataZapp return file
-// against this client's existing contacts and reports what WOULD happen,
-// without writing anything - same "preview before apply" shape as the
-// Needs Data/Datazap-selection screen already uses elsewhere in this tab.
+// purely against itself (see the matching-logic comment above) and reports
+// what's reviewable, without touching any contact record.
 export const previewDatazappAppend = createServerFn({ method: "POST" })
   .middleware([requireSupabaseAuth])
   .inputValidator((data: { clientId: string; rows: DatazappRawRow[] }) => data)
   .handler(async ({ data, context }) => {
     const admin = getSoiAdminClient();
     const email = (context.claims as { email?: string } | undefined)?.email;
+    // Still gated behind normal client access, same as every other
+    // SOI-builder function - just no longer reads anything from `contacts`.
     await requireClientAccess(admin, email, data.clientId);
 
-    const contacts = await fetchAllContactsForClient(admin, data.clientId);
-    const phoneIndex = buildPhoneIndex(contacts);
-    const contactsById = new Map(contacts.map((c) => [c.id, c]));
-    const results = data.rows.map((row) => matchDatazappRow(row, phoneIndex));
+    const results = data.rows.map((row) => matchDatazappRow(row));
 
     const counts = emptyTierCounts();
     for (const r of results) counts[r.tier]++;
@@ -1106,39 +1072,34 @@ export const previewDatazappAppend = createServerFn({ method: "POST" })
     const reviewRows: DatazappReviewRow[] = [];
     results.forEach((r, rowIndex) => {
       if (r.tier !== "confirmed" && r.tier !== "household") return;
-      if (!r.contactId) return;
-      const contact = contactsById.get(r.contactId);
       reviewRows.push({
         rowIndex,
-        contactId: r.contactId,
-        firstName: contact?.first_name ?? null,
-        lastName: contact?.last_name ?? null,
-        phone: contact?.phone ?? null,
+        firstName: r.firstName,
+        lastName: r.lastName,
+        phone: r.phone,
         tier: r.tier,
-        currentEmail: contact?.email ?? null,
-        currentAddress: contact?.address ?? null,
-        currentCity: contact?.city ?? null,
-        currentState: contact?.state ?? null,
-        currentZip: contact?.zip ?? null,
-        appendedEmail: r.appliedFields.email ?? null,
-        appendedAddress: r.appliedFields.address ?? null,
-        appendedAddress2: r.appliedFields.address_2 ?? null,
-        appendedCity: r.appliedFields.city ?? null,
-        appendedState: r.appliedFields.state ?? null,
-        appendedZip: r.appliedFields.zip ?? null,
+        originalEmail: r.originalEmail,
+        finalEmail: r.finalFields.email,
+        finalAddress: r.finalFields.address,
+        finalAddress2: r.finalFields.address_2,
+        finalCity: r.finalFields.city,
+        finalState: r.finalFields.state,
+        finalZip: r.finalFields.zip,
         doNotCall: r.doNotCall,
         possibleBusiness: r.possibleBusiness,
       });
     });
 
-    // Mismatch rows have nothing to apply, but a small sample is still
+    // Mismatch rows have nothing to keep, but a small sample is still
     // useful for spot-checking that the "no name in common at all" calls
-    // are actually right - same reasoning as before, just no longer needed
-    // for confirmed/household since those are now the full review table.
+    // are actually right.
     const sampleMismatch = results
       .filter((r) => r.tier === "mismatch")
       .slice(0, 25)
-      .map((r) => ({ originalName: r.originalName, appendedName: r.appendedName }));
+      .map((r) => ({
+        originalName: [r.firstName, r.lastName].filter(Boolean).join(" ") || "(no name)",
+        appendedName: r.appendedName,
+      }));
 
     return {
       total: results.length,
@@ -1150,20 +1111,21 @@ export const previewDatazappAppend = createServerFn({ method: "POST" })
     };
   });
 
-// What the review wizard hands back per approved row - the shape the
-// downloadable CSV is built from. Deliberately just the plain contact
-// fields (no tier/match metadata) since this is meant to be a clean list
-// Mike can upload straight into Suite Assist or anywhere else.
-type DatazappAppliedRow = {
-  first_name: string | null;
-  last_name: string | null;
-  email: string | null;
-  phone: string | null;
-  address: string | null;
-  address_2: string | null;
-  city: string | null;
-  state: string | null;
-  zip: string | null;
+// What the review wizard hands back per kept row - the shape the
+// downloadable CSV is built from. Plain contact-style fields, no tier/match
+// metadata, since this is meant to be a clean list Mike can upload straight
+// into Suite Assist or anywhere else - its own standalone list, same kind
+// of thing as "Final Full Contact," not written into any contact record.
+type DatazappKeptRow = {
+  first_name: string;
+  last_name: string;
+  email: string;
+  phone: string;
+  address: string;
+  address_2: string;
+  city: string;
+  state: string;
+  zip: string;
 };
 
 function csvEscape(value: string | null): string {
@@ -1171,7 +1133,7 @@ function csvEscape(value: string | null): string {
   return /[",\n]/.test(v) ? `"${v.replace(/"/g, '""')}"` : v;
 }
 
-function buildDatazappCsv(rows: DatazappAppliedRow[]): string {
+function buildDatazappCsv(rows: DatazappKeptRow[]): string {
   const headers = ["First Name", "Last Name", "Email", "Phone", "Address", "Address 2", "City", "State", "Zip"];
   const lines = [headers.join(",")];
   for (const r of rows) {
@@ -1184,23 +1146,15 @@ function buildDatazappCsv(rows: DatazappAppliedRow[]): string {
   return lines.join("\n");
 }
 
-// Applies exactly the rows Mike's team kept checked in the review wizard -
+// Finalizes exactly the rows Mike's team kept checked in the review wizard -
 // `includedRowIndexes` are positions in `rows` (same indexing
-// previewDatazappAppend's `reviewRows[].rowIndex` used), not contact ids,
-// since a row he unchecked should change nothing even if another row
-// matching the same contact stayed checked. Two things happen for every
-// kept confirmed/household row, per Mike: the appended fields merge into
-// this client's real contacts (blank-fill only, same as every other merge
-// in this app, then re-segmented so anyone who just gained an email/address
-// moves out of Incomplete/Nonqualified) AND the row goes into a standalone
-// CSV of everything just approved, for Mike to upload wherever else he
-// wants (Suite Assist, per his own example) - doing both instead of making
-// him choose one destination, since he was genuinely unsure which was
-// better and said "whatever is the better UI customer experience is the
-// right answer." A row that's confirmed/household but NOT checked, or that
-// never made the review table at all (mismatch/no_data/no_contact), is
-// left alone either way.
-export const applyDatazappAppend = createServerFn({ method: "POST" })
+// previewDatazappAppend's `reviewRows[].rowIndex` used). Re-runs the same
+// matching logic (deterministic from the file alone, nothing external to
+// drift) and builds a CSV from whichever confirmed/household rows survived
+// both the tier check and Mike's team's review - that CSV IS the result;
+// there's no database write of any kind here, on purpose, per Mike: "The
+// append data should have nothing to do with the prior contacts."
+export const finalizeDatazappAppend = createServerFn({ method: "POST" })
   .middleware([requireSupabaseAuth])
   .inputValidator((data: { clientId: string; rows: DatazappRawRow[]; includedRowIndexes: number[] }) => data)
   .handler(async ({ data, context }) => {
@@ -1208,105 +1162,33 @@ export const applyDatazappAppend = createServerFn({ method: "POST" })
     const email = (context.claims as { email?: string } | undefined)?.email;
     await requireClientAccess(admin, email, data.clientId);
 
-    const contacts = await fetchAllContactsForClient(admin, data.clientId);
-    const phoneIndex = buildPhoneIndex(contacts);
-    const contactsById = new Map(contacts.map((c) => [c.id, c]));
-    const results = data.rows.map((row) => matchDatazappRow(row, phoneIndex));
+    const results = data.rows.map((row) => matchDatazappRow(row));
     const included = new Set(data.includedRowIndexes);
 
     const counts = emptyTierCounts();
     for (const r of results) counts[r.tier]++;
 
-    const updates: Record<string, unknown>[] = [];
-    const appliedRows: DatazappAppliedRow[] = [];
-
+    const keptRows: DatazappKeptRow[] = [];
     results.forEach((r, rowIndex) => {
-      const canApplyFields = (r.tier === "confirmed" || r.tier === "household") && included.has(rowIndex);
-      if (!canApplyFields || !r.contactId) return;
-      const contact = contactsById.get(r.contactId);
-      if (!contact) return;
-
-      // Blank-fill only - never overwrite a field the contact already has
-      // real data in, same philosophy the main multi-list merge already
-      // uses everywhere else in this app.
-      const fields: Partial<Record<"email" | "address" | "address_2" | "city" | "state" | "zip", string>> = {};
-      let fieldsChanged = false;
-      (Object.keys(r.appliedFields) as Array<keyof typeof r.appliedFields>).forEach((key) => {
-        const incoming = r.appliedFields[key];
-        if (incoming && !contact[key]) {
-          fields[key] = incoming;
-          fieldsChanged = true;
-        }
+      const canKeep = (r.tier === "confirmed" || r.tier === "household") && included.has(rowIndex);
+      if (!canKeep) return;
+      keptRows.push({
+        first_name: r.firstName,
+        last_name: r.lastName,
+        email: r.finalFields.email,
+        phone: r.phone,
+        address: r.finalFields.address,
+        address_2: r.finalFields.address_2,
+        city: r.finalFields.city,
+        state: r.finalFields.state,
+        zip: r.finalFields.zip,
       });
-
-      // DataZapp's Do Not Call flag is about the PHONE NUMBER Mike sent it,
-      // not about whose name came back - so it's trustworthy regardless of
-      // match tier, same as before.
-      const existingNotes = contact.notes ?? "";
-      const noteAdditions: string[] = [];
-      if (r.doNotCall && !existingNotes.includes("[DataZapp: Do Not Call]")) {
-        noteAdditions.push("[DataZapp: Do Not Call]");
-      }
-      if (r.possibleBusiness && !existingNotes.includes("[DataZapp: possible business")) {
-        noteAdditions.push(`[DataZapp: possible business — ${r.possibleBusiness}]`);
-      }
-
-      const finalRow = {
-        id: contact.id,
-        // Full existing row, same reason process-upload's own upsert
-        // comment gives for doing this - a partial row through upsert risks
-        // blanking columns this request doesn't mention.
-        first_name: contact.first_name,
-        last_name: contact.last_name,
-        email: fields.email ?? contact.email,
-        phone: contact.phone,
-        address: fields.address ?? contact.address,
-        address_2: fields.address_2 ?? contact.address_2,
-        city: fields.city ?? contact.city,
-        state: fields.state ?? contact.state,
-        zip: fields.zip ?? contact.zip,
-        notes: noteAdditions.length ? [existingNotes, ...noteAdditions].filter(Boolean).join(" ") : contact.notes,
-        list_assignment: contact.list_assignment,
-        sources: contact.sources,
-      };
-
-      // Goes in the download list regardless of whether the merge below
-      // actually changed anything - Mike's team reviewed and kept this row,
-      // so it belongs in the list they take away, even if blank-fill found
-      // nothing new to write (e.g. the contact already had this field from
-      // an earlier round).
-      appliedRows.push({
-        first_name: finalRow.first_name,
-        last_name: finalRow.last_name,
-        email: finalRow.email,
-        phone: finalRow.phone,
-        address: finalRow.address,
-        address_2: finalRow.address_2,
-        city: finalRow.city,
-        state: finalRow.state,
-        zip: finalRow.zip,
-      });
-
-      if (!fieldsChanged && noteAdditions.length === 0) return;
-      updates.push(finalRow);
     });
-
-    for (let i = 0; i < updates.length; i += 500) {
-      const { error } = await admin.from("contacts").upsert(updates.slice(i, i + 500), { onConflict: "id" });
-      if (error) throw error;
-    }
-
-    // Reclassify everyone using the real segmentation rules, not a
-    // reimplementation of them - only worth calling at all if something
-    // actually changed.
-    const report = updates.length > 0 ? await runProcessUpload(data.clientId) : null;
 
     return {
       total: results.length,
-      appliedCount: updates.length,
-      keptCount: appliedRows.length,
+      keptCount: keptRows.length,
       counts,
-      report,
-      csv: appliedRows.length > 0 ? buildDatazappCsv(appliedRows) : null,
+      csv: keptRows.length > 0 ? buildDatazappCsv(keptRows) : null,
     };
   });

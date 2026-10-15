@@ -14,6 +14,8 @@ import {
   getSoiListView,
   setSoiReviewFlag,
   exportSoiList,
+  previewDatazappAppend,
+  applyDatazappAppend,
   type SoiAccess,
 } from "@/lib/soi-builder";
 
@@ -518,10 +520,16 @@ function PageHeader({
 type ProcessReport = Awaited<ReturnType<typeof processSoiUploads>>;
 
 function Workspace({ clientId }: { clientId: string }) {
-  // Just Upload / Review / Export - the old separate "Database Breakdown" tab
-  // tested as confusing on its own, so that same data now lives folded into
-  // the top of Review instead (see DatabaseBreakdown below).
-  const [tab, setTab] = useState<"upload" | "review" | "export">("upload");
+  // Upload / Review / Append Data / Export. "Append Data" added 2026-10-15
+  // per Mike's request, after a round of real-world DataZapp append files -
+  // its own second-round upload step for a file that gets matched/merged
+  // straight into contacts already sitting in this client's database,
+  // rather than treated like a normal new list (see soi-builder.ts's
+  // DataZapp-append section for why that has to be a different code path
+  // from the Upload tab below). Sits after Review/Final Combined List and
+  // before Export, since it only makes sense once a client's been through a
+  // first round already and DataZapp's reply is in hand.
+  const [tab, setTab] = useState<"upload" | "review" | "append" | "export">("upload");
   // The most recent Process run's report (raw/unique/dedupe counts) - lives
   // here so it survives switching from Upload to Review right after
   // processing, without needing to persist it anywhere server-side.
@@ -529,7 +537,7 @@ function Workspace({ clientId }: { clientId: string }) {
   return (
     <div className="mt-5">
       <div className="flex flex-wrap gap-1 rounded-full border border-border bg-glass p-1 backdrop-blur-xl w-fit">
-        {(["upload", "review", "export"] as const).map((t) => (
+        {(["upload", "review", "append", "export"] as const).map((t) => (
           <button
             key={t}
             onClick={() => setTab(t)}
@@ -537,7 +545,7 @@ function Workspace({ clientId }: { clientId: string }) {
               tab === t ? "bg-secondary text-foreground" : "text-muted-foreground hover:text-foreground"
             }`}
           >
-            {t === "upload" ? "Upload" : t === "review" ? "Review" : "Export"}
+            {t === "upload" ? "Upload" : t === "review" ? "Review" : t === "append" ? "Append Data" : "Export"}
           </button>
         ))}
       </div>
@@ -546,6 +554,7 @@ function Workspace({ clientId }: { clientId: string }) {
           <UploadTab clientId={clientId} onProcessed={() => setTab("review")} onReport={setLastProcessReport} />
         )}
         {tab === "review" && <ReviewTab clientId={clientId} lastProcessReport={lastProcessReport} />}
+        {tab === "append" && <AppendDataTab clientId={clientId} />}
         {tab === "export" && <ExportTab clientId={clientId} />}
       </div>
     </div>
@@ -860,6 +869,151 @@ function DatabaseBreakdown({
               {lastProcessReport.borderline_flags.length} borderline email/domain flag
               {lastProcessReport.borderline_flags.length === 1 ? "" : "s"} worth a second look.
             </p>
+          )}
+        </Card>
+      )}
+    </div>
+  );
+}
+
+// The preview/apply summary shapes returned by soi-builder.ts's new
+// DataZapp-append functions - pulled from their own return types rather
+// than hand-duplicated, same reasoning as ProcessReport above.
+type DatazappPreview = Awaited<ReturnType<typeof previewDatazappAppend>>;
+type DatazappApplyResult = Awaited<ReturnType<typeof applyDatazappAppend>>;
+
+const DATAZAPP_TIER_LABELS: Record<string, string> = {
+  confirmed: "Confirmed match",
+  household: "Same household (address only)",
+  mismatch: "Name doesn't match — not applied",
+  no_data: "DataZapp had nothing to add",
+  no_contact: "Couldn't find this contact",
+};
+
+// Second-round upload step: a DataZapp return file for a client who's
+// already been through Upload/Review once. Unlike UploadTab, there's no
+// column-mapping step at all - DataZapp's export format is fixed and known
+// (see soi-builder.ts), so the file goes straight from parse to preview.
+function AppendDataTab({ clientId }: { clientId: string }) {
+  const [fileName, setFileName] = useState<string | null>(null);
+  const [rows, setRows] = useState<Record<string, string>[] | null>(null);
+  const [preview, setPreview] = useState<DatazappPreview | null>(null);
+  const [applyResult, setApplyResult] = useState<DatazappApplyResult | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  async function handleFilePicked(file: File) {
+    setError(null);
+    setPreview(null);
+    setApplyResult(null);
+    setFileName(file.name);
+    setBusy(true);
+    try {
+      const lowerName = file.name.toLowerCase();
+      const parsed = SPREADSHEET_EXTENSIONS.some((ext) => lowerName.endsWith(ext))
+        ? await parseSpreadsheet(file)
+        : parseCsv(await file.text());
+      if (parsed.rows.length === 0) throw new Error("That file doesn't have any rows in it.");
+      setRows(parsed.rows);
+      const result = await previewDatazappAppend({ data: { clientId, rows: parsed.rows } });
+      setPreview(result);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function handleApply() {
+    if (!rows) return;
+    setBusy(true);
+    setError(null);
+    try {
+      const result = await applyDatazappAppend({ data: { clientId, rows } });
+      setApplyResult(result);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className="space-y-4">
+      <Card>
+        <h2 className="font-display text-lg font-semibold">Append Data</h2>
+        <p className="mt-1 text-sm text-muted-foreground">
+          Upload the file DataZapp sent back after appending emails/direct mail addresses to contacts that were missing
+          them. This checks DataZapp's own name on each row against the original contact before trusting the appended
+          data — common nicknames (Mike/Michael, Kate/Catherine) count as a match, and a same-household match (last name
+          agrees, first name doesn't) still gets the mailing address, just not the email. Anything that doesn't match at
+          all is left alone — nothing about the original contact is ever changed or removed.
+        </p>
+        <label className="mt-4 flex cursor-pointer items-center justify-center rounded-2xl border border-dashed border-border bg-muted/50 px-4 py-8 text-sm text-muted-foreground transition-colors hover:bg-muted">
+          <input
+            type="file"
+            accept=".csv,.xlsx,.xls,.xlsm,.xlsb,.ods,.tsv"
+            className="hidden"
+            onChange={(e) => {
+              const file = e.target.files?.[0];
+              if (file) handleFilePicked(file);
+              e.target.value = "";
+            }}
+          />
+          {busy ? "Working…" : fileName ? `${fileName} — click to replace` : "Click to choose the DataZapp file"}
+        </label>
+        {error && <p className="mt-3 text-sm text-destructive">{error}</p>}
+      </Card>
+
+      {preview && !applyResult && (
+        <Card>
+          <h3 className="font-display text-base font-semibold">Before you apply — {preview.total} rows checked</h3>
+          <div className="mt-3 grid gap-2 sm:grid-cols-2">
+            {(["confirmed", "household", "mismatch", "no_data", "no_contact"] as const).map((tier) => (
+              <div key={tier} className="rounded-2xl border border-border bg-glass px-4 py-3">
+                <p className="text-2xl font-bold tabular-nums">{preview.counts[tier]}</p>
+                <p className="text-xs text-muted-foreground">{DATAZAPP_TIER_LABELS[tier]}</p>
+              </div>
+            ))}
+          </div>
+          {preview.doNotCallCount > 0 && (
+            <p className="mt-3 text-sm text-muted-foreground">
+              {preview.doNotCallCount} contact{preview.doNotCallCount === 1 ? "" : "s"} came back flagged Do Not Call by
+              DataZapp — noted on the contact either way, regardless of whether the name matched.
+            </p>
+          )}
+          {preview.possibleBusinessCount > 0 && (
+            <p className="mt-1 text-sm text-muted-foreground">
+              {preview.possibleBusinessCount} came back with a company name attached — worth a look before treating them
+              as a personal contact.
+            </p>
+          )}
+          <p className="mt-4 text-sm text-muted-foreground">
+            Confirmed and same-household matches apply automatically below — no separate approval step for nicknames or
+            household matches. Mismatches, and rows DataZapp had nothing for, are left untouched.
+          </p>
+          <Button onClick={handleApply} disabled={busy}>
+            {busy ? "Applying…" : `Apply to ${preview.counts.confirmed + preview.counts.household} contacts`}
+          </Button>
+        </Card>
+      )}
+
+      {applyResult && (
+        <Card>
+          <h3 className="font-display text-base font-semibold">Applied</h3>
+          <p className="mt-2 text-sm text-muted-foreground">
+            Updated {applyResult.appliedCount} of {applyResult.total} contacts with the new email/direct mail address.{" "}
+            {applyResult.report ? "The database was reclassified — check Review for the updated counts." : ""}
+          </p>
+          {applyResult.report && (
+            <div className="mt-3 grid gap-2 sm:grid-cols-3">
+              {HUB_ORDER.map((list) => (
+                <div key={list} className="rounded-2xl border border-border bg-glass px-3 py-2">
+                  <p className="text-lg font-bold tabular-nums">{applyResult.report!.list_counts[list] ?? 0}</p>
+                  <p className="text-xs text-muted-foreground">{LIST_LABELS[list]}</p>
+                </div>
+              ))}
+            </div>
           )}
         </Card>
       )}

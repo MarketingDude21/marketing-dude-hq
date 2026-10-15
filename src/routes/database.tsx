@@ -15,7 +15,7 @@ import {
   setSoiReviewFlag,
   exportSoiList,
   previewDatazappAppend,
-  applyDatazappAppend,
+  finalizeDatazappAppend,
   type SoiAccess,
 } from "@/lib/soi-builder";
 
@@ -876,11 +876,11 @@ function DatabaseBreakdown({
   );
 }
 
-// The preview/apply summary shapes returned by soi-builder.ts's new
+// The preview/finalize summary shapes returned by soi-builder.ts's
 // DataZapp-append functions - pulled from their own return types rather
 // than hand-duplicated, same reasoning as ProcessReport above.
 type DatazappPreview = Awaited<ReturnType<typeof previewDatazappAppend>>;
-type DatazappApplyResult = Awaited<ReturnType<typeof applyDatazappAppend>>;
+type DatazappFinalizeResult = Awaited<ReturnType<typeof finalizeDatazappAppend>>;
 type DatazappReviewRow = DatazappPreview["reviewRows"][number];
 
 const DATAZAPP_TIER_LABELS: Record<string, string> = {
@@ -888,7 +888,6 @@ const DATAZAPP_TIER_LABELS: Record<string, string> = {
   household: "Same household (address only)",
   mismatch: "Name doesn't match — not reviewable",
   no_data: "DataZapp had nothing to add",
-  no_contact: "Couldn't find this contact",
 };
 
 function triggerCsvDownload(filename: string, content: string) {
@@ -901,37 +900,33 @@ function triggerCsvDownload(filename: string, content: string) {
   URL.revokeObjectURL(url);
 }
 
-// Second-round upload step: a DataZapp return file for a client who's
-// already been through Upload/Review once. Unlike UploadTab, there's no
-// column-mapping step at all - DataZapp's export format is fixed and known
-// (see soi-builder.ts), so the file goes straight from parse to preview.
-//
-// REDESIGNED 2026-10-15, same day as the first build, after Mike tested the
-// original auto-apply version live and said "redo this. This makes zero
-// sense... it needs to pop up the wizard the same way we did before... take
-// them through the same exercise as the first part where they said, okay,
-// who here do you want to keep?" "The same exercise as the first part" is
-// this tab's own "Needs Data — select who to research" screen above
-// (FinalCombinedListStep's "select" view) - a checkbox per row, defaulted
-// to checked, a Select all/Clear all toggle, search - mirrored here on
-// purpose rather than inventing a new pattern. Only confirmed/household
-// rows (the ones with anything to apply) show up as reviewable rows;
-// mismatch/no-data/no-contact rows are summarized as counts only, same as
-// before, since there's nothing to decide on those.
-//
-// On the output question (merge into this client's contacts vs. a
-// standalone download) Mike was genuinely torn and said "whatever is the
-// better UI customer experience is the right answer" - so this does both:
-// every row kept in review merges into the client's real contacts (blank-
-// fill only, then re-segmented, same as the rest of this app) AND comes back
-// as a ready CSV to download and use elsewhere (Suite Assist, per his own
-// example). Nothing forces a choice between the two.
+// Standalone pass over a DataZapp return file, with no connection to this
+// client's actual contacts at all. REDESIGNED TWICE the same day this first
+// shipped - see soi-builder.ts's header comment on this whole feature for
+// the full story. The short version: version 1 looked up each row's phone
+// number against this client's stored contacts and auto-applied matches
+// with no review; Mike tested it live, got "Applied: Updated 0 of 927
+// contacts," and separately said auto-apply was the wrong call regardless.
+// Version 2 added a review wizard but kept the contacts lookup - and Mike
+// said THAT was the real mistake: "The append data should have nothing to
+// do with the prior contacts... I'm uploading an appended list that's still
+// showing me zero results because I don't have that data from the original
+// upload, so it doesn't make sense." His own description of the process:
+// "you upload the appended data file. It's going to give you all the
+// matches. It's going to give you all the mismatches, and then it's going
+// to clean that list up... and it's going to ask us who we're keeping."
+// This version does exactly that and nothing else - the file already
+// carries its own original name/phone/email next to DataZapp's appended
+// columns, so matching is a same-row comparison, no database lookup
+// involved anywhere. The result is a standalone downloadable list, the
+// same kind of thing as "Final Full Contact" elsewhere in this tab, not a
+// write to any contact record.
 function AppendDataTab({ clientId }: { clientId: string }) {
   const [fileName, setFileName] = useState<string | null>(null);
   const [rows, setRows] = useState<Record<string, string>[] | null>(null);
   const [preview, setPreview] = useState<DatazappPreview | null>(null);
   const [checkedRows, setCheckedRows] = useState<Set<number>>(new Set());
-  const [applyResult, setApplyResult] = useState<DatazappApplyResult | null>(null);
+  const [finalizeResult, setFinalizeResult] = useState<DatazappFinalizeResult | null>(null);
   const [search, setSearch] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -939,7 +934,7 @@ function AppendDataTab({ clientId }: { clientId: string }) {
   async function handleFilePicked(file: File) {
     setError(null);
     setPreview(null);
-    setApplyResult(null);
+    setFinalizeResult(null);
     setSearch("");
     setFileName(file.name);
     setBusy(true);
@@ -984,15 +979,15 @@ function AppendDataTab({ clientId }: { clientId: string }) {
     });
   }
 
-  async function handleApply() {
+  async function handleFinalize() {
     if (!rows) return;
     setBusy(true);
     setError(null);
     try {
-      const result = await applyDatazappAppend({
+      const result = await finalizeDatazappAppend({
         data: { clientId, rows, includedRowIndexes: Array.from(checkedRows) },
       });
-      setApplyResult(result);
+      setFinalizeResult(result);
       if (result.csv) {
         triggerCsvDownload(`datazapp-appended-${new Date().toISOString().slice(0, 10)}.csv`, result.csv);
       }
@@ -1016,12 +1011,12 @@ function AppendDataTab({ clientId }: { clientId: string }) {
       <Card>
         <h2 className="font-display text-lg font-semibold">Append Data</h2>
         <p className="mt-1 text-sm text-muted-foreground">
-          Upload the file DataZapp sent back after appending emails/direct mail addresses to contacts that were missing
-          them. This checks DataZapp's own name on each row against the original contact before trusting the appended
-          data — common nicknames (Mike/Michael, Kate/Catherine) count as a match, and a same-household match (last name
-          agrees, first name doesn't) still gets the mailing address, just not the email. Nothing is written to any
-          contact until your team reviews the matches below and applies them — uploading the file only shows you what
-          DataZapp found.
+          Upload the file DataZapp sent back after appending emails/direct mail addresses to the contacts you sent it.
+          This doesn't touch any contact record at all — it's a standalone pass over just this file, checking DataZapp's
+          own appended name against the original name already in the same file before trusting the appended data. Common
+          nicknames (Mike/Michael, Kate/Catherine) count as a match, and a same-household match (last name agrees, first
+          name doesn't) still gets the mailing address, just not the email. The result is its own clean list you review
+          and download — same idea as Final Full Contact, just for this file.
         </p>
         <label className="mt-4 flex cursor-pointer items-center justify-center rounded-2xl border border-dashed border-border bg-muted/50 px-4 py-8 text-sm text-muted-foreground transition-colors hover:bg-muted">
           <input
@@ -1043,12 +1038,12 @@ function AppendDataTab({ clientId }: { clientId: string }) {
         {error && <p className="mt-3 text-sm text-destructive">{error}</p>}
       </Card>
 
-      {preview && !applyResult && (
+      {preview && !finalizeResult && (
         <>
           <Card>
             <h3 className="font-display text-base font-semibold">{preview.total} rows checked</h3>
             <div className="mt-3 grid gap-2 sm:grid-cols-2">
-              {(["confirmed", "household", "mismatch", "no_data", "no_contact"] as const).map((tier) => (
+              {(["confirmed", "household", "mismatch", "no_data"] as const).map((tier) => (
                 <div key={tier} className="rounded-2xl border border-border bg-glass px-4 py-3">
                   <p className="text-2xl font-bold tabular-nums">{preview.counts[tier]}</p>
                   <p className="text-xs text-muted-foreground">{DATAZAPP_TIER_LABELS[tier]}</p>
@@ -1057,9 +1052,8 @@ function AppendDataTab({ clientId }: { clientId: string }) {
             </div>
             {preview.doNotCallCount > 0 && (
               <p className="mt-3 text-sm text-muted-foreground">
-                {preview.doNotCallCount} contact{preview.doNotCallCount === 1 ? "" : "s"} came back flagged Do Not Call
-                by DataZapp — noted on the contact either way, regardless of whether the name matched or whether it's
-                kept below.
+                {preview.doNotCallCount} row{preview.doNotCallCount === 1 ? "" : "s"} came back flagged Do Not Call by
+                DataZapp, regardless of whether the name matched or whether it's kept below.
               </p>
             )}
             {preview.possibleBusinessCount > 0 && (
@@ -1069,9 +1063,9 @@ function AppendDataTab({ clientId }: { clientId: string }) {
               </p>
             )}
             <p className="mt-4 text-sm text-muted-foreground">
-              Only the {preview.counts.confirmed + preview.counts.household} confirmed/same-household matches below have
-              anything worth reviewing. Mismatches and rows DataZapp had nothing for are never written anywhere, so
-              there's nothing to decide on them.
+              Only the {preview.counts.confirmed + preview.counts.household} confirmed/same-household matches below are
+              worth reviewing. Mismatches and rows DataZapp had nothing for never make the list either way, so there's
+              nothing to decide on them.
             </p>
           </Card>
 
@@ -1087,10 +1081,10 @@ function AppendDataTab({ clientId }: { clientId: string }) {
               <div className="flex flex-wrap items-center justify-between gap-3">
                 <p className="text-sm text-muted-foreground">
                   <span className="font-semibold text-foreground">{checkedCount}</span> of {reviewRows.length} kept —
-                  uncheck anyone you don't want to apply.
+                  uncheck anyone you don't want on the final list.
                 </p>
-                <Button onClick={handleApply} disabled={busy || checkedCount === 0}>
-                  {busy ? "Applying…" : `Apply & download ${checkedCount} contact${checkedCount === 1 ? "" : "s"}`}
+                <Button onClick={handleFinalize} disabled={busy || checkedCount === 0}>
+                  {busy ? "Working…" : `Download the list (${checkedCount} kept)`}
                 </Button>
               </div>
               <input
@@ -1112,8 +1106,8 @@ function AppendDataTab({ clientId }: { clientId: string }) {
                         </th>
                         <th className="whitespace-nowrap pb-2 pr-4">Phone</th>
                         <th className="whitespace-nowrap pb-2 pr-4">Match</th>
-                        <th className="pb-2 pr-4">New email</th>
-                        <th className="pb-2 pr-4">New address</th>
+                        <th className="pb-2 pr-4">Email</th>
+                        <th className="pb-2 pr-4">Address</th>
                         <th className="whitespace-nowrap pb-2 pr-4">City</th>
                         <th className="whitespace-nowrap pb-2 pr-4">State</th>
                         <th className="whitespace-nowrap pb-2 pr-4">Zip</th>
@@ -1154,28 +1148,18 @@ function AppendDataTab({ clientId }: { clientId: string }) {
                             </span>
                           </td>
                           <td className="py-2 pr-4">
-                            {r.appendedEmail ? (
-                              r.currentEmail ? (
-                                <span className="text-muted-foreground">{r.currentEmail} (already has one)</span>
-                              ) : (
-                                r.appendedEmail
-                              )
-                            ) : (
+                            {r.finalEmail || (
                               <span className="text-muted-foreground">
                                 {r.tier === "household" ? "— (withheld, household match)" : "—"}
                               </span>
                             )}
                           </td>
                           <td className="py-2 pr-4">
-                            {r.appendedAddress && !r.currentAddress ? (
-                              r.appendedAddress
-                            ) : (
-                              <span className="text-muted-foreground">{r.currentAddress || "—"}</span>
-                            )}
+                            {r.finalAddress || <span className="text-muted-foreground">—</span>}
                           </td>
-                          <td className="whitespace-nowrap py-2 pr-4">{r.appendedCity || r.currentCity}</td>
-                          <td className="whitespace-nowrap py-2 pr-4">{r.appendedState || r.currentState}</td>
-                          <td className="whitespace-nowrap py-2 pr-4">{r.appendedZip || r.currentZip}</td>
+                          <td className="whitespace-nowrap py-2 pr-4">{r.finalCity}</td>
+                          <td className="whitespace-nowrap py-2 pr-4">{r.finalState}</td>
+                          <td className="whitespace-nowrap py-2 pr-4">{r.finalZip}</td>
                           <td className="sticky right-0 z-10 border-l border-border bg-background py-2 pl-3">
                             <input
                               type="checkbox"
@@ -1197,25 +1181,23 @@ function AppendDataTab({ clientId }: { clientId: string }) {
         </>
       )}
 
-      {applyResult && (
+      {finalizeResult && (
         <Card>
-          <h3 className="font-display text-base font-semibold">Applied</h3>
+          <h3 className="font-display text-base font-semibold">List ready</h3>
           <p className="mt-2 text-sm text-muted-foreground">
-            {applyResult.keptCount} contact{applyResult.keptCount === 1 ? "" : "s"} kept in review
-            {applyResult.appliedCount !== applyResult.keptCount
-              ? ` (${applyResult.appliedCount} actually had a blank field to fill in — the rest already had this data from an earlier round)`
-              : ""}
-            .{" "}
-            {applyResult.report
-              ? "Merged into this client's contacts and reclassified — check Review for the updated counts."
-              : ""}
+            {finalizeResult.keptCount} contact{finalizeResult.keptCount === 1 ? "" : "s"} on the final list. Nothing
+            about this client's existing contacts was touched — this is a standalone download, ready to upload wherever
+            you need it (Suite Assist, or anywhere else).
           </p>
-          {applyResult.csv ? (
+          {finalizeResult.csv ? (
             <div className="mt-3">
               <Button
                 variant="secondary"
                 onClick={() =>
-                  triggerCsvDownload(`datazapp-appended-${new Date().toISOString().slice(0, 10)}.csv`, applyResult.csv!)
+                  triggerCsvDownload(
+                    `datazapp-appended-${new Date().toISOString().slice(0, 10)}.csv`,
+                    finalizeResult.csv!,
+                  )
                 }
               >
                 Download the list again
@@ -1224,21 +1206,11 @@ function AppendDataTab({ clientId }: { clientId: string }) {
           ) : (
             <p className="mt-2 text-sm text-muted-foreground">Nothing was kept, so there's no list to download.</p>
           )}
-          {applyResult.report && (
-            <div className="mt-3 grid gap-2 sm:grid-cols-3">
-              {HUB_ORDER.map((list) => (
-                <div key={list} className="rounded-2xl border border-border bg-glass px-3 py-2">
-                  <p className="text-lg font-bold tabular-nums">{applyResult.report!.list_counts[list] ?? 0}</p>
-                  <p className="text-xs text-muted-foreground">{LIST_LABELS[list]}</p>
-                </div>
-              ))}
-            </div>
-          )}
           <div className="mt-4">
             <Button
               variant="secondary"
               onClick={() => {
-                setApplyResult(null);
+                setFinalizeResult(null);
                 setPreview(null);
                 setRows(null);
                 setFileName(null);

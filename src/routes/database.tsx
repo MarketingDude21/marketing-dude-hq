@@ -881,24 +881,58 @@ function DatabaseBreakdown({
 // than hand-duplicated, same reasoning as ProcessReport above.
 type DatazappPreview = Awaited<ReturnType<typeof previewDatazappAppend>>;
 type DatazappApplyResult = Awaited<ReturnType<typeof applyDatazappAppend>>;
+type DatazappReviewRow = DatazappPreview["reviewRows"][number];
 
 const DATAZAPP_TIER_LABELS: Record<string, string> = {
   confirmed: "Confirmed match",
   household: "Same household (address only)",
-  mismatch: "Name doesn't match — not applied",
+  mismatch: "Name doesn't match — not reviewable",
   no_data: "DataZapp had nothing to add",
   no_contact: "Couldn't find this contact",
 };
+
+function triggerCsvDownload(filename: string, content: string) {
+  const blob = new Blob([content], { type: "text/csv" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  a.click();
+  URL.revokeObjectURL(url);
+}
 
 // Second-round upload step: a DataZapp return file for a client who's
 // already been through Upload/Review once. Unlike UploadTab, there's no
 // column-mapping step at all - DataZapp's export format is fixed and known
 // (see soi-builder.ts), so the file goes straight from parse to preview.
+//
+// REDESIGNED 2026-10-15, same day as the first build, after Mike tested the
+// original auto-apply version live and said "redo this. This makes zero
+// sense... it needs to pop up the wizard the same way we did before... take
+// them through the same exercise as the first part where they said, okay,
+// who here do you want to keep?" "The same exercise as the first part" is
+// this tab's own "Needs Data — select who to research" screen above
+// (FinalCombinedListStep's "select" view) - a checkbox per row, defaulted
+// to checked, a Select all/Clear all toggle, search - mirrored here on
+// purpose rather than inventing a new pattern. Only confirmed/household
+// rows (the ones with anything to apply) show up as reviewable rows;
+// mismatch/no-data/no-contact rows are summarized as counts only, same as
+// before, since there's nothing to decide on those.
+//
+// On the output question (merge into this client's contacts vs. a
+// standalone download) Mike was genuinely torn and said "whatever is the
+// better UI customer experience is the right answer" - so this does both:
+// every row kept in review merges into the client's real contacts (blank-
+// fill only, then re-segmented, same as the rest of this app) AND comes back
+// as a ready CSV to download and use elsewhere (Suite Assist, per his own
+// example). Nothing forces a choice between the two.
 function AppendDataTab({ clientId }: { clientId: string }) {
   const [fileName, setFileName] = useState<string | null>(null);
   const [rows, setRows] = useState<Record<string, string>[] | null>(null);
   const [preview, setPreview] = useState<DatazappPreview | null>(null);
+  const [checkedRows, setCheckedRows] = useState<Set<number>>(new Set());
   const [applyResult, setApplyResult] = useState<DatazappApplyResult | null>(null);
+  const [search, setSearch] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -906,6 +940,7 @@ function AppendDataTab({ clientId }: { clientId: string }) {
     setError(null);
     setPreview(null);
     setApplyResult(null);
+    setSearch("");
     setFileName(file.name);
     setBusy(true);
     try {
@@ -917,6 +952,11 @@ function AppendDataTab({ clientId }: { clientId: string }) {
       setRows(parsed.rows);
       const result = await previewDatazappAppend({ data: { clientId, rows: parsed.rows } });
       setPreview(result);
+      // Opt-OUT, same as Mike's own description of how this should work:
+      // everyone worth reviewing starts checked (kept); his team unchecks
+      // the ones they don't want rather than having to check every row by
+      // hand.
+      setCheckedRows(new Set(result.reviewRows.map((r) => r.rowIndex)));
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -924,19 +964,52 @@ function AppendDataTab({ clientId }: { clientId: string }) {
     }
   }
 
+  function toggleRow(rowIndex: number, next: boolean) {
+    setCheckedRows((cur) => {
+      const copy = new Set(cur);
+      if (next) copy.add(rowIndex);
+      else copy.delete(rowIndex);
+      return copy;
+    });
+  }
+
+  function toggleAllVisible(visible: DatazappReviewRow[], next: boolean) {
+    setCheckedRows((cur) => {
+      const copy = new Set(cur);
+      for (const r of visible) {
+        if (next) copy.add(r.rowIndex);
+        else copy.delete(r.rowIndex);
+      }
+      return copy;
+    });
+  }
+
   async function handleApply() {
     if (!rows) return;
     setBusy(true);
     setError(null);
     try {
-      const result = await applyDatazappAppend({ data: { clientId, rows } });
+      const result = await applyDatazappAppend({
+        data: { clientId, rows, includedRowIndexes: Array.from(checkedRows) },
+      });
       setApplyResult(result);
+      if (result.csv) {
+        triggerCsvDownload(`datazapp-appended-${new Date().toISOString().slice(0, 10)}.csv`, result.csv);
+      }
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
       setBusy(false);
     }
   }
+
+  const q = search.trim().toLowerCase();
+  const reviewRows = preview?.reviewRows ?? [];
+  const filtered = q
+    ? reviewRows.filter((r) => [r.firstName, r.lastName, r.phone].some((v) => (v ?? "").toLowerCase().includes(q)))
+    : reviewRows;
+  const allFilteredChecked = filtered.length > 0 && filtered.every((r) => checkedRows.has(r.rowIndex));
+  const checkedCount = checkedRows.size;
 
   return (
     <div className="space-y-4">
@@ -946,8 +1019,9 @@ function AppendDataTab({ clientId }: { clientId: string }) {
           Upload the file DataZapp sent back after appending emails/direct mail addresses to contacts that were missing
           them. This checks DataZapp's own name on each row against the original contact before trusting the appended
           data — common nicknames (Mike/Michael, Kate/Catherine) count as a match, and a same-household match (last name
-          agrees, first name doesn't) still gets the mailing address, just not the email. Anything that doesn't match at
-          all is left alone — nothing about the original contact is ever changed or removed.
+          agrees, first name doesn't) still gets the mailing address, just not the email. Nothing is written to any
+          contact until your team reviews the matches below and applies them — uploading the file only shows you what
+          DataZapp found.
         </p>
         <label className="mt-4 flex cursor-pointer items-center justify-center rounded-2xl border border-dashed border-border bg-muted/50 px-4 py-8 text-sm text-muted-foreground transition-colors hover:bg-muted">
           <input
@@ -960,51 +1034,196 @@ function AppendDataTab({ clientId }: { clientId: string }) {
               e.target.value = "";
             }}
           />
-          {busy ? "Working…" : fileName ? `${fileName} — click to replace` : "Click to choose the DataZapp file"}
+          {busy && !preview
+            ? "Working…"
+            : fileName
+              ? `${fileName} — click to replace`
+              : "Click to choose the DataZapp file"}
         </label>
         {error && <p className="mt-3 text-sm text-destructive">{error}</p>}
       </Card>
 
       {preview && !applyResult && (
-        <Card>
-          <h3 className="font-display text-base font-semibold">Before you apply — {preview.total} rows checked</h3>
-          <div className="mt-3 grid gap-2 sm:grid-cols-2">
-            {(["confirmed", "household", "mismatch", "no_data", "no_contact"] as const).map((tier) => (
-              <div key={tier} className="rounded-2xl border border-border bg-glass px-4 py-3">
-                <p className="text-2xl font-bold tabular-nums">{preview.counts[tier]}</p>
-                <p className="text-xs text-muted-foreground">{DATAZAPP_TIER_LABELS[tier]}</p>
+        <>
+          <Card>
+            <h3 className="font-display text-base font-semibold">{preview.total} rows checked</h3>
+            <div className="mt-3 grid gap-2 sm:grid-cols-2">
+              {(["confirmed", "household", "mismatch", "no_data", "no_contact"] as const).map((tier) => (
+                <div key={tier} className="rounded-2xl border border-border bg-glass px-4 py-3">
+                  <p className="text-2xl font-bold tabular-nums">{preview.counts[tier]}</p>
+                  <p className="text-xs text-muted-foreground">{DATAZAPP_TIER_LABELS[tier]}</p>
+                </div>
+              ))}
+            </div>
+            {preview.doNotCallCount > 0 && (
+              <p className="mt-3 text-sm text-muted-foreground">
+                {preview.doNotCallCount} contact{preview.doNotCallCount === 1 ? "" : "s"} came back flagged Do Not Call
+                by DataZapp — noted on the contact either way, regardless of whether the name matched or whether it's
+                kept below.
+              </p>
+            )}
+            {preview.possibleBusinessCount > 0 && (
+              <p className="mt-1 text-sm text-muted-foreground">
+                {preview.possibleBusinessCount} came back with a company name attached — worth a look before treating
+                them as a personal contact.
+              </p>
+            )}
+            <p className="mt-4 text-sm text-muted-foreground">
+              Only the {preview.counts.confirmed + preview.counts.household} confirmed/same-household matches below have
+              anything worth reviewing. Mismatches and rows DataZapp had nothing for are never written anywhere, so
+              there's nothing to decide on them.
+            </p>
+          </Card>
+
+          {reviewRows.length === 0 ? (
+            <Card>
+              <p className="text-sm text-muted-foreground">
+                Nothing here matched well enough to review — DataZapp didn't return anything your team can safely use
+                from this file.
+              </p>
+            </Card>
+          ) : (
+            <>
+              <div className="flex flex-wrap items-center justify-between gap-3">
+                <p className="text-sm text-muted-foreground">
+                  <span className="font-semibold text-foreground">{checkedCount}</span> of {reviewRows.length} kept —
+                  uncheck anyone you don't want to apply.
+                </p>
+                <Button onClick={handleApply} disabled={busy || checkedCount === 0}>
+                  {busy ? "Applying…" : `Apply & download ${checkedCount} contact${checkedCount === 1 ? "" : "s"}`}
+                </Button>
               </div>
-            ))}
-          </div>
-          {preview.doNotCallCount > 0 && (
-            <p className="mt-3 text-sm text-muted-foreground">
-              {preview.doNotCallCount} contact{preview.doNotCallCount === 1 ? "" : "s"} came back flagged Do Not Call by
-              DataZapp — noted on the contact either way, regardless of whether the name matched.
-            </p>
+              <input
+                value={search}
+                onChange={(e) => setSearch(e.target.value)}
+                placeholder="Search name or phone…"
+                className="w-full max-w-md rounded-2xl border border-border bg-background px-4 py-2.5 text-sm outline-none ring-ring transition focus:ring-2"
+              />
+              <Card>
+                <div className="overflow-x-auto">
+                  <table className="w-full text-sm">
+                    <thead>
+                      <tr className="text-left text-muted-foreground">
+                        <th className="sticky left-0 z-10 w-24 min-w-24 max-w-24 truncate bg-background pb-2 pr-4">
+                          First name
+                        </th>
+                        <th className="sticky left-24 z-10 w-28 min-w-28 max-w-28 truncate border-r border-border bg-background pb-2 pr-4">
+                          Last name
+                        </th>
+                        <th className="whitespace-nowrap pb-2 pr-4">Phone</th>
+                        <th className="whitespace-nowrap pb-2 pr-4">Match</th>
+                        <th className="pb-2 pr-4">New email</th>
+                        <th className="pb-2 pr-4">New address</th>
+                        <th className="whitespace-nowrap pb-2 pr-4">City</th>
+                        <th className="whitespace-nowrap pb-2 pr-4">State</th>
+                        <th className="whitespace-nowrap pb-2 pr-4">Zip</th>
+                        <th className="sticky right-0 z-10 whitespace-nowrap border-l border-border bg-background pb-2 pl-3">
+                          <div className="flex items-center gap-2">
+                            <span>Keep</span>
+                            <button
+                              type="button"
+                              onClick={() => toggleAllVisible(filtered, !allFilteredChecked)}
+                              disabled={filtered.length === 0}
+                              className="text-xs font-medium normal-case text-primary underline-offset-2 transition-colors hover:underline disabled:opacity-60"
+                            >
+                              {allFilteredChecked ? "Clear all" : "Select all"}
+                            </button>
+                          </div>
+                        </th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {filtered.map((r) => (
+                        <tr key={r.rowIndex} className="border-t border-border">
+                          <td
+                            title={r.firstName || undefined}
+                            className="sticky left-0 z-10 w-24 min-w-24 max-w-24 truncate bg-background py-2 pr-4"
+                          >
+                            {r.firstName}
+                          </td>
+                          <td
+                            title={r.lastName || undefined}
+                            className="sticky left-24 z-10 w-28 min-w-28 max-w-28 truncate border-r border-border bg-background py-2 pr-4"
+                          >
+                            {r.lastName}
+                          </td>
+                          <td className="whitespace-nowrap py-2 pr-4">{r.phone}</td>
+                          <td className="py-2 pr-4">
+                            <span className="rounded-full bg-muted px-2.5 py-1 text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+                              {r.tier === "confirmed" ? "Confirmed" : "Household"}
+                            </span>
+                          </td>
+                          <td className="py-2 pr-4">
+                            {r.appendedEmail ? (
+                              r.currentEmail ? (
+                                <span className="text-muted-foreground">{r.currentEmail} (already has one)</span>
+                              ) : (
+                                r.appendedEmail
+                              )
+                            ) : (
+                              <span className="text-muted-foreground">
+                                {r.tier === "household" ? "— (withheld, household match)" : "—"}
+                              </span>
+                            )}
+                          </td>
+                          <td className="py-2 pr-4">
+                            {r.appendedAddress && !r.currentAddress ? (
+                              r.appendedAddress
+                            ) : (
+                              <span className="text-muted-foreground">{r.currentAddress || "—"}</span>
+                            )}
+                          </td>
+                          <td className="whitespace-nowrap py-2 pr-4">{r.appendedCity || r.currentCity}</td>
+                          <td className="whitespace-nowrap py-2 pr-4">{r.appendedState || r.currentState}</td>
+                          <td className="whitespace-nowrap py-2 pr-4">{r.appendedZip || r.currentZip}</td>
+                          <td className="sticky right-0 z-10 border-l border-border bg-background py-2 pl-3">
+                            <input
+                              type="checkbox"
+                              checked={checkedRows.has(r.rowIndex)}
+                              onChange={(e) => toggleRow(r.rowIndex, e.target.checked)}
+                            />
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                  {filtered.length === 0 && (
+                    <p className="text-sm text-muted-foreground">No matches for that search.</p>
+                  )}
+                </div>
+              </Card>
+            </>
           )}
-          {preview.possibleBusinessCount > 0 && (
-            <p className="mt-1 text-sm text-muted-foreground">
-              {preview.possibleBusinessCount} came back with a company name attached — worth a look before treating them
-              as a personal contact.
-            </p>
-          )}
-          <p className="mt-4 text-sm text-muted-foreground">
-            Confirmed and same-household matches apply automatically below — no separate approval step for nicknames or
-            household matches. Mismatches, and rows DataZapp had nothing for, are left untouched.
-          </p>
-          <Button onClick={handleApply} disabled={busy}>
-            {busy ? "Applying…" : `Apply to ${preview.counts.confirmed + preview.counts.household} contacts`}
-          </Button>
-        </Card>
+        </>
       )}
 
       {applyResult && (
         <Card>
           <h3 className="font-display text-base font-semibold">Applied</h3>
           <p className="mt-2 text-sm text-muted-foreground">
-            Updated {applyResult.appliedCount} of {applyResult.total} contacts with the new email/direct mail address.{" "}
-            {applyResult.report ? "The database was reclassified — check Review for the updated counts." : ""}
+            {applyResult.keptCount} contact{applyResult.keptCount === 1 ? "" : "s"} kept in review
+            {applyResult.appliedCount !== applyResult.keptCount
+              ? ` (${applyResult.appliedCount} actually had a blank field to fill in — the rest already had this data from an earlier round)`
+              : ""}
+            .{" "}
+            {applyResult.report
+              ? "Merged into this client's contacts and reclassified — check Review for the updated counts."
+              : ""}
           </p>
+          {applyResult.csv ? (
+            <div className="mt-3">
+              <Button
+                variant="secondary"
+                onClick={() =>
+                  triggerCsvDownload(`datazapp-appended-${new Date().toISOString().slice(0, 10)}.csv`, applyResult.csv!)
+                }
+              >
+                Download the list again
+              </Button>
+            </div>
+          ) : (
+            <p className="mt-2 text-sm text-muted-foreground">Nothing was kept, so there's no list to download.</p>
+          )}
           {applyResult.report && (
             <div className="mt-3 grid gap-2 sm:grid-cols-3">
               {HUB_ORDER.map((list) => (
@@ -1015,6 +1234,19 @@ function AppendDataTab({ clientId }: { clientId: string }) {
               ))}
             </div>
           )}
+          <div className="mt-4">
+            <Button
+              variant="secondary"
+              onClick={() => {
+                setApplyResult(null);
+                setPreview(null);
+                setRows(null);
+                setFileName(null);
+              }}
+            >
+              Upload another file
+            </Button>
+          </div>
         </Card>
       )}
     </div>

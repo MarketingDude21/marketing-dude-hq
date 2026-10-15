@@ -1340,7 +1340,7 @@ function AppendDataTab({ clientId }: { clientId: string }) {
   const emailReviewRows = emailPreview?.reviewRows ?? [];
   const emailFiltered = emailQ
     ? emailReviewRows.filter((r) =>
-        [r.firstName, r.lastName, r.email].some((v) => (v ?? "").toLowerCase().includes(emailQ)),
+        [r.firstName, r.lastName, r.email, r.phone].some((v) => (v ?? "").toLowerCase().includes(emailQ)),
       )
     : emailReviewRows;
   const allEmailFilteredChecked = emailFiltered.length > 0 && emailFiltered.every((r) => emailChecked.has(r.rowIndex));
@@ -1578,9 +1578,29 @@ function AppendDataTab({ clientId }: { clientId: string }) {
           <Card>
             <h3 className="font-display text-base font-semibold">{emailPreview.total} have a usable email</h3>
             <p className="mt-1 text-sm text-muted-foreground">
-              Everyone else from this file either has no email at all or was already kept above — nothing left to decide
-              on them.
+              Counted from every tier, not just confirmed/household — a mismatch or no-data row still goes on this email
+              list if it has an email, DataZapp's appended one included. Only a row with no usable email at all (neither
+              its own original email nor anything DataZapp appended) is left off.
             </p>
+            {/* Visibility into exactly what happened to the rows Stage 1
+                didn't keep, broken down by tier — added per Mike: "What
+                happens to the bottom 2 rows of 275 and 287 people... I'd
+                like to be able to see the data on those." */}
+            <div className="mt-3 grid gap-2 sm:grid-cols-2">
+              {(["confirmed", "household", "mismatch", "no_data"] as const)
+                .filter((tier) => emailPreview.remainingByTier[tier] > 0)
+                .map((tier) => (
+                  <div key={tier} className="rounded-2xl border border-border bg-glass px-4 py-3">
+                    <p className="text-2xl font-bold tabular-nums">
+                      {emailPreview.remainingByTier[tier] - emailPreview.noEmailByTier[tier]}{" "}
+                      <span className="text-sm font-normal text-muted-foreground">
+                        of {emailPreview.remainingByTier[tier]}
+                      </span>
+                    </p>
+                    <p className="text-xs text-muted-foreground">{DATAZAPP_TIER_LABELS[tier]} — have a usable email</p>
+                  </div>
+                ))}
+            </div>
             {emailError && <p className="mt-3 text-sm text-destructive">{emailError}</p>}
           </Card>
 
@@ -1613,6 +1633,8 @@ function AppendDataTab({ clientId }: { clientId: string }) {
                         <th className="pb-2 pr-4">First name</th>
                         <th className="pb-2 pr-4">Last name</th>
                         <th className="pb-2 pr-4">Email</th>
+                        <th className="pb-2 pr-4">Phone</th>
+                        <th className="pb-2 pr-4">From</th>
                         <th className="whitespace-nowrap border-l border-border pb-2 pl-3">
                           <div className="flex items-center gap-2">
                             <span>Keep</span>
@@ -1634,6 +1656,12 @@ function AppendDataTab({ clientId }: { clientId: string }) {
                           <td className="py-2 pr-4">{r.firstName}</td>
                           <td className="py-2 pr-4">{r.lastName}</td>
                           <td className="py-2 pr-4">{r.email}</td>
+                          <td className="whitespace-nowrap py-2 pr-4">{r.phone}</td>
+                          <td className="py-2 pr-4">
+                            <span className="rounded-full bg-muted px-2.5 py-1 text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+                              {DATAZAPP_TIER_LABELS[r.originalTier]}
+                            </span>
+                          </td>
                           <td className="border-l border-border py-2 pl-3">
                             <input
                               type="checkbox"

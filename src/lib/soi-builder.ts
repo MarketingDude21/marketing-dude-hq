@@ -1042,6 +1042,29 @@ function dzField(row: DatazappRawRow, header: string): string {
   return (row[header] ?? "").trim();
 }
 
+// Mirrors the main Upload tab's multi-column consolidation fix (2026-10-15,
+// "Phone 1, Phone 2... you need to be smarter than that") - this file's own
+// `phone`/`originalEmail` reads below used to look at exactly one hardcoded
+// column ("Phone 1", "Email 1") and nothing else. That's the same bug in a
+// second place: a DataZapp return file can carry "Email 1"/"Email 2" (or
+// just "Phone"/"Email" with no number) same as a normal CRM export, and
+// whichever one actually has the person's real value isn't guaranteed to be
+// column 1. Root-caused directly from Mike's report of a mismatch-tier row
+// with "a valid email, first name and last name" that still didn't make it
+// onto the Stage 2 email list - this is why. Scans every column on the row
+// (not a fixed list) for anything spelled "phone"/"email" with an optional
+// trailing number, and returns the first non-blank value found, in column
+// order.
+function firstNonBlankMatching(row: DatazappRawRow, pattern: RegExp): string {
+  for (const key of Object.keys(row)) {
+    if (pattern.test(key.trim())) {
+      const v = (row[key] ?? "").trim();
+      if (v) return v;
+    }
+  }
+  return "";
+}
+
 type DatazappMatchTier = "confirmed" | "household" | "mismatch" | "no_data";
 
 type DatazappMatchResult = {
@@ -1080,8 +1103,9 @@ function formatZip(zip: string, zip4: string): string {
 function matchDatazappRow(row: DatazappRawRow): DatazappMatchResult {
   const firstName = dzField(row, "First Name");
   const lastName = dzField(row, "Last Name");
-  const phone = dzField(row, "FORMATTED_PHONE_Phone 1") || dzField(row, "Phone 1");
-  const originalEmail = dzField(row, "Email 1");
+  const phone =
+    dzField(row, "FORMATTED_PHONE_Phone 1") || dzField(row, "Phone 1") || firstNonBlankMatching(row, /^phone\s*\d*$/i);
+  const originalEmail = dzField(row, "Email 1") || firstNonBlankMatching(row, /^email\s*\d*$/i);
 
   const dzFirst = dzField(row, "DataZapp_First");
   const dzLast = dzField(row, "DataZapp_Last");

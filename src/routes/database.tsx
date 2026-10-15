@@ -355,7 +355,11 @@ const MAPPING_ALIASES: Record<string, string[]> = {
   first_name: ["first name", "firstname", "first", "fname", "given name"],
   last_name: ["last name", "lastname", "last", "lname", "surname", "family name"],
   full_name: ["full name", "fullname", "name", "contact name", "display name"],
-  email: ["email", "e mail", "email address", "e mail address", "primary email", "emails"],
+  // "consolidated email"/"consolidated phone" are synthetic columns this
+  // file builds itself (see consolidateMultiColumn below) - never a real
+  // header from a file, always matched last since nothing a real export
+  // would use normalizes to those exact words.
+  email: ["email", "e mail", "email address", "e mail address", "primary email", "emails", "consolidated email"],
   phone: [
     "phone",
     "phone number",
@@ -367,6 +371,7 @@ const MAPPING_ALIASES: Record<string, string[]> = {
     "primary phone",
     "telephone",
     "phones",
+    "consolidated phone",
   ],
   address: ["address", "address 1", "street address", "address line 1", "mailing address", "street"],
   address_2: ["address 2", "address line 2", "apt", "unit", "suite"],
@@ -397,6 +402,62 @@ function guessColumnMapping(headers: string[]): Record<string, string> {
     }
   }
   return guessed;
+}
+
+// Bug fix, 2026-10-15 - Mike uploaded a real contacts export with "Phone 1,
+// Phone 2, Phone 3... Email 1, Email 2..." columns (a very common shape -
+// this is exactly what a phone/address-book contacts export looks like) and
+// got NOTHING mapped for phone or email at all: guessColumnMapping's alias
+// lists above only had plain, un-numbered spellings ("phone", "cell",
+// "email", etc.), so "Phone 1" normalized to "phone 1" and matched nothing.
+// His own words: "I believe its becasue it says Phone 1, Phone 2,... you
+// need to be smarter than that an know thats their phone number. We could
+// have lost all that data which is how i got the appended list" - meaning
+// this is very plausibly why a real chunk of his contacts needed a DataZapp
+// append in the first place, when the actual phone number was sitting right
+// there in his own original file the entire time.
+//
+// Goes one step further than just recognizing "Phone 1" as a phone column,
+// too: `contacts` only has ONE phone field and ONE email field, but a file
+// like this can have SEVERAL phone-ish or email-ish columns at once (Phone
+// 1 through 6 in Mike's exact file) - picking only the first one by header
+// order (which is all the old single-header-per-field mapping could ever
+// do, even once it recognized a column) still silently drops data whenever
+// THAT column happens to be blank for a given row but a sibling column
+// isn't. So this looks at every column that looks like a phone (or email)
+// column - an exact alias match, OR "<alias> <number>" - and builds one new
+// column per row from the first non-blank value across all of them. That
+// new column is what actually gets mapped to the phone/email field -
+// guessColumnMapping above never sees the original numbered columns at all
+// once this runs (see consolidateMultiColumn's own comment for why that
+// matters), so there's no ambiguity about which one wins.
+function looksLikeAliasColumn(header: string, aliases: string[]): boolean {
+  const n = normalizeHeader(header);
+  return aliases.some((alias) => {
+    const escaped = alias.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    return n === alias || new RegExp(`^${escaped}\\s*\\d+$`).test(n);
+  });
+}
+
+function consolidateMultiColumn(
+  rows: Record<string, string>[],
+  headers: string[],
+  aliases: string[],
+  outKey: string,
+): string[] {
+  const cols = headers.filter((h) => looksLikeAliasColumn(h, aliases));
+  if (cols.length === 0) return headers;
+  for (const row of rows) {
+    row[outKey] = cols.map((c) => (row[c] ?? "").trim()).find((v) => v) ?? "";
+  }
+  // Drop the original phone/email-ish columns from what guessColumnMapping
+  // gets to see - otherwise it could grab whichever original column happens
+  // to come first in the file (an exact, already-recognized alias like
+  // "Cell" sitting next to "Phone 1", say) even when THAT one is blank for a
+  // row and a sibling column has the real value. Only this new consolidated
+  // column is left for the phone/email field to match.
+  const colSet = new Set(cols);
+  return [...headers.filter((h) => !colSet.has(h)), outKey];
 }
 
 function DatabasePage() {
@@ -648,11 +709,22 @@ function UploadTab({
     } else {
       preview = parseCsv(await file.text());
     }
+    // Multi-column phone/email consolidation BEFORE guessing the mapping -
+    // see consolidateMultiColumn's own comment above for why this has to
+    // run first (a file with "Phone 1, Phone 2..." style columns used to
+    // get nothing mapped for phone at all).
+    let headers = consolidateMultiColumn(
+      preview.rows,
+      preview.headers,
+      MAPPING_ALIASES["phone"] ?? [],
+      "Consolidated Phone",
+    );
+    headers = consolidateMultiColumn(preview.rows, headers, MAPPING_ALIASES["email"] ?? [], "Consolidated Email");
     // Auto-match columns from the file's own headers (First Name, Email,
     // etc.) — see guessColumnMapping's comment for what counts as
     // recognizable. No manual mapping step; this is what lets a batch go
     // straight through without stopping for each file.
-    const mapping = guessColumnMapping(preview.headers);
+    const mapping = guessColumnMapping(headers);
     await uploadSoiFile({
       data: {
         clientId,

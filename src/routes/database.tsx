@@ -8,6 +8,7 @@ import {
   listSoiUploads,
   uploadSoiFile,
   deleteSoiUpload,
+  resetSoiDatabase,
   processSoiUploads,
   getSoiHubCounts,
   getSoiReviewCandidates,
@@ -484,7 +485,7 @@ function DatabasePage() {
         clientName={selected.name}
         onChangeClient={access.role === "team" ? () => setSelected(null) : undefined}
       />
-      <Workspace clientId={selected.id} />
+      <Workspace clientId={selected.id} clientName={selected.name} />
     </AppShell>
   );
 }
@@ -519,7 +520,7 @@ function PageHeader({
 // hand-duplicated) so it can never drift out of sync with what it returns.
 type ProcessReport = Awaited<ReturnType<typeof processSoiUploads>>;
 
-function Workspace({ clientId }: { clientId: string }) {
+function Workspace({ clientId, clientName }: { clientId: string; clientName: string }) {
   // Upload / Review / Append Data / Export. "Append Data" added 2026-10-15
   // per Mike's request, after a round of real-world DataZapp append files -
   // its own second-round upload step for a file that gets matched/merged
@@ -551,7 +552,13 @@ function Workspace({ clientId }: { clientId: string }) {
       </div>
       <div className="mt-5">
         {tab === "upload" && (
-          <UploadTab clientId={clientId} onProcessed={() => setTab("review")} onReport={setLastProcessReport} />
+          <UploadTab
+            clientId={clientId}
+            clientName={clientName}
+            onProcessed={() => setTab("review")}
+            onReport={setLastProcessReport}
+            onReset={() => setLastProcessReport(null)}
+          />
         )}
         {tab === "review" && <ReviewTab clientId={clientId} lastProcessReport={lastProcessReport} />}
         {tab === "append" && <AppendDataTab clientId={clientId} />}
@@ -568,16 +575,29 @@ type BatchItem = { file: File; status: "pending" | "uploading" | "done" | "error
 
 function UploadTab({
   clientId,
+  clientName,
   onProcessed,
   onReport,
+  onReset,
 }: {
   clientId: string;
+  clientName: string;
   onProcessed: () => void;
   onReport: (report: ProcessReport) => void;
+  onReset: () => void;
 }) {
   const [uploads, setUploads] = useState<
     Array<{ id: string; file_name: string; source_label: string; status: string }>
   >([]);
+  // "Reset database" confirmation - typing the client's own name is the
+  // gate, same spirit as GitHub/Lovable's own "type to confirm" deletes,
+  // since resetSoiDatabase is irreversible and wipes every contact this
+  // client has, not just the files on this screen.
+  const [resetOpen, setResetOpen] = useState(false);
+  const [resetConfirmText, setResetConfirmText] = useState("");
+  const [resetBusy, setResetBusy] = useState(false);
+  const [resetError, setResetError] = useState<string | null>(null);
+  const [resetDone, setResetDone] = useState<{ deletedContacts: number; deletedUploads: number } | null>(null);
   // The current drag/pick batch and how far it's gotten — files upload
   // automatically the moment they're picked (parsed, columns auto-matched,
   // sent) with no per-file "confirm and click Upload" step, so a whole
@@ -683,6 +703,30 @@ function UploadTab({
     }
   }
 
+  async function handleReset() {
+    if (resetConfirmText.trim() !== clientName.trim()) return;
+    setResetBusy(true);
+    setResetError(null);
+    try {
+      const result = await resetSoiDatabase({ data: { clientId } });
+      setResetDone(result);
+      setResetOpen(false);
+      setResetConfirmText("");
+      // Clear every bit of local state this screen (and Review, via
+      // onReset) was holding, so it's a genuinely clean slate without
+      // needing a page reload.
+      setUploads([]);
+      setBatch([]);
+      setProcessed(false);
+      setProcessResult(null);
+      onReset();
+    } catch (e) {
+      setResetError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setResetBusy(false);
+    }
+  }
+
   return (
     <div className="grid gap-5 lg:grid-cols-2">
       <Card>
@@ -769,6 +813,68 @@ function UploadTab({
             </p>
           )}
         </div>
+      </Card>
+
+      {/* "There should be a reset button on the Upload screen anytime you
+          want to rerun a new database. People may come back and add
+          contacts to it or clean their list." — added 2026-10-15. Wipes
+          every file and every contact this client has via
+          resetSoiDatabase, so a new upload round starts completely clean
+          instead of deduping against whatever's already in there. Gated
+          behind typing the client's own name, since there's no undo. */}
+      <Card className="lg:col-span-2 border-destructive/40">
+        <h2 className="font-display text-lg font-semibold text-destructive">Start over</h2>
+        <p className="mt-1 text-sm text-muted-foreground">
+          Permanently deletes every uploaded file and every contact for {clientName} so you can run a brand-new database
+          from scratch. This can't be undone — use it when a client wants their whole list wiped and re-cleaned, not
+          just a new batch added to what's already here.
+        </p>
+        {resetDone && !resetOpen && (
+          <p className="mt-3 text-sm text-muted-foreground">
+            Done — removed {resetDone.deletedContacts} contact{resetDone.deletedContacts === 1 ? "" : "s"} and{" "}
+            {resetDone.deletedUploads} uploaded file{resetDone.deletedUploads === 1 ? "" : "s"}. Ready for a fresh
+            upload.
+          </p>
+        )}
+        {!resetOpen ? (
+          <div className="mt-3">
+            <Button variant="danger" onClick={() => setResetOpen(true)}>
+              Reset database
+            </Button>
+          </div>
+        ) : (
+          <div className="mt-3 space-y-2">
+            <p className="text-sm text-muted-foreground">
+              Type <span className="font-semibold text-foreground">{clientName}</span> to confirm.
+            </p>
+            <input
+              value={resetConfirmText}
+              onChange={(e) => setResetConfirmText(e.target.value)}
+              placeholder={clientName}
+              className="w-full max-w-sm rounded-2xl border border-border bg-background px-4 py-2.5 text-sm outline-none ring-ring transition focus:ring-2"
+            />
+            <div className="flex gap-2">
+              <Button
+                variant="danger"
+                onClick={handleReset}
+                disabled={resetBusy || resetConfirmText.trim() !== clientName.trim()}
+              >
+                {resetBusy ? "Resetting…" : "Permanently delete everything"}
+              </Button>
+              <Button
+                variant="secondary"
+                onClick={() => {
+                  setResetOpen(false);
+                  setResetConfirmText("");
+                  setResetError(null);
+                }}
+              >
+                Cancel
+              </Button>
+            </div>
+            {resetError && <p className="text-sm text-destructive">{resetError}</p>}
+          </div>
+        )}
       </Card>
     </div>
   );

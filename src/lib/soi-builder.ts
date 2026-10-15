@@ -315,35 +315,46 @@ export const deleteSoiUpload = createServerFn({ method: "POST" })
     return { deleted: upload.file_name };
   });
 
+type ProcessUploadReport = {
+  raw_total: number;
+  unique_total: number;
+  dedupe_stats: Record<string, number>;
+  list_counts: Record<string, number>;
+  address_corrections: { name: string; message: string }[];
+  borderline_flags: { name: string; email: string; domain: string }[];
+};
+
+// Calls the real process-upload Edge Function directly - factored out of
+// processSoiUploads below so the new DataZapp-append step (further down)
+// can reuse it too, after writing newly-appended email/address fields
+// straight into `contacts`, to get everyone correctly reclassified out of
+// Incomplete/Nonqualified without duplicating any of the real segmentation
+// rules here.
+async function runProcessUpload(clientId: string): Promise<ProcessUploadReport> {
+  const url = process.env["SOI_SUPABASE_URL"];
+  const serviceKey = process.env["SOI_SUPABASE_SERVICE_ROLE_KEY"];
+  const res = await fetch(`${url}/functions/v1/process-upload`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${serviceKey}`,
+      apikey: serviceKey!,
+    },
+    body: JSON.stringify({ client_id: clientId }),
+  });
+  const json = await res.json();
+  if (!res.ok) throw new Error(json.error ?? `process-upload failed (${res.status})`);
+  return json as ProcessUploadReport;
+}
+
 export const processSoiUploads = createServerFn({ method: "POST" })
   .middleware([requireSupabaseAuth])
   .inputValidator((data: { clientId: string }) => data)
-  .handler(async ({ data, context }) => {
+  .handler(async ({ data, context }): Promise<ProcessUploadReport> => {
     const admin = getSoiAdminClient();
     const email = (context.claims as { email?: string } | undefined)?.email;
     await requireClientAccess(admin, email, data.clientId);
-
-    const url = process.env["SOI_SUPABASE_URL"];
-    const serviceKey = process.env["SOI_SUPABASE_SERVICE_ROLE_KEY"];
-    const res = await fetch(`${url}/functions/v1/process-upload`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${serviceKey}`,
-        apikey: serviceKey!,
-      },
-      body: JSON.stringify({ client_id: data.clientId }),
-    });
-    const json = await res.json();
-    if (!res.ok) throw new Error(json.error ?? `process-upload failed (${res.status})`);
-    return json as {
-      raw_total: number;
-      unique_total: number;
-      dedupe_stats: Record<string, number>;
-      list_counts: Record<string, number>;
-      address_corrections: { name: string; message: string }[];
-      borderline_flags: { name: string; email: string; domain: string }[];
-    };
+    return runProcessUpload(data.clientId);
   });
 
 const HUB_LISTS = [
@@ -577,17 +588,15 @@ export const setSoiReviewFlag = createServerFn({ method: "POST" })
       throw new Error("Not authorized for this contact");
     }
 
-    const { error } = await admin
-      .from("review_flags")
-      .upsert(
-        {
-          contact_id: data.contactId,
-          review_type: data.reviewType,
-          flagged: data.flagged,
-          flagged_by: email ?? "unknown",
-        },
-        { onConflict: "contact_id,review_type" },
-      );
+    const { error } = await admin.from("review_flags").upsert(
+      {
+        contact_id: data.contactId,
+        review_type: data.reviewType,
+        flagged: data.flagged,
+        flagged_by: email ?? "unknown",
+      },
+      { onConflict: "contact_id,review_type" },
+    );
     if (error) throw error;
     return { ok: true };
   });
@@ -634,4 +643,527 @@ export const exportSoiList = createServerFn({ method: "POST" })
       }[];
       warnings?: string[];
     };
+  });
+
+// ============================================================================
+// DataZapp append verification — a second-round "Append Data" step added
+// 2026-10-15 at Mike's request. The problem it solves: contacts missing an
+// email/mailing address get sent out to DataZapp (a third-party append
+// service, keyed on first name + last name + phone) to fill those gaps in -
+// mainly for direct mail, which is the actual product being sold. DataZapp's
+// reply often attaches the WRONG name to the address it finds, because it's
+// matching at the household/address level, not the individual - it hands
+// back whichever resident it has on file (a spouse, a prior occupant), not
+// necessarily the exact person Mike sent it. Mike's own words: "not
+// everything that appends matches the names... Mike and Michael, Kate and
+// Catherine... we need to know that's probably the same person."
+//
+// Deliberately a SEPARATE path from processSoiUploads/process-upload above,
+// not a variant of it - that function's job is segmenting freshly uploaded
+// raw list rows, and its weakest dedupe key (exact first+last name, used
+// only when a row has neither email nor phone) is exactly the kind of
+// mismatch this guards against, not something to lean on harder here. A
+// DataZapp return file already carries one unambiguous key straight back to
+// an existing contact - the very phone number Mike sent them - so finding
+// the right contact is a plain phone lookup, never a fuzzy one. The only
+// real judgment call is whether DataZapp's OWN appended name agrees with the
+// original name on that same row, which decides whether its appended
+// email/address gets trusted enough to write back.
+//
+// Built against two real sample files Mike sent (DataZapp's actual export
+// format - 44 columns, 927 rows), not guessed. What they showed:
+//   - DataZapp returns SOME data (at minimum an address) for 640 of 927 rows
+//     here; an appended email is rarer (382 of 927) - address really is the
+//     main yield, matching what Mike's actually after.
+//   - Of the 640 with a name back, only 209 (~33%) matched the original
+//     first+last name exactly. The rest split between genuine nicknames,
+//     a same-household resident returned instead of the person asked for
+//     (DataZapp_FIRST2/LAST2 carries a second household name on 144 rows,
+//     and it's often the real match when the primary slot isn't - e.g. "Don
+//     Blevins" came back with primary "Beverly Blevins" [his spouse] and
+//     secondary "Donald Blevins" [Don's own formal name]), and outright
+//     wrong-address matches sharing no name at all with the original.
+// ============================================================================
+
+// Clusters of common American first-name nicknames/formal-name pairs, so
+// "Jim" on the original contact and "James" on DataZapp's reply count as
+// confirmed, not a mismatch - per Mike, "we need to know that's probably the
+// same person." Not exhaustive (there's no complete list of every nickname
+// in English) - add a row here any time a real one gets missed; each row is
+// its own self-contained cluster, order doesn't matter.
+const NICKNAME_CLUSTERS: string[][] = [
+  ["james", "jim", "jimmy", "jamie"],
+  ["michael", "mike", "mikey", "mick", "mickey", "micheal"],
+  ["robert", "bob", "bobby", "rob", "robbie"],
+  ["william", "bill", "billy", "will", "willy", "liam"],
+  ["richard", "rick", "ricky", "rich", "dick"],
+  ["charles", "charlie", "chuck", "chas", "chick"],
+  ["thomas", "tom", "tommy"],
+  ["christopher", "chris", "topher", "kit"],
+  ["daniel", "dan", "danny"],
+  ["matthew", "matt", "matty"],
+  ["anthony", "tony"],
+  ["joseph", "joe", "joey"],
+  ["david", "dave", "davey", "davy"],
+  ["edward", "ed", "eddie", "eddy", "ted", "teddy"],
+  ["donald", "don", "donnie", "donny"],
+  ["steven", "stephen", "steve", "stevie"],
+  ["kenneth", "ken", "kenny"],
+  ["jeffrey", "jeff", "geoff", "geoffrey"],
+  ["timothy", "tim", "timmy"],
+  ["ronald", "ron", "ronnie"],
+  ["gerald", "gerry", "jerry"],
+  ["lawrence", "larry"],
+  ["patrick", "pat", "paddy", "patsy"],
+  ["raymond", "ray"],
+  ["gregory", "greg", "gregg"],
+  ["alexander", "alex", "xander", "al"],
+  ["nicholas", "nick", "nicky", "nico"],
+  ["benjamin", "ben", "benny", "benji"],
+  ["samuel", "sam", "sammy"],
+  ["jonathan", "jon", "jonny"],
+  ["john", "johnny", "jack", "jock"],
+  ["jacob", "jake", "jakey"],
+  ["henry", "hank"],
+  ["frederick", "fred", "freddie", "freddy"],
+  ["francis", "frank", "frankie"],
+  ["walter", "walt", "wally"],
+  ["albert", "al", "bert", "bertie"],
+  ["arthur", "art", "artie"],
+  ["eugene", "gene"],
+  ["harold", "harry", "hal"],
+  ["howard", "howie"],
+  ["joshua", "josh"],
+  ["nathaniel", "nathan", "nate"],
+  ["zachary", "zach", "zack", "zak"],
+  ["peter", "pete", "petey"],
+  ["philip", "phillip", "phil"],
+  ["vincent", "vince", "vinny"],
+  ["martin", "marty"],
+  ["douglas", "doug"],
+  ["bradley", "brad"],
+  ["russell", "russ"],
+  ["victor", "vic"],
+  ["leonard", "leo", "lenny"],
+  ["theodore", "ted", "teddy", "theo"],
+  ["dominic", "dom"],
+  ["andrew", "andy", "drew"],
+  ["marcus", "mark", "marc"],
+  ["randall", "randal", "randy"],
+  ["dwayne", "dwane", "duane"],
+  ["elias", "eli"],
+  ["ernest", "ernie", "erny"],
+  ["elizabeth", "liz", "lizzie", "beth", "betty", "eliza", "liza", "betsy"],
+  ["katherine", "katharine", "catherine", "kathryn", "kate", "katie", "kathy", "cathy", "kit", "kitty", "cat", "kat"],
+  ["margaret", "maggie", "peggy", "meg", "margie", "marge", "margo"],
+  ["patricia", "pat", "patty", "tricia", "trish"],
+  ["jennifer", "jen", "jenny", "jenn"],
+  ["barbara", "barb", "babs"],
+  ["susan", "sue", "susie", "suzy", "suzanne"],
+  ["deborah", "debra", "deb", "debbie"],
+  ["sandra", "sandy"],
+  ["cynthia", "cindy"],
+  ["angela", "angie"],
+  ["rebecca", "becky", "becca"],
+  ["stephanie", "steph"],
+  ["nicole", "nikki", "nicki"],
+  ["christina", "christine", "christy", "tina", "christie"],
+  ["jacqueline", "jackie", "jacky"],
+  ["theresa", "teresa", "terry", "terri", "tess", "tessa"],
+  ["frances", "fran", "francie"],
+  ["kimberly", "kim", "kimmy"],
+  ["sherry", "sheri", "sherri"],
+  ["judith", "judy"],
+  ["virginia", "ginny", "ginger"],
+  ["diane", "diana", "di", "didi"],
+  ["carol", "carole", "carrie"],
+  ["janet", "jan", "jannie"],
+  ["kathleen", "kathy", "kate", "katie"],
+  ["michelle", "shelly", "shelley", "shell"],
+  ["laura", "lori", "laurie"],
+  ["amanda", "mandy"],
+  ["melissa", "missy", "mel"],
+  ["victoria", "vicky", "vicki", "vickie", "tori"],
+  ["samantha", "sam", "sammy"],
+  ["jessica", "jess", "jessie"],
+  ["gabrielle", "gabby", "gabi"],
+  ["isabella", "bella", "izzy"],
+  ["olivia", "liv", "livvy"],
+  ["natalie", "nat", "natty"],
+  ["constance", "connie"],
+  ["bonita", "bonnie"],
+  ["dorothy", "dot", "dottie"],
+  ["lillian", "lily", "lil"],
+  ["rosalind", "roz", "rosie"],
+  ["penelope", "penny"],
+  ["josephine", "jo", "josie"],
+  ["geraldine", "gerry", "jerry"],
+  ["wilhelmina", "billie", "mina"],
+];
+
+const NICKNAME_LOOKUP: Map<string, number> = (() => {
+  const map = new Map<string, number>();
+  NICKNAME_CLUSTERS.forEach((cluster, idx) => {
+    for (const name of cluster) map.set(name, idx);
+  });
+  return map;
+})();
+
+function normalizeNameToken(name: string): string {
+  return name
+    .toLowerCase()
+    .trim()
+    .replace(/[^a-z]/g, "");
+}
+
+// True if two first names are plausibly the same person - exactly, or via a
+// known nickname/formal-name pair above. Blank on either side never counts
+// as a match - there's nothing real to compare.
+function firstNamesEquivalent(a: string, b: string): boolean {
+  const na = normalizeNameToken(a);
+  const nb = normalizeNameToken(b);
+  if (!na || !nb) return false;
+  if (na === nb) return true;
+  const ca = NICKNAME_LOOKUP.get(na);
+  const cb = NICKNAME_LOOKUP.get(nb);
+  return ca !== undefined && ca === cb;
+}
+
+function sameLastName(a: string, b: string): boolean {
+  const na = normalizeNameToken(a);
+  const nb = normalizeNameToken(b);
+  return !!na && !!nb && na === nb;
+}
+
+// Same last-10-digits normalization process-upload's own phoneKey() uses
+// (see the recovered source) - comparing raw phone strings directly misses
+// matches over formatting differences alone ("(859) 948-5464" vs
+// "8599485464").
+function normalizePhone(phone: string): string {
+  return phone.replace(/\D/g, "").slice(-10);
+}
+
+// One row of a DataZapp return file, exactly as DataZapp's own export names
+// its columns (confirmed against two real sample files Mike sent 2026-10-15,
+// not guessed). Never user-mapped like the normal Upload tab's files are -
+// this is always the same tool's fixed export format, so the frontend reads
+// these exact headers directly.
+type DatazappRawRow = Record<string, string>;
+
+function dzField(row: DatazappRawRow, header: string): string {
+  return (row[header] ?? "").trim();
+}
+
+type DatazappMatchTier = "confirmed" | "household" | "mismatch" | "no_data" | "no_contact";
+
+type FullContactRow = SoiContactRow & { address_2: string | null };
+
+type DatazappMatchResult = {
+  tier: DatazappMatchTier;
+  contactId: string | null;
+  originalName: string;
+  appendedName: string;
+  appliedFields: Partial<Record<"email" | "address" | "address_2" | "city" | "state" | "zip", string>>;
+  doNotCall: boolean;
+  possibleBusiness: string | null;
+};
+
+function formatZip(zip: string, zip4: string): string {
+  if (!zip) return "";
+  return zip4 ? `${zip}-${zip4}` : zip;
+}
+
+// The actual matching logic, run against one row of a parsed DataZapp file
+// plus a phone -> existing-contact(s) index already built for this client.
+// See the file-header comment above for why phone (not name) is the right
+// key back to an existing contact, and why the name comparison that follows
+// is purely about whether to TRUST the appended data, not about finding who
+// it belongs to.
+function matchDatazappRow(row: DatazappRawRow, contactsByPhone: Map<string, FullContactRow[]>): DatazappMatchResult {
+  const originalFirst = dzField(row, "First Name");
+  const originalLast = dzField(row, "Last Name");
+  const rawPhone = dzField(row, "FORMATTED_PHONE_Phone 1") || dzField(row, "Phone 1");
+  const phoneKeyVal = normalizePhone(rawPhone);
+  const originalName = [originalFirst, originalLast].filter(Boolean).join(" ") || "(no name)";
+
+  const candidates = phoneKeyVal ? (contactsByPhone.get(phoneKeyVal) ?? []) : [];
+  let contact: FullContactRow | undefined;
+  if (candidates.length === 1) {
+    contact = candidates[0];
+  } else if (candidates.length > 1) {
+    // A shared phone (e.g. a landline on two spouses' separate contact rows)
+    // - disambiguate using the original name this exact row was built from,
+    // since that's guaranteed to be the contact Mike actually exported.
+    contact = candidates.find(
+      (c) => sameLastName(c.last_name ?? "", originalLast) && firstNamesEquivalent(c.first_name ?? "", originalFirst),
+    );
+  }
+  if (!contact) {
+    return {
+      tier: "no_contact",
+      contactId: null,
+      originalName,
+      appendedName: "",
+      appliedFields: {},
+      doNotCall: false,
+      possibleBusiness: null,
+    };
+  }
+
+  const dzFirst = dzField(row, "DataZapp_First");
+  const dzLast = dzField(row, "DataZapp_Last");
+  const dzFirst2 = dzField(row, "DataZapp_FIRST2");
+  const dzLast2 = dzField(row, "DataZapp_LAST2");
+  const dzAddress = dzField(row, "DataZapp_Address");
+  const dzAddress2 = dzField(row, "DataZapp_ADDRESS2");
+  const dzCity = dzField(row, "DataZapp_City");
+  const dzState = dzField(row, "DataZapp_State");
+  const dzZip = formatZip(dzField(row, "DataZapp_ZIP"), dzField(row, "DataZapp_ZIP_4"));
+  const dzEmail = dzField(row, "DataZapp_EMAIL");
+  const doNotCall = dzField(row, "DataZapp_DoNotCall").toUpperCase() === "Y";
+  const possibleBusiness = dzField(row, "DataZapp_COMPANY_NAME") || null;
+
+  if (!dzFirst && !dzLast && !dzAddress) {
+    return {
+      tier: "no_data",
+      contactId: contact.id,
+      originalName,
+      appendedName: "",
+      appliedFields: {},
+      doNotCall,
+      possibleBusiness: null,
+    };
+  }
+
+  const appendedName = [dzFirst, dzLast].filter(Boolean).join(" ");
+
+  // Primary slot: exact or nickname-equivalent first name, exact last name.
+  const primaryConfirmed = sameLastName(dzLast, originalLast) && firstNamesEquivalent(dzFirst, originalFirst);
+  // Secondary resident (DataZapp_FIRST2/LAST2) catches the real match when
+  // DataZapp's primary slot handed back a spouse/other household member
+  // instead - confirmed against Mike's real sample data, see this section's
+  // header comment for a concrete example.
+  const secondaryConfirmed = sameLastName(dzLast2, originalLast) && firstNamesEquivalent(dzFirst2, originalFirst);
+
+  if (primaryConfirmed || secondaryConfirmed) {
+    return {
+      tier: "confirmed",
+      contactId: contact.id,
+      originalName,
+      appendedName,
+      appliedFields: {
+        email: dzEmail,
+        address: dzAddress,
+        address_2: dzAddress2,
+        city: dzCity,
+        state: dzState,
+        zip: dzZip,
+      },
+      doNotCall,
+      possibleBusiness,
+    };
+  }
+
+  // Last name agrees (either slot) but no first name matches at all - most
+  // plausibly the same household (a spouse or other resident), not a wrong
+  // address. Direct mail to that address is still almost certainly good -
+  // Mike's actual goal ("mainly direct mail, because we want them to order
+  // direct mail from us") doesn't depend on the first name being exact. The
+  // appended EMAIL is deliberately withheld in this tier: sending under the
+  // wrong identity is a real risk an address isn't.
+  const householdMatch = sameLastName(dzLast, originalLast) || sameLastName(dzLast2, originalLast);
+  if (householdMatch) {
+    return {
+      tier: "household",
+      contactId: contact.id,
+      originalName,
+      appendedName,
+      appliedFields: { address: dzAddress, address_2: dzAddress2, city: dzCity, state: dzState, zip: dzZip },
+      doNotCall,
+      possibleBusiness,
+    };
+  }
+
+  return {
+    tier: "mismatch",
+    contactId: contact.id,
+    originalName,
+    appendedName,
+    appliedFields: {},
+    doNotCall,
+    possibleBusiness: null,
+  };
+}
+
+async function fetchAllContactsForClient(admin: SupabaseClient, clientId: string): Promise<FullContactRow[]> {
+  let rows: FullContactRow[] = [];
+  for (let from = 0; ; from += PAGE_SIZE) {
+    const { data, error } = await admin
+      .from("contacts")
+      .select(
+        "id, first_name, last_name, email, phone, address, address_2, city, state, zip, notes, sources, list_assignment",
+      )
+      .eq("client_id", clientId)
+      .range(from, from + PAGE_SIZE - 1);
+    if (error) throw error;
+    rows = rows.concat((data ?? []) as FullContactRow[]);
+    if (!data || data.length < PAGE_SIZE) break;
+  }
+  return rows;
+}
+
+function buildPhoneIndex(contacts: FullContactRow[]): Map<string, FullContactRow[]> {
+  const map = new Map<string, FullContactRow[]>();
+  for (const c of contacts) {
+    if (!c.phone) continue;
+    const key = normalizePhone(c.phone);
+    if (!key) continue;
+    const list = map.get(key);
+    if (list) list.push(c);
+    else map.set(key, [c]);
+  }
+  return map;
+}
+
+function emptyTierCounts(): Record<DatazappMatchTier, number> {
+  return { confirmed: 0, household: 0, mismatch: 0, no_data: 0, no_contact: 0 };
+}
+
+// Read-only dry run: parses + matches a just-uploaded DataZapp return file
+// against this client's existing contacts and reports what WOULD happen,
+// without writing anything - same "preview before apply" shape as the
+// Needs Data/Datazap-selection screen already uses elsewhere in this tab.
+export const previewDatazappAppend = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator((data: { clientId: string; rows: DatazappRawRow[] }) => data)
+  .handler(async ({ data, context }) => {
+    const admin = getSoiAdminClient();
+    const email = (context.claims as { email?: string } | undefined)?.email;
+    await requireClientAccess(admin, email, data.clientId);
+
+    const contacts = await fetchAllContactsForClient(admin, data.clientId);
+    const phoneIndex = buildPhoneIndex(contacts);
+    const results = data.rows.map((row) => matchDatazappRow(row, phoneIndex));
+
+    const counts = emptyTierCounts();
+    for (const r of results) counts[r.tier]++;
+
+    // Only a sample of each bucket for display - mismatch/no_contact in
+    // particular can run into the hundreds, and a spot-check doesn't need
+    // every row listed.
+    const sample = (tier: DatazappMatchTier, limit = 25) =>
+      results
+        .filter((r) => r.tier === tier)
+        .slice(0, limit)
+        .map((r) => ({ originalName: r.originalName, appendedName: r.appendedName }));
+
+    return {
+      total: results.length,
+      counts,
+      doNotCallCount: results.filter((r) => r.doNotCall).length,
+      possibleBusinessCount: results.filter((r) => r.possibleBusiness).length,
+      sampleConfirmed: sample("confirmed"),
+      sampleHousehold: sample("household"),
+      sampleMismatch: sample("mismatch"),
+    };
+  });
+
+// Writes the verified append data straight into this client's existing
+// contacts, then re-runs the real segmentation so anyone who just gained an
+// email/address moves out of Incomplete/Nonqualified into the right bucket.
+// Confirmed (exact or nickname-verified) and household (last-name-only,
+// address-only) matches both apply automatically with no manual review step
+// - per Mike, a nickname match should "just know that's probably the same
+// person," and a household match is even safer since it only ever touches
+// the mailing address, never the email. Mismatch/no-data/no-contact rows
+// change nothing.
+export const applyDatazappAppend = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator((data: { clientId: string; rows: DatazappRawRow[] }) => data)
+  .handler(async ({ data, context }) => {
+    const admin = getSoiAdminClient();
+    const email = (context.claims as { email?: string } | undefined)?.email;
+    await requireClientAccess(admin, email, data.clientId);
+
+    const contacts = await fetchAllContactsForClient(admin, data.clientId);
+    const phoneIndex = buildPhoneIndex(contacts);
+    const contactsById = new Map(contacts.map((c) => [c.id, c]));
+    const results = data.rows.map((row) => matchDatazappRow(row, phoneIndex));
+
+    const counts = emptyTierCounts();
+    for (const r of results) counts[r.tier]++;
+
+    const updates: Record<string, unknown>[] = [];
+    let appliedCount = 0;
+
+    for (const r of results) {
+      if (!r.contactId) continue;
+      const contact = contactsById.get(r.contactId);
+      if (!contact) continue;
+
+      const canApplyFields = r.tier === "confirmed" || r.tier === "household";
+      const fields: Partial<Record<"email" | "address" | "address_2" | "city" | "state" | "zip", string>> = {};
+      let fieldsChanged = false;
+
+      if (canApplyFields) {
+        // Blank-fill only - never overwrite a field the contact already has
+        // real data in, same philosophy the main multi-list merge already
+        // uses everywhere else in this app.
+        (Object.keys(r.appliedFields) as Array<keyof typeof r.appliedFields>).forEach((key) => {
+          const incoming = r.appliedFields[key];
+          if (incoming && !contact[key]) {
+            fields[key] = incoming;
+            fieldsChanged = true;
+          }
+        });
+      }
+
+      // DataZapp's Do Not Call flag is about the PHONE NUMBER Mike sent it,
+      // not about whose name came back - so it's trustworthy regardless of
+      // match tier. A possible-business flag, on the other hand, names a
+      // specific company that's only meaningful if we're confident this is
+      // really the same entity - restricted to confirmed/household tiers.
+      const existingNotes = contact.notes ?? "";
+      const noteAdditions: string[] = [];
+      if (r.doNotCall && !existingNotes.includes("[DataZapp: Do Not Call]")) {
+        noteAdditions.push("[DataZapp: Do Not Call]");
+      }
+      if (canApplyFields && r.possibleBusiness && !existingNotes.includes("[DataZapp: possible business")) {
+        noteAdditions.push(`[DataZapp: possible business — ${r.possibleBusiness}]`);
+      }
+
+      if (!fieldsChanged && noteAdditions.length === 0) continue;
+
+      appliedCount++;
+      updates.push({
+        id: contact.id,
+        // Full existing row, same reason process-upload's own upsert
+        // comment gives for doing this - a partial row through upsert risks
+        // blanking columns this request doesn't mention.
+        first_name: contact.first_name,
+        last_name: contact.last_name,
+        email: fields.email ?? contact.email,
+        phone: contact.phone,
+        address: fields.address ?? contact.address,
+        address_2: fields.address_2 ?? contact.address_2,
+        city: fields.city ?? contact.city,
+        state: fields.state ?? contact.state,
+        zip: fields.zip ?? contact.zip,
+        notes: noteAdditions.length ? [existingNotes, ...noteAdditions].filter(Boolean).join(" ") : contact.notes,
+        list_assignment: contact.list_assignment,
+        sources: contact.sources,
+      });
+    }
+
+    for (let i = 0; i < updates.length; i += 500) {
+      const { error } = await admin.from("contacts").upsert(updates.slice(i, i + 500), { onConflict: "id" });
+      if (error) throw error;
+    }
+
+    // Reclassify everyone using the real segmentation rules, not a
+    // reimplementation of them - only worth calling at all if something
+    // actually changed.
+    const report = updates.length > 0 ? await runProcessUpload(data.clientId) : null;
+
+    return { total: results.length, appliedCount, counts, report };
   });

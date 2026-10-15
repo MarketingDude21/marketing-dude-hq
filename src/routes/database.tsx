@@ -15,8 +15,14 @@ import {
   getSoiListView,
   setSoiReviewFlag,
   exportSoiList,
+  exportSoiListLocal,
   previewDatazappAppend,
   finalizeDatazappAppend,
+  previewDatazappEmailList,
+  finalizeDatazappEmailList,
+  saveAppendDataStaging,
+  getAppendDataStaging,
+  clearAppendDataStaging,
   type SoiAccess,
 } from "@/lib/soi-builder";
 
@@ -1017,6 +1023,12 @@ type DatazappPreview = Awaited<ReturnType<typeof previewDatazappAppend>>;
 type DatazappFinalizeResult = Awaited<ReturnType<typeof finalizeDatazappAppend>>;
 type DatazappReviewRow = DatazappPreview["reviewRows"][number];
 
+// Stage 2 ("Email List") shapes - same reasoning as above, pulled from the
+// server functions' own return types.
+type DatazappEmailPreview = Awaited<ReturnType<typeof previewDatazappEmailList>>;
+type DatazappEmailFinalizeResult = Awaited<ReturnType<typeof finalizeDatazappEmailList>>;
+type DatazappEmailReviewRow = DatazappEmailPreview["reviewRows"][number];
+
 const DATAZAPP_TIER_LABELS: Record<string, string> = {
   confirmed: "Confirmed match",
   household: "Same household (address only)",
@@ -1064,6 +1076,56 @@ function AppendDataTab({ clientId }: { clientId: string }) {
   const [search, setSearch] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // Bug fix, 2026-10-15: Mike switched tabs mid-review and lost everything -
+  // "I went away from the Append Data screen and when I came back all data
+  // was not saved. I only switched windows." `restoring` covers the brief
+  // moment on mount while this checks for a previously-staged file (see
+  // getAppendDataStaging in soi-builder.ts) before deciding whether to show
+  // the empty upload prompt.
+  const [restoring, setRestoring] = useState(true);
+
+  // Stage 2 - "Email List" pass over whatever Stage 1 didn't keep.
+  const [emailPreview, setEmailPreview] = useState<DatazappEmailPreview | null>(null);
+  const [emailChecked, setEmailChecked] = useState<Set<number>>(new Set());
+  const [emailFinalizeResult, setEmailFinalizeResult] = useState<DatazappEmailFinalizeResult | null>(null);
+  const [emailSearch, setEmailSearch] = useState("");
+  const [emailBusy, setEmailBusy] = useState(false);
+  const [emailError, setEmailError] = useState<string | null>(null);
+  const [emailStageOpen, setEmailStageOpen] = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    setRestoring(true);
+    getAppendDataStaging({ data: { clientId } })
+      .then(async (staged) => {
+        if (cancelled || !staged) return;
+        setFileName(staged.fileName);
+        setRows(staged.rows);
+        const result = await previewDatazappAppend({ data: { clientId, rows: staged.rows } });
+        if (cancelled) return;
+        setPreview(result);
+        setCheckedRows(new Set(result.reviewRows.map((r) => r.rowIndex)));
+      })
+      .catch(() => {
+        // A failed restore just means the tab opens empty, same as someone's
+        // first time here - not worth surfacing as an error.
+      })
+      .finally(() => {
+        if (!cancelled) setRestoring(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [clientId]);
+
+  function resetEmailStage() {
+    setEmailPreview(null);
+    setEmailChecked(new Set());
+    setEmailFinalizeResult(null);
+    setEmailSearch("");
+    setEmailError(null);
+    setEmailStageOpen(false);
+  }
 
   async function handleFilePicked(file: File) {
     setError(null);
@@ -1072,6 +1134,7 @@ function AppendDataTab({ clientId }: { clientId: string }) {
     setSearch("");
     setFileName(file.name);
     setBusy(true);
+    resetEmailStage();
     try {
       const lowerName = file.name.toLowerCase();
       const parsed = SPREADSHEET_EXTENSIONS.some((ext) => lowerName.endsWith(ext))
@@ -1086,6 +1149,10 @@ function AppendDataTab({ clientId }: { clientId: string }) {
       // the ones they don't want rather than having to check every row by
       // hand.
       setCheckedRows(new Set(result.reviewRows.map((r) => r.rowIndex)));
+      // Best-effort: stage this upload so it survives a tab switch. A
+      // failure here doesn't block the review itself - just means this
+      // particular upload won't survive navigating away.
+      saveAppendDataStaging({ data: { clientId, fileName: file.name, rows: parsed.rows } }).catch(() => {});
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -1132,6 +1199,63 @@ function AppendDataTab({ clientId }: { clientId: string }) {
     }
   }
 
+  async function handleStartEmailStage() {
+    if (!rows) return;
+    setEmailStageOpen(true);
+    setEmailBusy(true);
+    setEmailError(null);
+    try {
+      const result = await previewDatazappEmailList({
+        data: { clientId, rows, keptRowIndexes: Array.from(checkedRows) },
+      });
+      setEmailPreview(result);
+      setEmailChecked(new Set(result.reviewRows.map((r) => r.rowIndex)));
+    } catch (e) {
+      setEmailError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setEmailBusy(false);
+    }
+  }
+
+  function toggleEmailRow(rowIndex: number, next: boolean) {
+    setEmailChecked((cur) => {
+      const copy = new Set(cur);
+      if (next) copy.add(rowIndex);
+      else copy.delete(rowIndex);
+      return copy;
+    });
+  }
+
+  function toggleAllEmailVisible(visible: DatazappEmailReviewRow[], next: boolean) {
+    setEmailChecked((cur) => {
+      const copy = new Set(cur);
+      for (const r of visible) {
+        if (next) copy.add(r.rowIndex);
+        else copy.delete(r.rowIndex);
+      }
+      return copy;
+    });
+  }
+
+  async function handleEmailFinalize() {
+    if (!rows) return;
+    setEmailBusy(true);
+    setEmailError(null);
+    try {
+      const result = await finalizeDatazappEmailList({
+        data: { clientId, rows, includedRowIndexes: Array.from(emailChecked) },
+      });
+      setEmailFinalizeResult(result);
+      if (result.csv) {
+        triggerCsvDownload(`datazapp-email-list-${new Date().toISOString().slice(0, 10)}.csv`, result.csv);
+      }
+    } catch (e) {
+      setEmailError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setEmailBusy(false);
+    }
+  }
+
   const q = search.trim().toLowerCase();
   const reviewRows = preview?.reviewRows ?? [];
   const filtered = q
@@ -1140,17 +1264,28 @@ function AppendDataTab({ clientId }: { clientId: string }) {
   const allFilteredChecked = filtered.length > 0 && filtered.every((r) => checkedRows.has(r.rowIndex));
   const checkedCount = checkedRows.size;
 
+  const emailQ = emailSearch.trim().toLowerCase();
+  const emailReviewRows = emailPreview?.reviewRows ?? [];
+  const emailFiltered = emailQ
+    ? emailReviewRows.filter((r) =>
+        [r.firstName, r.lastName, r.email].some((v) => (v ?? "").toLowerCase().includes(emailQ)),
+      )
+    : emailReviewRows;
+  const allEmailFilteredChecked = emailFiltered.length > 0 && emailFiltered.every((r) => emailChecked.has(r.rowIndex));
+  const emailCheckedCount = emailChecked.size;
+
   return (
     <div className="space-y-4">
       <Card>
         <h2 className="font-display text-lg font-semibold">Append Data</h2>
         <p className="mt-1 text-sm text-muted-foreground">
           Upload the file DataZapp sent back after appending emails/direct mail addresses to the contacts you sent it.
-          This doesn't touch any contact record at all — it's a standalone pass over just this file, checking DataZapp's
-          own appended name against the original name already in the same file before trusting the appended data. Common
+          Matching never looks anything up — it's a standalone pass over just this file, checking DataZapp's own
+          appended name against the original name already in the same file before trusting the appended data. Common
           nicknames (Mike/Michael, Kate/Catherine) count as a match, and a same-household match (last name agrees, first
-          name doesn't) still gets the mailing address, just not the email. The result is its own clean list you review
-          and download — same idea as Final Full Contact, just for this file.
+          name doesn't) still gets the mailing address, just not the email. Once you review and keep a row here, it gets
+          saved as its own "Appended Full Data" list (next to Final Full Contact on the Export tab) as well as a CSV you
+          can download right away.
         </p>
         <label className="mt-4 flex cursor-pointer items-center justify-center rounded-2xl border border-dashed border-border bg-muted/50 px-4 py-8 text-sm text-muted-foreground transition-colors hover:bg-muted">
           <input
@@ -1163,11 +1298,13 @@ function AppendDataTab({ clientId }: { clientId: string }) {
               e.target.value = "";
             }}
           />
-          {busy && !preview
-            ? "Working…"
-            : fileName
-              ? `${fileName} — click to replace`
-              : "Click to choose the DataZapp file"}
+          {restoring
+            ? "Checking for a saved file…"
+            : busy && !preview
+              ? "Working…"
+              : fileName
+                ? `${fileName} — click to replace`
+                : "Click to choose the DataZapp file"}
         </label>
         {error && <p className="mt-3 text-sm text-destructive">{error}</p>}
       </Card>
@@ -1319,9 +1456,10 @@ function AppendDataTab({ clientId }: { clientId: string }) {
         <Card>
           <h3 className="font-display text-base font-semibold">List ready</h3>
           <p className="mt-2 text-sm text-muted-foreground">
-            {finalizeResult.keptCount} contact{finalizeResult.keptCount === 1 ? "" : "s"} on the final list. Nothing
-            about this client's existing contacts was touched — this is a standalone download, ready to upload wherever
-            you need it (Suite Assist, or anywhere else).
+            {finalizeResult.keptCount} contact{finalizeResult.keptCount === 1 ? "" : "s"} saved to this client's
+            "Appended Full Data" list (find it on the Export tab, under Marketable) — {finalizeResult.written.inserted}{" "}
+            new, {finalizeResult.written.updated} filled in on an existing contact. Here's the same list as a CSV too,
+            ready to upload wherever else you need it (Suite Assist, or anywhere else).
           </p>
           {finalizeResult.csv ? (
             <div className="mt-3">
@@ -1340,20 +1478,155 @@ function AppendDataTab({ clientId }: { clientId: string }) {
           ) : (
             <p className="mt-2 text-sm text-muted-foreground">Nothing was kept, so there's no list to download.</p>
           )}
-          <div className="mt-4">
-            <Button
-              variant="secondary"
-              onClick={() => {
-                setFinalizeResult(null);
-                setPreview(null);
-                setRows(null);
-                setFileName(null);
-              }}
-            >
-              Upload another file
+        </Card>
+      )}
+
+      {/* Stage 2 - "Email List": added 2026-10-15 per Mike - "Most of the
+          people that they asked for data to be appended they want to keep...
+          we need to also be able to create an email list out of" whoever
+          Stage 1 didn't keep but who still has a usable email. */}
+      {finalizeResult && !emailStageOpen && (
+        <Card>
+          <h3 className="font-display text-base font-semibold">Build an Email List from the rest</h3>
+          <p className="mt-1 text-sm text-muted-foreground">
+            Everyone from this file who wasn't kept above but still has an email on file (their own original email,
+            never DataZapp's appended one unless it was already a confirmed match) — worth keeping for email even
+            without a mailing address.
+          </p>
+          <div className="mt-3">
+            <Button onClick={handleStartEmailStage} disabled={emailBusy}>
+              {emailBusy ? "Working…" : "Review the rest for email"}
             </Button>
           </div>
         </Card>
+      )}
+
+      {emailStageOpen && emailPreview && !emailFinalizeResult && (
+        <>
+          <Card>
+            <h3 className="font-display text-base font-semibold">{emailPreview.total} have a usable email</h3>
+            <p className="mt-1 text-sm text-muted-foreground">
+              Everyone else from this file either has no email at all or was already kept above — nothing left to decide
+              on them.
+            </p>
+            {emailError && <p className="mt-3 text-sm text-destructive">{emailError}</p>}
+          </Card>
+
+          {emailReviewRows.length === 0 ? (
+            <Card>
+              <p className="text-sm text-muted-foreground">Nobody left over has a usable email.</p>
+            </Card>
+          ) : (
+            <>
+              <div className="flex flex-wrap items-center justify-between gap-3">
+                <p className="text-sm text-muted-foreground">
+                  <span className="font-semibold text-foreground">{emailCheckedCount}</span> of {emailReviewRows.length}{" "}
+                  kept — uncheck anyone you don't want on the email list.
+                </p>
+                <Button onClick={handleEmailFinalize} disabled={emailBusy || emailCheckedCount === 0}>
+                  {emailBusy ? "Working…" : `Download the email list (${emailCheckedCount} kept)`}
+                </Button>
+              </div>
+              <input
+                value={emailSearch}
+                onChange={(e) => setEmailSearch(e.target.value)}
+                placeholder="Search name or email…"
+                className="w-full max-w-md rounded-2xl border border-border bg-background px-4 py-2.5 text-sm outline-none ring-ring transition focus:ring-2"
+              />
+              <Card>
+                <div className="overflow-x-auto">
+                  <table className="w-full text-sm">
+                    <thead>
+                      <tr className="text-left text-muted-foreground">
+                        <th className="pb-2 pr-4">First name</th>
+                        <th className="pb-2 pr-4">Last name</th>
+                        <th className="pb-2 pr-4">Email</th>
+                        <th className="whitespace-nowrap border-l border-border pb-2 pl-3">
+                          <div className="flex items-center gap-2">
+                            <span>Keep</span>
+                            <button
+                              type="button"
+                              onClick={() => toggleAllEmailVisible(emailFiltered, !allEmailFilteredChecked)}
+                              disabled={emailFiltered.length === 0}
+                              className="text-xs font-medium normal-case text-primary underline-offset-2 transition-colors hover:underline disabled:opacity-60"
+                            >
+                              {allEmailFilteredChecked ? "Clear all" : "Select all"}
+                            </button>
+                          </div>
+                        </th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {emailFiltered.map((r) => (
+                        <tr key={r.rowIndex} className="border-t border-border">
+                          <td className="py-2 pr-4">{r.firstName}</td>
+                          <td className="py-2 pr-4">{r.lastName}</td>
+                          <td className="py-2 pr-4">{r.email}</td>
+                          <td className="border-l border-border py-2 pl-3">
+                            <input
+                              type="checkbox"
+                              checked={emailChecked.has(r.rowIndex)}
+                              onChange={(e) => toggleEmailRow(r.rowIndex, e.target.checked)}
+                            />
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                  {emailFiltered.length === 0 && (
+                    <p className="text-sm text-muted-foreground">No matches for that search.</p>
+                  )}
+                </div>
+              </Card>
+            </>
+          )}
+        </>
+      )}
+
+      {emailFinalizeResult && (
+        <Card>
+          <h3 className="font-display text-base font-semibold">Email list ready</h3>
+          <p className="mt-2 text-sm text-muted-foreground">
+            {emailFinalizeResult.keptCount} contact{emailFinalizeResult.keptCount === 1 ? "" : "s"} saved to this
+            client's "Appended Email" list (Export tab, under Marketable) — {emailFinalizeResult.written.inserted} new,{" "}
+            {emailFinalizeResult.written.updated} filled in on an existing contact.
+          </p>
+          {emailFinalizeResult.csv ? (
+            <div className="mt-3">
+              <Button
+                variant="secondary"
+                onClick={() =>
+                  triggerCsvDownload(
+                    `datazapp-email-list-${new Date().toISOString().slice(0, 10)}.csv`,
+                    emailFinalizeResult.csv!,
+                  )
+                }
+              >
+                Download the list again
+              </Button>
+            </div>
+          ) : (
+            <p className="mt-2 text-sm text-muted-foreground">Nothing was kept, so there's no list to download.</p>
+          )}
+        </Card>
+      )}
+
+      {finalizeResult && (
+        <div>
+          <Button
+            variant="secondary"
+            onClick={() => {
+              setFinalizeResult(null);
+              setPreview(null);
+              setRows(null);
+              setFileName(null);
+              resetEmailStage();
+              clearAppendDataStaging({ data: { clientId } }).catch(() => {});
+            }}
+          >
+            Upload another file
+          </Button>
+        </div>
       )}
     </div>
   );
@@ -1725,7 +1998,21 @@ function FinalCombinedListStep({ clientId }: { clientId: string }) {
   async function downloadCsv(scope: string) {
     setDownloading(scope);
     try {
-      const result = await exportSoiList({ data: { clientId, scope } });
+      // Bug fix, 2026-10-15: this screen's own Full Contact count above
+      // comes from getSoiListView's final_full_contact branch (correct,
+      // already fixed) - but the download used to go through the remote
+      // export-lists Edge Function instead, which still has a known
+      // URL-length-limit bug for a big client and came back with a
+      // header-only, zero-row CSV for one of Mike's clients despite the
+      // on-screen count showing 391. exportSoiListLocal reuses the exact
+      // same local logic the on-screen count already uses, so the two can
+      // never disagree again. "needs_data_download" (a different scope,
+      // used only from the "select" view below) is untouched - not reported
+      // broken, still goes through the original remote function.
+      const result =
+        scope === "final_full_contact"
+          ? await exportSoiListLocal({ data: { clientId, scope: "final_full_contact" } })
+          : await exportSoiList({ data: { clientId, scope } });
       for (const [name, content] of Object.entries(result.files ?? {})) {
         const blob = new Blob([content], { type: "text/csv" });
         const url = URL.createObjectURL(blob);
@@ -1949,24 +2236,52 @@ function FinalCombinedListStep({ clientId }: { clientId: string }) {
   );
 }
 
-const EXPORT_SCOPES = [
-  { scope: "complete", label: "Full Direct Mail + Email/Phone" },
-  { scope: "email_list", label: "Email List" },
-  { scope: "incomplete", label: "Incomplete" },
-  { scope: "nonqualified", label: "Nonqualified" },
-  { scope: "facebook_audience", label: "Facebook Audience" },
-  { scope: "realtor_excluded", label: "Realtor Excluded" },
-  { scope: "business_excluded", label: "Business Excluded" },
-  { scope: "final_full_contact", label: "Final: Full Contact (ready to use)" },
+// Reorganized 2026-10-15 per Mike: "we should have here, these lists broken
+// into 2 sections. 'Marketable' is top bucket of lists... Then there can be
+// a button to combine all into one final database... 'Non-Marketable' is
+// the second list/bucket/column." Final Full Contact stays its own
+// prominent button at top, unchanged position - it was already the one
+// button Mike singled out by name ("ready to use)") before this reorg, and
+// it's the one this round's bug fix is actually about. Facebook Audience
+// doesn't fit either bucket (it's not a mailing/email list, it's an ad
+// platform upload) so it gets its own small section at the bottom, same as
+// before, just visually separated now instead of sitting in the same flat
+// grid as everything else.
+//
+// `local: true` entries go through exportSoiListLocal (see soi-builder.ts's
+// header comment on that function for why): the two brand-new buckets this
+// round added, which only exist as local list_assignment values and were
+// never in the remote export-lists Edge Function to begin with. Every
+// `local: false` entry is untouched from before this reorg - still the
+// original remote export-lists call.
+const MARKETABLE_SCOPES = [
+  { scope: "complete", label: "Full Direct Mail + Email/Phone", local: false },
+  { scope: "email_list", label: "Email List", local: false },
+  { scope: "appended_full_data", label: "Appended Full Data", local: true },
+  { scope: "appended_email", label: "Appended Email", local: true },
+] as const;
+
+const NON_MARKETABLE_SCOPES = [
+  { scope: "incomplete", label: "Incomplete", local: false },
+  { scope: "nonqualified", label: "Nonqualified", local: false },
+  { scope: "realtor_excluded", label: "Realtor Excluded", local: false },
+  { scope: "business_excluded", label: "Business Excluded", local: false },
 ] as const;
 
 function ExportTab({ clientId }: { clientId: string }) {
   const [busyScope, setBusyScope] = useState<string | null>(null);
 
-  async function handleExport(scope: string) {
+  async function runExport(scope: string, local: boolean) {
     setBusyScope(scope);
     try {
-      const result = await exportSoiList({ data: { clientId, scope } });
+      const result = local
+        ? await exportSoiListLocal({
+            data: {
+              clientId,
+              scope: scope as "final_full_contact" | "appended_full_data" | "appended_email" | "combine_marketable",
+            },
+          })
+        : await exportSoiList({ data: { clientId, scope } });
       for (const [name, content] of Object.entries(result.files ?? {})) {
         const blob = new Blob([content], { type: "text/csv" });
         const url = URL.createObjectURL(blob);
@@ -1982,20 +2297,77 @@ function ExportTab({ clientId }: { clientId: string }) {
   }
 
   return (
-    <Card>
-      <h2 className="font-display text-lg font-semibold">Download lists</h2>
-      <div className="mt-4 grid gap-2 sm:grid-cols-2">
-        {EXPORT_SCOPES.map((s) => (
-          <Button
-            key={s.scope}
-            variant="secondary"
-            onClick={() => handleExport(s.scope)}
-            disabled={busyScope === s.scope}
-          >
-            {busyScope === s.scope ? "Preparing…" : s.label}
+    <div className="space-y-4">
+      <Card>
+        <h2 className="font-display text-lg font-semibold">Final: Full Contact (ready to use)</h2>
+        <p className="mt-1 text-sm text-muted-foreground">
+          Everyone who made it through review with a complete record - the one list that's ready to use as-is.
+        </p>
+        <div className="mt-3">
+          <Button onClick={() => runExport("final_full_contact", true)} disabled={busyScope === "final_full_contact"}>
+            {busyScope === "final_full_contact" ? "Preparing…" : "Download"}
           </Button>
-        ))}
-      </div>
-    </Card>
+        </div>
+      </Card>
+
+      <Card>
+        <h2 className="font-display text-lg font-semibold">Marketable</h2>
+        <p className="mt-1 text-sm text-muted-foreground">
+          Everyone worth marketing to in some form - combine them all into one deduped database when you're ready.
+        </p>
+        <div className="mt-4 grid gap-2 sm:grid-cols-2">
+          {MARKETABLE_SCOPES.map((s) => (
+            <Button
+              key={s.scope}
+              variant="secondary"
+              onClick={() => runExport(s.scope, s.local)}
+              disabled={busyScope === s.scope}
+            >
+              {busyScope === s.scope ? "Preparing…" : s.label}
+            </Button>
+          ))}
+        </div>
+        <div className="mt-4 border-t border-border pt-4">
+          <Button onClick={() => runExport("combine_marketable", true)} disabled={busyScope === "combine_marketable"}>
+            {busyScope === "combine_marketable" ? "Preparing…" : "Combine all into one final database"}
+          </Button>
+          <p className="mt-2 text-sm text-muted-foreground">
+            Combines the 4 lists above into one CSV, matching and merging anyone who shows up more than once (by email,
+            then phone, then name) instead of listing them twice.
+          </p>
+        </div>
+      </Card>
+
+      <Card>
+        <h2 className="font-display text-lg font-semibold">Non-Marketable</h2>
+        <p className="mt-1 text-sm text-muted-foreground">Not worth spending marketing budget on, at least for now.</p>
+        <div className="mt-4 grid gap-2 sm:grid-cols-2">
+          {NON_MARKETABLE_SCOPES.map((s) => (
+            <Button
+              key={s.scope}
+              variant="secondary"
+              onClick={() => runExport(s.scope, s.local)}
+              disabled={busyScope === s.scope}
+            >
+              {busyScope === s.scope ? "Preparing…" : s.label}
+            </Button>
+          ))}
+        </div>
+      </Card>
+
+      <Card>
+        <h2 className="font-display text-lg font-semibold">Facebook Audience</h2>
+        <p className="mt-1 text-sm text-muted-foreground">Everyone targetable, formatted for an ad platform upload.</p>
+        <div className="mt-3">
+          <Button
+            variant="secondary"
+            onClick={() => runExport("facebook_audience", false)}
+            disabled={busyScope === "facebook_audience"}
+          >
+            {busyScope === "facebook_audience" ? "Preparing…" : "Download"}
+          </Button>
+        </div>
+      </Card>
+    </div>
   );
 }

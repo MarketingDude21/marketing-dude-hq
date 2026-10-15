@@ -315,6 +315,88 @@ export const deleteSoiUpload = createServerFn({ method: "POST" })
     return { deleted: upload.file_name };
   });
 
+// Bug fix, 2026-10-15: Mike reported "I went away from the Append Data
+// screen and when I came back all data was not saved. I only switched
+// windows." That's because the whole feature lived in plain React state -
+// switching tabs unmounted the component and threw away the uploaded file
+// and its computed matches. Fixed by staging the parsed rows (not the raw
+// file - already-parsed JSON round-trips exactly, no re-parsing/CSV-quoting
+// edge cases to worry about) in the SAME Storage bucket everything else in
+// this file uses, at a fixed per-client path that just gets overwritten on
+// every new upload - one file, not a growing history.
+//
+// Deliberately NOT a row in the `uploads` table: that table is also used to
+// tell the real process-upload Edge Function what to process, and a
+// DataZapp return file is a completely different shape (its own DataZapp_*
+// columns, no mapping) that function has never seen and was never built to
+// handle - adding a tracked `uploads` row here risked it getting silently
+// swept into a future "Process" run. Storage-only, bypassing that table
+// entirely, is the same kind of deliberate bypass as deleteSoiUpload/
+// resetSoiDatabase above (talk directly to the backend when the existing
+// Edge Function's shape doesn't fit), just via Storage instead of a table.
+//
+// Known limitation, stated plainly rather than silently: only the uploaded
+// file + its computed match tiers are restored. Per-row checkbox changes
+// mid-review are NOT persisted - reopening the tab resets to the same
+// opt-out default (every confirmed/household row checked) the first upload
+// always starts with. Round-tripping every checkbox too would mean writing
+// on every single click, which is a lot of chatter for a value that's
+// already cheap to recompute from the file.
+function appendDataStagingPath(clientId: string): string {
+  return `append-data-staging/${clientId}.json`;
+}
+
+export const saveAppendDataStaging = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator((data: { clientId: string; fileName: string; rows: DatazappRawRow[] }) => data)
+  .handler(async ({ data, context }) => {
+    const admin = getSoiAdminClient();
+    const email = (context.claims as { email?: string } | undefined)?.email;
+    await requireClientAccess(admin, email, data.clientId);
+
+    const payload = JSON.stringify({ fileName: data.fileName, rows: data.rows });
+    const { error } = await admin.storage.from("uploads").upload(appendDataStagingPath(data.clientId), payload, {
+      contentType: "application/json",
+      upsert: true,
+    });
+    if (error) throw error;
+    return { ok: true };
+  });
+
+export const getAppendDataStaging = createServerFn({ method: "GET" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator((data: { clientId: string }) => data)
+  .handler(async ({ data, context }): Promise<{ fileName: string; rows: DatazappRawRow[] } | null> => {
+    const admin = getSoiAdminClient();
+    const email = (context.claims as { email?: string } | undefined)?.email;
+    await requireClientAccess(admin, email, data.clientId);
+
+    const { data: file, error } = await admin.storage.from("uploads").download(appendDataStagingPath(data.clientId));
+    if (error) {
+      // Nothing staged yet is the normal, expected case (first time opening
+      // this tab, or right after "Upload another file") - not an error.
+      return null;
+    }
+    try {
+      const text = await file.text();
+      return JSON.parse(text) as { fileName: string; rows: DatazappRawRow[] };
+    } catch {
+      return null;
+    }
+  });
+
+export const clearAppendDataStaging = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator((data: { clientId: string }) => data)
+  .handler(async ({ data, context }) => {
+    const admin = getSoiAdminClient();
+    const email = (context.claims as { email?: string } | undefined)?.email;
+    await requireClientAccess(admin, email, data.clientId);
+
+    await admin.storage.from("uploads").remove([appendDataStagingPath(data.clientId)]);
+    return { ok: true };
+  });
+
 // Full "start over" for a client, added 2026-10-15 per Mike: "There should
 // be a reset button on the Upload screen anytime you want to rerun a new
 // database. People may come back and add contacts to it or clean their
@@ -343,6 +425,13 @@ export const resetSoiDatabase = createServerFn({ method: "POST" })
     }
     const { error: deleteUploadsErr } = await admin.from("uploads").delete().eq("client_id", data.clientId);
     if (deleteUploadsErr) throw deleteUploadsErr;
+
+    // 1b. Also clear any staged Append Data file (see saveAppendDataStaging
+    // below) - it lives outside the `uploads` table entirely (on purpose, so
+    // it never gets picked up by process-upload), so it wouldn't be touched
+    // by the loop above at all. Best-effort: a missing object here is not an
+    // error, there's just nothing staged.
+    await admin.storage.from("uploads").remove([appendDataStagingPath(data.clientId)]);
 
     // 2. Delete every review flag tied to this client's contacts FIRST -
     // review_flags has no client_id column of its own (it's keyed off
@@ -480,6 +569,13 @@ type SoiContactRow = {
   email: string | null;
   phone: string | null;
   address: string | null;
+  // Added 2026-10-15 alongside the new local export path below - the real
+  // `contacts` table has had this column the whole time (confirmed in the
+  // exact header of a CSV Mike sent: "first_name,last_name,address,
+  // address_2,city,state,zip,email,phone,notes,sources"), it just wasn't
+  // being selected by either fetch helper below, so every export built from
+  // them was silently dropping it.
+  address_2: string | null;
   city: string | null;
   state: string | null;
   zip: string | null;
@@ -503,10 +599,34 @@ async function fetchContactsForList(
   for (let from = 0; ; from += PAGE_SIZE) {
     const { data, error } = await admin
       .from("contacts")
-      .select("id, first_name, last_name, email, phone, address, city, state, zip, notes, sources, list_assignment")
+      .select(
+        "id, first_name, last_name, email, phone, address, address_2, city, state, zip, notes, sources, list_assignment",
+      )
       .eq("client_id", clientId)
       .eq("list_assignment", listAssignment)
       .order("last_name", { ascending: true })
+      .range(from, from + PAGE_SIZE - 1);
+    if (error) throw error;
+    rows = rows.concat(data ?? []);
+    if (!data || data.length < PAGE_SIZE) break;
+  }
+  return rows;
+}
+
+// Same as fetchContactsForList, but with no list_assignment filter at all -
+// every contact this client has, regardless of bucket. Used only by the new
+// append-data write path below, to find an existing contact to blank-fill-
+// merge into by phone number without having to guess which bucket they're
+// currently sitting in.
+async function fetchAllContactsForClient(admin: SupabaseClient, clientId: string): Promise<SoiContactRow[]> {
+  let rows: SoiContactRow[] = [];
+  for (let from = 0; ; from += PAGE_SIZE) {
+    const { data, error } = await admin
+      .from("contacts")
+      .select(
+        "id, first_name, last_name, email, phone, address, address_2, city, state, zip, notes, sources, list_assignment",
+      )
+      .eq("client_id", clientId)
       .range(from, from + PAGE_SIZE - 1);
     if (error) throw error;
     rows = rows.concat(data ?? []);
@@ -536,7 +656,7 @@ async function fetchContactsWithFlags(
     const { data, error } = await admin
       .from("contacts")
       .select(
-        "id, first_name, last_name, email, phone, address, city, state, zip, notes, sources, list_assignment, review_flags(flagged)",
+        "id, first_name, last_name, email, phone, address, address_2, city, state, zip, notes, sources, list_assignment, review_flags(flagged)",
       )
       .eq("client_id", clientId)
       .eq("list_assignment", listAssignment)
@@ -615,16 +735,7 @@ export const getSoiListView = createServerFn({ method: "GET" })
       reviewLists.map((l) => fetchContactsWithFlags(admin, data.clientId, l, "primary")),
     );
     const allContacts = groups.flat();
-
-    function isSurvivor(c: SoiContactRow & { flagged: boolean }): boolean {
-      if (c.list_assignment === "direct_mail" || c.list_assignment === "email_phone") return !c.flagged;
-      if (c.list_assignment === "email_list" || c.list_assignment === "incomplete") return c.flagged;
-      return false;
-    }
-    function isFullContact(c: SoiContactRow): boolean {
-      return !!(c.first_name && c.last_name && c.email && c.phone && c.address && c.city && c.state && c.zip);
-    }
-    return allContacts.filter((c) => isSurvivor(c) && isFullContact(c));
+    return allContacts.filter((c) => isPrimaryReviewSurvivor(c) && hasAllEightContactFields(c));
   });
 
 export const setSoiReviewFlag = createServerFn({ method: "POST" })
@@ -1111,6 +1222,30 @@ type DatazappReviewRow = {
   possibleBusiness: string | null;
 };
 
+// Shared by getSoiListView's final_full_contact branch AND the new
+// exportSoiListLocal below - hoisted to module scope on 2026-10-15 so there
+// is only ever ONE copy of this business rule. There used to be a second,
+// independent copy of this exact logic inside the remote export-lists Edge
+// Function, and the two quietly drifted apart: this local copy already fixed
+// the URL-length-limit bug (see fetchContactsWithFlags's header comment
+// above), but the remote copy never got that fix, so for a big-enough client
+// "Final: Full Contact (ready to use)" showed a correct nonzero count on
+// screen (from this local copy) while its CSV download came back completely
+// empty (from the still-broken remote copy) - confirmed directly against a
+// real file Mike sent (full_contact_ready_to_use_8.csv: header row only, zero
+// data rows) for a client whose Review tab showed "Complete Data 391/470".
+// Hoisting this out and having BOTH the on-screen count and the download use
+// the same function removes the drift entirely rather than just patching one
+// side of it.
+function isPrimaryReviewSurvivor(c: SoiContactRow & { flagged: boolean }): boolean {
+  if (c.list_assignment === "direct_mail" || c.list_assignment === "email_phone") return !c.flagged;
+  if (c.list_assignment === "email_list" || c.list_assignment === "incomplete") return c.flagged;
+  return false;
+}
+function hasAllEightContactFields(c: SoiContactRow): boolean {
+  return !!(c.first_name && c.last_name && c.email && c.phone && c.address && c.city && c.state && c.zip);
+}
+
 // Read-only dry run: parses + matches a just-uploaded DataZapp return file
 // purely against itself (see the matching-logic comment above) and reports
 // what's reviewable, without touching any contact record.
@@ -1206,14 +1341,120 @@ function buildDatazappCsv(rows: DatazappKeptRow[]): string {
   return lines.join("\n");
 }
 
+// List assignments this append-data write path is allowed to promote a
+// contact INTO. The reverse - protecting someone already in one of these
+// three from being reassigned OUT by a later append-data run - is what
+// PROTECTED_LIST_ASSIGNMENTS below is for.
+const PROTECTED_LIST_ASSIGNMENTS = new Set(["direct_mail", "email_phone", "email_list"]);
+
+const CONTACT_MERGE_FIELDS = [
+  "first_name",
+  "last_name",
+  "email",
+  "phone",
+  "address",
+  "address_2",
+  "city",
+  "state",
+  "zip",
+] as const;
+
+type AppendWriteFields = {
+  first_name: string;
+  last_name: string;
+  email: string;
+  phone: string;
+  address: string;
+  address_2: string;
+  city: string;
+  state: string;
+  zip: string;
+};
+
+// Writes finalized append-data rows into `contacts` under a new
+// list_assignment bucket ("appended_full_data" or "appended_email") - added
+// 2026-10-15 per Mike's request to treat these as real exportable buckets
+// ("Appended Full Data, and Appended Email" as entries in the new Export tab
+// Marketable section, combinable into one final database). This REVERSES
+// the "no database write of any kind" decision documented above
+// finalizeDatazappAppend's original version - that decision was about the
+// MATCHING step never depending on `contacts` (still true, unchanged,
+// matchDatazappRow still never reads a contact record), not about where the
+// kept results end up once Mike's team has decided who to keep.
+//
+// Matches by phone only, and only at this write step (never during preview/
+// matching) - looks up every one of this client's contacts once up front
+// rather than one query per row. Blank-fill-only merge, same philosophy as
+// process-upload's own real logic: never overwrites a field that already
+// has real data. list_assignment is the one exception - it DOES get
+// reassigned on a match, because being found here means DataZapp appended
+// something for a person who was missing data, which is the whole point of
+// promoting them into this bucket - UNLESS they're already sitting in
+// direct_mail/email_phone/email_list, the three buckets the real pipeline
+// already considers fully qualified; this never downgrades someone out of
+// those on the (unlikely, since Mike only sends DataZapp people missing
+// data in the first place) chance they show up in an append file too.
+async function upsertAppendedContacts(
+  admin: SupabaseClient,
+  clientId: string,
+  rows: AppendWriteFields[],
+  listAssignment: string,
+): Promise<{ updated: number; inserted: number }> {
+  const existing = await fetchAllContactsForClient(admin, clientId);
+  const byPhone = new Map<string, SoiContactRow>();
+  for (const c of existing) {
+    if (c.phone) byPhone.set(c.phone, c);
+  }
+
+  const updates: Promise<unknown>[] = [];
+  const toInsert: Record<string, unknown>[] = [];
+
+  for (const row of rows) {
+    const match = row.phone ? byPhone.get(row.phone) : undefined;
+    if (!match) {
+      toInsert.push({ client_id: clientId, list_assignment: listAssignment, ...row });
+      continue;
+    }
+    const merged: Record<string, unknown> = {};
+    for (const field of CONTACT_MERGE_FIELDS) {
+      if (!match[field] && row[field]) merged[field] = row[field];
+    }
+    if (!PROTECTED_LIST_ASSIGNMENTS.has(match.list_assignment ?? "")) {
+      merged["list_assignment"] = listAssignment;
+    }
+    if (Object.keys(merged).length > 0) {
+      updates.push(
+        Promise.resolve(admin.from("contacts").update(merged).eq("id", match.id)).then(({ error }) => {
+          if (error) throw error;
+        }),
+      );
+    }
+  }
+
+  // Bounded concurrency rather than one giant Promise.all - hundreds of
+  // individual updates (each a different row, different merged fields, so
+  // they can't be collapsed into one batch statement) fired all at once is
+  // more connections than this is worth risking.
+  for (let i = 0; i < updates.length; i += 25) {
+    await Promise.all(updates.slice(i, i + 25));
+  }
+  for (let i = 0; i < toInsert.length; i += 500) {
+    const { error } = await admin.from("contacts").insert(toInsert.slice(i, i + 500));
+    if (error) throw error;
+  }
+
+  return { updated: updates.length, inserted: toInsert.length };
+}
+
 // Finalizes exactly the rows Mike's team kept checked in the review wizard -
 // `includedRowIndexes` are positions in `rows` (same indexing
 // previewDatazappAppend's `reviewRows[].rowIndex` used). Re-runs the same
 // matching logic (deterministic from the file alone, nothing external to
-// drift) and builds a CSV from whichever confirmed/household rows survived
-// both the tier check and Mike's team's review - that CSV IS the result;
-// there's no database write of any kind here, on purpose, per Mike: "The
-// append data should have nothing to do with the prior contacts."
+// drift), builds the same standalone downloadable CSV as before (still
+// useful - Mike's own words, "ready to upload wherever you need it, Suite
+// Assist or anywhere else"), and ALSO writes the kept rows into `contacts`
+// as list_assignment "appended_full_data" (see upsertAppendedContacts above
+// for why this is no longer a no-DB-write operation).
 export const finalizeDatazappAppend = createServerFn({ method: "POST" })
   .middleware([requireSupabaseAuth])
   .inputValidator((data: { clientId: string; rows: DatazappRawRow[]; includedRowIndexes: number[] }) => data)
@@ -1245,10 +1486,244 @@ export const finalizeDatazappAppend = createServerFn({ method: "POST" })
       });
     });
 
+    const written = await upsertAppendedContacts(admin, data.clientId, keptRows, "appended_full_data");
+
     return {
       total: results.length,
       keptCount: keptRows.length,
       counts,
       csv: keptRows.length > 0 ? buildDatazappCsv(keptRows) : null,
+      written,
+    };
+  });
+
+// Stage 2 - "Email List" pass over whatever Stage 1 (above) didn't keep,
+// added 2026-10-15 per Mike: "We should have a secondary screen where it has
+// the remaining contacts to clean up next because we can still create an
+// email list out of it... if there was an email appended it should be added
+// in and we want to create a final list of people that have first name last
+// name and email as bare fields." Deliberately only ever offers each row's
+// OWN original email (the one already in the uploaded file before DataZapp
+// touched it) - never DataZapp's appended email for a household/mismatch
+// row, since that's exactly the kind of untrusted identity match Mike built
+// Stage 1's whole tier system to guard against; re-litigating that trust
+// question for Stage 2 isn't worth it when the row's own pre-existing email
+// is always safe to offer.
+type DatazappEmailReviewRow = {
+  rowIndex: number;
+  firstName: string;
+  lastName: string;
+  email: string;
+};
+
+export const previewDatazappEmailList = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator((data: { clientId: string; rows: DatazappRawRow[]; keptRowIndexes: number[] }) => data)
+  .handler(async ({ data, context }) => {
+    const admin = getSoiAdminClient();
+    const email = (context.claims as { email?: string } | undefined)?.email;
+    await requireClientAccess(admin, email, data.clientId);
+
+    const results = data.rows.map((row) => matchDatazappRow(row));
+    const kept = new Set(data.keptRowIndexes);
+
+    const reviewRows: DatazappEmailReviewRow[] = [];
+    results.forEach((r, rowIndex) => {
+      if (kept.has(rowIndex)) return; // already on the Stage 1 "Appended Full Data" list
+      if (!r.originalEmail) return; // nothing usable - this is the "rest would be incomplete" group
+      reviewRows.push({ rowIndex, firstName: r.firstName, lastName: r.lastName, email: r.originalEmail });
+    });
+
+    return { total: reviewRows.length, reviewRows };
+  });
+
+function buildDatazappEmailCsv(rows: { first_name: string; last_name: string; email: string }[]): string {
+  const headers = ["First Name", "Last Name", "Email"];
+  const lines = [headers.join(",")];
+  for (const r of rows) {
+    lines.push([r.first_name, r.last_name, r.email].map(csvEscape).join(","));
+  }
+  return lines.join("\n");
+}
+
+export const finalizeDatazappEmailList = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator((data: { clientId: string; rows: DatazappRawRow[]; includedRowIndexes: number[] }) => data)
+  .handler(async ({ data, context }) => {
+    const admin = getSoiAdminClient();
+    const email = (context.claims as { email?: string } | undefined)?.email;
+    await requireClientAccess(admin, email, data.clientId);
+
+    const results = data.rows.map((row) => matchDatazappRow(row));
+    const included = new Set(data.includedRowIndexes);
+
+    const keptRows: { first_name: string; last_name: string; email: string; phone: string }[] = [];
+    results.forEach((r, rowIndex) => {
+      if (!included.has(rowIndex) || !r.originalEmail) return;
+      keptRows.push({ first_name: r.firstName, last_name: r.lastName, email: r.originalEmail, phone: r.phone });
+    });
+
+    const written = await upsertAppendedContacts(
+      admin,
+      data.clientId,
+      keptRows.map((r) => ({
+        first_name: r.first_name,
+        last_name: r.last_name,
+        email: r.email,
+        phone: r.phone,
+        address: "",
+        address_2: "",
+        city: "",
+        state: "",
+        zip: "",
+      })),
+      "appended_email",
+    );
+
+    return {
+      keptCount: keptRows.length,
+      csv: keptRows.length > 0 ? buildDatazappEmailCsv(keptRows) : null,
+      written,
+    };
+  });
+
+// ============================================================================
+// Export tab reorganization, 2026-10-15 - Mike's request: split the flat
+// button list into "Marketable" (Full Direct Mail + Email/Phone, Email
+// List, the two new Appended buckets above) and "Non-Marketable" (Incomplete,
+// Nonqualified, Realtor Excluded, Business Excluded), plus a "combine all
+// into one final database" button that dedupes across every Marketable
+// bucket. The two new Appended scopes don't exist in the remote export-lists
+// Edge Function at all (it predates this feature), and "final_full_contact"
+// has the known URL-length-limit bug documented above
+// isPrimaryReviewSurvivor - so this is a local export path covering exactly
+// those scopes, reusing the exact same fetch helpers and (for
+// final_full_contact) the exact same hoisted survivor/complete-record rules
+// as getSoiListView's on-screen count, so the download can never disagree
+// with what the screen shows again. Every OTHER scope on the Export tab
+// (complete, email_list, incomplete, nonqualified, facebook_audience,
+// realtor_excluded, business_excluded) is untouched - still the original
+// exportSoiList calling the real remote Edge Function, since Mike never
+// reported those broken and there's no reason to touch what works.
+// ============================================================================
+
+function buildContactsCsvV2(rows: SoiContactRow[]): string {
+  const headers = [
+    "first_name",
+    "last_name",
+    "address",
+    "address_2",
+    "city",
+    "state",
+    "zip",
+    "email",
+    "phone",
+    "notes",
+    "sources",
+  ];
+  const lines = [headers.join(",")];
+  for (const r of rows) {
+    lines.push(
+      [
+        r.first_name,
+        r.last_name,
+        r.address,
+        r.address_2,
+        r.city,
+        r.state,
+        r.zip,
+        r.email,
+        r.phone,
+        r.notes,
+        (r.sources ?? []).join("; "),
+      ]
+        .map((v) => csvEscape(v))
+        .join(","),
+    );
+  }
+  return lines.join("\n");
+}
+
+// Dedupes across the combined Marketable buckets for the new "combine all
+// into one final database" button - mirrors process-upload's own stated
+// matching priority (email, then phone, then name) as closely as a from-
+// scratch reimplementation reasonably can without access to that function's
+// source: this is Claude's own implementation of that priority, not a call
+// into the real pipeline's dedupe, worth stating plainly rather than
+// implying it's byte-identical. Same blank-fill-only merge philosophy as
+// everywhere else in this file - the surviving row only ever gains fields
+// it was missing, never loses or overwrites a real value it already had.
+function dedupeContactRows(rows: SoiContactRow[]): SoiContactRow[] {
+  const out: SoiContactRow[] = [];
+  const byEmail = new Map<string, number>();
+  const byPhone = new Map<string, number>();
+
+  for (const row of rows) {
+    const emailKey = (row.email ?? "").toLowerCase().trim();
+    const phoneKey = (row.phone ?? "").replace(/\D/g, "");
+
+    let existingIdx: number | undefined;
+    if (emailKey && byEmail.has(emailKey)) existingIdx = byEmail.get(emailKey);
+    else if (phoneKey && byPhone.has(phoneKey)) existingIdx = byPhone.get(phoneKey);
+
+    if (existingIdx === undefined) {
+      out.push({ ...row });
+      const idx = out.length - 1;
+      if (emailKey) byEmail.set(emailKey, idx);
+      if (phoneKey) byPhone.set(phoneKey, idx);
+      continue;
+    }
+
+    const survivor = out[existingIdx];
+    if (!survivor) continue; // existingIdx always came from out.length - 1 above - unreachable in practice
+    for (const field of CONTACT_MERGE_FIELDS) {
+      if (!survivor[field] && row[field]) survivor[field] = row[field];
+    }
+    if (row.notes && !survivor.notes) survivor.notes = row.notes;
+    survivor.sources = Array.from(new Set([...(survivor.sources ?? []), ...(row.sources ?? [])]));
+    if (emailKey) byEmail.set(emailKey, existingIdx);
+    if (phoneKey) byPhone.set(phoneKey, existingIdx);
+  }
+
+  return out;
+}
+
+export const exportSoiListLocal = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator(
+    (data: {
+      clientId: string;
+      scope: "final_full_contact" | "appended_full_data" | "appended_email" | "combine_marketable";
+    }) => data,
+  )
+  .handler(async ({ data, context }) => {
+    const admin = getSoiAdminClient();
+    const email = (context.claims as { email?: string } | undefined)?.email;
+    await requireClientAccess(admin, email, data.clientId);
+
+    const stamp = new Date().toISOString().slice(0, 10);
+
+    if (data.scope === "appended_full_data" || data.scope === "appended_email") {
+      const rows = await fetchContactsForList(admin, data.clientId, data.scope);
+      const label = data.scope === "appended_full_data" ? "appended-full-data" : "appended-email";
+      return { files: { [`${label}-${stamp}.csv`]: buildContactsCsvV2(rows) }, count: rows.length };
+    }
+
+    if (data.scope === "final_full_contact") {
+      const reviewLists = ["direct_mail", "email_phone", "email_list", "incomplete"] as const;
+      const groups = await Promise.all(
+        reviewLists.map((l) => fetchContactsWithFlags(admin, data.clientId, l, "primary")),
+      );
+      const survivors = groups.flat().filter((c) => isPrimaryReviewSurvivor(c) && hasAllEightContactFields(c));
+      return { files: { [`final-full-contact-${stamp}.csv`]: buildContactsCsvV2(survivors) }, count: survivors.length };
+    }
+
+    // combine_marketable
+    const lists = ["direct_mail", "email_phone", "email_list", "appended_full_data", "appended_email"] as const;
+    const groups = await Promise.all(lists.map((l) => fetchContactsForList(admin, data.clientId, l)));
+    const combined = dedupeContactRows(groups.flat());
+    return {
+      files: { [`final-marketable-database-${stamp}.csv`]: buildContactsCsvV2(combined) },
+      count: combined.length,
     };
   });

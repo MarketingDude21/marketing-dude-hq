@@ -602,6 +602,26 @@ function Workspace({ clientId, clientName }: { clientId: string; clientName: str
   // here so it survives switching from Upload to Review right after
   // processing, without needing to persist it anywhere server-side.
   const [lastProcessReport, setLastProcessReport] = useState<ProcessReport | null>(null);
+  // Bug fix, 2026-10-15 - Mike: "I did a reset and the append data was still
+  // there, that should reset too." resetSoiDatabase itself was already
+  // correct (it does wipe the append-data staging blob and every contact,
+  // including anything just written by "appended_full_data"/"appended_email")
+  // - the real bug was that AppendDataTab is a normal React component that
+  // only ever loads its own state ONCE, on mount (the staging-restore effect,
+  // plus whatever Stage 1/Stage 2 result is already sitting in its state from
+  // the session). Resetting the database from the Upload tab had no way to
+  // tell an already-mounted AppendDataTab (or ExportTab) "your in-memory
+  // state is stale now, throw it away" - so if Mike reset without leaving
+  // the Append Data tab, or came back to it, it kept showing (and could even
+  // re-download) the exact pre-reset result, which is also the likely
+  // explanation for "Marketable file on appended full data is empty but it
+  // does download on append data screen": the download that still worked was
+  // reading stale component state, not the database, while the Export tab's
+  // button correctly queried the now-actually-empty database. Bumping this
+  // counter on every successful reset and using it as those tabs' React
+  // `key` forces a full, clean remount - the same effect as a page reload,
+  // but scoped to just those two tabs.
+  const [resetCounter, setResetCounter] = useState(0);
   return (
     <div className="mt-5">
       <div className="flex flex-wrap gap-1 rounded-full border border-border bg-glass p-1 backdrop-blur-xl w-fit">
@@ -624,12 +644,22 @@ function Workspace({ clientId, clientName }: { clientId: string; clientName: str
             clientName={clientName}
             onProcessed={() => setTab("review")}
             onReport={setLastProcessReport}
-            onReset={() => setLastProcessReport(null)}
+            onReset={() => {
+              setLastProcessReport(null);
+              setResetCounter((n) => n + 1);
+            }}
           />
         )}
-        {tab === "review" && <ReviewTab clientId={clientId} lastProcessReport={lastProcessReport} />}
-        {tab === "append" && <AppendDataTab clientId={clientId} />}
-        {tab === "export" && <ExportTab clientId={clientId} />}
+        {tab === "review" && (
+          <ReviewTab
+            key={resetCounter}
+            clientId={clientId}
+            clientName={clientName}
+            lastProcessReport={lastProcessReport}
+          />
+        )}
+        {tab === "append" && <AppendDataTab key={resetCounter} clientId={clientId} clientName={clientName} />}
+        {tab === "export" && <ExportTab key={resetCounter} clientId={clientId} clientName={clientName} />}
       </div>
     </div>
   );
@@ -1118,6 +1148,31 @@ function triggerCsvDownload(filename: string, content: string) {
   URL.revokeObjectURL(url);
 }
 
+// Added 2026-10-15 per Mike: "All downloads files should have the file name
+// then last name of User so they can be identified" - with several clients
+// and several downloads apiece, a folder full of "final-full-contact-
+// 2026-10-15.csv" files from different clients all look identical once
+// they've landed in Downloads. Pulls the last word of the client's name
+// (handles the normal "First Last" case; falls back to the whole name for
+// anything else, like a company name with no obvious "last name") and
+// tucks it in right before the .csv extension, so every download this tab
+// produces - the Append Data CSVs, every Export tab button, Needs Data -
+// stays identifiable regardless of which one of these functions built it.
+function clientLastNameForFilename(clientName: string): string {
+  const parts = clientName.trim().split(/\s+/).filter(Boolean);
+  const candidate = parts.length > 0 ? (parts[parts.length - 1] ?? clientName) : clientName;
+  const safe = candidate
+    .replace(/[^a-zA-Z0-9_-]+/g, "-")
+    .replace(/-+/g, "-")
+    .replace(/^-|-$/g, "");
+  return safe || "client";
+}
+
+function withClientSuffix(filename: string, clientName: string): string {
+  const suffix = clientLastNameForFilename(clientName);
+  return /\.csv$/i.test(filename) ? filename.replace(/\.csv$/i, `-${suffix}.csv`) : `${filename}-${suffix}`;
+}
+
 // Standalone pass over a DataZapp return file, with no connection to this
 // client's actual contacts at all. REDESIGNED TWICE the same day this first
 // shipped - see soi-builder.ts's header comment on this whole feature for
@@ -1139,7 +1194,7 @@ function triggerCsvDownload(filename: string, content: string) {
 // involved anywhere. The result is a standalone downloadable list, the
 // same kind of thing as "Final Full Contact" elsewhere in this tab, not a
 // write to any contact record.
-function AppendDataTab({ clientId }: { clientId: string }) {
+function AppendDataTab({ clientId, clientName }: { clientId: string; clientName: string }) {
   const [fileName, setFileName] = useState<string | null>(null);
   const [rows, setRows] = useState<Record<string, string>[] | null>(null);
   const [preview, setPreview] = useState<DatazappPreview | null>(null);
@@ -1262,7 +1317,10 @@ function AppendDataTab({ clientId }: { clientId: string }) {
       });
       setFinalizeResult(result);
       if (result.csv) {
-        triggerCsvDownload(`datazapp-appended-${new Date().toISOString().slice(0, 10)}.csv`, result.csv);
+        triggerCsvDownload(
+          withClientSuffix(`datazapp-appended-${new Date().toISOString().slice(0, 10)}.csv`, clientName),
+          result.csv,
+        );
       }
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
@@ -1319,7 +1377,10 @@ function AppendDataTab({ clientId }: { clientId: string }) {
       });
       setEmailFinalizeResult(result);
       if (result.csv) {
-        triggerCsvDownload(`datazapp-email-list-${new Date().toISOString().slice(0, 10)}.csv`, result.csv);
+        triggerCsvDownload(
+          withClientSuffix(`datazapp-email-list-${new Date().toISOString().slice(0, 10)}.csv`, clientName),
+          result.csv,
+        );
       }
     } catch (e) {
       setEmailError(e instanceof Error ? e.message : String(e));
@@ -1396,7 +1457,9 @@ function AppendDataTab({ clientId }: { clientId: string }) {
             {preview.doNotCallCount > 0 && (
               <p className="mt-3 text-sm text-muted-foreground">
                 {preview.doNotCallCount} row{preview.doNotCallCount === 1 ? "" : "s"} came back flagged Do Not Call by
-                DataZapp, regardless of whether the name matched or whether it's kept below.
+                DataZapp. That flag is informational only here - it has never excluded anyone from review, from being
+                kept below, or from the email list. These are relationships, not cold-call targets, so nothing in this
+                app filters on it.
               </p>
             )}
             {preview.possibleBusinessCount > 0 && (
@@ -1539,7 +1602,7 @@ function AppendDataTab({ clientId }: { clientId: string }) {
                 variant="secondary"
                 onClick={() =>
                   triggerCsvDownload(
-                    `datazapp-appended-${new Date().toISOString().slice(0, 10)}.csv`,
+                    withClientSuffix(`datazapp-appended-${new Date().toISOString().slice(0, 10)}.csv`, clientName),
                     finalizeResult.csv!,
                   )
                 }
@@ -1697,7 +1760,7 @@ function AppendDataTab({ clientId }: { clientId: string }) {
                 variant="secondary"
                 onClick={() =>
                   triggerCsvDownload(
-                    `datazapp-email-list-${new Date().toISOString().slice(0, 10)}.csv`,
+                    withClientSuffix(`datazapp-email-list-${new Date().toISOString().slice(0, 10)}.csv`, clientName),
                     emailFinalizeResult.csv!,
                   )
                 }
@@ -1750,7 +1813,15 @@ function positionKey(clientId: string, stepKey: string): string {
   return `soi-review-position:${clientId}:${stepKey}`;
 }
 
-function ReviewTab({ clientId, lastProcessReport }: { clientId: string; lastProcessReport: ProcessReport | null }) {
+function ReviewTab({
+  clientId,
+  clientName,
+  lastProcessReport,
+}: {
+  clientId: string;
+  clientName: string;
+  lastProcessReport: ProcessReport | null;
+}) {
   const [stepKey, setStepKey] = useState<(typeof REVIEW_STEPS)[number]["key"]>("complete");
   const step = REVIEW_STEPS.find((s) => s.key === stepKey) ?? REVIEW_STEPS[0];
   const editable = step.kind === "review";
@@ -1884,7 +1955,7 @@ function ReviewTab({ clientId, lastProcessReport }: { clientId: string; lastProc
         ))}
       </div>
       {step.key === "final_full_contact" ? (
-        <FinalCombinedListStep clientId={clientId} />
+        <FinalCombinedListStep clientId={clientId} clientName={clientName} />
       ) : (
         <>
           {stepCopy ? (
@@ -2069,7 +2140,7 @@ function ReviewTab({ clientId, lastProcessReport }: { clientId: string; lastProc
 // sync with what the server function actually returns.
 type NeedsDataContact = NonNullable<Awaited<ReturnType<typeof exportSoiList>>["contacts"]>[number];
 
-function FinalCombinedListStep({ clientId }: { clientId: string }) {
+function FinalCombinedListStep({ clientId, clientName }: { clientId: string; clientName: string }) {
   const [view, setView] = useState<"summary" | "select">("summary");
   const [fullContactCount, setFullContactCount] = useState<number | null>(null);
   const [needsData, setNeedsData] = useState<NeedsDataContact[] | null>(null);
@@ -2118,7 +2189,7 @@ function FinalCombinedListStep({ clientId }: { clientId: string }) {
         const url = URL.createObjectURL(blob);
         const a = document.createElement("a");
         a.href = url;
-        a.download = name;
+        a.download = withClientSuffix(name, clientName);
         a.click();
         URL.revokeObjectURL(url);
       }
@@ -2368,7 +2439,7 @@ const NON_MARKETABLE_SCOPES = [
   { scope: "business_excluded", label: "Business Excluded", local: false },
 ] as const;
 
-function ExportTab({ clientId }: { clientId: string }) {
+function ExportTab({ clientId, clientName }: { clientId: string; clientName: string }) {
   const [busyScope, setBusyScope] = useState<string | null>(null);
 
   async function runExport(scope: string, local: boolean) {
@@ -2387,7 +2458,7 @@ function ExportTab({ clientId }: { clientId: string }) {
         const url = URL.createObjectURL(blob);
         const a = document.createElement("a");
         a.href = url;
-        a.download = name;
+        a.download = withClientSuffix(name, clientName);
         a.click();
         URL.revokeObjectURL(url);
       }
@@ -2401,7 +2472,8 @@ function ExportTab({ clientId }: { clientId: string }) {
       <Card>
         <h2 className="font-display text-lg font-semibold">Final: Full Contact (ready to use)</h2>
         <p className="mt-1 text-sm text-muted-foreground">
-          Everyone who made it through review with a complete record - the one list that's ready to use as-is.
+          Everyone who made it through review with a complete record (name, address, city, state, zip, email, AND phone)
+          - the one list that's ready to use as-is, pulled fresh from every bucket below.
         </p>
         <div className="mt-3">
           <Button onClick={() => runExport("final_full_contact", true)} disabled={busyScope === "final_full_contact"}>
@@ -2413,7 +2485,9 @@ function ExportTab({ clientId }: { clientId: string }) {
       <Card>
         <h2 className="font-display text-lg font-semibold">Marketable</h2>
         <p className="mt-1 text-sm text-muted-foreground">
-          Everyone worth marketing to in some form - combine them all into one deduped database when you're ready.
+          Everyone worth marketing to in some form - combine them all into one deduped database when you're ready. "Full
+          Direct Mail + Email/Phone" below is the same bucket the "Final: Full Contact" list above is pulled from, just
+          not narrowed down to only the fully-complete records - most of the time the two will look very similar.
         </p>
         <div className="mt-4 grid gap-2 sm:grid-cols-2">
           {MARKETABLE_SCOPES.map((s) => (

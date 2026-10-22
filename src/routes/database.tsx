@@ -1,56 +1,598 @@
-import { useEffect, useMemo, useState } from "react";
-import { createFileRoute } from "@tanstack/react-router";
-import { AppShell } from "@/components/AppShell";
-import {
-  getSoiAccess,
-  provisionSoiClient,
-  listSoiClients,
-  listSoiUploads,
-  uploadSoiFile,
-  deleteSoiUpload,
-  resetSoiDatabase,
-  processSoiUploads,
-  getSoiHubCounts,
-  getSoiReviewCandidates,
-  getSoiListView,
-  setSoiReviewFlag,
-  exportSoiList,
-  exportSoiListLocal,
-  previewDatazappAppend,
-  finalizeDatazappAppend,
-  previewDatazappEmailList,
-  finalizeDatazappEmailList,
-  saveAppendDataStaging,
-  getAppendDataStaging,
-  clearAppendDataStaging,
-  type SoiAccess,
-} from "@/lib/soi-builder";
+import { createServerFn } from "@tanstack/react-start";
+import { createClient, type SupabaseClient } from "@supabase/supabase-js";
+import { requireSupabaseAuth } from "@/integrations/supabase/auth-middleware";
 
-export const Route = createFileRoute("/database")({
-  head: () => ({
-    meta: [
-      { title: "Build My Database — Your Marketing Dude" },
-      {
-        name: "description",
-        content: "Clean and segment your contact database into marketing lists.",
+// ============================================================================
+// Build My Database / SOI Builder — native integration
+//
+// This talks to a SEPARATE Supabase project ("SOI Builder", not the one this
+// dashboard itself runs on) that already has a fully working, live,
+// battle-tested backend: 5 Edge Functions (process-upload, export-lists,
+// upload-file, delete-upload, invite-client) doing all the real contact
+// segmentation logic. None of that logic is touched, reimplemented, or
+// changed here — this file only adds a way to reach it from inside the
+// dashboard a user is already logged into, so there's no second login.
+//
+// Identity bridge: SOI Builder has its own separate Supabase Auth users
+// (its `clients`/`team_members`/`client_access` tables key off THOSE users'
+// ids, not this dashboard's). There is no shared user id or email column to
+// join on directly, so the bridge is: take the dashboard user's email
+// (from their verified JWT claims) and look up a matching user over in SOI
+// Builder's own auth system via the admin API. If found, `team_members` or
+// `client_access` tells us their role there exactly as it always did — this
+// doesn't loosen or change SOI Builder's own access rules at all, it just
+// resolves them automatically instead of asking the person to log in twice.
+//
+// Requires two secrets added in Lovable Cloud -> Secrets (server-only,
+// never sent to the browser):
+//   SOI_SUPABASE_URL                  = https://xoqrupoygkhkpobeekjz.supabase.co
+//   SOI_SUPABASE_SERVICE_ROLE_KEY     = (the service_role key from that
+//                                        project's Settings -> API)
+//
+// Auto-provisioning: the first time someone with no existing team_members or
+// client_access row opens Build My Database, provisionSoiClient() creates a
+// SOI Builder client for them automatically (see below) - signing into the
+// dashboard IS the onboarding step now, no separate manual "invite client"
+// action needed for a normal client. IMPORTANT: this treats anyone unknown
+// to SOI Builder as a new CLIENT. If Mike ever adds a new team member, add
+// their team_members row in SOI Builder first (Supabase Studio) BEFORE they
+// ever open Build My Database in the dashboard, or they'll be auto-enrolled
+// as a client instead.
+// ============================================================================
+
+function getSoiAdminClient(): SupabaseClient {
+  const url = process.env["SOI_SUPABASE_URL"];
+  const serviceKey = process.env["SOI_SUPABASE_SERVICE_ROLE_KEY"];
+  if (!url || !serviceKey) {
+    throw new Error(
+      "Build My Database isn't connected yet — add SOI_SUPABASE_URL and SOI_SUPABASE_SERVICE_ROLE_KEY in Lovable Cloud -> Secrets.",
+    );
+  }
+  return createClient(url, serviceKey, {
+    auth: { persistSession: false, autoRefreshToken: false },
+  });
+}
+
+export type SoiAccess = { role: "team" } | { role: "client"; clientId: string; clientName: string } | { role: "none" };
+
+// Resolves the currently logged-in dashboard user's role in SOI Builder by
+// email. Nothing here bypasses SOI Builder's own access rules - it just
+// looks up the same team_members / client_access rows the old separate
+// login screen would have checked after a manual sign-in.
+async function resolveAccessForEmail(admin: SupabaseClient, email: string): Promise<SoiAccess> {
+  const cleanEmail = email.toLowerCase().trim();
+
+  // SOI Builder's own auth.users - separate account system from this
+  // dashboard's. Paginated in case the account list ever grows past a
+  // single page; team + clients combined are unlikely to exceed a few
+  // pages, but this is cheap insurance against silently missing someone.
+  let matchedUserId: string | undefined;
+  for (let page = 1; ; page++) {
+    const { data, error } = await admin.auth.admin.listUsers({ page, perPage: 1000 });
+    if (error) throw error;
+    const found = data.users.find((u) => (u.email ?? "").toLowerCase() === cleanEmail);
+    if (found) {
+      matchedUserId = found.id;
+      break;
+    }
+    if (data.users.length < 1000) break;
+  }
+
+  if (!matchedUserId) return { role: "none" };
+
+  const { data: teamRow } = await admin
+    .from("team_members")
+    .select("user_id")
+    .eq("user_id", matchedUserId)
+    .maybeSingle();
+  if (teamRow) return { role: "team" };
+
+  const { data: accessRow } = await admin
+    .from("client_access")
+    .select("client_id")
+    .eq("user_id", matchedUserId)
+    .maybeSingle();
+  if (accessRow) {
+    const { data: clientRow } = await admin.from("clients").select("name").eq("id", accessRow.client_id).maybeSingle();
+    return { role: "client", clientId: accessRow.client_id, clientName: clientRow?.name ?? "Your database" };
+  }
+
+  return { role: "none" };
+}
+
+export const getSoiAccess = createServerFn({ method: "GET" })
+  .middleware([requireSupabaseAuth])
+  .handler(async ({ context }): Promise<SoiAccess> => {
+    const email = (context.claims as { email?: string } | undefined)?.email;
+    if (!email) return { role: "none" };
+    const admin = getSoiAdminClient();
+    return resolveAccessForEmail(admin, email);
+  });
+
+function randomSoiPassword(): string {
+  const chars = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghjkmnpqrstuvwxyz23456789";
+  let out = "";
+  for (let i = 0; i < 24; i++) out += chars[Math.floor(Math.random() * chars.length)];
+  return out;
+}
+
+// Auto-provisions a brand-new SOI Builder client the moment someone who
+// isn't already a team member or client there opens Build My Database.
+// Previously a team member had to run the old app's "invite client" flow by
+// hand, one person at a time, before that person could see anything here.
+// Mike's requirement: signing into the unified dashboard IS the client
+// onboarding now, so this has to happen automatically, not as a separate
+// manual step. This does the same two things invite-client always did
+// (create their SOI Builder login, link it to a client record) but from a
+// trusted server context on the dashboard's behalf, since the person
+// arriving here is a brand-new client, not yet a team member with a bearer
+// token invite-client could authenticate.
+export const provisionSoiClient = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .handler(async ({ context }): Promise<SoiAccess> => {
+    const email = (context.claims as { email?: string } | undefined)?.email;
+    if (!email) return { role: "none" };
+    const admin = getSoiAdminClient();
+
+    // Re-check fresh, right before creating anything - never provision over
+    // an existing team_members or client_access row, and safe to call more
+    // than once (e.g. a page refresh mid-provisioning) without duplicating.
+    const existing = await resolveAccessForEmail(admin, email);
+    if (existing.role !== "none") return existing;
+
+    const cleanEmail = email.toLowerCase().trim();
+
+    // A friendlier client name than the raw email, pulled from this same
+    // person's dashboard profile (Voice DNA's agents.full_name) when they
+    // have one set - SOI Builder's own `clients` table has no email column
+    // to look this up by, so there's nothing to borrow from over there.
+    let clientName = cleanEmail;
+    try {
+      const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+      const { data: agentRow } = await supabaseAdmin
+        .from("agents")
+        .select("full_name")
+        .eq("id", context.userId)
+        .maybeSingle();
+      if (agentRow?.full_name) clientName = agentRow.full_name;
+    } catch {
+      // Non-fatal - fall back to using the email as the client name.
+    }
+
+    // Create their SOI Builder login. They'll never actually sign in with
+    // it directly - the dashboard session is what grants access now - so
+    // the password is random and thrown away immediately.
+    let soiUserId: string | undefined;
+    const created = await admin.auth.admin.createUser({
+      email: cleanEmail,
+      password: randomSoiPassword(),
+      email_confirm: true,
+    });
+    if (!created.error) {
+      soiUserId = created.data.user?.id;
+    } else {
+      // Already exists over there under this email but somehow has neither
+      // a team_members nor client_access row (resolveAccessForEmail just
+      // checked and found none) - look the account up rather than failing.
+      for (let page = 1; ; page++) {
+        const { data, error } = await admin.auth.admin.listUsers({ page, perPage: 1000 });
+        if (error) throw error;
+        const found = data.users.find((u) => (u.email ?? "").toLowerCase() === cleanEmail);
+        if (found) {
+          soiUserId = found.id;
+          break;
+        }
+        if (data.users.length < 1000) break;
+      }
+    }
+    if (!soiUserId) throw new Error("Could not create your Build My Database account.");
+
+    const { data: clientRow, error: clientErr } = await admin
+      .from("clients")
+      .insert({ name: clientName })
+      .select("id, name")
+      .single();
+    if (clientErr) throw clientErr;
+
+    const { error: accessErr } = await admin
+      .from("client_access")
+      .upsert({ user_id: soiUserId, client_id: clientRow.id }, { onConflict: "user_id,client_id" });
+    if (accessErr) throw accessErr;
+
+    return { role: "client", clientId: clientRow.id, clientName: clientRow.name ?? clientName };
+  });
+
+// Team members manage multiple clients - the picker list for that view.
+export const listSoiClients = createServerFn({ method: "GET" })
+  .middleware([requireSupabaseAuth])
+  .handler(async ({ context }) => {
+    const email = (context.claims as { email?: string } | undefined)?.email;
+    const admin = getSoiAdminClient();
+    const access = email ? await resolveAccessForEmail(admin, email) : { role: "none" as const };
+    if (access.role !== "team") {
+      throw new Error("Only team members can view the client list.");
+    }
+    const { data, error } = await admin
+      .from("clients")
+      .select("id, name, processing_started_at, created_at")
+      .order("created_at", { ascending: false });
+    if (error) throw error;
+    return data;
+  });
+
+// Shared guard used by every per-client action below: re-resolves the
+// caller's access every call (rather than trusting a client_id the browser
+// sends) so a client can never pass someone else's client_id and a team
+// member is always verified fresh. Small extra cost, real security value.
+async function requireClientAccess(
+  admin: SupabaseClient,
+  email: string | undefined,
+  requestedClientId: string,
+): Promise<void> {
+  if (!email) throw new Error("Not authenticated");
+  const access = await resolveAccessForEmail(admin, email);
+  if (access.role === "team") return;
+  if (access.role === "client" && access.clientId === requestedClientId) return;
+  throw new Error("Not authorized for this client");
+}
+
+export const listSoiUploads = createServerFn({ method: "GET" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator((data: { clientId: string }) => data)
+  .handler(async ({ data, context }) => {
+    const admin = getSoiAdminClient();
+    const email = (context.claims as { email?: string } | undefined)?.email;
+    await requireClientAccess(admin, email, data.clientId);
+    const { data: uploads, error } = await admin
+      .from("uploads")
+      .select("id, file_name, source_label, status, row_count, error_message, created_at")
+      .eq("client_id", data.clientId)
+      .order("created_at", { ascending: false });
+    if (error) throw error;
+    return uploads;
+  });
+
+export const uploadSoiFile = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator(
+    (data: { clientId: string; fileName: string; sourceLabel: string; kind: "vcf" | "mapped_csv"; content: string }) =>
+      data,
+  )
+  .handler(async ({ data, context }) => {
+    const admin = getSoiAdminClient();
+    const email = (context.claims as { email?: string } | undefined)?.email;
+    await requireClientAccess(admin, email, data.clientId);
+
+    // Calls the SAME upload-file Edge Function that's been running this
+    // app in production - not a reimplementation, the real thing.
+    const url = process.env["SOI_SUPABASE_URL"];
+    const serviceKey = process.env["SOI_SUPABASE_SERVICE_ROLE_KEY"];
+    const res = await fetch(`${url}/functions/v1/upload-file`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${serviceKey}`,
+        apikey: serviceKey!,
       },
-    ],
-  }),
-  component: DatabasePage,
-});
+      body: JSON.stringify({
+        client_id: data.clientId,
+        file_name: data.fileName,
+        source_label: data.sourceLabel,
+        kind: data.kind,
+        content: data.content,
+      }),
+    });
+    const json = await res.json();
+    if (!res.ok) throw new Error(json.error ?? `upload-file failed (${res.status})`);
+    return json;
+  });
 
-type ClientOption = { id: string; name: string };
+export const deleteSoiUpload = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator((data: { clientId: string; uploadId: string }) => data)
+  .handler(async ({ data, context }) => {
+    const admin = getSoiAdminClient();
+    const email = (context.claims as { email?: string } | undefined)?.email;
+    await requireClientAccess(admin, email, data.clientId);
 
-const LIST_LABELS: Record<string, string> = {
-  direct_mail: "Full Direct Mail",
-  email_phone: "Email + Phone",
-  email_list: "Email Only",
-  incomplete: "Incomplete",
-  nonqualified: "Nonqualified",
-  realtor_excluded: "Realtor Excluded",
-  business_excluded: "Business Excluded",
+    // Same behavior as the original delete-upload function (remove Storage
+    // file(s) + the uploads row) - reimplemented directly here rather than
+    // calling that function over HTTP, because it authenticates its caller
+    // with a real per-user access token, which a service-role backend call
+    // doesn't have. The access check above (requireClientAccess) already
+    // covers exactly what that function's own check covered.
+    const { data: upload, error: findErr } = await admin
+      .from("uploads")
+      .select("id, client_id, file_name, storage_path")
+      .eq("id", data.uploadId)
+      .single();
+    if (findErr || !upload) throw new Error("Upload not found");
+    if (upload.client_id !== data.clientId) throw new Error("Not authorized for this client");
+
+    await admin.storage.from("uploads").remove([upload.storage_path, `${upload.storage_path}.mapped.json`]);
+    const { error: deleteErr } = await admin.from("uploads").delete().eq("id", data.uploadId);
+    if (deleteErr) throw deleteErr;
+    return { deleted: upload.file_name };
+  });
+
+// Bug fix, 2026-10-15: Mike reported "I went away from the Append Data
+// screen and when I came back all data was not saved. I only switched
+// windows." That's because the whole feature lived in plain React state -
+// switching tabs unmounted the component and threw away the uploaded file
+// and its computed matches. Fixed by staging the parsed rows (not the raw
+// file - already-parsed JSON round-trips exactly, no re-parsing/CSV-quoting
+// edge cases to worry about) in the SAME Storage bucket everything else in
+// this file uses, at a fixed per-client path that just gets overwritten on
+// every new upload - one file, not a growing history.
+//
+// Deliberately NOT a row in the `uploads` table: that table is also used to
+// tell the real process-upload Edge Function what to process, and a
+// DataZapp return file is a completely different shape (its own DataZapp_*
+// columns, no mapping) that function has never seen and was never built to
+// handle - adding a tracked `uploads` row here risked it getting silently
+// swept into a future "Process" run. Storage-only, bypassing that table
+// entirely, is the same kind of deliberate bypass as deleteSoiUpload/
+// resetSoiDatabase above (talk directly to the backend when the existing
+// Edge Function's shape doesn't fit), just via Storage instead of a table.
+//
+// UPDATE 2026-10-22: the "known limitation" this comment used to end on -
+// per-row checkbox state not persisting - turned into a real production
+// problem (see appendDataCheckedPath below for the full story) and is now
+// fixed. That per-row state lives in its own Storage object rather than
+// here, specifically so it can be written on every single click without
+// re-uploading the entire file's rows each time.
+function appendDataStagingPath(clientId: string): string {
+  return `append-data-staging/${clientId}.json`;
+}
+
+// Added 2026-10-22 per Mike, after he and a client independently reviewed
+// the same Append Data list and ended up with "different lists": "Anything
+// that the client unchecks needs to automatically save in real time and
+// transfer through to anything on the admin side... the only time that
+// list should be deleted is if we decide to go ahead and delete that list."
+// Root cause was that per-row checked/unchecked state was never written
+// anywhere - every login/every remount of AppendDataTab defaulted back to
+// "everyone checked" (see the old comment this replaced, just above), so
+// whichever side looked last only ever saw their OWN in-memory guess, never
+// what the other side had actually done, and a client who navigated away
+// before clicking Download lost everything. This is a second, separate
+// Storage object (not merged into the main staging blob above) specifically
+// so toggling one checkbox only ever uploads a small
+// { checkedRowIndexes: [...] } payload, not the entire uploaded file's rows
+// over again on every click.
+function appendDataCheckedPath(clientId: string): string {
+  return `append-data-staging/${clientId}.checked.json`;
+}
+
+export const saveAppendDataStaging = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator((data: { clientId: string; fileName: string; rows: DatazappRawRow[] }) => data)
+  .handler(async ({ data, context }) => {
+    const admin = getSoiAdminClient();
+    const email = (context.claims as { email?: string } | undefined)?.email;
+    await requireClientAccess(admin, email, data.clientId);
+
+    const payload = JSON.stringify({ fileName: data.fileName, rows: data.rows });
+    const { error } = await admin.storage.from("uploads").upload(appendDataStagingPath(data.clientId), payload, {
+      contentType: "application/json",
+      upsert: true,
+    });
+    if (error) throw error;
+    // A brand new file means every old row index is meaningless (row 12 in
+    // the old file isn't row 12 in this one) - clear out any leftover
+    // checked-rows state from a previous upload rather than letting a stale
+    // set silently get applied to the new one. Best-effort, same as every
+    // other staging cleanup in this file: nothing staged yet is normal, not
+    // an error.
+    await admin.storage.from("uploads").remove([appendDataCheckedPath(data.clientId)]);
+    return { ok: true };
+  });
+
+export const getAppendDataStaging = createServerFn({ method: "GET" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator((data: { clientId: string }) => data)
+  .handler(
+    async ({
+      data,
+      context,
+    }): Promise<{ fileName: string; rows: DatazappRawRow[]; checkedRowIndexes: number[] | null } | null> => {
+      const admin = getSoiAdminClient();
+      const email = (context.claims as { email?: string } | undefined)?.email;
+      await requireClientAccess(admin, email, data.clientId);
+
+      const { data: file, error } = await admin.storage.from("uploads").download(appendDataStagingPath(data.clientId));
+      if (error) {
+        // Nothing staged yet is the normal, expected case (first time opening
+        // this tab, or right after "Delete this list") - not an error.
+        return null;
+      }
+      let staged: { fileName: string; rows: DatazappRawRow[] };
+      try {
+        const text = await file.text();
+        staged = JSON.parse(text) as { fileName: string; rows: DatazappRawRow[] };
+      } catch {
+        return null;
+      }
+
+      // Checked-rows state (see appendDataCheckedPath above) comes back
+      // bundled with the file itself so the frontend's one restore call on
+      // mount gets the complete picture in one round trip. null just means
+      // "nobody has saved a checked-rows change for this file yet" - not an
+      // error - so the frontend falls back to its normal everyone-starts-
+      // checked default.
+      let checkedRowIndexes: number[] | null = null;
+      const { data: checkedFile } = await admin.storage.from("uploads").download(appendDataCheckedPath(data.clientId));
+      if (checkedFile) {
+        try {
+          const parsed = JSON.parse(await checkedFile.text()) as { checkedRowIndexes: number[] };
+          checkedRowIndexes = parsed.checkedRowIndexes;
+        } catch {
+          checkedRowIndexes = null;
+        }
+      }
+
+      return { ...staged, checkedRowIndexes };
+    },
+  );
+
+// Saves the Stage 1 review table's checked/unchecked state in real time -
+// called from toggleRow/toggleAllVisible in AppendDataTab on every single
+// change, the same fire-immediately-on-every-click pattern setSoiReviewFlag
+// already uses elsewhere in this file (see `toggle`/`toggleAll` in
+// database.tsx). Not debounced, on purpose - Mike's complaint was that
+// "real time" wasn't actually happening, so this errs toward one small
+// request per click rather than batching and risking the same lost-progress
+// problem if the client navigates away between a debounce firing.
+export const saveAppendDataCheckedRows = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator((data: { clientId: string; checkedRowIndexes: number[] }) => data)
+  .handler(async ({ data, context }) => {
+    const admin = getSoiAdminClient();
+    const email = (context.claims as { email?: string } | undefined)?.email;
+    await requireClientAccess(admin, email, data.clientId);
+
+    const payload = JSON.stringify({ checkedRowIndexes: data.checkedRowIndexes });
+    const { error } = await admin.storage.from("uploads").upload(appendDataCheckedPath(data.clientId), payload, {
+      contentType: "application/json",
+      upsert: true,
+    });
+    if (error) throw error;
+    return { ok: true };
+  });
+
+// Deliberate, explicit wipe of a client's staged Append Data file AND its
+// checked-rows state - this is now the ONLY thing that clears either of
+// them (see the "real time" comment above appendDataCheckedPath - a
+// toggle, a tab switch, or a reload must never do this on their own). The
+// frontend's new "Delete this list" button is the one UI entry point that
+// calls this.
+export const clearAppendDataStaging = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator((data: { clientId: string }) => data)
+  .handler(async ({ data, context }) => {
+    const admin = getSoiAdminClient();
+    const email = (context.claims as { email?: string } | undefined)?.email;
+    await requireClientAccess(admin, email, data.clientId);
+
+    await admin.storage
+      .from("uploads")
+      .remove([appendDataStagingPath(data.clientId), appendDataCheckedPath(data.clientId)]);
+    return { ok: true };
+  });
+
+// Full "start over" for a client, added 2026-10-15 per Mike: "There should
+// be a reset button on the Upload screen anytime you want to rerun a new
+// database. People may come back and add contacts to it or clean their
+// list." Wipes every uploaded file AND every contact this client has, so
+// the next upload starts completely clean rather than deduping/merging
+// against leftover data from a previous round. Irreversible, on purpose -
+// the frontend gates this behind a type-the-client's-name confirmation
+// before ever calling it.
+export const resetSoiDatabase = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator((data: { clientId: string }) => data)
+  .handler(async ({ data, context }) => {
+    const admin = getSoiAdminClient();
+    const email = (context.claims as { email?: string } | undefined)?.email;
+    await requireClientAccess(admin, email, data.clientId);
+
+    // 1. Remove every uploaded file's Storage object(s) + row - same cleanup
+    // deleteSoiUpload above already does one file at a time.
+    const { data: uploads, error: uploadsErr } = await admin
+      .from("uploads")
+      .select("id, storage_path")
+      .eq("client_id", data.clientId);
+    if (uploadsErr) throw uploadsErr;
+    for (const u of uploads ?? []) {
+      await admin.storage.from("uploads").remove([u.storage_path, `${u.storage_path}.mapped.json`]);
+    }
+    const { error: deleteUploadsErr } = await admin.from("uploads").delete().eq("client_id", data.clientId);
+    if (deleteUploadsErr) throw deleteUploadsErr;
+
+    // 1b. Also clear any staged Append Data file AND its checked-rows state
+    // (see saveAppendDataStaging/appendDataCheckedPath below) - both live
+    // outside the `uploads` table entirely (on purpose, so neither ever gets
+    // picked up by process-upload), so neither would be touched by the loop
+    // above at all. Best-effort: a missing object here is not an error,
+    // there's just nothing staged.
+    await admin.storage
+      .from("uploads")
+      .remove([appendDataStagingPath(data.clientId), appendDataCheckedPath(data.clientId)]);
+
+    // 2. Delete every review flag tied to this client's contacts FIRST -
+    // review_flags has no client_id column of its own (it's keyed off
+    // contact_id, same note as setSoiReviewFlag below), so this isn't
+    // something to leave to an assumed cascade on the contacts delete next.
+    let contactIds: string[] = [];
+    for (let from = 0; ; from += PAGE_SIZE) {
+      const { data: rows, error } = await admin
+        .from("contacts")
+        .select("id")
+        .eq("client_id", data.clientId)
+        .range(from, from + PAGE_SIZE - 1);
+      if (error) throw error;
+      contactIds = contactIds.concat((rows ?? []).map((r) => r.id as string));
+      if (!rows || rows.length < PAGE_SIZE) break;
+    }
+    for (let i = 0; i < contactIds.length; i += 500) {
+      const { error } = await admin
+        .from("review_flags")
+        .delete()
+        .in("contact_id", contactIds.slice(i, i + 500));
+      if (error) throw error;
+    }
+
+    // 3. Delete every contact for this client - the actual reset. One
+    // request regardless of row count; Postgrest matches server-side.
+    const { error: deleteContactsErr } = await admin.from("contacts").delete().eq("client_id", data.clientId);
+    if (deleteContactsErr) throw deleteContactsErr;
+
+    return { deletedContacts: contactIds.length, deletedUploads: (uploads ?? []).length };
+  });
+
+type ProcessUploadReport = {
+  raw_total: number;
+  unique_total: number;
+  dedupe_stats: Record<string, number>;
+  list_counts: Record<string, number>;
+  address_corrections: { name: string; message: string }[];
+  borderline_flags: { name: string; email: string; domain: string }[];
 };
-const HUB_ORDER = [
+
+// Calls the real process-upload Edge Function directly - factored out of
+// processSoiUploads below so the new DataZapp-append step (further down)
+// can reuse it too, after writing newly-appended email/address fields
+// straight into `contacts`, to get everyone correctly reclassified out of
+// Incomplete/Nonqualified without duplicating any of the real segmentation
+// rules here.
+async function runProcessUpload(clientId: string): Promise<ProcessUploadReport> {
+  const url = process.env["SOI_SUPABASE_URL"];
+  const serviceKey = process.env["SOI_SUPABASE_SERVICE_ROLE_KEY"];
+  const res = await fetch(`${url}/functions/v1/process-upload`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${serviceKey}`,
+      apikey: serviceKey!,
+    },
+    body: JSON.stringify({ client_id: clientId }),
+  });
+  const json = await res.json();
+  if (!res.ok) throw new Error(json.error ?? `process-upload failed (${res.status})`);
+  return json as ProcessUploadReport;
+}
+
+export const processSoiUploads = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator((data: { clientId: string }) => data)
+  .handler(async ({ data, context }): Promise<ProcessUploadReport> => {
+    const admin = getSoiAdminClient();
+    const email = (context.claims as { email?: string } | undefined)?.email;
+    await requireClientAccess(admin, email, data.clientId);
+    return runProcessUpload(data.clientId);
+  });
+
+const HUB_LISTS = [
   "direct_mail",
   "email_phone",
   "email_list",
@@ -60,2488 +602,1309 @@ const HUB_ORDER = [
   "business_excluded",
 ] as const;
 
-// Database Breakdown summary cards - separate from LIST_LABELS/HUB_ORDER
-// above (those still label each contact's own individual list_assignment for
-// the per-row "List" badge on the combined "Your Most Complete Data" review
-// step). Mike wants the breakdown itself to show Full Direct Mail and
-// Email + Phone combined into one "Complete Data" number, since that matches
-// how the review step already treats them as one combined bucket.
-// mode picks how the card's number is computed from `lists`' totals and
-// `checkedLists`' _checked counts (see getSoiHubCounts): "checked" shows
-// checked/total for an opt-IN list (email_list/incomplete - checked = kept);
-// "survivors" shows (total - checked)/total for an opt-OUT list (direct_mail/
-// email_phone - checked = removed, so survivors are the UNCHECKED ones);
-// "none" is just the plain total, no live math. Both live formats give Mike
-// real-time transparency on who'll actually make the final list without
-// downloading anything.
-const BREAKDOWN_CARDS = [
-  {
-    key: "complete_data",
-    label: "Complete Data",
-    lists: ["direct_mail", "email_phone"] as const,
-    checkedLists: ["direct_mail", "email_phone"] as const,
-    mode: "survivors" as const,
-  },
-  {
-    key: "email_list",
-    label: "Email Only",
-    lists: ["email_list"] as const,
-    checkedLists: ["email_list"] as const,
-    mode: "checked" as const,
-  },
-  {
-    key: "incomplete",
-    label: "Incomplete",
-    lists: ["incomplete"] as const,
-    checkedLists: ["incomplete"] as const,
-    mode: "checked" as const,
-  },
-  {
-    key: "nonqualified",
-    label: "Nonqualified",
-    lists: ["nonqualified"] as const,
-    checkedLists: [] as const,
-    mode: "none" as const,
-  },
-  {
-    key: "realtor_excluded",
-    label: "Realtor Excluded",
-    lists: ["realtor_excluded"] as const,
-    checkedLists: [] as const,
-    mode: "none" as const,
-  },
-  {
-    key: "business_excluded",
-    label: "Business Excluded",
-    lists: ["business_excluded"] as const,
-    checkedLists: [] as const,
-    mode: "none" as const,
-  },
-] as const;
+// Every list that has a checkbox review step at all - direct_mail/email_phone
+// are opt-OUT (checked = removed), email_list/incomplete are opt-IN (checked
+// = kept). The frontend combines these into "checked/total" (opt-in) or
+// "survivors/total" (opt-out, i.e. total minus checked) as appropriate - see
+// BREAKDOWN_CARDS in database.tsx. Mike wants this same real-time
+// transparency (no downloading needed to see who'll make the final list) on
+// every reviewable bucket, not just the opt-in ones.
+// "nonqualified" added 2026-10-15 per Mike: "The No qualifies list needs the
+// ability to be cleaned up too... Need to be able to select all and follow
+// same process as email list clean up" - it's now a 5th opt-in review step,
+// same pattern as email_list/incomplete.
+const CHECKED_COUNT_LISTS = ["direct_mail", "email_phone", "email_list", "incomplete", "nonqualified"] as const;
 
-// direct_mail/email_phone: opt-OUT (checking = remove). email_list/incomplete: opt-IN (checking = keep).
-// This whole tab bar matches the original SOI Builder app's own review flow
-// tab-for-tab: 3 editable review steps, then read-only browsable lists for
-// everything else the old app also let you look through (not just download).
-const REVIEW_STEPS = [
-  {
-    key: "complete",
-    label: "Your Most Complete Data",
-    kind: "review" as const,
-    lists: ["direct_mail", "email_phone"] as const,
-    optOut: true,
-    description:
-      "Full addresses, plus everyone with a first name, last name, email, and phone. Check off anyone you don't actually know.",
-  },
-  {
-    key: "email_list",
-    label: "Email List",
-    kind: "review" as const,
-    lists: ["email_list"] as const,
-    optOut: false,
-    description: "Everyone else with a usable email. Check off anyone you actually know and want to keep.",
-  },
-  {
-    key: "incomplete",
-    label: "Incomplete",
-    kind: "review" as const,
-    lists: ["incomplete"] as const,
-    optOut: false,
-    description: "Missing enough info to sort automatically. Check off anyone you actually know and want to keep.",
-  },
-  {
-    key: "final_full_contact",
-    label: "Final Combined List",
-    kind: "view" as const,
-    description: "Everyone who made it through review with a complete record — ready to use.",
-  },
-  {
-    key: "nonqualified",
-    label: "Nonqualified",
-    kind: "view" as const,
-    description: "Didn't qualify for any list.",
-  },
-  {
-    key: "facebook_audience",
-    label: "Facebook Audience",
-    kind: "view" as const,
-    description: "Everyone with an email or phone, excluding realtors and businesses.",
-  },
-  {
-    key: "realtor_excluded",
-    label: "Realtors",
-    kind: "view" as const,
-    description: "Excluded as fellow real estate agents, not clients.",
-  },
-  {
-    key: "business_excluded",
-    label: "Businesses",
-    kind: "view" as const,
-    description: "Excluded as businesses, not individuals.",
-  },
-] as const;
+export const getSoiHubCounts = createServerFn({ method: "GET" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator((data: { clientId: string }) => data)
+  .handler(async ({ data, context }) => {
+    const admin = getSoiAdminClient();
+    const email = (context.claims as { email?: string } | undefined)?.email;
+    await requireClientAccess(admin, email, data.clientId);
 
-// Big on-screen headline + a short instructional subheadline for the 3
-// editable review steps only (not the read-only browsable views) - matches
-// the old app's own "who don't you know on this list" framing, exact copy
-// from Mike. Kept as a separate lookup rather than extra fields on
-// REVIEW_STEPS above so that array's per-entry shape doesn't need to change.
-// Mike's said a short how-to video will eventually go in this same spot too -
-// nothing to build for that yet, just keep this location in mind.
-const STEP_COPY: Partial<Record<(typeof REVIEW_STEPS)[number]["key"], { headline: string; subheadline: string }>> = {
-  complete: {
-    headline: "Who Don't You Want To Market To On This List?",
-    subheadline:
-      "Is there anyone on this list you don't know, like, trust, or want to see your content? This list should be comprised of past clients, family, friends, and anyone whom you'd expect to hire you when moving or refer you to a friend.",
-  },
-  email_list: {
-    headline: "Who Should Receive Your Content?",
-    subheadline:
-      "Is there anyone on this list that you want to see your content? Place a check next to anyone you want to add to your marketing lists. This list should be comprised of current leads, past clients, family, friends, and anyone whom you'd expect to hire you when moving or refer you to a friend.",
-  },
-  incomplete: {
-    headline: "Who Should Receive Your Content?",
-    subheadline:
-      "Is there anyone on this list that you want to see your content? Place a check next to anyone you want to add to your marketing lists. This list should be comprised of current leads, past clients, family, friends, and anyone whom you'd expect to hire you when moving or refer you to a friend.",
-  },
-};
+    const counts: Record<string, number> = {};
+    for (const list of HUB_LISTS) {
+      const { count, error } = await admin
+        .from("contacts")
+        .select("id", { count: "exact", head: true })
+        .eq("client_id", data.clientId)
+        .eq("list_assignment", list);
+      if (error) throw error;
+      counts[list] = count ?? 0;
+    }
 
-function Card({ children, className = "" }: { children: React.ReactNode; className?: string }) {
-  return (
-    <div className={`rounded-3xl border border-border bg-glass p-6 backdrop-blur-2xl ${className}`}>{children}</div>
-  );
-}
+    // "!inner" forces the join so filtering on the embedded review_flags
+    // columns actually restricts which contacts are counted (a plain left
+    // join would still count every contact, flagged or not).
+    for (const list of CHECKED_COUNT_LISTS) {
+      const { count, error } = await admin
+        .from("contacts")
+        .select("id, review_flags!inner(flagged)", { count: "exact", head: true })
+        .eq("client_id", data.clientId)
+        .eq("list_assignment", list)
+        .eq("review_flags.review_type", "primary")
+        .eq("review_flags.flagged", true);
+      if (error) throw error;
+      counts[`${list}_checked`] = count ?? 0;
+    }
 
-function Button({
-  children,
-  onClick,
-  variant = "primary",
-  disabled,
-}: {
-  children: React.ReactNode;
-  onClick?: () => void;
-  variant?: "primary" | "secondary" | "danger";
-  disabled?: boolean;
-}) {
-  const styles =
-    variant === "primary"
-      ? "bg-primary text-primary-foreground shadow-lg shadow-primary/30 hover:-translate-y-0.5"
-      : variant === "danger"
-        ? "border border-destructive/40 text-destructive hover:bg-destructive/10"
-        : "border border-border bg-glass hover:bg-secondary";
-  return (
-    <button
-      onClick={onClick}
-      disabled={disabled}
-      className={`rounded-full px-5 py-2 text-sm font-semibold transition-all disabled:cursor-not-allowed disabled:opacity-50 ${styles}`}
-    >
-      {children}
-    </button>
-  );
-}
-
-function fileToBase64(file: File): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onload = () => {
-      const result = reader.result as string;
-      resolve(result.split(",")[1] ?? "");
-    };
-    reader.onerror = reject;
-    reader.readAsDataURL(file);
+    return counts;
   });
-}
 
-// Excel/ODS/TSV support: SheetJS is loaded from a CDN at runtime instead of
-// an npm dependency, so this works the moment the file is pasted in — no
-// separate "add a package" step in Lovable needed. Cached after the first
-// load so picking a second spreadsheet file in the same session doesn't
-// re-fetch it. Typed as `any` on purpose: it's a runtime-loaded module a
-// build-time type checker can never see a declaration for.
-let sheetJsPromise: Promise<any> | null = null;
-async function loadSheetJs(): Promise<any> {
-  if (!sheetJsPromise) {
-    // @ts-expect-error — CDN URL module specifier, not resolvable at build time.
-    sheetJsPromise = import(/* @vite-ignore */ "https://cdn.jsdelivr.net/npm/xlsx@0.18.5/+esm");
-  }
-  return sheetJsPromise;
-}
-
-async function parseSpreadsheet(file: File): Promise<{ headers: string[]; rows: Record<string, string>[] }> {
-  const XLSX = await loadSheetJs();
-  const buffer = await file.arrayBuffer();
-  const workbook = XLSX.read(buffer, { type: "array" });
-  const firstSheetName: string | undefined = workbook.SheetNames[0];
-  if (!firstSheetName) return { headers: [], rows: [] };
-  const sheet = workbook.Sheets[firstSheetName];
-  const rawRows: Record<string, unknown>[] = XLSX.utils.sheet_to_json(sheet, { defval: "" });
-  const firstRow = rawRows[0];
-  const headers = firstRow ? Object.keys(firstRow) : [];
-  const rows = rawRows.map((row) => {
-    const out: Record<string, string> = {};
-    for (const h of headers) {
-      const v = row[h];
-      out[h] = v === null || v === undefined ? "" : String(v);
-    }
-    return out;
-  });
-  return { headers, rows };
-}
-
-function parseCsv(text: string): { headers: string[]; rows: Record<string, string>[] } {
-  const lines = text
-    .replace(/\r\n/g, "\n")
-    .split("\n")
-    .filter((l) => l.length > 0);
-  if (lines.length === 0) return { headers: [], rows: [] };
-  const splitLine = (line: string): string[] => {
-    const out: string[] = [];
-    let cur = "";
-    let inQuotes = false;
-    for (let i = 0; i < line.length; i++) {
-      const ch = line[i];
-      if (inQuotes) {
-        if (ch === '"' && line[i + 1] === '"') {
-          cur += '"';
-          i++;
-        } else if (ch === '"') {
-          inQuotes = false;
-        } else {
-          cur += ch;
-        }
-      } else if (ch === '"') {
-        inQuotes = true;
-      } else if (ch === ",") {
-        out.push(cur);
-        cur = "";
-      } else {
-        cur += ch;
-      }
-    }
-    out.push(cur);
-    return out;
-  };
-  const headers = splitLine(lines[0] ?? "").map((h) => h.trim());
-  const rows = lines.slice(1).map((line) => {
-    const cells = splitLine(line);
-    const row: Record<string, string> = {};
-    headers.forEach((h, i) => (row[h] = cells[i] ?? ""));
-    return row;
-  });
-  return { headers, rows };
-}
-
-const MAPPING_FIELDS = [
-  { key: "first_name", label: "First name" },
-  { key: "last_name", label: "Last name" },
-  { key: "full_name", label: "Full name (if no separate first/last)" },
-  { key: "email", label: "Email" },
-  { key: "phone", label: "Phone" },
-  { key: "address", label: "Address" },
-  { key: "address_2", label: "Address 2" },
-  { key: "city", label: "City" },
-  { key: "state", label: "State" },
-  { key: "zip", label: "Zip" },
-  { key: "notes", label: "Notes" },
-] as const;
-
-// Recognized header spellings per field, so a normal CRM export (WiseAgent,
-// Follow Up Boss, a phone contacts export, etc.) maps itself automatically
-// instead of making the person pick every dropdown by hand. Anything that
-// doesn't match one of these still shows up as "— none —" for a manual pick
-// — this only fills in the obvious ones, it never guesses wrong silently
-// because the dropdowns stay fully visible and editable either way.
-const MAPPING_ALIASES: Record<string, string[]> = {
-  first_name: ["first name", "firstname", "first", "fname", "given name"],
-  last_name: ["last name", "lastname", "last", "lname", "surname", "family name"],
-  full_name: ["full name", "fullname", "name", "contact name", "display name"],
-  // "consolidated email"/"consolidated phone" are synthetic columns this
-  // file builds itself (see consolidateMultiColumn below) - never a real
-  // header from a file, always matched last since nothing a real export
-  // would use normalizes to those exact words.
-  email: ["email", "e mail", "email address", "e mail address", "primary email", "emails", "consolidated email"],
-  phone: [
-    "phone",
-    "phone number",
-    "cell",
-    "cell phone",
-    "mobile",
-    "mobile phone",
-    "home phone",
-    "primary phone",
-    "telephone",
-    "phones",
-    "consolidated phone",
-  ],
-  address: ["address", "address 1", "street address", "address line 1", "mailing address", "street"],
-  address_2: ["address 2", "address line 2", "apt", "unit", "suite"],
-  city: ["city", "town"],
-  state: ["state", "st", "province"],
-  zip: ["zip", "zip code", "zipcode", "postal code"],
-  notes: ["notes", "note", "comments", "comment"],
-};
-
-function normalizeHeader(header: string): string {
-  return header
-    .toLowerCase()
-    .trim()
-    .replace(/[^a-z0-9]+/g, " ")
-    .replace(/\s+/g, " ")
-    .trim();
-}
-
-function guessColumnMapping(headers: string[]): Record<string, string> {
-  const guessed: Record<string, string> = {};
-  const claimed = new Set<string>();
-  for (const field of MAPPING_FIELDS) {
-    const aliases = MAPPING_ALIASES[field.key] ?? [];
-    const match = headers.find((h) => !claimed.has(h) && aliases.includes(normalizeHeader(h)));
-    if (match) {
-      guessed[field.key] = match;
-      claimed.add(match);
-    }
-  }
-  return guessed;
-}
-
-// Bug fix, 2026-10-15 - Mike uploaded a real contacts export with "Phone 1,
-// Phone 2, Phone 3... Email 1, Email 2..." columns (a very common shape -
-// this is exactly what a phone/address-book contacts export looks like) and
-// got NOTHING mapped for phone or email at all: guessColumnMapping's alias
-// lists above only had plain, un-numbered spellings ("phone", "cell",
-// "email", etc.), so "Phone 1" normalized to "phone 1" and matched nothing.
-// His own words: "I believe its becasue it says Phone 1, Phone 2,... you
-// need to be smarter than that an know thats their phone number. We could
-// have lost all that data which is how i got the appended list" - meaning
-// this is very plausibly why a real chunk of his contacts needed a DataZapp
-// append in the first place, when the actual phone number was sitting right
-// there in his own original file the entire time.
-//
-// Goes one step further than just recognizing "Phone 1" as a phone column,
-// too: `contacts` only has ONE phone field and ONE email field, but a file
-// like this can have SEVERAL phone-ish or email-ish columns at once (Phone
-// 1 through 6 in Mike's exact file) - picking only the first one by header
-// order (which is all the old single-header-per-field mapping could ever
-// do, even once it recognized a column) still silently drops data whenever
-// THAT column happens to be blank for a given row but a sibling column
-// isn't. So this looks at every column that looks like a phone (or email)
-// column - an exact alias match, OR "<alias> <number>" - and builds one new
-// column per row from the first non-blank value across all of them. That
-// new column is what actually gets mapped to the phone/email field -
-// guessColumnMapping above never sees the original numbered columns at all
-// once this runs (see consolidateMultiColumn's own comment for why that
-// matters), so there's no ambiguity about which one wins.
-function looksLikeAliasColumn(header: string, aliases: string[]): boolean {
-  const n = normalizeHeader(header);
-  return aliases.some((alias) => {
-    const escaped = alias.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-    return n === alias || new RegExp(`^${escaped}\\s*\\d+$`).test(n);
-  });
-}
-
-function consolidateMultiColumn(
-  rows: Record<string, string>[],
-  headers: string[],
-  aliases: string[],
-  outKey: string,
-): string[] {
-  const cols = headers.filter((h) => looksLikeAliasColumn(h, aliases));
-  if (cols.length === 0) return headers;
-  for (const row of rows) {
-    row[outKey] = cols.map((c) => (row[c] ?? "").trim()).find((v) => v) ?? "";
-  }
-  // Drop the original phone/email-ish columns from what guessColumnMapping
-  // gets to see - otherwise it could grab whichever original column happens
-  // to come first in the file (an exact, already-recognized alias like
-  // "Cell" sitting next to "Phone 1", say) even when THAT one is blank for a
-  // row and a sibling column has the real value. Only this new consolidated
-  // column is left for the phone/email field to match.
-  const colSet = new Set(cols);
-  return [...headers.filter((h) => !colSet.has(h)), outKey];
-}
-
-function DatabasePage() {
-  const [access, setAccess] = useState<SoiAccess | null>(null);
-  const [accessError, setAccessError] = useState<string | null>(null);
-  const [clients, setClients] = useState<ClientOption[]>([]);
-  const [selected, setSelected] = useState<ClientOption | null>(null);
-
-  useEffect(() => {
-    getSoiAccess()
-      .then(async (a) => {
-        // First time anyone new opens this: auto-create their Build My
-        // Database client record right here, instead of showing a "not set
-        // up yet" message and waiting on a team member to do it by hand.
-        // Signing into the dashboard is the onboarding step now.
-        const resolved = a.role === "none" ? await provisionSoiClient() : a;
-        setAccess(resolved);
-        if (resolved.role === "team") {
-          const list = await listSoiClients();
-          setClients(list.map((c) => ({ id: c.id, name: c.name })));
-        } else if (resolved.role === "client") {
-          setSelected({ id: resolved.clientId, name: resolved.clientName });
-        }
-      })
-      .catch((e) => setAccessError(e instanceof Error ? e.message : String(e)));
-  }, []);
-
-  if (accessError) {
-    return (
-      <AppShell>
-        <PageHeader />
-        <Card className="mt-5">
-          <p className="text-sm text-destructive">{accessError}</p>
-        </Card>
-      </AppShell>
-    );
-  }
-
-  if (!access) {
-    return (
-      <AppShell>
-        <PageHeader />
-        <Card className="mt-5">
-          <p className="text-sm text-muted-foreground">Loading…</p>
-        </Card>
-      </AppShell>
-    );
-  }
-
-  if (access.role === "none") {
-    return (
-      <AppShell>
-        <PageHeader />
-        <Card className="mt-5">
-          <p className="text-sm text-muted-foreground">
-            We couldn't set up your Build My Database account automatically. Refresh and try again, or ask your team to
-            check your access.
-          </p>
-        </Card>
-      </AppShell>
-    );
-  }
-
-  if (access.role === "team" && !selected) {
-    return (
-      <AppShell>
-        <PageHeader />
-        <Card className="mt-5">
-          <h2 className="font-display text-lg font-semibold">Choose a client</h2>
-          <div className="mt-4 grid gap-2 sm:grid-cols-2 lg:grid-cols-3">
-            {clients.map((c) => (
-              <button
-                key={c.id}
-                onClick={() => setSelected(c)}
-                className="rounded-2xl border border-border bg-glass px-4 py-3 text-left text-sm font-medium transition-colors hover:bg-secondary"
-              >
-                {c.name}
-              </button>
-            ))}
-            {clients.length === 0 && <p className="text-sm text-muted-foreground">No clients yet.</p>}
-          </div>
-        </Card>
-      </AppShell>
-    );
-  }
-
-  if (!selected) return null;
-
-  return (
-    <AppShell>
-      <PageHeader
-        clientName={selected.name}
-        onChangeClient={access.role === "team" ? () => setSelected(null) : undefined}
-      />
-      <Workspace clientId={selected.id} clientName={selected.name} />
-    </AppShell>
-  );
-}
-
-function PageHeader({
-  clientName,
-  onChangeClient,
-}: {
-  clientName?: string | undefined;
-  onChangeClient?: (() => void) | undefined;
-}) {
-  return (
-    <div className="flex flex-wrap items-end justify-between gap-3 pt-2">
-      <div>
-        <h1 className="font-display text-2xl font-bold tracking-tight">Build My Database</h1>
-        <p className="mt-1 text-sm text-muted-foreground">
-          {clientName ? `Working on: ${clientName}` : "Clean and segment your contacts into marketing lists."}
-        </p>
-      </div>
-      {onChangeClient && (
-        <Button variant="secondary" onClick={onChangeClient}>
-          Change client
-        </Button>
-      )}
-    </div>
-  );
-}
-
-// The full report handed back by processSoiUploads - raw/unique counts and a
-// dedupe/address/borderline breakdown, straight from the real process-upload
-// Edge Function. Pulled from processSoiUploads's own return type (rather than
-// hand-duplicated) so it can never drift out of sync with what it returns.
-type ProcessReport = Awaited<ReturnType<typeof processSoiUploads>>;
-
-function Workspace({ clientId, clientName }: { clientId: string; clientName: string }) {
-  // Upload / Review / Append Data / Export. "Append Data" added 2026-10-15
-  // per Mike's request, after a round of real-world DataZapp append files -
-  // its own second-round upload step for a file that gets matched/merged
-  // straight into contacts already sitting in this client's database,
-  // rather than treated like a normal new list (see soi-builder.ts's
-  // DataZapp-append section for why that has to be a different code path
-  // from the Upload tab below). Sits after Review/Final Combined List and
-  // before Export, since it only makes sense once a client's been through a
-  // first round already and DataZapp's reply is in hand.
-  const [tab, setTab] = useState<"upload" | "review" | "append" | "export">("upload");
-  // The most recent Process run's report (raw/unique/dedupe counts) - lives
-  // here so it survives switching from Upload to Review right after
-  // processing, without needing to persist it anywhere server-side.
-  const [lastProcessReport, setLastProcessReport] = useState<ProcessReport | null>(null);
-  // Bug fix, 2026-10-15 - Mike: "I did a reset and the append data was still
-  // there, that should reset too." resetSoiDatabase itself was already
-  // correct (it does wipe the append-data staging blob and every contact,
-  // including anything just written by "appended_full_data"/"appended_email")
-  // - the real bug was that AppendDataTab is a normal React component that
-  // only ever loads its own state ONCE, on mount (the staging-restore effect,
-  // plus whatever Stage 1/Stage 2 result is already sitting in its state from
-  // the session). Resetting the database from the Upload tab had no way to
-  // tell an already-mounted AppendDataTab (or ExportTab) "your in-memory
-  // state is stale now, throw it away" - so if Mike reset without leaving
-  // the Append Data tab, or came back to it, it kept showing (and could even
-  // re-download) the exact pre-reset result, which is also the likely
-  // explanation for "Marketable file on appended full data is empty but it
-  // does download on append data screen": the download that still worked was
-  // reading stale component state, not the database, while the Export tab's
-  // button correctly queried the now-actually-empty database. Bumping this
-  // counter on every successful reset and using it as those tabs' React
-  // `key` forces a full, clean remount - the same effect as a page reload,
-  // but scoped to just those two tabs.
-  const [resetCounter, setResetCounter] = useState(0);
-  return (
-    <div className="mt-5">
-      <div className="flex flex-wrap gap-1 rounded-full border border-border bg-glass p-1 backdrop-blur-xl w-fit">
-        {(["upload", "review", "append", "export"] as const).map((t) => (
-          <button
-            key={t}
-            onClick={() => setTab(t)}
-            className={`rounded-full px-4 py-1.5 text-sm font-medium transition-colors ${
-              tab === t ? "bg-secondary text-foreground" : "text-muted-foreground hover:text-foreground"
-            }`}
-          >
-            {t === "upload" ? "Upload" : t === "review" ? "Review" : t === "append" ? "Append Data" : "Export"}
-          </button>
-        ))}
-      </div>
-      <div className="mt-5">
-        {tab === "upload" && (
-          <UploadTab
-            clientId={clientId}
-            clientName={clientName}
-            onProcessed={() => setTab("review")}
-            onReport={setLastProcessReport}
-            onReset={() => {
-              setLastProcessReport(null);
-              setResetCounter((n) => n + 1);
-            }}
-          />
-        )}
-        {tab === "review" && (
-          <ReviewTab
-            key={resetCounter}
-            clientId={clientId}
-            clientName={clientName}
-            lastProcessReport={lastProcessReport}
-          />
-        )}
-        {tab === "append" && <AppendDataTab key={resetCounter} clientId={clientId} clientName={clientName} />}
-        {tab === "export" && <ExportTab key={resetCounter} clientId={clientId} clientName={clientName} />}
-      </div>
-    </div>
-  );
-}
-
-// Formats SheetJS can read directly, browser-side, with no server round trip.
-const SPREADSHEET_EXTENSIONS = [".xlsx", ".xls", ".xlsm", ".xlsb", ".ods", ".tsv"];
-
-type BatchItem = {
-  file: File;
-  status: "pending" | "uploading" | "done" | "error" | "needs_conversion";
-  error?: string;
-};
-
-function UploadTab({
-  clientId,
-  clientName,
-  onProcessed,
-  onReport,
-  onReset,
-}: {
-  clientId: string;
-  clientName: string;
-  onProcessed: () => void;
-  onReport: (report: ProcessReport) => void;
-  onReset: () => void;
-}) {
-  const [uploads, setUploads] = useState<
-    Array<{ id: string; file_name: string; source_label: string; status: string }>
-  >([]);
-  // "Reset database" confirmation - typing the client's own name is the
-  // gate, same spirit as GitHub/Lovable's own "type to confirm" deletes,
-  // since resetSoiDatabase is irreversible and wipes every contact this
-  // client has, not just the files on this screen.
-  const [resetOpen, setResetOpen] = useState(false);
-  const [resetConfirmText, setResetConfirmText] = useState("");
-  const [resetBusy, setResetBusy] = useState(false);
-  const [resetError, setResetError] = useState<string | null>(null);
-  const [resetDone, setResetDone] = useState<{ deletedContacts: number; deletedUploads: number } | null>(null);
-  // The current drag/pick batch and how far it's gotten — files upload
-  // automatically the moment they're picked (parsed, columns auto-matched,
-  // sent) with no per-file "confirm and click Upload" step, so a whole
-  // batch goes straight through to the Process step without stopping to
-  // ask for anything, matching how the old app worked.
-  const [batch, setBatch] = useState<BatchItem[]>([]);
-  const [batchRunning, setBatchRunning] = useState(false);
-  const [busy, setBusy] = useState(false);
-  const [processResult, setProcessResult] = useState<Record<string, number> | null>(null);
-  // Once Process finishes successfully we jump straight to the Review tab
-  // (where the breakdown + report now live) instead of leaving the results
-  // sitting inline here — this just remembers that this batch has already
-  // been run, so the button still reads "Processed" if he clicks back to
-  // this tab.
-  const [processed, setProcessed] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-
-  const refresh = () => listSoiUploads({ data: { clientId } }).then(setUploads);
-  useEffect(() => {
-    refresh();
-  }, [clientId]);
-
-  async function uploadOneFile(file: File): Promise<void> {
-    const lowerName = file.name.toLowerCase();
-    const sourceLabel = file.name.replace(/\.[^.]+$/, "");
-    if (lowerName.endsWith(".vcf")) {
-      const content = await fileToBase64(file);
-      await uploadSoiFile({ data: { clientId, fileName: file.name, sourceLabel, kind: "vcf", content } });
-      return;
-    }
-    let preview: { headers: string[]; rows: Record<string, string>[] };
-    if (SPREADSHEET_EXTENSIONS.some((ext) => lowerName.endsWith(ext))) {
-      try {
-        preview = await parseSpreadsheet(file);
-      } catch {
-        throw new Error("Couldn't read that file — try re-saving/exporting it as a .csv instead.");
-      }
-    } else {
-      preview = parseCsv(await file.text());
-    }
-    // Multi-column phone/email consolidation BEFORE guessing the mapping -
-    // see consolidateMultiColumn's own comment above for why this has to
-    // run first (a file with "Phone 1, Phone 2..." style columns used to
-    // get nothing mapped for phone at all).
-    let headers = consolidateMultiColumn(
-      preview.rows,
-      preview.headers,
-      MAPPING_ALIASES["phone"] ?? [],
-      "Consolidated Phone",
-    );
-    headers = consolidateMultiColumn(preview.rows, headers, MAPPING_ALIASES["email"] ?? [], "Consolidated Email");
-    // Auto-match columns from the file's own headers (First Name, Email,
-    // etc.) — see guessColumnMapping's comment for what counts as
-    // recognizable. No manual mapping step; this is what lets a batch go
-    // straight through without stopping for each file.
-    const mapping = guessColumnMapping(headers);
-    await uploadSoiFile({
-      data: {
-        clientId,
-        fileName: file.name,
-        sourceLabel,
-        kind: "mapped_csv",
-        content: JSON.stringify({ mapping, rows: preview.rows }),
-      },
-    });
-  }
-
-  async function handleFilesPicked(files: File[]) {
-    if (files.length === 0) return;
-    setError(null);
-    setProcessed(false);
-    const items: BatchItem[] = files.map((file) => ({ file, status: "pending" }));
-    setBatch(items);
-    setBatchRunning(true);
-    for (let i = 0; i < items.length; i++) {
-      const item = items[i];
-      if (!item) continue;
-      // Caught here, before ever attempting an upload, rather than as a
-      // thrown error from uploadOneFile - Apple's .numbers format is a
-      // proprietary bundle no browser-side library can parse, so this isn't
-      // a failure to report, it's a known, expected limitation with a clear
-      // one-click fix. Rendered as its own full-width callout below (see
-      // the batch list JSX) instead of squeezed into the same single-line
-      // status text every other row uses, after Mike said he saw this but
-      // it clearly didn't land: "it does not allow numbers files to be
-      // uploaded. Is there a reason for that?"
-      if (item.file.name.toLowerCase().endsWith(".numbers")) {
-        setBatch((cur) => cur.map((it, idx) => (idx === i ? { ...it, status: "needs_conversion" } : it)));
-        continue;
-      }
-      setBatch((cur) => cur.map((it, idx) => (idx === i ? { ...it, status: "uploading" } : it)));
-      try {
-        await uploadOneFile(item.file);
-        setBatch((cur) => cur.map((it, idx) => (idx === i ? { ...it, status: "done" } : it)));
-      } catch (e) {
-        const message = e instanceof Error ? e.message : String(e);
-        setBatch((cur) => cur.map((it, idx) => (idx === i ? { ...it, status: "error", error: message } : it)));
-      }
-    }
-    setBatchRunning(false);
-    await refresh();
-  }
-
-  async function handleProcess() {
-    setBusy(true);
-    setError(null);
-    try {
-      const result = await processSoiUploads({ data: { clientId } });
-      setProcessResult(result.list_counts);
-      setProcessed(true);
-      onReport(result);
-      // Don't make Mike hunt for the results on this screen — jump straight
-      // to the Review tab, where the breakdown + report now live.
-      onProcessed();
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  async function handleReset() {
-    if (resetConfirmText.trim() !== clientName.trim()) return;
-    setResetBusy(true);
-    setResetError(null);
-    try {
-      const result = await resetSoiDatabase({ data: { clientId } });
-      setResetDone(result);
-      setResetOpen(false);
-      setResetConfirmText("");
-      // Clear every bit of local state this screen (and Review, via
-      // onReset) was holding, so it's a genuinely clean slate without
-      // needing a page reload.
-      setUploads([]);
-      setBatch([]);
-      setProcessed(false);
-      setProcessResult(null);
-      onReset();
-    } catch (e) {
-      setResetError(e instanceof Error ? e.message : String(e));
-    } finally {
-      setResetBusy(false);
-    }
-  }
-
-  return (
-    <div className="grid gap-5 lg:grid-cols-2">
-      <Card>
-        <h2 className="font-display text-lg font-semibold">Add a file</h2>
-        <p className="mt-1 text-sm text-muted-foreground">
-          CSV, Excel, or OpenDocument spreadsheet export from your CRM, or a .vcf contacts export. (Apple Numbers files
-          need to be exported to CSV or Excel first — Numbers can do that in one click via File &gt; Export To.)
-        </p>
-        <label className="mt-4 flex cursor-pointer flex-col items-start gap-3 rounded-2xl border border-dashed border-border bg-background/40 px-5 py-6 transition-colors hover:bg-secondary/40 sm:flex-row sm:items-center sm:justify-between">
-          <span className="text-sm text-muted-foreground">
-            {batchRunning
-              ? "Uploading…"
-              : "Drop one or more files here, or click to browse — they upload automatically."}
-          </span>
-          <span className="rounded-full bg-primary px-5 py-2 text-sm font-semibold text-primary-foreground shadow-lg shadow-primary/30 transition-transform hover:-translate-y-0.5">
-            Choose files
-          </span>
-          <input
-            type="file"
-            multiple
-            accept=".csv,.vcf,.xls,.xlsx,.xlsm,.xlsb,.ods,.tsv,.numbers"
-            onChange={(e) => handleFilesPicked(Array.from(e.target.files ?? []))}
-            className="hidden"
-          />
-        </label>
-        {batch.length > 0 && (
-          <ul className="mt-4 space-y-2">
-            {batch.map((item, idx) =>
-              item.status === "needs_conversion" ? (
-                // Full-width callout, not squeezed into the same one-line
-                // status text every other row uses below — the whole point
-                // is that this gets seen and understood as "a quick export
-                // step, not an error," not missed as small inline text.
-                <li key={idx} className="rounded-2xl border border-border bg-secondary/40 px-4 py-3 text-sm">
-                  <p className="truncate font-medium">{item.file.name}</p>
-                  <p className="mt-1 font-medium text-foreground">
-                    This is an Apple Numbers file — it needs a quick one-click export first, same as any other app that
-                    isn't Numbers itself:
-                  </p>
-                  <ol className="mt-1 list-decimal space-y-0.5 pl-5 text-muted-foreground">
-                    <li>Open the file in Numbers on your Mac.</li>
-                    <li>File &gt; Export To &gt; CSV (or Excel) &mdash; one click, no data is lost.</li>
-                    <li>Come back here and upload that exported file instead.</li>
-                  </ol>
-                </li>
-              ) : (
-                <li key={idx} className="flex items-center justify-between gap-2 text-sm">
-                  <span className="truncate">{item.file.name}</span>
-                  <span
-                    className={
-                      item.status === "done"
-                        ? "text-xs font-medium text-primary"
-                        : item.status === "error"
-                          ? "text-xs font-medium text-destructive"
-                          : "text-xs text-muted-foreground"
-                    }
-                  >
-                    {item.status === "pending" && "Waiting…"}
-                    {item.status === "uploading" && "Uploading…"}
-                    {item.status === "done" && "Uploaded ✓"}
-                    {item.status === "error" && (item.error ?? "Failed")}
-                  </span>
-                </li>
-              ),
-            )}
-          </ul>
-        )}
-        {error && <p className="mt-3 text-sm text-destructive">{error}</p>}
-      </Card>
-
-      <Card>
-        <h2 className="font-display text-lg font-semibold">Uploaded files</h2>
-        <ul className="mt-3 space-y-2">
-          {uploads.map((u) => (
-            <li
-              key={u.id}
-              className="flex items-center justify-between rounded-xl border border-border px-3 py-2 text-sm"
-            >
-              <span>
-                {u.file_name} <span className="text-muted-foreground">({u.source_label})</span>
-              </span>
-              <button
-                onClick={() => deleteSoiUpload({ data: { clientId, uploadId: u.id } }).then(refresh)}
-                className="text-xs text-destructive hover:underline"
-              >
-                Remove
-              </button>
-            </li>
-          ))}
-          {uploads.length === 0 && <p className="text-sm text-muted-foreground">No files uploaded yet.</p>}
-        </ul>
-        <div className="mt-5 border-t border-border pt-4">
-          <Button onClick={handleProcess} disabled={busy || uploads.length === 0}>
-            {busy ? "Processing…" : processed ? "Processed ✓" : "Process all uploads"}
-          </Button>
-          {processed && processResult && (
-            <p className="mt-3 text-sm text-muted-foreground">
-              Done — see the breakdown on the{" "}
-              <button onClick={onProcessed} className="font-medium text-primary hover:underline">
-                Review
-              </button>{" "}
-              tab.
-            </p>
-          )}
-        </div>
-      </Card>
-
-      {/* "There should be a reset button on the Upload screen anytime you
-          want to rerun a new database. People may come back and add
-          contacts to it or clean their list." — added 2026-10-15. Wipes
-          every file and every contact this client has via
-          resetSoiDatabase, so a new upload round starts completely clean
-          instead of deduping against whatever's already in there. Gated
-          behind typing the client's own name, since there's no undo. */}
-      <Card className="lg:col-span-2 border-destructive/40">
-        <h2 className="font-display text-lg font-semibold text-destructive">Start over</h2>
-        <p className="mt-1 text-sm text-muted-foreground">
-          Permanently deletes every uploaded file and every contact for {clientName} so you can run a brand-new database
-          from scratch. This can't be undone — use it when a client wants their whole list wiped and re-cleaned, not
-          just a new batch added to what's already here.
-        </p>
-        {resetDone && !resetOpen && (
-          <p className="mt-3 text-sm text-muted-foreground">
-            Done — removed {resetDone.deletedContacts} contact{resetDone.deletedContacts === 1 ? "" : "s"} and{" "}
-            {resetDone.deletedUploads} uploaded file{resetDone.deletedUploads === 1 ? "" : "s"}. Ready for a fresh
-            upload.
-          </p>
-        )}
-        {!resetOpen ? (
-          <div className="mt-3">
-            <Button variant="danger" onClick={() => setResetOpen(true)}>
-              Reset database
-            </Button>
-          </div>
-        ) : (
-          <div className="mt-3 space-y-2">
-            <p className="text-sm text-muted-foreground">
-              Type <span className="font-semibold text-foreground">{clientName}</span> to confirm.
-            </p>
-            <input
-              value={resetConfirmText}
-              onChange={(e) => setResetConfirmText(e.target.value)}
-              placeholder={clientName}
-              className="w-full max-w-sm rounded-2xl border border-border bg-background px-4 py-2.5 text-sm outline-none ring-ring transition focus:ring-2"
-            />
-            <div className="flex gap-2">
-              <Button
-                variant="danger"
-                onClick={handleReset}
-                disabled={resetBusy || resetConfirmText.trim() !== clientName.trim()}
-              >
-                {resetBusy ? "Resetting…" : "Permanently delete everything"}
-              </Button>
-              <Button
-                variant="secondary"
-                onClick={() => {
-                  setResetOpen(false);
-                  setResetConfirmText("");
-                  setResetError(null);
-                }}
-              >
-                Cancel
-              </Button>
-            </div>
-            {resetError && <p className="text-sm text-destructive">{resetError}</p>}
-          </div>
-        )}
-      </Card>
-    </div>
-  );
-}
-
-// Turns a dedupe_stats key like "exact_email_match" into "Exact email match" -
-// generic on purpose, since the real reason codes live in the process-upload
-// Edge Function and could be renamed/added to there without this needing to
-// change in lockstep.
-function formatDedupeReason(key: string): string {
-  const words = key.replace(/_/g, " ").trim();
-  return words ? words.charAt(0).toUpperCase() + words.slice(1) : key;
-}
-
-// The breakdown counts used to live on their own separate "Database
-// Breakdown" tab - Mike found that confusing and asked for it folded into
-// the top of Review instead, directly above the step tabs. Also surfaces the
-// duplicate-removal report from the most recent Process run (the "little
-// report" the old app had), when there is one.
-function DatabaseBreakdown({
-  clientId,
-  lastProcessReport,
-  refreshSignal,
-}: {
-  clientId: string;
-  lastProcessReport: ProcessReport | null;
-  // Bumped by ReviewTab any time a checkbox is saved, so the checked/total
-  // numbers below stay live instead of only updating on the next Process run
-  // or tab switch - this is the "reflect the math in real time" Mike asked for.
-  refreshSignal: number;
-}) {
-  const [counts, setCounts] = useState<Record<string, number> | null>(null);
-  useEffect(() => {
-    getSoiHubCounts({ data: { clientId } }).then(setCounts);
-    // Re-fetch on a fresh Process run and on every saved checkbox change, not just on client change.
-  }, [clientId, lastProcessReport, refreshSignal]);
-
-  const duplicatesRemoved = lastProcessReport ? lastProcessReport.raw_total - lastProcessReport.unique_total : 0;
-
-  return (
-    <div className="mb-6">
-      <h2 className="font-display text-lg font-semibold">Database Breakdown</h2>
-      {counts ? (
-        <div className="mt-3 grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
-          {BREAKDOWN_CARDS.map((card) => {
-            const total = card.lists.reduce((sum: number, l) => sum + (counts[l] ?? 0), 0);
-            const checkedSum = card.checkedLists.reduce((sum: number, l) => sum + (counts[`${l}_checked`] ?? 0), 0);
-            const display =
-              card.mode === "checked"
-                ? `${checkedSum}/${total}`
-                : card.mode === "survivors"
-                  ? `${total - checkedSum}/${total}`
-                  : total;
-            const caption =
-              card.mode === "checked"
-                ? "checked off / total on list"
-                : card.mode === "survivors"
-                  ? "will make final list / total on list"
-                  : null;
-            return (
-              <Card key={card.key}>
-                <p className="text-sm text-muted-foreground">{card.label}</p>
-                <p className="mt-1 font-display text-3xl font-bold">{display}</p>
-                {caption && <p className="mt-1 text-xs text-muted-foreground">{caption}</p>}
-              </Card>
-            );
-          })}
-        </div>
-      ) : (
-        <p className="mt-3 text-sm text-muted-foreground">Loading…</p>
-      )}
-
-      {lastProcessReport && (
-        <Card className="mt-4">
-          <h3 className="font-display text-base font-semibold">Just processed</h3>
-          <p className="mt-1 text-sm text-muted-foreground">
-            {lastProcessReport.raw_total} contact{lastProcessReport.raw_total === 1 ? "" : "s"} uploaded →{" "}
-            {lastProcessReport.unique_total} unique ({duplicatesRemoved} duplicate{duplicatesRemoved === 1 ? "" : "s"}{" "}
-            removed).
-          </p>
-          {Object.keys(lastProcessReport.dedupe_stats).length > 0 && (
-            <ul className="mt-2 space-y-1 text-sm text-muted-foreground">
-              {Object.entries(lastProcessReport.dedupe_stats).map(([reason, count]) => (
-                <li key={reason}>
-                  {formatDedupeReason(reason)}: {count}
-                </li>
-              ))}
-            </ul>
-          )}
-          {lastProcessReport.address_corrections.length > 0 && (
-            <p className="mt-2 text-sm text-muted-foreground">
-              {lastProcessReport.address_corrections.length} address correction
-              {lastProcessReport.address_corrections.length === 1 ? "" : "s"} made.
-            </p>
-          )}
-          {lastProcessReport.borderline_flags.length > 0 && (
-            <p className="mt-1 text-sm text-muted-foreground">
-              {lastProcessReport.borderline_flags.length} borderline email/domain flag
-              {lastProcessReport.borderline_flags.length === 1 ? "" : "s"} worth a second look.
-            </p>
-          )}
-        </Card>
-      )}
-    </div>
-  );
-}
-
-// The preview/finalize summary shapes returned by soi-builder.ts's
-// DataZapp-append functions - pulled from their own return types rather
-// than hand-duplicated, same reasoning as ProcessReport above.
-type DatazappPreview = Awaited<ReturnType<typeof previewDatazappAppend>>;
-type DatazappFinalizeResult = Awaited<ReturnType<typeof finalizeDatazappAppend>>;
-type DatazappReviewRow = DatazappPreview["reviewRows"][number];
-
-// Stage 2 ("Email List") shapes - same reasoning as above, pulled from the
-// server functions' own return types.
-type DatazappEmailPreview = Awaited<ReturnType<typeof previewDatazappEmailList>>;
-type DatazappEmailFinalizeResult = Awaited<ReturnType<typeof finalizeDatazappEmailList>>;
-type DatazappEmailReviewRow = DatazappEmailPreview["reviewRows"][number];
-
-const DATAZAPP_TIER_LABELS: Record<string, string> = {
-  confirmed: "Confirmed match",
-  household: "Same household (address only)",
-  mismatch: "Name doesn't match — not reviewable",
-  no_data: "DataZapp had nothing to add",
-};
-
-function triggerCsvDownload(filename: string, content: string) {
-  const blob = new Blob([content], { type: "text/csv" });
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement("a");
-  a.href = url;
-  a.download = filename;
-  a.click();
-  URL.revokeObjectURL(url);
-}
-
-// Added 2026-10-15 per Mike: "All downloads files should have the file name
-// then last name of User so they can be identified" - with several clients
-// and several downloads apiece, a folder full of "final-full-contact-
-// 2026-10-15.csv" files from different clients all look identical once
-// they've landed in Downloads. Pulls the last word of the client's name
-// (handles the normal "First Last" case; falls back to the whole name for
-// anything else, like a company name with no obvious "last name") and
-// tucks it in right before the .csv extension, so every download this tab
-// produces - the Append Data CSVs, every Export tab button, Needs Data -
-// stays identifiable regardless of which one of these functions built it.
-function clientLastNameForFilename(clientName: string): string {
-  const parts = clientName.trim().split(/\s+/).filter(Boolean);
-  const candidate = parts.length > 0 ? (parts[parts.length - 1] ?? clientName) : clientName;
-  const safe = candidate
-    .replace(/[^a-zA-Z0-9_-]+/g, "-")
-    .replace(/-+/g, "-")
-    .replace(/^-|-$/g, "");
-  return safe || "client";
-}
-
-function withClientSuffix(filename: string, clientName: string): string {
-  const suffix = clientLastNameForFilename(clientName);
-  return /\.csv$/i.test(filename) ? filename.replace(/\.csv$/i, `-${suffix}.csv`) : `${filename}-${suffix}`;
-}
-
-// Standalone pass over a DataZapp return file, with no connection to this
-// client's actual contacts at all. REDESIGNED TWICE the same day this first
-// shipped - see soi-builder.ts's header comment on this whole feature for
-// the full story. The short version: version 1 looked up each row's phone
-// number against this client's stored contacts and auto-applied matches
-// with no review; Mike tested it live, got "Applied: Updated 0 of 927
-// contacts," and separately said auto-apply was the wrong call regardless.
-// Version 2 added a review wizard but kept the contacts lookup - and Mike
-// said THAT was the real mistake: "The append data should have nothing to
-// do with the prior contacts... I'm uploading an appended list that's still
-// showing me zero results because I don't have that data from the original
-// upload, so it doesn't make sense." His own description of the process:
-// "you upload the appended data file. It's going to give you all the
-// matches. It's going to give you all the mismatches, and then it's going
-// to clean that list up... and it's going to ask us who we're keeping."
-// This version does exactly that and nothing else - the file already
-// carries its own original name/phone/email next to DataZapp's appended
-// columns, so matching is a same-row comparison, no database lookup
-// involved anywhere. The result is a standalone downloadable list, the
-// same kind of thing as "Final Full Contact" elsewhere in this tab, not a
-// write to any contact record.
-function AppendDataTab({ clientId, clientName }: { clientId: string; clientName: string }) {
-  const [fileName, setFileName] = useState<string | null>(null);
-  const [rows, setRows] = useState<Record<string, string>[] | null>(null);
-  const [preview, setPreview] = useState<DatazappPreview | null>(null);
-  const [checkedRows, setCheckedRows] = useState<Set<number>>(new Set());
-  const [finalizeResult, setFinalizeResult] = useState<DatazappFinalizeResult | null>(null);
-  const [search, setSearch] = useState("");
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  // Bug fix, 2026-10-15: Mike switched tabs mid-review and lost everything -
-  // "I went away from the Append Data screen and when I came back all data
-  // was not saved. I only switched windows." `restoring` covers the brief
-  // moment on mount while this checks for a previously-staged file (see
-  // getAppendDataStaging in soi-builder.ts) before deciding whether to show
-  // the empty upload prompt.
-  const [restoring, setRestoring] = useState(true);
-
-  // Stage 2 - "Email List" pass over whatever Stage 1 didn't keep.
-  const [emailPreview, setEmailPreview] = useState<DatazappEmailPreview | null>(null);
-  const [emailChecked, setEmailChecked] = useState<Set<number>>(new Set());
-  const [emailFinalizeResult, setEmailFinalizeResult] = useState<DatazappEmailFinalizeResult | null>(null);
-  const [emailSearch, setEmailSearch] = useState("");
-  const [emailBusy, setEmailBusy] = useState(false);
-  const [emailError, setEmailError] = useState<string | null>(null);
-  const [emailStageOpen, setEmailStageOpen] = useState(false);
-
-  useEffect(() => {
-    let cancelled = false;
-    setRestoring(true);
-    getAppendDataStaging({ data: { clientId } })
-      .then(async (staged) => {
-        if (cancelled || !staged) return;
-        setFileName(staged.fileName);
-        setRows(staged.rows);
-        const result = await previewDatazappAppend({ data: { clientId, rows: staged.rows } });
-        if (cancelled) return;
-        setPreview(result);
-        setCheckedRows(new Set(result.reviewRows.map((r) => r.rowIndex)));
-      })
-      .catch(() => {
-        // A failed restore just means the tab opens empty, same as someone's
-        // first time here - not worth surfacing as an error.
-      })
-      .finally(() => {
-        if (!cancelled) setRestoring(false);
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [clientId]);
-
-  function resetEmailStage() {
-    setEmailPreview(null);
-    setEmailChecked(new Set());
-    setEmailFinalizeResult(null);
-    setEmailSearch("");
-    setEmailError(null);
-    setEmailStageOpen(false);
-  }
-
-  async function handleFilePicked(file: File) {
-    setError(null);
-    setPreview(null);
-    setFinalizeResult(null);
-    setSearch("");
-    setFileName(file.name);
-    setBusy(true);
-    resetEmailStage();
-    try {
-      const lowerName = file.name.toLowerCase();
-      const parsed = SPREADSHEET_EXTENSIONS.some((ext) => lowerName.endsWith(ext))
-        ? await parseSpreadsheet(file)
-        : parseCsv(await file.text());
-      if (parsed.rows.length === 0) throw new Error("That file doesn't have any rows in it.");
-      setRows(parsed.rows);
-      const result = await previewDatazappAppend({ data: { clientId, rows: parsed.rows } });
-      setPreview(result);
-      // Opt-OUT, same as Mike's own description of how this should work:
-      // everyone worth reviewing starts checked (kept); his team unchecks
-      // the ones they don't want rather than having to check every row by
-      // hand.
-      setCheckedRows(new Set(result.reviewRows.map((r) => r.rowIndex)));
-      // Best-effort: stage this upload so it survives a tab switch. A
-      // failure here doesn't block the review itself - just means this
-      // particular upload won't survive navigating away.
-      saveAppendDataStaging({ data: { clientId, fileName: file.name, rows: parsed.rows } }).catch(() => {});
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  function toggleRow(rowIndex: number, next: boolean) {
-    setCheckedRows((cur) => {
-      const copy = new Set(cur);
-      if (next) copy.add(rowIndex);
-      else copy.delete(rowIndex);
-      return copy;
-    });
-  }
-
-  function toggleAllVisible(visible: DatazappReviewRow[], next: boolean) {
-    setCheckedRows((cur) => {
-      const copy = new Set(cur);
-      for (const r of visible) {
-        if (next) copy.add(r.rowIndex);
-        else copy.delete(r.rowIndex);
-      }
-      return copy;
-    });
-  }
-
-  async function handleFinalize() {
-    if (!rows) return;
-    setBusy(true);
-    setError(null);
-    try {
-      const result = await finalizeDatazappAppend({
-        data: { clientId, rows, includedRowIndexes: Array.from(checkedRows) },
-      });
-      setFinalizeResult(result);
-      if (result.csv) {
-        triggerCsvDownload(
-          withClientSuffix(`datazapp-appended-${new Date().toISOString().slice(0, 10)}.csv`, clientName),
-          result.csv,
-        );
-      }
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  async function handleStartEmailStage() {
-    if (!rows) return;
-    setEmailStageOpen(true);
-    setEmailBusy(true);
-    setEmailError(null);
-    try {
-      const result = await previewDatazappEmailList({
-        data: { clientId, rows, keptRowIndexes: Array.from(checkedRows) },
-      });
-      setEmailPreview(result);
-      setEmailChecked(new Set(result.reviewRows.map((r) => r.rowIndex)));
-    } catch (e) {
-      setEmailError(e instanceof Error ? e.message : String(e));
-    } finally {
-      setEmailBusy(false);
-    }
-  }
-
-  function toggleEmailRow(rowIndex: number, next: boolean) {
-    setEmailChecked((cur) => {
-      const copy = new Set(cur);
-      if (next) copy.add(rowIndex);
-      else copy.delete(rowIndex);
-      return copy;
-    });
-  }
-
-  function toggleAllEmailVisible(visible: DatazappEmailReviewRow[], next: boolean) {
-    setEmailChecked((cur) => {
-      const copy = new Set(cur);
-      for (const r of visible) {
-        if (next) copy.add(r.rowIndex);
-        else copy.delete(r.rowIndex);
-      }
-      return copy;
-    });
-  }
-
-  async function handleEmailFinalize() {
-    if (!rows) return;
-    setEmailBusy(true);
-    setEmailError(null);
-    try {
-      const result = await finalizeDatazappEmailList({
-        data: { clientId, rows, includedRowIndexes: Array.from(emailChecked) },
-      });
-      setEmailFinalizeResult(result);
-      if (result.csv) {
-        triggerCsvDownload(
-          withClientSuffix(`datazapp-email-list-${new Date().toISOString().slice(0, 10)}.csv`, clientName),
-          result.csv,
-        );
-      }
-    } catch (e) {
-      setEmailError(e instanceof Error ? e.message : String(e));
-    } finally {
-      setEmailBusy(false);
-    }
-  }
-
-  const q = search.trim().toLowerCase();
-  const reviewRows = preview?.reviewRows ?? [];
-  const filtered = q
-    ? reviewRows.filter((r) => [r.firstName, r.lastName, r.phone].some((v) => (v ?? "").toLowerCase().includes(q)))
-    : reviewRows;
-  const allFilteredChecked = filtered.length > 0 && filtered.every((r) => checkedRows.has(r.rowIndex));
-  const checkedCount = checkedRows.size;
-
-  const emailQ = emailSearch.trim().toLowerCase();
-  const emailReviewRows = emailPreview?.reviewRows ?? [];
-  const emailFiltered = emailQ
-    ? emailReviewRows.filter((r) =>
-        [r.firstName, r.lastName, r.email, r.phone].some((v) => (v ?? "").toLowerCase().includes(emailQ)),
-      )
-    : emailReviewRows;
-  const allEmailFilteredChecked = emailFiltered.length > 0 && emailFiltered.every((r) => emailChecked.has(r.rowIndex));
-  const emailCheckedCount = emailChecked.size;
-
-  return (
-    <div className="space-y-4">
-      <Card>
-        <h2 className="font-display text-lg font-semibold">Append Data</h2>
-        <p className="mt-1 text-sm text-muted-foreground">
-          Upload the file DataZapp sent back after appending emails/direct mail addresses to the contacts you sent it.
-          Matching never looks anything up — it's a standalone pass over just this file, checking DataZapp's own
-          appended name against the original name already in the same file before trusting the appended data. Common
-          nicknames (Mike/Michael, Kate/Catherine) count as a match, and a same-household match (last name agrees, first
-          name doesn't) still gets the mailing address, just not the email. Once you review and keep a row here, it gets
-          saved as its own "Appended Full Data" list (next to Final Full Contact on the Export tab) as well as a CSV you
-          can download right away.
-        </p>
-        <label className="mt-4 flex cursor-pointer items-center justify-center rounded-2xl border border-dashed border-border bg-muted/50 px-4 py-8 text-sm text-muted-foreground transition-colors hover:bg-muted">
-          <input
-            type="file"
-            accept=".csv,.xlsx,.xls,.xlsm,.xlsb,.ods,.tsv"
-            className="hidden"
-            onChange={(e) => {
-              const file = e.target.files?.[0];
-              if (file) handleFilePicked(file);
-              e.target.value = "";
-            }}
-          />
-          {restoring
-            ? "Checking for a saved file…"
-            : busy && !preview
-              ? "Working…"
-              : fileName
-                ? `${fileName} — click to replace`
-                : "Click to choose the DataZapp file"}
-        </label>
-        {error && <p className="mt-3 text-sm text-destructive">{error}</p>}
-      </Card>
-
-      {preview && !finalizeResult && (
-        <>
-          <Card>
-            <h3 className="font-display text-base font-semibold">{preview.total} rows checked</h3>
-            <div className="mt-3 grid gap-2 sm:grid-cols-2">
-              {(["confirmed", "household", "mismatch", "no_data"] as const).map((tier) => (
-                <div key={tier} className="rounded-2xl border border-border bg-glass px-4 py-3">
-                  <p className="text-2xl font-bold tabular-nums">{preview.counts[tier]}</p>
-                  <p className="text-xs text-muted-foreground">{DATAZAPP_TIER_LABELS[tier]}</p>
-                </div>
-              ))}
-            </div>
-            {preview.doNotCallCount > 0 && (
-              <p className="mt-3 text-sm text-muted-foreground">
-                {preview.doNotCallCount} row{preview.doNotCallCount === 1 ? "" : "s"} came back flagged Do Not Call by
-                DataZapp. That flag is informational only here - it has never excluded anyone from review, from being
-                kept below, or from the email list. These are relationships, not cold-call targets, so nothing in this
-                app filters on it.
-              </p>
-            )}
-            {preview.possibleBusinessCount > 0 && (
-              <p className="mt-1 text-sm text-muted-foreground">
-                {preview.possibleBusinessCount} came back with a company name attached — worth a look before treating
-                them as a personal contact.
-              </p>
-            )}
-            <p className="mt-4 text-sm text-muted-foreground">
-              Only the {preview.counts.confirmed + preview.counts.household} confirmed/same-household matches below are
-              worth reviewing. Mismatches and rows DataZapp had nothing for never make the list either way, so there's
-              nothing to decide on them.
-            </p>
-          </Card>
-
-          {reviewRows.length === 0 ? (
-            <Card>
-              <p className="text-sm text-muted-foreground">
-                Nothing here matched well enough to review — DataZapp didn't return anything your team can safely use
-                from this file.
-              </p>
-            </Card>
-          ) : (
-            <>
-              <div className="flex flex-wrap items-center justify-between gap-3">
-                <p className="text-sm text-muted-foreground">
-                  <span className="font-semibold text-foreground">{checkedCount}</span> of {reviewRows.length} kept —
-                  uncheck anyone you don't want on the final list.
-                </p>
-                <Button onClick={handleFinalize} disabled={busy || checkedCount === 0}>
-                  {busy ? "Working…" : `Download the list (${checkedCount} kept)`}
-                </Button>
-              </div>
-              <input
-                value={search}
-                onChange={(e) => setSearch(e.target.value)}
-                placeholder="Search name or phone…"
-                className="w-full max-w-md rounded-2xl border border-border bg-background px-4 py-2.5 text-sm outline-none ring-ring transition focus:ring-2"
-              />
-              <Card>
-                <div className="overflow-x-auto">
-                  <table className="w-full text-sm">
-                    <thead>
-                      <tr className="text-left text-muted-foreground">
-                        <th className="sticky left-0 z-10 w-24 min-w-24 max-w-24 truncate bg-background pb-2 pr-4">
-                          First name
-                        </th>
-                        <th className="sticky left-24 z-10 w-28 min-w-28 max-w-28 truncate border-r border-border bg-background pb-2 pr-4">
-                          Last name
-                        </th>
-                        <th className="whitespace-nowrap pb-2 pr-4">Phone</th>
-                        <th className="whitespace-nowrap pb-2 pr-4">Match</th>
-                        <th className="pb-2 pr-4">Email</th>
-                        <th className="pb-2 pr-4">Address</th>
-                        <th className="whitespace-nowrap pb-2 pr-4">City</th>
-                        <th className="whitespace-nowrap pb-2 pr-4">State</th>
-                        <th className="whitespace-nowrap pb-2 pr-4">Zip</th>
-                        <th className="sticky right-0 z-10 whitespace-nowrap border-l border-border bg-background pb-2 pl-3">
-                          <div className="flex items-center gap-2">
-                            <span>Keep</span>
-                            <button
-                              type="button"
-                              onClick={() => toggleAllVisible(filtered, !allFilteredChecked)}
-                              disabled={filtered.length === 0}
-                              className="text-xs font-medium normal-case text-primary underline-offset-2 transition-colors hover:underline disabled:opacity-60"
-                            >
-                              {allFilteredChecked ? "Clear all" : "Select all"}
-                            </button>
-                          </div>
-                        </th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {filtered.map((r) => (
-                        <tr key={r.rowIndex} className="border-t border-border">
-                          <td
-                            title={r.firstName || undefined}
-                            className="sticky left-0 z-10 w-24 min-w-24 max-w-24 truncate bg-background py-2 pr-4"
-                          >
-                            {r.firstName}
-                          </td>
-                          <td
-                            title={r.lastName || undefined}
-                            className="sticky left-24 z-10 w-28 min-w-28 max-w-28 truncate border-r border-border bg-background py-2 pr-4"
-                          >
-                            {r.lastName}
-                          </td>
-                          <td className="whitespace-nowrap py-2 pr-4">{r.phone}</td>
-                          <td className="py-2 pr-4">
-                            <span className="rounded-full bg-muted px-2.5 py-1 text-xs font-semibold uppercase tracking-wide text-muted-foreground">
-                              {r.tier === "confirmed" ? "Confirmed" : "Household"}
-                            </span>
-                          </td>
-                          <td className="py-2 pr-4">
-                            {r.finalEmail || (
-                              <span className="text-muted-foreground">
-                                {r.tier === "household" ? "— (withheld, household match)" : "—"}
-                              </span>
-                            )}
-                          </td>
-                          <td className="py-2 pr-4">
-                            {r.finalAddress || <span className="text-muted-foreground">—</span>}
-                          </td>
-                          <td className="whitespace-nowrap py-2 pr-4">{r.finalCity}</td>
-                          <td className="whitespace-nowrap py-2 pr-4">{r.finalState}</td>
-                          <td className="whitespace-nowrap py-2 pr-4">{r.finalZip}</td>
-                          <td className="sticky right-0 z-10 border-l border-border bg-background py-2 pl-3">
-                            <input
-                              type="checkbox"
-                              checked={checkedRows.has(r.rowIndex)}
-                              onChange={(e) => toggleRow(r.rowIndex, e.target.checked)}
-                            />
-                          </td>
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                  {filtered.length === 0 && (
-                    <p className="text-sm text-muted-foreground">No matches for that search.</p>
-                  )}
-                </div>
-              </Card>
-            </>
-          )}
-        </>
-      )}
-
-      {finalizeResult && (
-        <Card>
-          <h3 className="font-display text-base font-semibold">List ready</h3>
-          <p className="mt-2 text-sm text-muted-foreground">
-            {finalizeResult.keptCount} contact{finalizeResult.keptCount === 1 ? "" : "s"} saved to this client's
-            "Appended Full Data" list (find it on the Export tab, under Marketable) — {finalizeResult.written.inserted}{" "}
-            new, {finalizeResult.written.updated} filled in on an existing contact. Here's the same list as a CSV too,
-            ready to upload wherever else you need it (Suite Assist, or anywhere else).
-          </p>
-          {finalizeResult.csv ? (
-            <div className="mt-3">
-              <Button
-                variant="secondary"
-                onClick={() =>
-                  triggerCsvDownload(
-                    withClientSuffix(`datazapp-appended-${new Date().toISOString().slice(0, 10)}.csv`, clientName),
-                    finalizeResult.csv!,
-                  )
-                }
-              >
-                Download the list again
-              </Button>
-            </div>
-          ) : (
-            <p className="mt-2 text-sm text-muted-foreground">Nothing was kept, so there's no list to download.</p>
-          )}
-        </Card>
-      )}
-
-      {/* Stage 2 - "Email List": added 2026-10-15 per Mike - "Most of the
-          people that they asked for data to be appended they want to keep...
-          we need to also be able to create an email list out of" whoever
-          Stage 1 didn't keep but who still has a usable email. */}
-      {finalizeResult && !emailStageOpen && (
-        <Card>
-          <h3 className="font-display text-base font-semibold">Build an Email List from the rest</h3>
-          <p className="mt-1 text-sm text-muted-foreground">
-            Everyone from this file who wasn't kept above but still has an email on file (their own original email,
-            never DataZapp's appended one unless it was already a confirmed match) — worth keeping for email even
-            without a mailing address.
-          </p>
-          <div className="mt-3">
-            <Button onClick={handleStartEmailStage} disabled={emailBusy}>
-              {emailBusy ? "Working…" : "Review the rest for email"}
-            </Button>
-          </div>
-        </Card>
-      )}
-
-      {emailStageOpen && emailPreview && !emailFinalizeResult && (
-        <>
-          <Card>
-            <h3 className="font-display text-base font-semibold">{emailPreview.total} have a usable email</h3>
-            <p className="mt-1 text-sm text-muted-foreground">
-              Counted from every tier, not just confirmed/household — a mismatch or no-data row still goes on this email
-              list if it has an email, DataZapp's appended one included. Only a row with no usable email at all (neither
-              its own original email nor anything DataZapp appended) is left off.
-            </p>
-            {/* Visibility into exactly what happened to the rows Stage 1
-                didn't keep, broken down by tier — added per Mike: "What
-                happens to the bottom 2 rows of 275 and 287 people... I'd
-                like to be able to see the data on those." */}
-            <div className="mt-3 grid gap-2 sm:grid-cols-2">
-              {(["confirmed", "household", "mismatch", "no_data"] as const)
-                .filter((tier) => emailPreview.remainingByTier[tier] > 0)
-                .map((tier) => (
-                  <div key={tier} className="rounded-2xl border border-border bg-glass px-4 py-3">
-                    <p className="text-2xl font-bold tabular-nums">
-                      {emailPreview.remainingByTier[tier] - emailPreview.noEmailByTier[tier]}{" "}
-                      <span className="text-sm font-normal text-muted-foreground">
-                        of {emailPreview.remainingByTier[tier]}
-                      </span>
-                    </p>
-                    <p className="text-xs text-muted-foreground">{DATAZAPP_TIER_LABELS[tier]} — have a usable email</p>
-                  </div>
-                ))}
-            </div>
-            {emailError && <p className="mt-3 text-sm text-destructive">{emailError}</p>}
-          </Card>
-
-          {emailReviewRows.length === 0 ? (
-            <Card>
-              <p className="text-sm text-muted-foreground">Nobody left over has a usable email.</p>
-            </Card>
-          ) : (
-            <>
-              <div className="flex flex-wrap items-center justify-between gap-3">
-                <p className="text-sm text-muted-foreground">
-                  <span className="font-semibold text-foreground">{emailCheckedCount}</span> of {emailReviewRows.length}{" "}
-                  kept — uncheck anyone you don't want on the email list.
-                </p>
-                <Button onClick={handleEmailFinalize} disabled={emailBusy || emailCheckedCount === 0}>
-                  {emailBusy ? "Working…" : `Download the email list (${emailCheckedCount} kept)`}
-                </Button>
-              </div>
-              <input
-                value={emailSearch}
-                onChange={(e) => setEmailSearch(e.target.value)}
-                placeholder="Search name or email…"
-                className="w-full max-w-md rounded-2xl border border-border bg-background px-4 py-2.5 text-sm outline-none ring-ring transition focus:ring-2"
-              />
-              <Card>
-                <div className="overflow-x-auto">
-                  <table className="w-full text-sm">
-                    <thead>
-                      <tr className="text-left text-muted-foreground">
-                        <th className="pb-2 pr-4">First name</th>
-                        <th className="pb-2 pr-4">Last name</th>
-                        <th className="pb-2 pr-4">Email</th>
-                        <th className="pb-2 pr-4">Phone</th>
-                        <th className="pb-2 pr-4">From</th>
-                        <th className="whitespace-nowrap border-l border-border pb-2 pl-3">
-                          <div className="flex items-center gap-2">
-                            <span>Keep</span>
-                            <button
-                              type="button"
-                              onClick={() => toggleAllEmailVisible(emailFiltered, !allEmailFilteredChecked)}
-                              disabled={emailFiltered.length === 0}
-                              className="text-xs font-medium normal-case text-primary underline-offset-2 transition-colors hover:underline disabled:opacity-60"
-                            >
-                              {allEmailFilteredChecked ? "Clear all" : "Select all"}
-                            </button>
-                          </div>
-                        </th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {emailFiltered.map((r) => (
-                        <tr key={r.rowIndex} className="border-t border-border">
-                          <td className="py-2 pr-4">{r.firstName}</td>
-                          <td className="py-2 pr-4">{r.lastName}</td>
-                          <td className="py-2 pr-4">{r.email}</td>
-                          <td className="whitespace-nowrap py-2 pr-4">{r.phone}</td>
-                          <td className="py-2 pr-4">
-                            <span className="rounded-full bg-muted px-2.5 py-1 text-xs font-semibold uppercase tracking-wide text-muted-foreground">
-                              {DATAZAPP_TIER_LABELS[r.originalTier]}
-                            </span>
-                          </td>
-                          <td className="border-l border-border py-2 pl-3">
-                            <input
-                              type="checkbox"
-                              checked={emailChecked.has(r.rowIndex)}
-                              onChange={(e) => toggleEmailRow(r.rowIndex, e.target.checked)}
-                            />
-                          </td>
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                  {emailFiltered.length === 0 && (
-                    <p className="text-sm text-muted-foreground">No matches for that search.</p>
-                  )}
-                </div>
-              </Card>
-            </>
-          )}
-        </>
-      )}
-
-      {emailFinalizeResult && (
-        <Card>
-          <h3 className="font-display text-base font-semibold">Email list ready</h3>
-          <p className="mt-2 text-sm text-muted-foreground">
-            {emailFinalizeResult.keptCount} contact{emailFinalizeResult.keptCount === 1 ? "" : "s"} saved to this
-            client's "Appended Email" list (Export tab, under Marketable) — {emailFinalizeResult.written.inserted} new,{" "}
-            {emailFinalizeResult.written.updated} filled in on an existing contact.
-          </p>
-          {emailFinalizeResult.csv ? (
-            <div className="mt-3">
-              <Button
-                variant="secondary"
-                onClick={() =>
-                  triggerCsvDownload(
-                    withClientSuffix(`datazapp-email-list-${new Date().toISOString().slice(0, 10)}.csv`, clientName),
-                    emailFinalizeResult.csv!,
-                  )
-                }
-              >
-                Download the list again
-              </Button>
-            </div>
-          ) : (
-            <p className="mt-2 text-sm text-muted-foreground">Nothing was kept, so there's no list to download.</p>
-          )}
-        </Card>
-      )}
-
-      {finalizeResult && (
-        <div>
-          <Button
-            variant="secondary"
-            onClick={() => {
-              setFinalizeResult(null);
-              setPreview(null);
-              setRows(null);
-              setFileName(null);
-              resetEmailStage();
-              clearAppendDataStaging({ data: { clientId } }).catch(() => {});
-            }}
-          >
-            Upload another file
-          </Button>
-        </div>
-      )}
-    </div>
-  );
-}
-
-type ReviewContact = {
+type SoiContactRow = {
   id: string;
   first_name: string | null;
   last_name: string | null;
   email: string | null;
   phone: string | null;
   address: string | null;
+  // Added 2026-10-15 alongside the new local export path below - the real
+  // `contacts` table has had this column the whole time (confirmed in the
+  // exact header of a CSV Mike sent: "first_name,last_name,address,
+  // address_2,city,state,zip,email,phone,notes,sources"), it just wasn't
+  // being selected by either fetch helper below, so every export built from
+  // them was silently dropping it.
+  address_2: string | null;
   city: string | null;
   state: string | null;
   zip: string | null;
+  notes: string | null;
+  sources: string[] | null;
   list_assignment: string | null;
-  flagged: boolean;
 };
 
-function positionKey(clientId: string, stepKey: string): string {
-  return `soi-review-position:${clientId}:${stepKey}`;
-}
+const PAGE_SIZE = 1000;
 
-function ReviewTab({
-  clientId,
-  clientName,
-  lastProcessReport,
-}: {
-  clientId: string;
-  clientName: string;
-  lastProcessReport: ProcessReport | null;
-}) {
-  const [stepKey, setStepKey] = useState<(typeof REVIEW_STEPS)[number]["key"]>("complete");
-  const step = REVIEW_STEPS.find((s) => s.key === stepKey) ?? REVIEW_STEPS[0];
-  const editable = step.kind === "review";
-  const [contacts, setContacts] = useState<ReviewContact[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [loadError, setLoadError] = useState<string | null>(null);
-  const [search, setSearch] = useState("");
-  const [leftOffId, setLeftOffId] = useState<string | null>(null);
-  const [jumpTo, setJumpTo] = useState<string | null>(null);
-  // Bumped after every saved checkbox change, so DatabaseBreakdown's
-  // checked/total numbers refetch and stay live rather than only updating on
-  // the next Process run.
-  const [refreshSignal, setRefreshSignal] = useState(0);
-  const rowRefs = useMemo(() => new Map<string, HTMLTableRowElement>(), []);
-
-  useEffect(() => {
-    setSearch("");
-    setJumpTo(null);
-    setLoadError(null);
-
-    // "Final Combined List" gets its own dedicated Full Contact / Needs Data
-    // component below (FinalCombinedListStep) instead of the generic table -
-    // it fetches its own data, so skip the generic fetch entirely here.
-    if (step.key === "final_full_contact") {
-      setContacts([]);
-      setLoading(false);
-      setLeftOffId(null);
-      return;
-    }
-
-    setLoading(true);
-    const request =
-      step.kind === "review"
-        ? Promise.all(step.lists.map((l) => getSoiReviewCandidates({ data: { clientId, listAssignment: l } })))
-        : getSoiListView({ data: { clientId, view: step.key } }).then((rows) => [
-            rows.map((r) => ({ ...r, flagged: false })),
-          ]);
-    request
-      .then((results) => setContacts(results.flat()))
-      // A failed fetch used to just leave this list empty with no
-      // explanation while the error surfaced as an uncaught rejection
-      // elsewhere - show it here instead, on the step it actually happened
-      // on, so it's obvious this is "the list failed to load" rather than
-      // "this list is genuinely empty."
-      .catch((e) => setLoadError(e instanceof Error ? e.message : String(e)))
-      .finally(() => setLoading(false));
-
-    if (step.kind === "review") {
-      try {
-        setLeftOffId(localStorage.getItem(positionKey(clientId, step.key)));
-      } catch {
-        setLeftOffId(null);
-      }
-    } else {
-      setLeftOffId(null);
-    }
-  }, [clientId, step]);
-
-  function savePosition(contactId: string) {
-    try {
-      localStorage.setItem(positionKey(clientId, step.key), contactId);
-    } catch {
-      // Browser storage isn't available - resume just won't be offered next time.
-    }
-  }
-
-  async function toggle(contactId: string, next: boolean) {
-    setContacts((cs) => cs.map((c) => (c.id === contactId ? { ...c, flagged: next } : c)));
-    savePosition(contactId);
-    await setSoiReviewFlag({ data: { clientId, contactId, reviewType: "primary", flagged: next } });
-    setRefreshSignal((n) => n + 1);
-  }
-
-  async function toggleAll(next: boolean) {
-    const ids = filtered.map((c) => c.id);
-    setContacts((cs) => cs.map((c) => (ids.includes(c.id) ? { ...c, flagged: next } : c)));
-    await Promise.all(
-      ids.map((id) => setSoiReviewFlag({ data: { clientId, contactId: id, reviewType: "primary", flagged: next } })),
-    );
-    setRefreshSignal((n) => n + 1);
-  }
-
-  const q = search.trim().toLowerCase();
-  const filtered = q
-    ? contacts.filter((c) =>
-        [c.first_name, c.last_name, c.email, c.phone].some((v) => (v ?? "").toLowerCase().includes(q)),
+// Plain paginated fetch of everyone in one list_assignment bucket. Loops on
+// .range() instead of a single unbounded select - PostgREST caps a single
+// request at 1000 rows by default, and several of Mike's real buckets
+// (nonqualified alone has run past 3000) blow past that easily.
+async function fetchContactsForList(
+  admin: SupabaseClient,
+  clientId: string,
+  listAssignment: string,
+): Promise<SoiContactRow[]> {
+  let rows: SoiContactRow[] = [];
+  for (let from = 0; ; from += PAGE_SIZE) {
+    const { data, error } = await admin
+      .from("contacts")
+      .select(
+        "id, first_name, last_name, email, phone, address, address_2, city, state, zip, notes, sources, list_assignment",
       )
-    : contacts;
-  const allChecked = filtered.length > 0 && filtered.every((c) => c.flagged);
-  const showListColumn =
-    step.kind === "review"
-      ? step.lists.length > 1
-      : step.key === "final_full_contact" || step.key === "facebook_audience";
-  // Same full-address layout on every screen, not just Incomplete, so Mike
-  // can see how the data sorts on any list at a glance.
-  const showAddressColumns = true;
-  const leftOffContact = leftOffId ? contacts.find((c) => c.id === leftOffId) : undefined;
-  const stepCopy = STEP_COPY[step.key];
-  // Live "how many will actually make the final list" math for every
-  // editable review step, so Mike can reconcile without downloading
-  // anything. email_list/incomplete are opt-IN (checked = kept), so the
-  // number that matters is how many are checked; "Your Most Complete Data"
-  // (direct_mail/email_phone) is opt-OUT (checked = removed), so the number
-  // that matters is how many are UNCHECKED - i.e. total minus checked.
-  const checkedCount = contacts.filter((c) => c.flagged).length;
-  const showCheckedCount = step.kind === "review";
-  const makesFinalListCount = step.kind === "review" && step.optOut ? contacts.length - checkedCount : checkedCount;
-
-  useEffect(() => {
-    if (!jumpTo) return;
-    const row = rowRefs.get(jumpTo);
-    if (row) row.scrollIntoView({ behavior: "smooth", block: "center" });
-    setJumpTo(null);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [jumpTo]);
-
-  return (
-    <div>
-      <DatabaseBreakdown clientId={clientId} lastProcessReport={lastProcessReport} refreshSignal={refreshSignal} />
-      <div className="flex flex-wrap gap-2">
-        {REVIEW_STEPS.map((s) => (
-          <button
-            key={s.key}
-            onClick={() => setStepKey(s.key)}
-            className={`rounded-full px-4 py-1.5 text-sm font-medium transition-colors ${
-              stepKey === s.key ? "bg-secondary" : "border border-border hover:bg-secondary/50"
-            }`}
-          >
-            {s.label}
-          </button>
-        ))}
-      </div>
-      {step.key === "final_full_contact" ? (
-        <FinalCombinedListStep clientId={clientId} clientName={clientName} />
-      ) : (
-        <>
-          {stepCopy ? (
-            <div className="mt-4">
-              <h1 className="font-display text-2xl font-bold tracking-tight sm:text-3xl">{stepCopy.headline}</h1>
-              <p className="mt-2 max-w-2xl text-sm text-muted-foreground sm:text-base">{stepCopy.subheadline}</p>
-              {showCheckedCount ? (
-                <p className="mt-3 text-sm text-muted-foreground">
-                  <span className="font-semibold text-foreground">
-                    {makesFinalListCount}/{contacts.length}
-                  </span>{" "}
-                  {step.kind === "review" && step.optOut
-                    ? "will make your final list — checked contacts get removed."
-                    : "checked off — these are the ones that'll make your final list."}
-                </p>
-              ) : (
-                <p className="mt-3 text-sm text-muted-foreground">
-                  {contacts.length} contact{contacts.length === 1 ? "" : "s"} on this list.
-                </p>
-              )}
-            </div>
-          ) : (
-            <p className="mt-3 text-sm text-muted-foreground">
-              {contacts.length} contact{contacts.length === 1 ? "" : "s"} on this list. {step.description}
-            </p>
-          )}
-
-          {leftOffContact && (
-            <div className="mt-3 flex flex-wrap items-center justify-between gap-3 rounded-2xl border border-border bg-background/40 px-4 py-3">
-              <p className="text-sm text-muted-foreground">
-                You left off around{" "}
-                <span className="font-semibold text-foreground">
-                  {leftOffContact.first_name} {leftOffContact.last_name}
-                </span>{" "}
-                last time.
-              </p>
-              <div className="flex gap-2">
-                <Button onClick={() => setJumpTo(leftOffContact.id)}>Jump back there</Button>
-                <Button variant="secondary" onClick={() => setLeftOffId(null)}>
-                  Start from the top
-                </Button>
-              </div>
-            </div>
-          )}
-
-          <input
-            value={search}
-            onChange={(e) => setSearch(e.target.value)}
-            placeholder="Search name, email, or phone…"
-            className="mt-4 w-full max-w-md rounded-2xl border border-border bg-background px-4 py-2.5 text-sm outline-none ring-ring transition focus:ring-2"
-          />
-
-          <Card className="mt-4">
-            {loading ? (
-              <p className="text-sm text-muted-foreground">Loading…</p>
-            ) : loadError ? (
-              <p className="text-sm text-destructive">Couldn't load this list: {loadError}</p>
-            ) : (
-              <div className="overflow-x-auto">
-                {/* FIXED (2026-09-25) — per Mike: "we can't see the keep all
-                    section from when you look at the name... the user needs
-                    to now scroll left to see what the name is and scroll
-                    right... the entire view needs to be shifted over or
-                    expanded so that you can see every column." Root cause:
-                    with 8-9 columns of real address data this table is wider
-                    than the page, so the overflow-x-auto div has to scroll —
-                    unavoidable on most screens without dropping columns
-                    Mike didn't ask to drop. Instead of removing columns,
-                    First name / Last name are now frozen (sticky) on the
-                    left and the checkbox column is frozen on the right, so
-                    whichever way you scroll to read Email/Address/Zip/etc.,
-                    the name AND the checkbox stay on screen the whole time
-                    — you never lose track of who you're looking at. Padding
-                    also tightened slightly (pr-6 → pr-4) so more columns
-                    fit before scrolling is even needed. Same fix applied to
-                    the "Needs Data" table below in FinalCombinedListStep,
-                    which had the identical layout and would hit the same
-                    complaint. */}
-                <table className="w-full text-sm">
-                  <thead>
-                    <tr className="text-left text-muted-foreground">
-                      <th className="sticky left-0 z-10 w-24 min-w-24 max-w-24 truncate bg-background pb-2 pr-4">
-                        First name
-                      </th>
-                      <th className="sticky left-24 z-10 w-28 min-w-28 max-w-28 truncate border-r border-border bg-background pb-2 pr-4">
-                        Last name
-                      </th>
-                      <th className="pb-2 pr-4">Email</th>
-                      <th className="whitespace-nowrap pb-2 pr-4">Phone</th>
-                      {showAddressColumns && <th className="pb-2 pr-4">Address</th>}
-                      <th className="whitespace-nowrap pb-2 pr-4">City</th>
-                      {showAddressColumns && (
-                        <>
-                          <th className="whitespace-nowrap pb-2 pr-4">State</th>
-                          <th className="whitespace-nowrap pb-2 pr-4">Zip</th>
-                        </>
-                      )}
-                      {showListColumn && <th className="whitespace-nowrap pb-2 pr-4">List</th>}
-                      {editable && (
-                        <th className="sticky right-0 z-10 whitespace-nowrap border-l border-border bg-background pb-2 pl-3">
-                          <label className="flex items-center gap-1.5">
-                            <input type="checkbox" checked={allChecked} onChange={(e) => toggleAll(e.target.checked)} />
-                            {step.optOut ? "Remove all" : "Keep all"}
-                          </label>
-                        </th>
-                      )}
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {filtered.map((c) => (
-                      <tr
-                        key={c.id}
-                        ref={(el) => {
-                          if (el) rowRefs.set(c.id, el);
-                          else rowRefs.delete(c.id);
-                        }}
-                        className={`border-t border-border ${c.id === leftOffId ? "bg-secondary/40" : ""}`}
-                      >
-                        {/* Sticky cells stay fully opaque (not the row's
-                            bg-secondary/40 "left off" tint) on purpose —
-                            they need a solid backing so the columns
-                            scrolling underneath them don't show through. */}
-                        <td
-                          title={c.first_name || undefined}
-                          className="sticky left-0 z-10 w-24 min-w-24 max-w-24 truncate bg-background py-2 pr-4"
-                        >
-                          {c.first_name}
-                        </td>
-                        <td
-                          title={c.last_name || undefined}
-                          className="sticky left-24 z-10 w-28 min-w-28 max-w-28 truncate border-r border-border bg-background py-2 pr-4"
-                        >
-                          {c.last_name}
-                        </td>
-                        <td className="py-2 pr-4">{c.email}</td>
-                        <td className="whitespace-nowrap py-2 pr-4">{c.phone}</td>
-                        {showAddressColumns && <td className="py-2 pr-4">{c.address}</td>}
-                        <td className="whitespace-nowrap py-2 pr-4">{c.city}</td>
-                        {showAddressColumns && (
-                          <>
-                            <td className="whitespace-nowrap py-2 pr-4">{c.state}</td>
-                            <td className="whitespace-nowrap py-2 pr-4">{c.zip}</td>
-                          </>
-                        )}
-                        {showListColumn && (
-                          <td className="whitespace-nowrap py-2 pr-4">
-                            <span className="rounded-full bg-muted px-2.5 py-1 text-xs font-semibold uppercase tracking-wide text-muted-foreground">
-                              {LIST_LABELS[c.list_assignment ?? ""] ?? c.list_assignment}
-                            </span>
-                          </td>
-                        )}
-                        {editable && (
-                          <td className="sticky right-0 z-10 border-l border-border bg-background py-2 pl-3">
-                            <input
-                              type="checkbox"
-                              checked={c.flagged}
-                              onChange={(e) => toggle(c.id, e.target.checked)}
-                            />
-                          </td>
-                        )}
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-                {filtered.length === 0 && (
-                  <p className="text-sm text-muted-foreground">
-                    {contacts.length === 0 ? "Nobody on this list." : "No matches for that search."}
-                  </p>
-                )}
-              </div>
-            )}
-          </Card>
-        </>
-      )}
-    </div>
-  );
+      .eq("client_id", clientId)
+      .eq("list_assignment", listAssignment)
+      .order("last_name", { ascending: true })
+      .range(from, from + PAGE_SIZE - 1);
+    if (error) throw error;
+    rows = rows.concat(data ?? []);
+    if (!data || data.length < PAGE_SIZE) break;
+  }
+  return rows;
 }
 
-// Type of one entry in exportSoiList's `contacts` array (used by the
-// needs_data_list / needs_data_download scopes) - pulled from exportSoiList's
-// own return type instead of hand-duplicated, so this can never drift out of
-// sync with what the server function actually returns.
-type NeedsDataContact = NonNullable<Awaited<ReturnType<typeof exportSoiList>>["contacts"]>[number];
-
-function FinalCombinedListStep({ clientId, clientName }: { clientId: string; clientName: string }) {
-  const [view, setView] = useState<"summary" | "select">("summary");
-  const [fullContactCount, setFullContactCount] = useState<number | null>(null);
-  const [needsData, setNeedsData] = useState<NeedsDataContact[] | null>(null);
-  const [loading, setLoading] = useState(true);
-  const [loadError, setLoadError] = useState<string | null>(null);
-  const [downloading, setDownloading] = useState<string | null>(null);
-  const [search, setSearch] = useState("");
-  const [selectAllBusy, setSelectAllBusy] = useState(false);
-
-  useEffect(() => {
-    setView("summary");
-    setLoading(true);
-    setLoadError(null);
-    Promise.all([
-      getSoiListView({ data: { clientId, view: "final_full_contact" } }),
-      exportSoiList({ data: { clientId, scope: "needs_data_list" } }),
-    ])
-      .then(([fullContact, needs]) => {
-        setFullContactCount(fullContact.length);
-        setNeedsData(needs.contacts ?? []);
-      })
-      .catch((e) => setLoadError(e instanceof Error ? e.message : String(e)))
-      .finally(() => setLoading(false));
-  }, [clientId]);
-
-  async function downloadCsv(scope: string) {
-    setDownloading(scope);
-    try {
-      // Bug fix, 2026-10-15: this screen's own Full Contact count above
-      // comes from getSoiListView's final_full_contact branch (correct,
-      // already fixed) - but the download used to go through the remote
-      // export-lists Edge Function instead, which still has a known
-      // URL-length-limit bug for a big client and came back with a
-      // header-only, zero-row CSV for one of Mike's clients despite the
-      // on-screen count showing 391. exportSoiListLocal reuses the exact
-      // same local logic the on-screen count already uses, so the two can
-      // never disagree again. "needs_data_download" (a different scope,
-      // used only from the "select" view below) is untouched - not reported
-      // broken, still goes through the original remote function.
-      const result =
-        scope === "final_full_contact"
-          ? await exportSoiListLocal({ data: { clientId, scope: "final_full_contact" } })
-          : await exportSoiList({ data: { clientId, scope } });
-      for (const [name, content] of Object.entries(result.files ?? {})) {
-        const blob = new Blob([content], { type: "text/csv" });
-        const url = URL.createObjectURL(blob);
-        const a = document.createElement("a");
-        a.href = url;
-        a.download = withClientSuffix(name, clientName);
-        a.click();
-        URL.revokeObjectURL(url);
-      }
-    } finally {
-      setDownloading(null);
-    }
+// Same as fetchContactsForList, but with no list_assignment filter at all -
+// every contact this client has, regardless of bucket. Used only by the new
+// append-data write path below, to find an existing contact to blank-fill-
+// merge into by phone number without having to guess which bucket they're
+// currently sitting in.
+async function fetchAllContactsForClient(admin: SupabaseClient, clientId: string): Promise<SoiContactRow[]> {
+  let rows: SoiContactRow[] = [];
+  for (let from = 0; ; from += PAGE_SIZE) {
+    const { data, error } = await admin
+      .from("contacts")
+      .select(
+        "id, first_name, last_name, email, phone, address, address_2, city, state, zip, notes, sources, list_assignment",
+      )
+      .eq("client_id", clientId)
+      .range(from, from + PAGE_SIZE - 1);
+    if (error) throw error;
+    rows = rows.concat(data ?? []);
+    if (!data || data.length < PAGE_SIZE) break;
   }
-
-  async function toggleSelected(contactId: string, next: boolean) {
-    setNeedsData((cur) => (cur ? cur.map((c) => (c.id === contactId ? { ...c, already_selected: next } : c)) : cur));
-    await setSoiReviewFlag({ data: { clientId, contactId, reviewType: "datazap_append", flagged: next } });
-  }
-
-  // Bulk version of toggleSelected, added 2026-10-12 per Mike's "select all
-  // button" request on this screen — applies to whichever rows are
-  // currently visible (so it respects the search box: searching first, then
-  // "Select all" only checks off the filtered matches, not the whole list).
-  // Only fires a setSoiReviewFlag call for rows that actually need to
-  // change, same no-op-skipping care toggleSelected's callers already rely
-  // on elsewhere in this file.
-  async function toggleAllVisible(contacts: NeedsDataContact[], next: boolean) {
-    const ids = new Set(contacts.map((c) => c.id));
-    setNeedsData((cur) => (cur ? cur.map((c) => (ids.has(c.id) ? { ...c, already_selected: next } : c)) : cur));
-    await Promise.all(
-      contacts
-        .filter((c) => c.already_selected !== next)
-        .map((c) =>
-          setSoiReviewFlag({ data: { clientId, contactId: c.id, reviewType: "datazap_append", flagged: next } }),
-        ),
-    );
-  }
-
-  if (loadError) {
-    return (
-      <Card className="mt-4">
-        <p className="text-sm text-destructive">Couldn't load this list: {loadError}</p>
-      </Card>
-    );
-  }
-
-  if (loading || !needsData) {
-    return (
-      <Card className="mt-4">
-        <p className="text-sm text-muted-foreground">Loading…</p>
-      </Card>
-    );
-  }
-
-  if (view === "select") {
-    const q = search.trim().toLowerCase();
-    const filtered = q
-      ? needsData.filter((c) =>
-          [c.first_name, c.last_name, c.email, c.phone].some((v) => (v ?? "").toLowerCase().includes(q)),
-        )
-      : needsData;
-    const selectedCount = needsData.filter((c) => c.already_selected).length;
-    // Drives the header button's label/behavior — respects the search box,
-    // same as toggleAllVisible itself: with no search typed, "filtered" is
-    // just everyone, so this is a plain select-all; with a search typed, it
-    // only covers the visible matches.
-    const allFilteredSelected = filtered.length > 0 && filtered.every((c) => c.already_selected);
-    async function onSelectAllClick() {
-      setSelectAllBusy(true);
-      try {
-        await toggleAllVisible(filtered, !allFilteredSelected);
-      } finally {
-        setSelectAllBusy(false);
-      }
-    }
-    return (
-      <div className="mt-4">
-        <div className="flex flex-wrap items-center justify-between gap-3">
-          <div>
-            <h2 className="font-display text-lg font-semibold">Needs Data — select who to research</h2>
-            <p className="mt-1 text-sm text-muted-foreground">
-              Datazap charges per contact appended, so check off only the people worth paying to research.{" "}
-              {selectedCount} selected.
-            </p>
-          </div>
-          <div className="flex gap-2">
-            <Button variant="secondary" onClick={() => setView("summary")}>
-              ← Back
-            </Button>
-            <Button
-              onClick={() => downloadCsv("needs_data_download")}
-              disabled={downloading === "needs_data_download" || selectedCount === 0}
-            >
-              {downloading === "needs_data_download" ? "Preparing…" : "Download selected for Datazap"}
-            </Button>
-          </div>
-        </div>
-        <input
-          value={search}
-          onChange={(e) => setSearch(e.target.value)}
-          placeholder="Search name, email, or phone…"
-          className="mt-4 w-full max-w-md rounded-2xl border border-border bg-background px-4 py-2.5 text-sm outline-none ring-ring transition focus:ring-2"
-        />
-        <Card className="mt-4">
-          <div className="overflow-x-auto">
-            {/* Same frozen-columns fix as the review table above (2026-09-25) —
-                identical column layout, same scrolling complaint would apply. */}
-            <table className="w-full text-sm">
-              <thead>
-                <tr className="text-left text-muted-foreground">
-                  <th className="sticky left-0 z-10 w-24 min-w-24 max-w-24 truncate bg-background pb-2 pr-4">
-                    First name
-                  </th>
-                  <th className="sticky left-24 z-10 w-28 min-w-28 max-w-28 truncate border-r border-border bg-background pb-2 pr-4">
-                    Last name
-                  </th>
-                  <th className="pb-2 pr-4">Email</th>
-                  <th className="whitespace-nowrap pb-2 pr-4">Phone</th>
-                  <th className="pb-2 pr-4">Address</th>
-                  <th className="whitespace-nowrap pb-2 pr-4">City</th>
-                  <th className="whitespace-nowrap pb-2 pr-4">State</th>
-                  <th className="whitespace-nowrap pb-2 pr-4">Zip</th>
-                  <th className="whitespace-nowrap pb-2 pr-4">Missing</th>
-                  <th className="sticky right-0 z-10 whitespace-nowrap border-l border-border bg-background pb-2 pl-3">
-                    {/* "Select all" button, added 2026-10-12 per Mike's
-                        request on this exact screen — toggles every
-                        currently-visible (filtered) row at once instead of
-                        making someone click each checkbox by hand. Flips to
-                        "Clear all" once everything visible is already
-                        checked, so it's reversible with the same button. */}
-                    <div className="flex items-center gap-2">
-                      <span>Select</span>
-                      <button
-                        type="button"
-                        onClick={onSelectAllClick}
-                        disabled={selectAllBusy || filtered.length === 0}
-                        className="text-xs font-medium normal-case text-primary underline-offset-2 transition-colors hover:underline disabled:opacity-60"
-                      >
-                        {selectAllBusy ? "Working…" : allFilteredSelected ? "Clear all" : "Select all"}
-                      </button>
-                    </div>
-                  </th>
-                </tr>
-              </thead>
-              <tbody>
-                {filtered.map((c) => (
-                  <tr key={c.id} className="border-t border-border">
-                    <td
-                      title={c.first_name || undefined}
-                      className="sticky left-0 z-10 w-24 min-w-24 max-w-24 truncate bg-background py-2 pr-4"
-                    >
-                      {c.first_name}
-                    </td>
-                    <td
-                      title={c.last_name || undefined}
-                      className="sticky left-24 z-10 w-28 min-w-28 max-w-28 truncate border-r border-border bg-background py-2 pr-4"
-                    >
-                      {c.last_name}
-                    </td>
-                    <td className="py-2 pr-4">{c.email}</td>
-                    <td className="whitespace-nowrap py-2 pr-4">{c.phone}</td>
-                    <td className="py-2 pr-4">{c.address}</td>
-                    <td className="whitespace-nowrap py-2 pr-4">{c.city}</td>
-                    <td className="whitespace-nowrap py-2 pr-4">{c.state}</td>
-                    <td className="whitespace-nowrap py-2 pr-4">{c.zip}</td>
-                    <td className="py-2 pr-4">
-                      <span className="rounded-full bg-muted px-2.5 py-1 text-xs font-semibold uppercase tracking-wide text-muted-foreground">
-                        {c.missing.join(", ") || "—"}
-                      </span>
-                    </td>
-                    <td className="sticky right-0 z-10 border-l border-border bg-background py-2 pl-3">
-                      <input
-                        type="checkbox"
-                        checked={c.already_selected}
-                        onChange={(e) => toggleSelected(c.id, e.target.checked)}
-                      />
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-            {filtered.length === 0 && (
-              <p className="text-sm text-muted-foreground">
-                {needsData.length === 0 ? "Nobody needs more data." : "No matches for that search."}
-              </p>
-            )}
-          </div>
-        </Card>
-      </div>
-    );
-  }
-
-  return (
-    <div className="mt-4 grid gap-4 sm:grid-cols-2">
-      <Card>
-        <h2 className="font-display text-lg font-semibold">Full Contact</h2>
-        <p className="mt-1 text-sm text-muted-foreground">
-          Everyone who made it through review with a complete record — ready to use.
-        </p>
-        <p className="mt-3 font-display text-3xl font-bold">{fullContactCount ?? 0}</p>
-        <div className="mt-4">
-          <Button onClick={() => downloadCsv("final_full_contact")} disabled={downloading === "final_full_contact"}>
-            {downloading === "final_full_contact" ? "Preparing…" : "Download"}
-          </Button>
-        </div>
-      </Card>
-      <Card>
-        <h2 className="font-display text-lg font-semibold">Needs Data</h2>
-        <p className="mt-1 text-sm text-muted-foreground">
-          Survived review but missing at least one field. Datazap charges per contact appended, so pick exactly who's
-          worth paying to research rather than sending everyone.
-        </p>
-        <p className="mt-3 font-display text-3xl font-bold">{needsData.length}</p>
-        <div className="mt-4">
-          <Button variant="secondary" onClick={() => setView("select")}>
-            Review &amp; select →
-          </Button>
-        </div>
-      </Card>
-    </div>
-  );
+  return rows;
 }
 
-// Reorganized 2026-10-15 per Mike: "we should have here, these lists broken
-// into 2 sections. 'Marketable' is top bucket of lists... Then there can be
-// a button to combine all into one final database... 'Non-Marketable' is
-// the second list/bucket/column." Final Full Contact stays its own
-// prominent button at top, unchanged position - it was already the one
-// button Mike singled out by name ("ready to use)") before this reorg, and
-// it's the one this round's bug fix is actually about. Facebook Audience
-// doesn't fit either bucket (it's not a mailing/email list, it's an ad
-// platform upload) so it gets its own small section at the bottom, same as
-// before, just visually separated now instead of sitting in the same flat
-// grid as everything else.
+// Same idea, but also joins in each contact's review_flags.flagged - using
+// PostgREST's embedded-resource join (contacts JOIN review_flags server
+// side) instead of fetching contacts, collecting their ids, then a second
+// "WHERE contact_id IN (id1, id2, id3, ...)" lookup. That second shape is
+// exactly what previously broke export-lists outright for a big client (see
+// that function's own header comment in the recovered backup) - the id list
+// gets long enough to blow past a single request's URL length limit.
+// getSoiReviewCandidates and getSoiListView's final_full_contact branch had
+// that same latent bug; it just never got exercised by a small enough test
+// client until now. Paginated the same way as fetchContactsForList above.
+async function fetchContactsWithFlags(
+  admin: SupabaseClient,
+  clientId: string,
+  listAssignment: string,
+  reviewType: string,
+): Promise<(SoiContactRow & { flagged: boolean })[]> {
+  let rows: (SoiContactRow & { flagged: boolean })[] = [];
+  for (let from = 0; ; from += PAGE_SIZE) {
+    const { data, error } = await admin
+      .from("contacts")
+      .select(
+        "id, first_name, last_name, email, phone, address, address_2, city, state, zip, notes, sources, list_assignment, review_flags(flagged)",
+      )
+      .eq("client_id", clientId)
+      .eq("list_assignment", listAssignment)
+      .eq("review_flags.review_type", reviewType)
+      .order("last_name", { ascending: true })
+      .range(from, from + PAGE_SIZE - 1);
+    if (error) throw error;
+    const page = (data ?? []).map((row: Record<string, unknown>) => {
+      const { review_flags, ...contact } = row;
+      const rf = review_flags as { flagged: boolean }[] | { flagged: boolean } | null;
+      const flagged = Array.isArray(rf) ? rf.some((r) => r?.flagged) : !!rf?.flagged;
+      return { ...(contact as SoiContactRow), flagged };
+    });
+    rows = rows.concat(page);
+    if (page.length < PAGE_SIZE) break;
+  }
+  return rows;
+}
+
+// Review-flag joins for the 3-step wizard (primary review_type only - the
+// same lists the original wizard reviewed). Read-only, so reimplementing
+// this one small join here (rather than only ever calling export-lists) is
+// safe - it doesn't change how any contact is classified.
+export const getSoiReviewCandidates = createServerFn({ method: "GET" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator(
+    (data: {
+      clientId: string;
+      // "nonqualified" added 2026-10-15 - it's now a reviewable list too.
+      listAssignment: "direct_mail" | "email_phone" | "email_list" | "incomplete" | "nonqualified";
+    }) => data,
+  )
+  .handler(async ({ data, context }) => {
+    const admin = getSoiAdminClient();
+    const email = (context.claims as { email?: string } | undefined)?.email;
+    await requireClientAccess(admin, email, data.clientId);
+
+    return fetchContactsWithFlags(admin, data.clientId, data.listAssignment, "primary");
+  });
+
+// Browsable (read-only, no checkboxes) views the old app's tab bar showed
+// alongside the 3 review steps: the pure "everyone in this bucket" lists
+// (nonqualified/realtor_excluded/business_excluded), and two COMPUTED
+// populations that span multiple list_assignment values, matching the exact
+// same logic export-lists already uses for those two CSV scopes - safe to
+// mirror here since these are read-only, nothing is reclassified.
+export const getSoiListView = createServerFn({ method: "GET" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator(
+    (data: {
+      clientId: string;
+      view: "nonqualified" | "realtor_excluded" | "business_excluded" | "facebook_audience" | "final_full_contact";
+    }) => data,
+  )
+  .handler(async ({ data, context }): Promise<SoiContactRow[]> => {
+    const admin = getSoiAdminClient();
+    const email = (context.claims as { email?: string } | undefined)?.email;
+    await requireClientAccess(admin, email, data.clientId);
+
+    if (data.view === "nonqualified" || data.view === "realtor_excluded" || data.view === "business_excluded") {
+      return fetchContactsForList(admin, data.clientId, data.view);
+    }
+
+    if (data.view === "facebook_audience") {
+      // Same rule as export-lists' facebook_audience scope: everyone not
+      // realtor/business-excluded, with an email or phone to target with.
+      const lists = ["direct_mail", "email_phone", "email_list", "incomplete", "nonqualified"];
+      const groups = await Promise.all(lists.map((l) => fetchContactsForList(admin, data.clientId, l)));
+      return groups.flat().filter((c) => !!(c.email || c.phone));
+    }
+
+    // "final_full_contact" - same survivor + full-8-field rule export-lists
+    // uses for its matching CSV scope. Uses the same join-based, paginated
+    // fetch as getSoiReviewCandidates above - this branch used to build a
+    // flat id list across all 4 review lists and look up flags separately,
+    // which is exactly the shape that can blow past a URL length limit for
+    // a client with a lot of contacts. "nonqualified" added 2026-10-15, now
+    // that it's a reviewable opt-in list too (see isPrimaryReviewSurvivor) -
+    // anyone Mike actually checks "keep" there, who also happens to have a
+    // complete 8-field record, now counts toward this list same as a kept
+    // Email List/Incomplete contact already did.
+    const reviewLists = ["direct_mail", "email_phone", "email_list", "incomplete", "nonqualified"] as const;
+    const groups = await Promise.all(
+      reviewLists.map((l) => fetchContactsWithFlags(admin, data.clientId, l, "primary")),
+    );
+    const allContacts = groups.flat();
+    return allContacts.filter((c) => isPrimaryReviewSurvivor(c) && hasAllEightContactFields(c));
+  });
+
+export const setSoiReviewFlag = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator((data: { clientId: string; contactId: string; reviewType: string; flagged: boolean }) => data)
+  .handler(async ({ data, context }) => {
+    const admin = getSoiAdminClient();
+    const email = (context.claims as { email?: string } | undefined)?.email;
+    await requireClientAccess(admin, email, data.clientId);
+
+    // Confirm the contact actually belongs to this client before writing -
+    // review_flags itself has no client_id column (it's keyed off
+    // contact_id only), so this is the one place that boundary has to be
+    // enforced explicitly.
+    const { data: contact, error: contactErr } = await admin
+      .from("contacts")
+      .select("id, client_id")
+      .eq("id", data.contactId)
+      .single();
+    if (contactErr || !contact || contact.client_id !== data.clientId) {
+      throw new Error("Not authorized for this contact");
+    }
+
+    const { error } = await admin.from("review_flags").upsert(
+      {
+        contact_id: data.contactId,
+        review_type: data.reviewType,
+        flagged: data.flagged,
+        flagged_by: email ?? "unknown",
+      },
+      { onConflict: "contact_id,review_type" },
+    );
+    if (error) throw error;
+    return { ok: true };
+  });
+
+export const exportSoiList = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator((data: { clientId: string; scope: string }) => data)
+  .handler(async ({ data, context }) => {
+    const admin = getSoiAdminClient();
+    const email = (context.claims as { email?: string } | undefined)?.email;
+    await requireClientAccess(admin, email, data.clientId);
+
+    const url = process.env["SOI_SUPABASE_URL"];
+    const serviceKey = process.env["SOI_SUPABASE_SERVICE_ROLE_KEY"];
+    const res = await fetch(`${url}/functions/v1/export-lists`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${serviceKey}`,
+        apikey: serviceKey!,
+      },
+      body: JSON.stringify({ client_id: data.clientId, scope: data.scope }),
+    });
+    const json = await res.json();
+    if (!res.ok) throw new Error(json.error ?? `export-lists failed (${res.status})`);
+    return json as {
+      files?: Record<string, string>;
+      contacts?: {
+        id: string;
+        first_name: string | null;
+        last_name: string | null;
+        email: string | null;
+        phone: string | null;
+        address: string | null;
+        address_2: string | null;
+        city: string | null;
+        state: string | null;
+        zip: string | null;
+        notes: string | null;
+        sources: string[] | null;
+        list_assignment: string | null;
+        already_selected: boolean;
+        missing: string[];
+      }[];
+      warnings?: string[];
+    };
+  });
+
+// ============================================================================
+// DataZapp append verification — a second-round "Append Data" step added
+// 2026-10-15 at Mike's request. The problem it solves: contacts missing an
+// email/mailing address get sent out to DataZapp (a third-party append
+// service, keyed on first name + last name + phone) to fill those gaps in -
+// mainly for direct mail, which is the actual product being sold. DataZapp's
+// reply often attaches the WRONG name to the address it finds, because it's
+// matching at the household/address level, not the individual - it hands
+// back whichever resident it has on file (a spouse, a prior occupant), not
+// necessarily the exact person Mike sent it. Mike's own words: "not
+// everything that appends matches the names... Mike and Michael, Kate and
+// Catherine... we need to know that's probably the same person."
 //
-// `local: true` entries go through exportSoiListLocal (see soi-builder.ts's
-// header comment on that function for why): the two brand-new buckets this
-// round added, which only exist as local list_assignment values and were
-// never in the remote export-lists Edge Function to begin with. Every
-// `local: false` entry is untouched from before this reorg - still the
-// original remote export-lists call.
-const MARKETABLE_SCOPES = [
-  { scope: "complete", label: "Full Direct Mail + Email/Phone", local: false },
-  { scope: "email_list", label: "Email List", local: false },
-  { scope: "appended_full_data", label: "Appended Full Data", local: true },
-  { scope: "appended_email", label: "Appended Email", local: true },
+// Built against two real sample files Mike sent (DataZapp's actual export
+// format - 44 columns, 927 rows), not guessed. What they showed:
+//   - DataZapp returns SOME data (at minimum an address) for 640 of 927 rows
+//     here; an appended email is rarer (382 of 927) - address really is the
+//     main yield, matching what Mike's actually after.
+//   - Of the 640 with a name back, only 209 (~33%) matched the original
+//     first+last name exactly. The rest split between genuine nicknames,
+//     a same-household resident returned instead of the person asked for
+//     (DataZapp_FIRST2/LAST2 carries a second household name on 144 rows,
+//     and it's often the real match when the primary slot isn't - e.g. "Don
+//     Blevins" came back with primary "Beverly Blevins" [his spouse] and
+//     secondary "Donald Blevins" [Don's own formal name]), and outright
+//     wrong-address matches sharing no name at all with the original.
+//
+// REDESIGNED TWICE the same day this first went out, both times from real
+// usage, not guessing again:
+//   1. First redesign: the very first version auto-applied confirmed/
+//      household matches straight into the client's existing `contacts`
+//      (looked up by phone) with no review step. Mike tested it live and got
+//      "Applied: Updated 0 of 927 contacts," and separately said the
+//      no-review design was wrong regardless: "just because the data is
+//      appended doesn't mean they're going to keep them."
+//   2. Second redesign (this one): Mike then said the whole premise of
+//      looking anything up in `contacts` was wrong - "The append data should
+//      have nothing to do with the prior contacts... I'm uploading an
+//      appended list that's still showing me zero results because I don't
+//      have that data from the original upload, so it doesn't make sense."
+//      His own words for the actual process: upload the DataZapp file, see
+//      every match and mismatch, clean it up, decide who to keep - and the
+//      result is its own standalone list, same kind of thing as "Final Full
+//      Contact," not written into any contact record. That's what finally
+//      explains the "0 of 927" - the old version needed a phone match
+//      against stored contacts to find anything at all, and this client's
+//      didn't produce one, which should never have been able to block
+//      anything in the first place.
+//
+// What this means structurally: this whole feature no longer reads or
+// writes the `contacts` table at all. A DataZapp return file already
+// carries its own original First Name/Last Name/Phone/Email columns
+// (that's exactly what Mike sent DataZapp to begin with) right alongside
+// DataZapp's appended DataZapp_* columns - so confirming a match is purely a
+// same-row comparison inside the uploaded file itself, nothing to look up
+// anywhere. The nickname-cluster matching logic below is UNCHANGED from the
+// very first version and still verified against the same real 927-row file;
+// only what the tiers get used for changed - straight into a downloadable
+// list, never into any contact record.
+// ============================================================================
+
+// Clusters of common American first-name nicknames/formal-name pairs, so
+// "Jim" on the original contact and "James" on DataZapp's reply count as
+// confirmed, not a mismatch - per Mike, "we need to know that's probably the
+// same person." Not exhaustive (there's no complete list of every nickname
+// in English) - add a row here any time a real one gets missed; each row is
+// its own self-contained cluster, order doesn't matter.
+const NICKNAME_CLUSTERS: string[][] = [
+  ["james", "jim", "jimmy", "jamie"],
+  ["michael", "mike", "mikey", "mick", "mickey", "micheal"],
+  ["robert", "bob", "bobby", "rob", "robbie"],
+  ["william", "bill", "billy", "will", "willy", "liam"],
+  ["richard", "rick", "ricky", "rich", "dick"],
+  ["charles", "charlie", "chuck", "chas", "chick"],
+  ["thomas", "tom", "tommy"],
+  ["christopher", "chris", "topher", "kit"],
+  ["daniel", "dan", "danny"],
+  ["matthew", "matt", "matty"],
+  ["anthony", "tony"],
+  ["joseph", "joe", "joey"],
+  ["david", "dave", "davey", "davy"],
+  ["edward", "ed", "eddie", "eddy", "ted", "teddy"],
+  ["donald", "don", "donnie", "donny"],
+  ["steven", "stephen", "steve", "stevie"],
+  ["kenneth", "ken", "kenny"],
+  ["jeffrey", "jeff", "geoff", "geoffrey"],
+  ["timothy", "tim", "timmy"],
+  ["ronald", "ron", "ronnie"],
+  ["gerald", "gerry", "jerry"],
+  ["lawrence", "larry"],
+  ["patrick", "pat", "paddy", "patsy"],
+  ["raymond", "ray"],
+  ["gregory", "greg", "gregg"],
+  ["alexander", "alex", "xander", "al"],
+  ["nicholas", "nick", "nicky", "nico"],
+  ["benjamin", "ben", "benny", "benji"],
+  ["samuel", "sam", "sammy"],
+  ["jonathan", "jon", "jonny"],
+  ["john", "johnny", "jack", "jock"],
+  ["jacob", "jake", "jakey"],
+  ["henry", "hank"],
+  ["frederick", "fred", "freddie", "freddy"],
+  ["francis", "frank", "frankie"],
+  ["walter", "walt", "wally"],
+  ["albert", "al", "bert", "bertie"],
+  ["arthur", "art", "artie"],
+  ["eugene", "gene"],
+  ["harold", "harry", "hal"],
+  ["howard", "howie"],
+  ["joshua", "josh"],
+  ["nathaniel", "nathan", "nate"],
+  ["zachary", "zach", "zack", "zak"],
+  ["peter", "pete", "petey"],
+  ["philip", "phillip", "phil"],
+  ["vincent", "vince", "vinny"],
+  ["martin", "marty"],
+  ["douglas", "doug"],
+  ["bradley", "brad"],
+  ["russell", "russ"],
+  ["victor", "vic"],
+  ["leonard", "leo", "lenny"],
+  ["theodore", "ted", "teddy", "theo"],
+  ["dominic", "dom"],
+  ["andrew", "andy", "drew"],
+  ["marcus", "mark", "marc"],
+  ["randall", "randal", "randy"],
+  ["dwayne", "dwane", "duane"],
+  ["elias", "eli"],
+  ["ernest", "ernie", "erny"],
+  ["elizabeth", "liz", "lizzie", "beth", "betty", "eliza", "liza", "betsy"],
+  ["katherine", "katharine", "catherine", "kathryn", "kate", "katie", "kathy", "cathy", "kit", "kitty", "cat", "kat"],
+  ["margaret", "maggie", "peggy", "meg", "margie", "marge", "margo"],
+  ["patricia", "pat", "patty", "tricia", "trish"],
+  ["jennifer", "jen", "jenny", "jenn"],
+  ["barbara", "barb", "babs"],
+  ["susan", "sue", "susie", "suzy", "suzanne"],
+  ["deborah", "debra", "deb", "debbie"],
+  ["sandra", "sandy"],
+  ["cynthia", "cindy"],
+  ["angela", "angie"],
+  ["rebecca", "becky", "becca"],
+  ["stephanie", "steph"],
+  ["nicole", "nikki", "nicki"],
+  ["christina", "christine", "christy", "tina", "christie"],
+  ["jacqueline", "jackie", "jacky"],
+  ["theresa", "teresa", "terry", "terri", "tess", "tessa"],
+  ["frances", "fran", "francie"],
+  ["kimberly", "kim", "kimmy"],
+  ["sherry", "sheri", "sherri"],
+  ["judith", "judy"],
+  ["virginia", "ginny", "ginger"],
+  ["diane", "diana", "di", "didi"],
+  ["carol", "carole", "carrie"],
+  ["janet", "jan", "jannie"],
+  ["kathleen", "kathy", "kate", "katie"],
+  ["michelle", "shelly", "shelley", "shell"],
+  ["laura", "lori", "laurie"],
+  ["amanda", "mandy"],
+  ["melissa", "missy", "mel"],
+  ["victoria", "vicky", "vicki", "vickie", "tori"],
+  ["samantha", "sam", "sammy"],
+  ["jessica", "jess", "jessie"],
+  ["gabrielle", "gabby", "gabi"],
+  ["isabella", "bella", "izzy"],
+  ["olivia", "liv", "livvy"],
+  ["natalie", "nat", "natty"],
+  ["constance", "connie"],
+  ["bonita", "bonnie"],
+  ["dorothy", "dot", "dottie"],
+  ["lillian", "lily", "lil"],
+  ["rosalind", "roz", "rosie"],
+  ["penelope", "penny"],
+  ["josephine", "jo", "josie"],
+  ["geraldine", "gerry", "jerry"],
+  ["wilhelmina", "billie", "mina"],
+];
+
+const NICKNAME_LOOKUP: Map<string, number> = (() => {
+  const map = new Map<string, number>();
+  NICKNAME_CLUSTERS.forEach((cluster, idx) => {
+    for (const name of cluster) map.set(name, idx);
+  });
+  return map;
+})();
+
+function normalizeNameToken(name: string): string {
+  return name
+    .toLowerCase()
+    .trim()
+    .replace(/[^a-z]/g, "");
+}
+
+// True if two first names are plausibly the same person - exactly, or via a
+// known nickname/formal-name pair above. Blank on either side never counts
+// as a match - there's nothing real to compare.
+function firstNamesEquivalent(a: string, b: string): boolean {
+  const na = normalizeNameToken(a);
+  const nb = normalizeNameToken(b);
+  if (!na || !nb) return false;
+  if (na === nb) return true;
+  const ca = NICKNAME_LOOKUP.get(na);
+  const cb = NICKNAME_LOOKUP.get(nb);
+  return ca !== undefined && ca === cb;
+}
+
+function sameLastName(a: string, b: string): boolean {
+  const na = normalizeNameToken(a);
+  const nb = normalizeNameToken(b);
+  return !!na && !!nb && na === nb;
+}
+
+// One row of a DataZapp return file, exactly as DataZapp's own export names
+// its columns (confirmed against two real sample files Mike sent 2026-10-15,
+// not guessed). Never user-mapped like the normal Upload tab's files are -
+// this is always the same tool's fixed export format, so the frontend reads
+// these exact headers directly. Critically, this file already carries the
+// ORIGINAL First Name/Last Name/Phone/Email columns Mike sent DataZapp,
+// right alongside DataZapp's own appended DataZapp_* columns - so every
+// comparison below is a same-row, same-file comparison, nothing looked up
+// anywhere else.
+type DatazappRawRow = Record<string, string>;
+
+function dzField(row: DatazappRawRow, header: string): string {
+  return (row[header] ?? "").trim();
+}
+
+// Mirrors the main Upload tab's multi-column consolidation fix (2026-10-15,
+// "Phone 1, Phone 2... you need to be smarter than that") - this file's own
+// `phone`/`originalEmail` reads below used to look at exactly one hardcoded
+// column ("Phone 1", "Email 1") and nothing else. That's the same bug in a
+// second place: a DataZapp return file can carry "Email 1"/"Email 2" (or
+// just "Phone"/"Email" with no number) same as a normal CRM export, and
+// whichever one actually has the person's real value isn't guaranteed to be
+// column 1. Root-caused directly from Mike's report of a mismatch-tier row
+// with "a valid email, first name and last name" that still didn't make it
+// onto the Stage 2 email list - this is why. Scans every column on the row
+// (not a fixed list) for anything spelled "phone"/"email" with an optional
+// trailing number, and returns the first non-blank value found, in column
+// order.
+function firstNonBlankMatching(row: DatazappRawRow, pattern: RegExp): string {
+  for (const key of Object.keys(row)) {
+    if (pattern.test(key.trim())) {
+      const v = (row[key] ?? "").trim();
+      if (v) return v;
+    }
+  }
+  return "";
+}
+
+type DatazappMatchTier = "confirmed" | "household" | "mismatch" | "no_data";
+
+type DatazappMatchResult = {
+  tier: DatazappMatchTier;
+  firstName: string;
+  lastName: string;
+  phone: string;
+  originalEmail: string;
+  // The raw email DataZapp appended, regardless of tier - added 2026-10-15
+  // for Stage 2 ("Email List") below, which trusts it even on a mismatch/
+  // no_data row, unlike `finalFields.email` (still tier-gated, used only by
+  // Stage 1/"Appended Full Data", which stays exactly as cautious as before
+  // about not attaching a mismatched identity's email to a direct mail
+  // record). Mike, on Stage 2 specifically: "The people who direct mail does
+  // not match does NOT mean we throw away their email because they will
+  // just go on email list" - a mismatch row not being trustworthy enough for
+  // a mailing address doesn't mean its appended email is worthless too.
+  dzEmail: string;
+  appendedName: string;
+  finalFields: { email: string; address: string; address_2: string; city: string; state: string; zip: string };
+  doNotCall: boolean;
+  possibleBusiness: string | null;
+};
+
+function formatZip(zip: string, zip4: string): string {
+  if (!zip) return "";
+  return zip4 ? `${zip}-${zip4}` : zip;
+}
+
+// The actual matching logic - purely a within-the-row comparison between
+// the original name DataZapp was given (First Name/Last Name, right there
+// in the file) and the name DataZapp handed back (DataZapp_First/Last, or
+// the secondary DataZapp_FIRST2/LAST2 resident slot). Nothing here reads or
+// writes any contact record - see this section's header comment for why
+// that's the point of this redesign, not an oversight.
+function matchDatazappRow(row: DatazappRawRow): DatazappMatchResult {
+  const firstName = dzField(row, "First Name");
+  const lastName = dzField(row, "Last Name");
+  const phone =
+    dzField(row, "FORMATTED_PHONE_Phone 1") || dzField(row, "Phone 1") || firstNonBlankMatching(row, /^phone\s*\d*$/i);
+  const originalEmail = dzField(row, "Email 1") || firstNonBlankMatching(row, /^email\s*\d*$/i);
+
+  const dzFirst = dzField(row, "DataZapp_First");
+  const dzLast = dzField(row, "DataZapp_Last");
+  const dzFirst2 = dzField(row, "DataZapp_FIRST2");
+  const dzLast2 = dzField(row, "DataZapp_LAST2");
+  const dzAddress = dzField(row, "DataZapp_Address");
+  const dzAddress2 = dzField(row, "DataZapp_ADDRESS2");
+  const dzCity = dzField(row, "DataZapp_City");
+  const dzState = dzField(row, "DataZapp_State");
+  const dzZip = formatZip(dzField(row, "DataZapp_ZIP"), dzField(row, "DataZapp_ZIP_4"));
+  const dzEmail = dzField(row, "DataZapp_EMAIL");
+  const doNotCall = dzField(row, "DataZapp_DoNotCall").toUpperCase() === "Y";
+  const possibleBusiness = dzField(row, "DataZapp_COMPANY_NAME") || null;
+
+  const emptyFields = { email: "", address: "", address_2: "", city: "", state: "", zip: "" };
+
+  if (!dzFirst && !dzLast && !dzAddress) {
+    return {
+      tier: "no_data",
+      firstName,
+      lastName,
+      phone,
+      originalEmail,
+      dzEmail,
+      appendedName: "",
+      finalFields: emptyFields,
+      doNotCall,
+      possibleBusiness: null,
+    };
+  }
+
+  const appendedName = [dzFirst, dzLast].filter(Boolean).join(" ");
+
+  // Primary slot: exact or nickname-equivalent first name, exact last name.
+  const primaryConfirmed = sameLastName(dzLast, lastName) && firstNamesEquivalent(dzFirst, firstName);
+  // Secondary resident (DataZapp_FIRST2/LAST2) catches the real match when
+  // DataZapp's primary slot handed back a spouse/other household member
+  // instead - confirmed against Mike's real sample data, see this section's
+  // header comment for a concrete example.
+  const secondaryConfirmed = sameLastName(dzLast2, lastName) && firstNamesEquivalent(dzFirst2, firstName);
+
+  if (primaryConfirmed || secondaryConfirmed) {
+    return {
+      tier: "confirmed",
+      firstName,
+      lastName,
+      phone,
+      originalEmail,
+      dzEmail,
+      appendedName,
+      // Keep whatever original email this row already had (it may have one
+      // if it was only missing an address) - only fall back to DataZapp's
+      // appended email when there wasn't one.
+      finalFields: {
+        email: originalEmail || dzEmail,
+        address: dzAddress,
+        address_2: dzAddress2,
+        city: dzCity,
+        state: dzState,
+        zip: dzZip,
+      },
+      doNotCall,
+      possibleBusiness,
+    };
+  }
+
+  // Last name agrees (either slot) but no first name matches at all - most
+  // plausibly the same household (a spouse or other resident), not a wrong
+  // address. Direct mail to that address is still almost certainly good -
+  // Mike's actual goal ("mainly direct mail, because we want them to order
+  // direct mail from us") doesn't depend on the first name being exact. The
+  // appended EMAIL is deliberately withheld in this tier: sending under the
+  // wrong identity is a real risk an address isn't.
+  const householdMatch = sameLastName(dzLast, lastName) || sameLastName(dzLast2, lastName);
+  if (householdMatch) {
+    return {
+      tier: "household",
+      firstName,
+      lastName,
+      phone,
+      originalEmail,
+      dzEmail,
+      appendedName,
+      finalFields: {
+        email: originalEmail,
+        address: dzAddress,
+        address_2: dzAddress2,
+        city: dzCity,
+        state: dzState,
+        zip: dzZip,
+      },
+      doNotCall,
+      possibleBusiness,
+    };
+  }
+
+  return {
+    tier: "mismatch",
+    firstName,
+    lastName,
+    phone,
+    originalEmail,
+    dzEmail,
+    appendedName,
+    finalFields: emptyFields,
+    doNotCall,
+    possibleBusiness: null,
+  };
+}
+
+function emptyTierCounts(): Record<DatazappMatchTier, number> {
+  return { confirmed: 0, household: 0, mismatch: 0, no_data: 0 };
+}
+
+// REDESIGNED TWICE the same day this first went out - see this section's
+// header comment for the full story. This second pass is the one Mike
+// actually asked for: "The append data should have nothing to do with the
+// prior contacts... I'm uploading an appended list that's still showing me
+// zero results because I don't have that data from the original upload, so
+// it doesn't make sense." His description of the process, in his own words:
+// "you upload the appended data file. It's going to give you all the
+// matches. It's going to give you all the mismatches, and then it's going
+// to clean that list up so that we could only take the correct data at the
+// end of the day, and it's going to ask us who we're keeping." That's
+// exactly what previewDatazappAppend/finalizeDatazappAppend below do - the
+// review table UI itself (checkbox per row, defaulted checked, Select
+// all/Clear all, search) is unchanged from the first redesign, since Mike
+// confirmed that part was right; what's gone is any read or write against
+// the `contacts` table.
+//
+// One row of what the review wizard shows and lets Mike's team check/uncheck
+// - only ever built for the confirmed/household tiers, since mismatch/
+// no_data rows have nothing worth keeping either way (they still show up in
+// `counts` for visibility, just not as reviewable rows). `rowIndex` is this
+// row's position in the uploaded file - the stable key the frontend's
+// checkboxes use, and what finalizeDatazappAppend's `includedRowIndexes`
+// refers back to.
+type DatazappReviewRow = {
+  rowIndex: number;
+  firstName: string;
+  lastName: string;
+  phone: string;
+  tier: "confirmed" | "household";
+  originalEmail: string;
+  finalEmail: string;
+  finalAddress: string;
+  finalAddress2: string;
+  finalCity: string;
+  finalState: string;
+  finalZip: string;
+  doNotCall: boolean;
+  possibleBusiness: string | null;
+};
+
+// Shared by getSoiListView's final_full_contact branch AND the new
+// exportSoiListLocal below - hoisted to module scope on 2026-10-15 so there
+// is only ever ONE copy of this business rule. There used to be a second,
+// independent copy of this exact logic inside the remote export-lists Edge
+// Function, and the two quietly drifted apart: this local copy already fixed
+// the URL-length-limit bug (see fetchContactsWithFlags's header comment
+// above), but the remote copy never got that fix, so for a big-enough client
+// "Final: Full Contact (ready to use)" showed a correct nonzero count on
+// screen (from this local copy) while its CSV download came back completely
+// empty (from the still-broken remote copy) - confirmed directly against a
+// real file Mike sent (full_contact_ready_to_use_8.csv: header row only, zero
+// data rows) for a client whose Review tab showed "Complete Data 391/470".
+// Hoisting this out and having BOTH the on-screen count and the download use
+// the same function removes the drift entirely rather than just patching one
+// side of it.
+function isPrimaryReviewSurvivor(c: SoiContactRow & { flagged: boolean }): boolean {
+  if (c.list_assignment === "direct_mail" || c.list_assignment === "email_phone") return !c.flagged;
+  // "nonqualified" added 2026-10-15 - Mike wants it cleaned up the same way
+  // as email_list/incomplete: opt-IN, checked = "yes, I know this person,
+  // keep them" - didn't qualify automatically for another list doesn't mean
+  // Mike doesn't actually want them on his final list.
+  if (c.list_assignment === "email_list" || c.list_assignment === "incomplete" || c.list_assignment === "nonqualified")
+    return c.flagged;
+  return false;
+}
+function hasAllEightContactFields(c: SoiContactRow): boolean {
+  return !!(c.first_name && c.last_name && c.email && c.phone && c.address && c.city && c.state && c.zip);
+}
+
+// Read-only dry run: parses + matches a just-uploaded DataZapp return file
+// purely against itself (see the matching-logic comment above) and reports
+// what's reviewable, without touching any contact record.
+export const previewDatazappAppend = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator((data: { clientId: string; rows: DatazappRawRow[] }) => data)
+  .handler(async ({ data, context }) => {
+    const admin = getSoiAdminClient();
+    const email = (context.claims as { email?: string } | undefined)?.email;
+    // Still gated behind normal client access, same as every other
+    // SOI-builder function - just no longer reads anything from `contacts`.
+    await requireClientAccess(admin, email, data.clientId);
+
+    const results = data.rows.map((row) => matchDatazappRow(row));
+
+    const counts = emptyTierCounts();
+    for (const r of results) counts[r.tier]++;
+
+    const reviewRows: DatazappReviewRow[] = [];
+    results.forEach((r, rowIndex) => {
+      if (r.tier !== "confirmed" && r.tier !== "household") return;
+      reviewRows.push({
+        rowIndex,
+        firstName: r.firstName,
+        lastName: r.lastName,
+        phone: r.phone,
+        tier: r.tier,
+        originalEmail: r.originalEmail,
+        finalEmail: r.finalFields.email,
+        finalAddress: r.finalFields.address,
+        finalAddress2: r.finalFields.address_2,
+        finalCity: r.finalFields.city,
+        finalState: r.finalFields.state,
+        finalZip: r.finalFields.zip,
+        doNotCall: r.doNotCall,
+        possibleBusiness: r.possibleBusiness,
+      });
+    });
+
+    // Mismatch rows have nothing to keep, but a small sample is still
+    // useful for spot-checking that the "no name in common at all" calls
+    // are actually right.
+    const sampleMismatch = results
+      .filter((r) => r.tier === "mismatch")
+      .slice(0, 25)
+      .map((r) => ({
+        originalName: [r.firstName, r.lastName].filter(Boolean).join(" ") || "(no name)",
+        appendedName: r.appendedName,
+      }));
+
+    return {
+      total: results.length,
+      counts,
+      doNotCallCount: results.filter((r) => r.doNotCall).length,
+      possibleBusinessCount: results.filter((r) => r.possibleBusiness).length,
+      reviewRows,
+      sampleMismatch,
+    };
+  });
+
+// What the review wizard hands back per kept row - the shape the
+// downloadable CSV is built from. Plain contact-style fields, no tier/match
+// metadata, since this is meant to be a clean list Mike can upload straight
+// into Suite Assist or anywhere else - its own standalone list, same kind
+// of thing as "Final Full Contact," not written into any contact record.
+type DatazappKeptRow = {
+  first_name: string;
+  last_name: string;
+  email: string;
+  phone: string;
+  address: string;
+  address_2: string;
+  city: string;
+  state: string;
+  zip: string;
+};
+
+function csvEscape(value: string | null): string {
+  const v = value ?? "";
+  return /[",\n]/.test(v) ? `"${v.replace(/"/g, '""')}"` : v;
+}
+
+function buildDatazappCsv(rows: DatazappKeptRow[]): string {
+  const headers = ["First Name", "Last Name", "Email", "Phone", "Address", "Address 2", "City", "State", "Zip"];
+  const lines = [headers.join(",")];
+  for (const r of rows) {
+    lines.push(
+      [r.first_name, r.last_name, r.email, r.phone, r.address, r.address_2, r.city, r.state, r.zip]
+        .map(csvEscape)
+        .join(","),
+    );
+  }
+  return lines.join("\n");
+}
+
+// List assignments this append-data write path is allowed to promote a
+// contact INTO. The reverse - protecting someone already in one of these
+// three from being reassigned OUT by a later append-data run - is what
+// PROTECTED_LIST_ASSIGNMENTS below is for.
+const PROTECTED_LIST_ASSIGNMENTS = new Set(["direct_mail", "email_phone", "email_list"]);
+
+const CONTACT_MERGE_FIELDS = [
+  "first_name",
+  "last_name",
+  "email",
+  "phone",
+  "address",
+  "address_2",
+  "city",
+  "state",
+  "zip",
 ] as const;
 
-const NON_MARKETABLE_SCOPES = [
-  { scope: "incomplete", label: "Incomplete", local: false },
-  { scope: "nonqualified", label: "Nonqualified", local: false },
-  { scope: "realtor_excluded", label: "Realtor Excluded", local: false },
-  { scope: "business_excluded", label: "Business Excluded", local: false },
-] as const;
+type AppendWriteFields = {
+  first_name: string;
+  last_name: string;
+  email: string;
+  phone: string;
+  address: string;
+  address_2: string;
+  city: string;
+  state: string;
+  zip: string;
+};
 
-function ExportTab({ clientId, clientName }: { clientId: string; clientName: string }) {
-  const [busyScope, setBusyScope] = useState<string | null>(null);
+// Writes finalized append-data rows into `contacts` under a new
+// list_assignment bucket ("appended_full_data" or "appended_email") - added
+// 2026-10-15 per Mike's request to treat these as real exportable buckets
+// ("Appended Full Data, and Appended Email" as entries in the new Export tab
+// Marketable section, combinable into one final database). This REVERSES
+// the "no database write of any kind" decision documented above
+// finalizeDatazappAppend's original version - that decision was about the
+// MATCHING step never depending on `contacts` (still true, unchanged,
+// matchDatazappRow still never reads a contact record), not about where the
+// kept results end up once Mike's team has decided who to keep.
+//
+// Matches by phone only, and only at this write step (never during preview/
+// matching) - looks up every one of this client's contacts once up front
+// rather than one query per row. Blank-fill-only merge, same philosophy as
+// process-upload's own real logic: never overwrites a field that already
+// has real data. list_assignment is the one exception - it DOES get
+// reassigned on a match, because being found here means DataZapp appended
+// something for a person who was missing data, which is the whole point of
+// promoting them into this bucket - UNLESS they're already sitting in
+// direct_mail/email_phone/email_list, the three buckets the real pipeline
+// already considers fully qualified; this never downgrades someone out of
+// those on the (unlikely, since Mike only sends DataZapp people missing
+// data in the first place) chance they show up in an append file too.
+async function upsertAppendedContacts(
+  admin: SupabaseClient,
+  clientId: string,
+  rows: AppendWriteFields[],
+  listAssignment: string,
+): Promise<{ updated: number; inserted: number }> {
+  const existing = await fetchAllContactsForClient(admin, clientId);
+  const byPhone = new Map<string, SoiContactRow>();
+  for (const c of existing) {
+    if (c.phone) byPhone.set(c.phone, c);
+  }
 
-  async function runExport(scope: string, local: boolean) {
-    setBusyScope(scope);
-    try {
-      const result = local
-        ? await exportSoiListLocal({
-            data: {
-              clientId,
-              scope: scope as "final_full_contact" | "appended_full_data" | "appended_email" | "combine_marketable",
-            },
-          })
-        : await exportSoiList({ data: { clientId, scope } });
-      for (const [name, content] of Object.entries(result.files ?? {})) {
-        const blob = new Blob([content], { type: "text/csv" });
-        const url = URL.createObjectURL(blob);
-        const a = document.createElement("a");
-        a.href = url;
-        a.download = withClientSuffix(name, clientName);
-        a.click();
-        URL.revokeObjectURL(url);
-      }
-    } finally {
-      setBusyScope(null);
+  const updates: Promise<unknown>[] = [];
+  const toInsert: Record<string, unknown>[] = [];
+
+  for (const row of rows) {
+    const match = row.phone ? byPhone.get(row.phone) : undefined;
+    if (!match) {
+      toInsert.push({ client_id: clientId, list_assignment: listAssignment, ...row });
+      continue;
+    }
+    const merged: Record<string, unknown> = {};
+    for (const field of CONTACT_MERGE_FIELDS) {
+      if (!match[field] && row[field]) merged[field] = row[field];
+    }
+    if (!PROTECTED_LIST_ASSIGNMENTS.has(match.list_assignment ?? "")) {
+      merged["list_assignment"] = listAssignment;
+    }
+    if (Object.keys(merged).length > 0) {
+      updates.push(
+        Promise.resolve(admin.from("contacts").update(merged).eq("id", match.id)).then(({ error }) => {
+          if (error) throw error;
+        }),
+      );
     }
   }
 
-  return (
-    <div className="space-y-4">
-      <Card>
-        <h2 className="font-display text-lg font-semibold">Final: Full Contact (ready to use)</h2>
-        <p className="mt-1 text-sm text-muted-foreground">
-          Everyone who made it through review with a complete record (name, address, city, state, zip, email, AND phone)
-          - the one list that's ready to use as-is, pulled fresh from every bucket below.
-        </p>
-        <div className="mt-3">
-          <Button onClick={() => runExport("final_full_contact", true)} disabled={busyScope === "final_full_contact"}>
-            {busyScope === "final_full_contact" ? "Preparing…" : "Download"}
-          </Button>
-        </div>
-      </Card>
+  // Bounded concurrency rather than one giant Promise.all - hundreds of
+  // individual updates (each a different row, different merged fields, so
+  // they can't be collapsed into one batch statement) fired all at once is
+  // more connections than this is worth risking.
+  for (let i = 0; i < updates.length; i += 25) {
+    await Promise.all(updates.slice(i, i + 25));
+  }
+  for (let i = 0; i < toInsert.length; i += 500) {
+    const { error } = await admin.from("contacts").insert(toInsert.slice(i, i + 500));
+    if (error) throw error;
+  }
 
-      <Card>
-        <h2 className="font-display text-lg font-semibold">Marketable</h2>
-        <p className="mt-1 text-sm text-muted-foreground">
-          Everyone worth marketing to in some form - combine them all into one deduped database when you're ready. "Full
-          Direct Mail + Email/Phone" below is the same bucket the "Final: Full Contact" list above is pulled from, just
-          not narrowed down to only the fully-complete records - most of the time the two will look very similar.
-        </p>
-        <div className="mt-4 grid gap-2 sm:grid-cols-2">
-          {MARKETABLE_SCOPES.map((s) => (
-            <Button
-              key={s.scope}
-              variant="secondary"
-              onClick={() => runExport(s.scope, s.local)}
-              disabled={busyScope === s.scope}
-            >
-              {busyScope === s.scope ? "Preparing…" : s.label}
-            </Button>
-          ))}
-        </div>
-        <div className="mt-4 border-t border-border pt-4">
-          <Button onClick={() => runExport("combine_marketable", true)} disabled={busyScope === "combine_marketable"}>
-            {busyScope === "combine_marketable" ? "Preparing…" : "Combine all into one final database"}
-          </Button>
-          <p className="mt-2 text-sm text-muted-foreground">
-            Combines the 4 lists above into one CSV, matching and merging anyone who shows up more than once (by email,
-            then phone, then name) instead of listing them twice.
-          </p>
-        </div>
-      </Card>
-
-      <Card>
-        <h2 className="font-display text-lg font-semibold">Non-Marketable</h2>
-        <p className="mt-1 text-sm text-muted-foreground">Not worth spending marketing budget on, at least for now.</p>
-        <div className="mt-4 grid gap-2 sm:grid-cols-2">
-          {NON_MARKETABLE_SCOPES.map((s) => (
-            <Button
-              key={s.scope}
-              variant="secondary"
-              onClick={() => runExport(s.scope, s.local)}
-              disabled={busyScope === s.scope}
-            >
-              {busyScope === s.scope ? "Preparing…" : s.label}
-            </Button>
-          ))}
-        </div>
-      </Card>
-
-      <Card>
-        <h2 className="font-display text-lg font-semibold">Facebook Audience</h2>
-        <p className="mt-1 text-sm text-muted-foreground">Everyone targetable, formatted for an ad platform upload.</p>
-        <div className="mt-3">
-          <Button
-            variant="secondary"
-            onClick={() => runExport("facebook_audience", false)}
-            disabled={busyScope === "facebook_audience"}
-          >
-            {busyScope === "facebook_audience" ? "Preparing…" : "Download"}
-          </Button>
-        </div>
-      </Card>
-    </div>
-  );
+  return { updated: updates.length, inserted: toInsert.length };
 }
+
+// Finalizes exactly the rows Mike's team kept checked in the review wizard -
+// `includedRowIndexes` are positions in `rows` (same indexing
+// previewDatazappAppend's `reviewRows[].rowIndex` used). Re-runs the same
+// matching logic (deterministic from the file alone, nothing external to
+// drift), builds the same standalone downloadable CSV as before (still
+// useful - Mike's own words, "ready to upload wherever you need it, Suite
+// Assist or anywhere else"), and ALSO writes the kept rows into `contacts`
+// as list_assignment "appended_full_data" (see upsertAppendedContacts above
+// for why this is no longer a no-DB-write operation).
+export const finalizeDatazappAppend = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator((data: { clientId: string; rows: DatazappRawRow[]; includedRowIndexes: number[] }) => data)
+  .handler(async ({ data, context }) => {
+    const admin = getSoiAdminClient();
+    const email = (context.claims as { email?: string } | undefined)?.email;
+    await requireClientAccess(admin, email, data.clientId);
+
+    const results = data.rows.map((row) => matchDatazappRow(row));
+    const included = new Set(data.includedRowIndexes);
+
+    const counts = emptyTierCounts();
+    for (const r of results) counts[r.tier]++;
+
+    const keptRows: DatazappKeptRow[] = [];
+    results.forEach((r, rowIndex) => {
+      const canKeep = (r.tier === "confirmed" || r.tier === "household") && included.has(rowIndex);
+      if (!canKeep) return;
+      keptRows.push({
+        first_name: r.firstName,
+        last_name: r.lastName,
+        email: r.finalFields.email,
+        phone: r.phone,
+        address: r.finalFields.address,
+        address_2: r.finalFields.address_2,
+        city: r.finalFields.city,
+        state: r.finalFields.state,
+        zip: r.finalFields.zip,
+      });
+    });
+
+    const written = await upsertAppendedContacts(admin, data.clientId, keptRows, "appended_full_data");
+
+    return {
+      total: results.length,
+      keptCount: keptRows.length,
+      counts,
+      csv: keptRows.length > 0 ? buildDatazappCsv(keptRows) : null,
+      written,
+    };
+  });
+
+// Stage 2 - "Email List" pass over whatever Stage 1 (above) didn't keep,
+// added 2026-10-15 per Mike: "We should have a secondary screen where it has
+// the remaining contacts to clean up next because we can still create an
+// email list out of it... if there was an email appended it should be added
+// in and we want to create a final list of people that have first name last
+// name and email as bare fields."
+//
+// REVISED the same day, from Mike testing this live and getting a blank
+// email list: the first version only ever offered each row's OWN original
+// email, never DataZapp's appended one, for any row outside the
+// confirmed/household tiers - trying to avoid attaching a mismatched
+// identity's email to someone. Mike corrected that directly: "The people
+// who direct tmail do not match DOES not mean we throw away their email
+// because they will just go on email list... Just want to make sure that
+// even if their direct amil did not match we dont remove them if they have
+// an email and or phone here. We want them still included." So "usable
+// email" here is now `originalEmail || dzEmail` for EVERY row not kept in
+// Stage 1, regardless of tier - a mismatch/no_data row not being trustworthy
+// enough for a mailing address doesn't mean its appended email is worthless
+// too, same reasoning Mike already applied to the household tier's mailing
+// address in Stage 1.
+type DatazappEmailReviewRow = {
+  rowIndex: number;
+  firstName: string;
+  lastName: string;
+  email: string;
+  phone: string;
+  originalTier: DatazappMatchTier;
+};
+
+function bestStage2Email(r: DatazappMatchResult): string {
+  return r.originalEmail || r.dzEmail;
+}
+
+export const previewDatazappEmailList = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator((data: { clientId: string; rows: DatazappRawRow[]; keptRowIndexes: number[] }) => data)
+  .handler(async ({ data, context }) => {
+    const admin = getSoiAdminClient();
+    const email = (context.claims as { email?: string } | undefined)?.email;
+    await requireClientAccess(admin, email, data.clientId);
+
+    const results = data.rows.map((row) => matchDatazappRow(row));
+    const kept = new Set(data.keptRowIndexes);
+
+    // Visibility into what happens to everyone NOT on the email list below,
+    // broken down by their Stage 1 tier - added per Mike: "What happens to
+    // the bottom 2 rows of 275 and 287 people... I'd like to be able to see
+    // the data on those." `remainingByTier` counts everyone not kept in
+    // Stage 1, by tier; `noEmailByTier` is the subset of each that still had
+    // no usable email at all (truly nothing to work with, not just withheld
+    // out of caution).
+    const remainingByTier = emptyTierCounts();
+    const noEmailByTier = emptyTierCounts();
+
+    const reviewRows: DatazappEmailReviewRow[] = [];
+    results.forEach((r, rowIndex) => {
+      if (kept.has(rowIndex)) return; // already on the Stage 1 "Appended Full Data" list
+      remainingByTier[r.tier]++;
+      const usableEmail = bestStage2Email(r);
+      if (!usableEmail) {
+        noEmailByTier[r.tier]++;
+        return;
+      }
+      reviewRows.push({
+        rowIndex,
+        firstName: r.firstName,
+        lastName: r.lastName,
+        email: usableEmail,
+        phone: r.phone,
+        originalTier: r.tier,
+      });
+    });
+
+    return { total: reviewRows.length, reviewRows, remainingByTier, noEmailByTier };
+  });
+
+function buildDatazappEmailCsv(rows: { first_name: string; last_name: string; email: string }[]): string {
+  const headers = ["First Name", "Last Name", "Email"];
+  const lines = [headers.join(",")];
+  for (const r of rows) {
+    lines.push([r.first_name, r.last_name, r.email].map(csvEscape).join(","));
+  }
+  return lines.join("\n");
+}
+
+export const finalizeDatazappEmailList = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator((data: { clientId: string; rows: DatazappRawRow[]; includedRowIndexes: number[] }) => data)
+  .handler(async ({ data, context }) => {
+    const admin = getSoiAdminClient();
+    const email = (context.claims as { email?: string } | undefined)?.email;
+    await requireClientAccess(admin, email, data.clientId);
+
+    const results = data.rows.map((row) => matchDatazappRow(row));
+    const included = new Set(data.includedRowIndexes);
+
+    const keptRows: { first_name: string; last_name: string; email: string; phone: string }[] = [];
+    results.forEach((r, rowIndex) => {
+      const usableEmail = bestStage2Email(r);
+      if (!included.has(rowIndex) || !usableEmail) return;
+      keptRows.push({ first_name: r.firstName, last_name: r.lastName, email: usableEmail, phone: r.phone });
+    });
+
+    const written = await upsertAppendedContacts(
+      admin,
+      data.clientId,
+      keptRows.map((r) => ({
+        first_name: r.first_name,
+        last_name: r.last_name,
+        email: r.email,
+        phone: r.phone,
+        address: "",
+        address_2: "",
+        city: "",
+        state: "",
+        zip: "",
+      })),
+      "appended_email",
+    );
+
+    return {
+      keptCount: keptRows.length,
+      csv: keptRows.length > 0 ? buildDatazappEmailCsv(keptRows) : null,
+      written,
+    };
+  });
+
+// ============================================================================
+// Export tab reorganization, 2026-10-15 - Mike's request: split the flat
+// button list into "Marketable" (Full Direct Mail + Email/Phone, Email
+// List, the two new Appended buckets above) and "Non-Marketable" (Incomplete,
+// Nonqualified, Realtor Excluded, Business Excluded), plus a "combine all
+// into one final database" button that dedupes across every Marketable
+// bucket. The two new Appended scopes don't exist in the remote export-lists
+// Edge Function at all (it predates this feature), and "final_full_contact"
+// has the known URL-length-limit bug documented above
+// isPrimaryReviewSurvivor - so this is a local export path covering exactly
+// those scopes, reusing the exact same fetch helpers and (for
+// final_full_contact) the exact same hoisted survivor/complete-record rules
+// as getSoiListView's on-screen count, so the download can never disagree
+// with what the screen shows again. Every OTHER scope on the Export tab
+// (complete, email_list, incomplete, nonqualified, facebook_audience,
+// realtor_excluded, business_excluded) is untouched - still the original
+// exportSoiList calling the real remote Edge Function, since Mike never
+// reported those broken and there's no reason to touch what works.
+// ============================================================================
+
+function buildContactsCsvV2(rows: SoiContactRow[]): string {
+  const headers = [
+    "first_name",
+    "last_name",
+    "address",
+    "address_2",
+    "city",
+    "state",
+    "zip",
+    "email",
+    "phone",
+    "notes",
+    "sources",
+  ];
+  const lines = [headers.join(",")];
+  for (const r of rows) {
+    lines.push(
+      [
+        r.first_name,
+        r.last_name,
+        r.address,
+        r.address_2,
+        r.city,
+        r.state,
+        r.zip,
+        r.email,
+        r.phone,
+        r.notes,
+        (r.sources ?? []).join("; "),
+      ]
+        .map((v) => csvEscape(v))
+        .join(","),
+    );
+  }
+  return lines.join("\n");
+}
+
+// Dedupes across the combined Marketable buckets for the new "combine all
+// into one final database" button - mirrors process-upload's own stated
+// matching priority (email, then phone, then name) as closely as a from-
+// scratch reimplementation reasonably can without access to that function's
+// source: this is Claude's own implementation of that priority, not a call
+// into the real pipeline's dedupe, worth stating plainly rather than
+// implying it's byte-identical. Same blank-fill-only merge philosophy as
+// everywhere else in this file - the surviving row only ever gains fields
+// it was missing, never loses or overwrites a real value it already had.
+function dedupeContactRows(rows: SoiContactRow[]): SoiContactRow[] {
+  const out: SoiContactRow[] = [];
+  const byEmail = new Map<string, number>();
+  const byPhone = new Map<string, number>();
+
+  for (const row of rows) {
+    const emailKey = (row.email ?? "").toLowerCase().trim();
+    const phoneKey = (row.phone ?? "").replace(/\D/g, "");
+
+    let existingIdx: number | undefined;
+    if (emailKey && byEmail.has(emailKey)) existingIdx = byEmail.get(emailKey);
+    else if (phoneKey && byPhone.has(phoneKey)) existingIdx = byPhone.get(phoneKey);
+
+    if (existingIdx === undefined) {
+      out.push({ ...row });
+      const idx = out.length - 1;
+      if (emailKey) byEmail.set(emailKey, idx);
+      if (phoneKey) byPhone.set(phoneKey, idx);
+      continue;
+    }
+
+    const survivor = out[existingIdx];
+    if (!survivor) continue; // existingIdx always came from out.length - 1 above - unreachable in practice
+    for (const field of CONTACT_MERGE_FIELDS) {
+      if (!survivor[field] && row[field]) survivor[field] = row[field];
+    }
+    if (row.notes && !survivor.notes) survivor.notes = row.notes;
+    survivor.sources = Array.from(new Set([...(survivor.sources ?? []), ...(row.sources ?? [])]));
+    if (emailKey) byEmail.set(emailKey, existingIdx);
+    if (phoneKey) byPhone.set(phoneKey, existingIdx);
+  }
+
+  return out;
+}
+
+export const exportSoiListLocal = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator(
+    (data: {
+      clientId: string;
+      scope: "final_full_contact" | "appended_full_data" | "appended_email" | "combine_marketable";
+    }) => data,
+  )
+  .handler(async ({ data, context }) => {
+    const admin = getSoiAdminClient();
+    const email = (context.claims as { email?: string } | undefined)?.email;
+    await requireClientAccess(admin, email, data.clientId);
+
+    const stamp = new Date().toISOString().slice(0, 10);
+
+    if (data.scope === "appended_full_data" || data.scope === "appended_email") {
+      const rows = await fetchContactsForList(admin, data.clientId, data.scope);
+      const label = data.scope === "appended_full_data" ? "appended-full-data" : "appended-email";
+      return { files: { [`${label}-${stamp}.csv`]: buildContactsCsvV2(rows) }, count: rows.length };
+    }
+
+    if (data.scope === "final_full_contact") {
+      // "nonqualified" added 2026-10-15 - see the comment on getSoiListView's
+      // own copy of this list above for why.
+      const reviewLists = ["direct_mail", "email_phone", "email_list", "incomplete", "nonqualified"] as const;
+      const groups = await Promise.all(
+        reviewLists.map((l) => fetchContactsWithFlags(admin, data.clientId, l, "primary")),
+      );
+      const survivors = groups.flat().filter((c) => isPrimaryReviewSurvivor(c) && hasAllEightContactFields(c));
+      return { files: { [`final-full-contact-${stamp}.csv`]: buildContactsCsvV2(survivors) }, count: survivors.length };
+    }
+
+    // combine_marketable
+    const lists = ["direct_mail", "email_phone", "email_list", "appended_full_data", "appended_email"] as const;
+    const groups = await Promise.all(lists.map((l) => fetchContactsForList(admin, data.clientId, l)));
+    const combined = dedupeContactRows(groups.flat());
+    return {
+      files: { [`final-marketable-database-${stamp}.csv`]: buildContactsCsvV2(combined) },
+      count: combined.length,
+    };
+  });

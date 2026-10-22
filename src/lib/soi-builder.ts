@@ -335,15 +335,33 @@ export const deleteSoiUpload = createServerFn({ method: "POST" })
 // resetSoiDatabase above (talk directly to the backend when the existing
 // Edge Function's shape doesn't fit), just via Storage instead of a table.
 //
-// Known limitation, stated plainly rather than silently: only the uploaded
-// file + its computed match tiers are restored. Per-row checkbox changes
-// mid-review are NOT persisted - reopening the tab resets to the same
-// opt-out default (every confirmed/household row checked) the first upload
-// always starts with. Round-tripping every checkbox too would mean writing
-// on every single click, which is a lot of chatter for a value that's
-// already cheap to recompute from the file.
+// UPDATE 2026-10-22: the "known limitation" this comment used to end on -
+// per-row checkbox state not persisting - turned into a real production
+// problem (see appendDataCheckedPath below for the full story) and is now
+// fixed. That per-row state lives in its own Storage object rather than
+// here, specifically so it can be written on every single click without
+// re-uploading the entire file's rows each time.
 function appendDataStagingPath(clientId: string): string {
   return `append-data-staging/${clientId}.json`;
+}
+
+// Added 2026-10-22 per Mike, after he and a client independently reviewed
+// the same Append Data list and ended up with "different lists": "Anything
+// that the client unchecks needs to automatically save in real time and
+// transfer through to anything on the admin side... the only time that
+// list should be deleted is if we decide to go ahead and delete that list."
+// Root cause was that per-row checked/unchecked state was never written
+// anywhere - every login/every remount of AppendDataTab defaulted back to
+// "everyone checked" (see the old comment this replaced, just above), so
+// whichever side looked last only ever saw their OWN in-memory guess, never
+// what the other side had actually done, and a client who navigated away
+// before clicking Download lost everything. This is a second, separate
+// Storage object (not merged into the main staging blob above) specifically
+// so toggling one checkbox only ever uploads a small
+// { checkedRowIndexes: [...] } payload, not the entire uploaded file's rows
+// over again on every click.
+function appendDataCheckedPath(clientId: string): string {
+  return `append-data-staging/${clientId}.checked.json`;
 }
 
 export const saveAppendDataStaging = createServerFn({ method: "POST" })
@@ -360,31 +378,94 @@ export const saveAppendDataStaging = createServerFn({ method: "POST" })
       upsert: true,
     });
     if (error) throw error;
+    // A brand new file means every old row index is meaningless (row 12 in
+    // the old file isn't row 12 in this one) - clear out any leftover
+    // checked-rows state from a previous upload rather than letting a stale
+    // set silently get applied to the new one. Best-effort, same as every
+    // other staging cleanup in this file: nothing staged yet is normal, not
+    // an error.
+    await admin.storage.from("uploads").remove([appendDataCheckedPath(data.clientId)]);
     return { ok: true };
   });
 
 export const getAppendDataStaging = createServerFn({ method: "GET" })
   .middleware([requireSupabaseAuth])
   .inputValidator((data: { clientId: string }) => data)
-  .handler(async ({ data, context }): Promise<{ fileName: string; rows: DatazappRawRow[] } | null> => {
+  .handler(
+    async ({
+      data,
+      context,
+    }): Promise<{ fileName: string; rows: DatazappRawRow[]; checkedRowIndexes: number[] | null } | null> => {
+      const admin = getSoiAdminClient();
+      const email = (context.claims as { email?: string } | undefined)?.email;
+      await requireClientAccess(admin, email, data.clientId);
+
+      const { data: file, error } = await admin.storage.from("uploads").download(appendDataStagingPath(data.clientId));
+      if (error) {
+        // Nothing staged yet is the normal, expected case (first time opening
+        // this tab, or right after "Delete this list") - not an error.
+        return null;
+      }
+      let staged: { fileName: string; rows: DatazappRawRow[] };
+      try {
+        const text = await file.text();
+        staged = JSON.parse(text) as { fileName: string; rows: DatazappRawRow[] };
+      } catch {
+        return null;
+      }
+
+      // Checked-rows state (see appendDataCheckedPath above) comes back
+      // bundled with the file itself so the frontend's one restore call on
+      // mount gets the complete picture in one round trip. null just means
+      // "nobody has saved a checked-rows change for this file yet" - not an
+      // error - so the frontend falls back to its normal everyone-starts-
+      // checked default.
+      let checkedRowIndexes: number[] | null = null;
+      const { data: checkedFile } = await admin.storage.from("uploads").download(appendDataCheckedPath(data.clientId));
+      if (checkedFile) {
+        try {
+          const parsed = JSON.parse(await checkedFile.text()) as { checkedRowIndexes: number[] };
+          checkedRowIndexes = parsed.checkedRowIndexes;
+        } catch {
+          checkedRowIndexes = null;
+        }
+      }
+
+      return { ...staged, checkedRowIndexes };
+    },
+  );
+
+// Saves the Stage 1 review table's checked/unchecked state in real time -
+// called from toggleRow/toggleAllVisible in AppendDataTab on every single
+// change, the same fire-immediately-on-every-click pattern setSoiReviewFlag
+// already uses elsewhere in this file (see `toggle`/`toggleAll` in
+// database.tsx). Not debounced, on purpose - Mike's complaint was that
+// "real time" wasn't actually happening, so this errs toward one small
+// request per click rather than batching and risking the same lost-progress
+// problem if the client navigates away between a debounce firing.
+export const saveAppendDataCheckedRows = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator((data: { clientId: string; checkedRowIndexes: number[] }) => data)
+  .handler(async ({ data, context }) => {
     const admin = getSoiAdminClient();
     const email = (context.claims as { email?: string } | undefined)?.email;
     await requireClientAccess(admin, email, data.clientId);
 
-    const { data: file, error } = await admin.storage.from("uploads").download(appendDataStagingPath(data.clientId));
-    if (error) {
-      // Nothing staged yet is the normal, expected case (first time opening
-      // this tab, or right after "Upload another file") - not an error.
-      return null;
-    }
-    try {
-      const text = await file.text();
-      return JSON.parse(text) as { fileName: string; rows: DatazappRawRow[] };
-    } catch {
-      return null;
-    }
+    const payload = JSON.stringify({ checkedRowIndexes: data.checkedRowIndexes });
+    const { error } = await admin.storage.from("uploads").upload(appendDataCheckedPath(data.clientId), payload, {
+      contentType: "application/json",
+      upsert: true,
+    });
+    if (error) throw error;
+    return { ok: true };
   });
 
+// Deliberate, explicit wipe of a client's staged Append Data file AND its
+// checked-rows state - this is now the ONLY thing that clears either of
+// them (see the "real time" comment above appendDataCheckedPath - a
+// toggle, a tab switch, or a reload must never do this on their own). The
+// frontend's new "Delete this list" button is the one UI entry point that
+// calls this.
 export const clearAppendDataStaging = createServerFn({ method: "POST" })
   .middleware([requireSupabaseAuth])
   .inputValidator((data: { clientId: string }) => data)
@@ -393,7 +474,9 @@ export const clearAppendDataStaging = createServerFn({ method: "POST" })
     const email = (context.claims as { email?: string } | undefined)?.email;
     await requireClientAccess(admin, email, data.clientId);
 
-    await admin.storage.from("uploads").remove([appendDataStagingPath(data.clientId)]);
+    await admin.storage
+      .from("uploads")
+      .remove([appendDataStagingPath(data.clientId), appendDataCheckedPath(data.clientId)]);
     return { ok: true };
   });
 
@@ -426,12 +509,15 @@ export const resetSoiDatabase = createServerFn({ method: "POST" })
     const { error: deleteUploadsErr } = await admin.from("uploads").delete().eq("client_id", data.clientId);
     if (deleteUploadsErr) throw deleteUploadsErr;
 
-    // 1b. Also clear any staged Append Data file (see saveAppendDataStaging
-    // below) - it lives outside the `uploads` table entirely (on purpose, so
-    // it never gets picked up by process-upload), so it wouldn't be touched
-    // by the loop above at all. Best-effort: a missing object here is not an
-    // error, there's just nothing staged.
-    await admin.storage.from("uploads").remove([appendDataStagingPath(data.clientId)]);
+    // 1b. Also clear any staged Append Data file AND its checked-rows state
+    // (see saveAppendDataStaging/appendDataCheckedPath below) - both live
+    // outside the `uploads` table entirely (on purpose, so neither ever gets
+    // picked up by process-upload), so neither would be touched by the loop
+    // above at all. Best-effort: a missing object here is not an error,
+    // there's just nothing staged.
+    await admin.storage
+      .from("uploads")
+      .remove([appendDataStagingPath(data.clientId), appendDataCheckedPath(data.clientId)]);
 
     // 2. Delete every review flag tied to this client's contacts FIRST -
     // review_flags has no client_id column of its own (it's keyed off
@@ -523,7 +609,11 @@ const HUB_LISTS = [
 // BREAKDOWN_CARDS in database.tsx. Mike wants this same real-time
 // transparency (no downloading needed to see who'll make the final list) on
 // every reviewable bucket, not just the opt-in ones.
-const CHECKED_COUNT_LISTS = ["direct_mail", "email_phone", "email_list", "incomplete"] as const;
+// "nonqualified" added 2026-10-15 per Mike: "The No qualifies list needs the
+// ability to be cleaned up too... Need to be able to select all and follow
+// same process as email list clean up" - it's now a 5th opt-in review step,
+// same pattern as email_list/incomplete.
+const CHECKED_COUNT_LISTS = ["direct_mail", "email_phone", "email_list", "incomplete", "nonqualified"] as const;
 
 export const getSoiHubCounts = createServerFn({ method: "GET" })
   .middleware([requireSupabaseAuth])
@@ -683,7 +773,11 @@ async function fetchContactsWithFlags(
 export const getSoiReviewCandidates = createServerFn({ method: "GET" })
   .middleware([requireSupabaseAuth])
   .inputValidator(
-    (data: { clientId: string; listAssignment: "direct_mail" | "email_phone" | "email_list" | "incomplete" }) => data,
+    (data: {
+      clientId: string;
+      // "nonqualified" added 2026-10-15 - it's now a reviewable list too.
+      listAssignment: "direct_mail" | "email_phone" | "email_list" | "incomplete" | "nonqualified";
+    }) => data,
   )
   .handler(async ({ data, context }) => {
     const admin = getSoiAdminClient();
@@ -729,8 +823,12 @@ export const getSoiListView = createServerFn({ method: "GET" })
     // fetch as getSoiReviewCandidates above - this branch used to build a
     // flat id list across all 4 review lists and look up flags separately,
     // which is exactly the shape that can blow past a URL length limit for
-    // a client with a lot of contacts.
-    const reviewLists = ["direct_mail", "email_phone", "email_list", "incomplete"] as const;
+    // a client with a lot of contacts. "nonqualified" added 2026-10-15, now
+    // that it's a reviewable opt-in list too (see isPrimaryReviewSurvivor) -
+    // anyone Mike actually checks "keep" there, who also happens to have a
+    // complete 8-field record, now counts toward this list same as a kept
+    // Email List/Incomplete contact already did.
+    const reviewLists = ["direct_mail", "email_phone", "email_list", "incomplete", "nonqualified"] as const;
     const groups = await Promise.all(
       reviewLists.map((l) => fetchContactsWithFlags(admin, data.clientId, l, "primary")),
     );
@@ -1277,7 +1375,12 @@ type DatazappReviewRow = {
 // side of it.
 function isPrimaryReviewSurvivor(c: SoiContactRow & { flagged: boolean }): boolean {
   if (c.list_assignment === "direct_mail" || c.list_assignment === "email_phone") return !c.flagged;
-  if (c.list_assignment === "email_list" || c.list_assignment === "incomplete") return c.flagged;
+  // "nonqualified" added 2026-10-15 - Mike wants it cleaned up the same way
+  // as email_list/incomplete: opt-IN, checked = "yes, I know this person,
+  // keep them" - didn't qualify automatically for another list doesn't mean
+  // Mike doesn't actually want them on his final list.
+  if (c.list_assignment === "email_list" || c.list_assignment === "incomplete" || c.list_assignment === "nonqualified")
+    return c.flagged;
   return false;
 }
 function hasAllEightContactFields(c: SoiContactRow): boolean {
@@ -1786,7 +1889,9 @@ export const exportSoiListLocal = createServerFn({ method: "POST" })
     }
 
     if (data.scope === "final_full_contact") {
-      const reviewLists = ["direct_mail", "email_phone", "email_list", "incomplete"] as const;
+      // "nonqualified" added 2026-10-15 - see the comment on getSoiListView's
+      // own copy of this list above for why.
+      const reviewLists = ["direct_mail", "email_phone", "email_list", "incomplete", "nonqualified"] as const;
       const groups = await Promise.all(
         reviewLists.map((l) => fetchContactsWithFlags(admin, data.clientId, l, "primary")),
       );

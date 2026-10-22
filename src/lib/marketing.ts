@@ -182,6 +182,22 @@ export type PostMetadata = {
   source?: string | undefined;
   drive_file_id?: string | undefined;
   drive_thumbnail_url?: string | undefined;
+  // The REAL, full-resolution direct-download link for this post's Drive
+  // photo — added 2026-10-22 per Mike: "the links need to be the image or
+  // video that is being shared on the approved post... a lot of the cases
+  // the images are missing." drive_thumbnail_url above is Drive's small
+  // ~400px preview image (good for an inline <img> on screen, which is the
+  // only thing it was ever written for), but every Drive-photo write path
+  // was also handing that same small preview URL to the Word-doc export's
+  // "⬇ Download" link, instead of DriveFile.downloadUrl (the real
+  // drive.google.com/uc?export=download link, which already existed for
+  // exactly this purpose — see mapDriveApiFile). A VA clicking that link
+  // got Drive's tiny preview-serving endpoint, not an actual downloadable
+  // photo. This field is additive — drive_thumbnail_url keeps meaning
+  // "on-screen preview" everywhere it's already used; this one is read only
+  // by the Word-doc export (photoLinksForPost) and the Photo Scan/content-
+  // calendar auto-suggest write paths that now also populate it.
+  drive_download_url?: string | null | undefined;
   media_id?: string | null | undefined;
   media_url?: string | null | undefined;
   media_type?: string | null | undefined;
@@ -850,6 +866,7 @@ export const setPostDrivePhoto = createServerFn({ method: "POST" })
       ...((existing.metadata as Record<string, unknown> | null) ?? {}),
       drive_file_id: data.driveFileId,
       drive_thumbnail_url: data.thumbnailUrl,
+      drive_download_url: driveDownloadUrl(data.driveFileId),
       media_id: null,
       media_url: null,
       media_type: null,
@@ -2734,6 +2751,18 @@ function isHeicDriveFile(f: { name: string; mimeType: string }): boolean {
 // confirmed the folder is accessible (verifyDriveFolderAccessible) if it
 // wants a clear error on a private/unshared folder — this function itself
 // just throws whatever the Drive API returns.
+// The real, full-resolution direct-download link for a Drive file id — see
+// PostMetadata.drive_download_url's comment for why this is now computed
+// and stored separately from the small on-screen preview thumbnail. Pulled
+// out as its own helper (2026-10-22) so every write path that attaches a
+// Drive photo to something (a post, an email photo, a reel photo, Photo
+// Scan, content-calendar auto-suggest) builds this identically, rather than
+// re-typing the URL template and risking it drift out of sync with
+// mapDriveApiFile's own copy below.
+function driveDownloadUrl(fileId: string): string {
+  return `https://drive.google.com/uc?export=download&id=${fileId}`;
+}
+
 function mapDriveApiFile(f: { id: string; name: string; mimeType: string }): DriveFile {
   return {
     id: f.id,
@@ -2742,7 +2771,7 @@ function mapDriveApiFile(f: { id: string; name: string; mimeType: string }): Dri
     isVideo: f.mimeType.startsWith("video/"),
     thumbnailUrl: `https://drive.google.com/thumbnail?id=${f.id}&sz=w400`,
     viewUrl: `https://drive.google.com/file/d/${f.id}/view`,
-    downloadUrl: `https://drive.google.com/uc?export=download&id=${f.id}`,
+    downloadUrl: driveDownloadUrl(f.id),
   };
 }
 
@@ -3053,6 +3082,7 @@ export const setPublicReviewDrivePhoto = createServerFn({ method: "POST" })
       ...((existing.metadata as Record<string, unknown> | null) ?? {}),
       drive_file_id: data.driveFileId,
       drive_thumbnail_url: data.thumbnailUrl,
+      drive_download_url: driveDownloadUrl(data.driveFileId),
       media_id: null,
       media_url: null,
       media_type: null,
@@ -4507,6 +4537,7 @@ export const generateMonthlyBatch = createServerFn({ method: "POST" })
               media_type: pick?.mediaType ?? null,
               drive_file_id: pick?.source === "drive" ? pick.driveFileId : null,
               drive_thumbnail_url: pick?.source === "drive" ? pick.driveThumbnailUrl : null,
+              drive_download_url: pick?.source === "drive" ? driveDownloadUrl(pick.driveFileId) : null,
             },
           });
         }
@@ -5193,6 +5224,7 @@ export const addPhotoPostsToBatch = createServerFn({ method: "POST" })
               source: "drive_photo_scan",
               drive_file_id: item.sourceId,
               drive_thumbnail_url: item.thumbnailUrl,
+              drive_download_url: driveDownloadUrl(item.sourceId),
             }
           : {
               batch_id: data.batchId ?? null,

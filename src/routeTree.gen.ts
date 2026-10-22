@@ -13,7 +13,6 @@ import { Route as IndexRouteImport } from './routes/index'
 import { Route as AccountRouteImport } from './routes/account'
 import { Route as DatabaseRouteImport } from './routes/database'
 import { Route as LoginRouteImport } from './routes/login'
-import { Route as MarketingRouteImport } from './routes/marketing'
 import { Route as ResetPasswordRouteImport } from './routes/reset-password'
 import { Route as SweetAssistRouteImport } from './routes/sweet-assist'
 import { Route as VoiceRouteImport } from './routes/voice'
@@ -38,11 +37,6 @@ const DatabaseRoute = DatabaseRouteImport.update({
 const LoginRoute = LoginRouteImport.update({
   id: '/login',
   path: '/login',
-  getParentRoute: () => rootRouteImport,
-} as any)
-const MarketingRoute = MarketingRouteImport.update({
-  id: '/marketing',
-  path: '/marketing',
   getParentRoute: () => rootRouteImport,
 } as any)
 const ResetPasswordRoute = ResetPasswordRouteImport.update({
@@ -76,7 +70,6 @@ export interface FileRoutesByFullPath {
   '/account': typeof AccountRoute
   '/database': typeof DatabaseRoute
   '/login': typeof LoginRoute
-  '/marketing': typeof MarketingRoute
   '/reset-password': typeof ResetPasswordRoute
   '/sweet-assist': typeof SweetAssistRoute
   '/voice': typeof VoiceRoute
@@ -88,7 +81,6 @@ export interface FileRoutesByTo {
   '/account': typeof AccountRoute
   '/database': typeof DatabaseRoute
   '/login': typeof LoginRoute
-  '/marketing': typeof MarketingRoute
   '/reset-password': typeof ResetPasswordRoute
   '/sweet-assist': typeof SweetAssistRoute
   '/voice': typeof VoiceRoute
@@ -101,7 +93,6 @@ export interface FileRoutesById {
   '/account': typeof AccountRoute
   '/database': typeof DatabaseRoute
   '/login': typeof LoginRoute
-  '/marketing': typeof MarketingRoute
   '/reset-password': typeof ResetPasswordRoute
   '/sweet-assist': typeof SweetAssistRoute
   '/voice': typeof VoiceRoute
@@ -115,7 +106,6 @@ export interface FileRouteTypes {
     | '/account'
     | '/database'
     | '/login'
-    | '/marketing'
     | '/reset-password'
     | '/sweet-assist'
     | '/voice'
@@ -127,7 +117,6 @@ export interface FileRouteTypes {
     | '/account'
     | '/database'
     | '/login'
-    | '/marketing'
     | '/reset-password'
     | '/sweet-assist'
     | '/voice'
@@ -139,7 +128,6 @@ export interface FileRouteTypes {
     | '/account'
     | '/database'
     | '/login'
-    | '/marketing'
     | '/reset-password'
     | '/sweet-assist'
     | '/voice'
@@ -152,7 +140,6 @@ export interface RootRouteChildren {
   AccountRoute: typeof AccountRoute
   DatabaseRoute: typeof DatabaseRoute
   LoginRoute: typeof LoginRoute
-  MarketingRoute: typeof MarketingRoute
   ResetPasswordRoute: typeof ResetPasswordRoute
   SweetAssistRoute: typeof SweetAssistRoute
   VoiceRoute: typeof VoiceRoute
@@ -188,13 +175,6 @@ declare module '@tanstack/react-router' {
       path: '/login'
       fullPath: '/login'
       preLoaderRoute: typeof LoginRouteImport
-      parentRoute: typeof rootRouteImport
-    }
-    '/marketing': {
-      id: '/marketing'
-      path: '/marketing'
-      fullPath: '/marketing'
-      preLoaderRoute: typeof MarketingRouteImport
       parentRoute: typeof rootRouteImport
     }
     '/reset-password': {
@@ -240,7 +220,6 @@ const rootRouteChildren: RootRouteChildren = {
   AccountRoute: AccountRoute,
   DatabaseRoute: DatabaseRoute,
   LoginRoute: LoginRoute,
-  MarketingRoute: MarketingRoute,
   ResetPasswordRoute: ResetPasswordRoute,
   SweetAssistRoute: SweetAssistRoute,
   VoiceRoute: VoiceRoute,

@@ -1534,15 +1534,17 @@ export const rewritePostContent = createServerFn({ method: "POST" })
 
     const { data: agent, error: agentErr } = await supabaseAdmin
       .from("agents")
-      .select("full_name, market_area, voice_summary")
+      .select("full_name, market_area, voice_summary, voice_answers")
       .eq("id", data.agentId)
       .maybeSingle();
     if (agentErr) throw agentErr;
     const agentName = agent?.full_name ?? "the agent";
     const firstName = agentName.split(" ")[0] || agentName;
     const agentCity = agent?.market_area ?? "their market";
-    const dna =
-      agent?.voice_summary ?? "Warm, conversational, authentic real estate agent. Short posts. Real human energy.";
+    const dna = withContentBrandingStrategy(
+      agent?.voice_summary ?? "Warm, conversational, authentic real estate agent. Short posts. Real human energy.",
+      agent?.voice_answers,
+    );
 
     const kind =
       existing.content_type === "email"
@@ -2258,15 +2260,17 @@ export const rewritePublicReviewPost = createServerFn({ method: "POST" })
 
     const { data: agent, error: agentErr } = await supabaseAdmin
       .from("agents")
-      .select("full_name, market_area, voice_summary")
+      .select("full_name, market_area, voice_summary, voice_answers")
       .eq("id", agentId)
       .maybeSingle();
     if (agentErr) throw agentErr;
     const agentName = agent?.full_name ?? "the agent";
     const firstName = agentName.split(" ")[0] || agentName;
     const agentCity = agent?.market_area ?? "their market";
-    const dna =
-      agent?.voice_summary ?? "Warm, conversational, authentic real estate agent. Short posts. Real human energy.";
+    const dna = withContentBrandingStrategy(
+      agent?.voice_summary ?? "Warm, conversational, authentic real estate agent. Short posts. Real human energy.",
+      agent?.voice_answers,
+    );
 
     const kind =
       existing.content_type === "email"
@@ -3473,6 +3477,42 @@ export const setAgentDriveFolder = createServerFn({ method: "POST" })
     return { ok: true };
   });
 
+// Content Branding Strategy (2026-10-22) — per Mike: "once somebody is
+// finished with the interview... I want to add a section... called their
+// content branding strategy. This section will just have a document that I
+// can upload inside of here that'll also play into their voice DNA profile."
+// Stored as free text inside the existing agents.voice_answers jsonb blob
+// (see voice-dna.ts's VoiceDnaAnswers type) rather than a new column - no
+// migration needed, same reasoning Append Data's checked-rows state and the
+// Nonqualified list both already used this same week: this app's schema
+// changes don't flow through this repo, so a flexible jsonb field that
+// already exists is the safe place to add a new piece of agent data.
+//
+// Every place below that reads voice_summary to build a content-generation
+// prompt now also reads voice_answers and, if this field is set, appends it
+// underneath the Voice DNA text - so a post written for this agent is shaped
+// by both the interview AND whatever extra brand/content strategy guidance
+// Mike uploaded for them, not just the interview alone.
+function contentBrandingStrategyText(voiceAnswers: unknown): string | null {
+  if (!voiceAnswers || typeof voiceAnswers !== "object") return null;
+  const text = (voiceAnswers as { contentBrandingStrategy?: unknown }).contentBrandingStrategy;
+  return typeof text === "string" && text.trim() ? text.trim() : null;
+}
+
+function withContentBrandingStrategy(voiceDna: string, voiceAnswers: unknown): string {
+  const strategy = contentBrandingStrategyText(voiceAnswers);
+  if (!strategy) return voiceDna;
+  return `${voiceDna}\n\nCONTENT BRANDING STRATEGY (additional guidance from the agent - weave this in alongside the voice DNA above):\n${strategy}`;
+}
+
+function withContentBrandingStrategyOptional(voiceDna: string | undefined, voiceAnswers: unknown): string | undefined {
+  const strategy = contentBrandingStrategyText(voiceAnswers);
+  if (!strategy) return voiceDna;
+  return voiceDna
+    ? `${voiceDna}\n\nCONTENT BRANDING STRATEGY (additional guidance from the agent - weave this in alongside the voice DNA above):\n${strategy}`
+    : `CONTENT BRANDING STRATEGY (additional guidance from the agent):\n${strategy}`;
+}
+
 // ============================================================================
 // Native "Create content" — Phase 2, step 2. The old app sourced post/email/
 // video copy from a Google Drive content calendar (content-calendar.js, one
@@ -3595,15 +3635,17 @@ export const generateMarketingContent = createServerFn({ method: "POST" })
     const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
     const { data: agent, error: agentErr } = await supabaseAdmin
       .from("agents")
-      .select("full_name, market_area, voice_summary")
+      .select("full_name, market_area, voice_summary, voice_answers")
       .eq("id", data.agentId)
       .maybeSingle();
     if (agentErr) throw agentErr;
 
     const agentName = agent?.full_name ?? "the agent";
     const agentCity = agent?.market_area ?? "their market";
-    const voiceDna =
-      agent?.voice_summary ?? "Warm, conversational, authentic real estate agent. Short posts. Real human energy.";
+    const voiceDna = withContentBrandingStrategy(
+      agent?.voice_summary ?? "Warm, conversational, authentic real estate agent. Short posts. Real human energy.",
+      agent?.voice_answers,
+    );
 
     const learnedFeedback = await fetchLearnedFeedback(data.agentId);
     const prompt = buildContentPrompt(data, agentName, agentCity, voiceDna, learnedFeedback);
@@ -3787,13 +3829,15 @@ export const sendAgentChatMessage = createServerFn({ method: "POST" })
     const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
     const { data: agent } = await supabaseAdmin
       .from("agents")
-      .select("full_name, market_area, voice_summary")
+      .select("full_name, market_area, voice_summary, voice_answers")
       .eq("id", data.agentId)
       .maybeSingle();
     const agentName = agent?.full_name ?? "the agent";
     const agentCity = agent?.market_area ?? "their market";
-    const voiceDna =
-      agent?.voice_summary ?? "Warm, conversational, authentic real estate agent. Short posts. Real human energy.";
+    const voiceDna = withContentBrandingStrategy(
+      agent?.voice_summary ?? "Warm, conversational, authentic real estate agent. Short posts. Real human energy.",
+      agent?.voice_answers,
+    );
 
     const learnedFeedback = await fetchLearnedFeedback(data.agentId);
     const systemPrompt = buildChatSystemPrompt(data.mode, agentName, agentCity, voiceDna, learnedFeedback);
@@ -4446,7 +4490,7 @@ export const generateMonthlyBatch = createServerFn({ method: "POST" })
     const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
     const { data: agent, error: agentErr } = await supabaseAdmin
       .from("agents")
-      .select("full_name, market_area, voice_summary")
+      .select("full_name, market_area, voice_summary, voice_answers")
       .eq("id", data.agentId)
       .maybeSingle();
     if (agentErr) throw agentErr;
@@ -4469,7 +4513,7 @@ export const generateMonthlyBatch = createServerFn({ method: "POST" })
         `${agentName} hasn't completed the Voice DNA interview yet — monthly content can't be generated until that's done. Complete the interview in Voice DNA first, then come back and generate this month's content.`,
       );
     }
-    const dna = agent.voice_summary;
+    const dna = withContentBrandingStrategy(agent.voice_summary, agent.voice_answers);
     const learnedFeedback = await fetchLearnedFeedback(data.agentId);
 
     const docs = await fetchNativeCalendarDocs(data.monthId);
@@ -4997,12 +5041,12 @@ export const scanAgentDrivePhotos = createServerFn({ method: "POST" })
       const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
       const { data: agent } = await supabaseAdmin
         .from("agents")
-        .select("full_name, market_area, voice_summary")
+        .select("full_name, market_area, voice_summary, voice_answers")
         .eq("id", data.agentId)
         .maybeSingle();
       const agentName = agent?.full_name ?? undefined;
       const agentCity = agent?.market_area ?? undefined;
-      const voiceDna = agent?.voice_summary ?? undefined;
+      const voiceDna = withContentBrandingStrategyOptional(agent?.voice_summary ?? undefined, agent?.voice_answers);
 
       // Searches the whole folder tree under this agent's Drive folder, not
       // just its direct contents — see listDriveFolderIds above for why
@@ -5128,12 +5172,12 @@ export const scanAgentLibraryPhotos = createServerFn({ method: "POST" })
     const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
     const { data: agent } = await supabaseAdmin
       .from("agents")
-      .select("full_name, market_area, voice_summary")
+      .select("full_name, market_area, voice_summary, voice_answers")
       .eq("id", data.agentId)
       .maybeSingle();
     const agentName = agent?.full_name ?? undefined;
     const agentCity = agent?.market_area ?? undefined;
-    const voiceDna = agent?.voice_summary ?? undefined;
+    const voiceDna = withContentBrandingStrategyOptional(agent?.voice_summary ?? undefined, agent?.voice_answers);
 
     const { data: photos, error } = await supabaseAdmin
       .from("agent_photos")
@@ -5283,12 +5327,12 @@ export const regeneratePhotoScanCaption = createServerFn({ method: "POST" })
 
     const { data: agent } = await supabaseAdmin
       .from("agents")
-      .select("full_name, market_area, voice_summary")
+      .select("full_name, market_area, voice_summary, voice_answers")
       .eq("id", data.agentId)
       .maybeSingle();
     const agentName = agent?.full_name ?? undefined;
     const agentCity = agent?.market_area ?? undefined;
-    const voiceDna = agent?.voice_summary ?? undefined;
+    const voiceDna = withContentBrandingStrategyOptional(agent?.voice_summary ?? undefined, agent?.voice_answers);
 
     let arrayBuffer: ArrayBuffer;
     let mediaType = "image/jpeg";

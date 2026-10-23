@@ -106,10 +106,31 @@ export const VOICE_DNA_QUESTIONS: VoiceDnaQuestion[] = [
 
 export type VoiceDnaAnswer = { question: string; answer: string };
 
-// Shape stored in the agents.voice_answers jsonb column.
+// Added 2026-10-22 per Mike's "beneath the headshot logo section, we should
+// put in the rest of their information... phone number, their website,
+// their license number if applicable, their email address, and the
+// address" request - see saveAgentBusinessInfo below for why these live
+// here instead of new dedicated columns. Phone itself isn't in here - it
+// already has its own `agents.phone` column (shared with the interview's
+// own Basics step), so this only holds the fields that had nowhere else to
+// go.
+export type AgentBusinessInfo = {
+  website: string;
+  licenseNumber: string;
+  email: string;
+  officeAddress: string;
+};
+
+// Shape stored in the agents.voice_answers jsonb column. businessInfo and
+// contentBrandingStrategy (both added 2026-10-22) are set independently of
+// the interview's own answers/serviceAreas, via their own save calls below -
+// see saveAgentVoiceProfile's merge-not-overwrite comment for why that
+// matters.
 export type VoiceDnaAnswers = {
   answers: VoiceDnaAnswer[];
   serviceAreas: string;
+  businessInfo?: AgentBusinessInfo;
+  contentBrandingStrategy?: string;
 };
 
 function buildVoiceDnaPrompt(name: string, city: string, answers: VoiceDnaAnswer[]): string {
@@ -342,16 +363,147 @@ export const saveAgentVoiceProfile = createServerFn({ method: "POST" })
     const email = (context.claims as { email?: string } | undefined)?.email;
     await requireAgentAccess(context.userId, email, data.agentId);
     const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+
+    // Merge rather than blindly overwrite (2026-10-22): voice_answers now
+    // also carries businessInfo/contentBrandingStrategy (see the types
+    // above and the two new save functions below), set independently of
+    // the interview through their own save calls, any time. Finishing or
+    // redoing the 16-question interview writes a fresh `answers`/
+    // `serviceAreas` pair here - it must never silently wipe out business
+    // info or a content branding strategy someone already filled in on
+    // this same screen, which a blind overwrite of the whole column would
+    // have done.
+    const { data: existingRow } = await supabaseAdmin
+      .from("agents")
+      .select("voice_answers")
+      .eq("id", data.agentId)
+      .maybeSingle();
+    const existing = (existingRow?.voice_answers as VoiceDnaAnswers | null) ?? null;
+    const nextVoiceAnswers: VoiceDnaAnswers = {
+      ...existing,
+      answers: data.voiceAnswers.answers,
+      serviceAreas: data.voiceAnswers.serviceAreas,
+    };
+
     const { error } = await supabaseAdmin
       .from("agents")
       .update({
         full_name: data.fullName.trim() || null,
         market_area: data.marketArea.trim() || null,
         phone: data.phone.trim() || null,
-        voice_answers: data.voiceAnswers,
+        voice_answers: nextVoiceAnswers,
         voice_summary: data.voiceSummary,
         updated_at: new Date().toISOString(),
       })
+      .eq("id", data.agentId);
+    if (error) return { ok: false, error: error.message };
+    return { ok: true };
+  });
+
+// Business Info — phone/website/license/email/office address (2026-10-22),
+// per Mike: "beneath the headshot logo section, we should put in the rest
+// of their information, where they could put their phone number, their
+// website, their license number if applicable, their email address, and
+// the address, like where their office location is." Independent of the
+// interview entirely - same "live independent of interview stage, saved
+// immediately" pattern the headshot/logo uploads already use (see
+// uploadBrandAsset in voice.tsx), not gated behind finishing all 16
+// questions the way the rest of voice_answers normally is.
+//
+// Phone reuses the existing agents.phone column the interview's own Basics
+// step already writes - one canonical phone number, editable from either
+// place. The other four fields have no existing column, so they go into
+// voice_answers.businessInfo instead - no schema migration needed, same
+// reasoning as everything else added to this column. Read-modify-write,
+// since voice_answers may already hold real interview answers/service
+// areas (or a content branding strategy, saved separately below) that a
+// blind overwrite here would wipe out.
+export const saveAgentBusinessInfo = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .validator(
+    (data: {
+      agentId: string;
+      phone: string;
+      website: string;
+      licenseNumber: string;
+      email: string;
+      officeAddress: string;
+    }) => data,
+  )
+  .handler(async ({ data, context }): Promise<{ ok: true } | { ok: false; error: string }> => {
+    const email = (context.claims as { email?: string } | undefined)?.email;
+    await requireAgentAccess(context.userId, email, data.agentId);
+    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+
+    const { data: existingRow, error: readErr } = await supabaseAdmin
+      .from("agents")
+      .select("voice_answers")
+      .eq("id", data.agentId)
+      .maybeSingle();
+    if (readErr) return { ok: false, error: readErr.message };
+
+    const existing = (existingRow?.voice_answers as VoiceDnaAnswers | null) ?? { answers: [], serviceAreas: "" };
+    const nextVoiceAnswers: VoiceDnaAnswers = {
+      ...existing,
+      businessInfo: {
+        website: data.website.trim(),
+        licenseNumber: data.licenseNumber.trim(),
+        email: data.email.trim(),
+        officeAddress: data.officeAddress.trim(),
+      },
+    };
+
+    const { error } = await supabaseAdmin
+      .from("agents")
+      .update({
+        phone: data.phone.trim() || null,
+        voice_answers: nextVoiceAnswers,
+        updated_at: new Date().toISOString(),
+      })
+      .eq("id", data.agentId);
+    if (error) return { ok: false, error: error.message };
+    return { ok: true };
+  });
+
+// Content Branding Strategy (2026-10-22) — per Mike: "once somebody is
+// finished with the interview... I want to add a section... called their
+// content branding strategy. This section will just have a document that I
+// can upload inside of here that'll also play into their voice DNA
+// profile." See withContentBrandingStrategy/withContentBrandingStrategyOptional
+// in marketing.ts for exactly how this text gets woven into every place
+// that builds a content-generation prompt from this agent's Voice DNA.
+//
+// Plain text only, by design: typed or pasted directly in the textarea, or
+// auto-filled from a plain-text (.txt/.md) file the browser reads
+// client-side with zero new dependencies (see handleContentStrategyFile in
+// voice.tsx). A real Word/PDF upload-and-extract is a materially bigger,
+// separate build - it needs an actual parsing library - so it's flagged to
+// Mike as a follow-up rather than guessed at here; the textarea is always
+// available either way for pasting a doc's text in by hand right now.
+export const saveContentBrandingStrategy = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .validator((data: { agentId: string; text: string }) => data)
+  .handler(async ({ data, context }): Promise<{ ok: true } | { ok: false; error: string }> => {
+    const email = (context.claims as { email?: string } | undefined)?.email;
+    await requireAgentAccess(context.userId, email, data.agentId);
+    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+
+    const { data: existingRow, error: readErr } = await supabaseAdmin
+      .from("agents")
+      .select("voice_answers")
+      .eq("id", data.agentId)
+      .maybeSingle();
+    if (readErr) return { ok: false, error: readErr.message };
+
+    const existing = (existingRow?.voice_answers as VoiceDnaAnswers | null) ?? { answers: [], serviceAreas: "" };
+    const nextVoiceAnswers: VoiceDnaAnswers = {
+      ...existing,
+      contentBrandingStrategy: data.text.trim(),
+    };
+
+    const { error } = await supabaseAdmin
+      .from("agents")
+      .update({ voice_answers: nextVoiceAnswers, updated_at: new Date().toISOString() })
       .eq("id", data.agentId);
     if (error) return { ok: false, error: error.message };
     return { ok: true };

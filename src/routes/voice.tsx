@@ -10,8 +10,11 @@ import {
   saveAgentVoiceProfile,
   createBrandAssetUploadUrl,
   finalizeBrandAssetUpload,
+  saveAgentBusinessInfo,
+  saveContentBrandingStrategy,
   type VoiceDnaAnswer,
   type VoiceDnaAnswers,
+  type AgentBusinessInfo,
 } from "@/lib/voice-dna";
 // Reused from Monthly Marketing (2026-09-28) — same admin_allowlist +
 // agents identity model, so "who am I working on behalf of" is resolved the
@@ -44,6 +47,7 @@ type Stage = "loading" | "intro" | "basics" | "interview" | "areas" | "generatin
 
 type Basics = { fullName: string; marketArea: string; phone: string };
 const EMPTY_BASICS: Basics = { fullName: "", marketArea: "", phone: "" };
+const EMPTY_BUSINESS_INFO: AgentBusinessInfo = { website: "", licenseNumber: "", email: "", officeAddress: "" };
 
 function emptyAnswers(): string[] {
   return new Array(VOICE_DNA_QUESTIONS.length).fill("");
@@ -256,6 +260,25 @@ function VoiceWorkspace({
   const [uploadingKind, setUploadingKind] = useState<"headshot" | "logo" | null>(null);
   const [brandAssetError, setBrandAssetError] = useState<string | null>(null);
 
+  // Business Info — phone/website/license/email/office address (2026-10-22),
+  // per Mike: "beneath the headshot logo section, we should put in the rest
+  // of their information." Live independent of interview stage, same as
+  // the brand assets above — saved with their own button, not gated behind
+  // finishing the 16-question interview. Phone reuses `basics.phone` above
+  // rather than a second copy of it (see handleSaveBusinessInfo below).
+  const [businessInfo, setBusinessInfo] = useState<AgentBusinessInfo>(EMPTY_BUSINESS_INFO);
+  const [businessInfoSaving, setBusinessInfoSaving] = useState(false);
+  const [businessInfoStatus, setBusinessInfoStatus] = useState<string | null>(null);
+
+  // Content Branding Strategy (2026-10-22) — per Mike: "a document that I
+  // can upload inside of here that'll also play into their voice DNA
+  // profile." Also live independent of interview stage. See
+  // handleContentStrategyFile below for why this only auto-reads plain
+  // text files, not Word/PDF.
+  const [contentStrategy, setContentStrategy] = useState("");
+  const [contentStrategySaving, setContentStrategySaving] = useState(false);
+  const [contentStrategyStatus, setContentStrategyStatus] = useState<string | null>(null);
+
   // Load whatever profile already exists for the agent we're working on —
   // via the access-checked server function (see voice-dna.ts), not a direct
   // browser Supabase read, since that read used to be RLS-scoped to
@@ -278,6 +301,8 @@ function VoiceWorkspace({
           setHeadshotUrl(data.headshot_url);
           setLogoUrl(data.logo_url);
           const stored = data.voice_answers;
+          setBusinessInfo(stored?.businessInfo ?? EMPTY_BUSINESS_INFO);
+          setContentStrategy(stored?.contentBrandingStrategy ?? "");
           if (stored?.answers?.length) {
             const restored = emptyAnswers();
             stored.answers.forEach((a, i) => {
@@ -317,6 +342,63 @@ function VoiceWorkspace({
     } finally {
       setUploadingKind(null);
     }
+  }
+
+  async function handleSaveBusinessInfo() {
+    setBusinessInfoSaving(true);
+    setBusinessInfoStatus(null);
+    try {
+      const result = await saveAgentBusinessInfo({
+        data: {
+          agentId,
+          phone: basics.phone,
+          website: businessInfo.website,
+          licenseNumber: businessInfo.licenseNumber,
+          email: businessInfo.email,
+          officeAddress: businessInfo.officeAddress,
+        },
+      });
+      setBusinessInfoStatus(result.ok ? "Saved." : `Could not save: ${result.error}`);
+    } catch (e) {
+      setBusinessInfoStatus(e instanceof Error ? e.message : "Could not save.");
+    } finally {
+      setBusinessInfoSaving(false);
+    }
+  }
+
+  async function handleSaveContentStrategy() {
+    setContentStrategySaving(true);
+    setContentStrategyStatus(null);
+    try {
+      const result = await saveContentBrandingStrategy({ data: { agentId, text: contentStrategy } });
+      setContentStrategyStatus(result.ok ? "Saved." : `Could not save: ${result.error}`);
+    } catch (e) {
+      setContentStrategyStatus(e instanceof Error ? e.message : "Could not save.");
+    } finally {
+      setContentStrategySaving(false);
+    }
+  }
+
+  // Auto-reads a plain-text file straight into the textarea below, client
+  // side, with zero new dependencies — covers .txt/.md. A real Word/PDF
+  // upload-and-extract needs an actual parsing library, which is a bigger,
+  // separate build; the textarea itself is always there either way, so
+  // pasting a doc's text in by hand works right now for any file type.
+  function handleContentStrategyFile(file: File) {
+    const lowerName = file.name.toLowerCase();
+    if (!lowerName.endsWith(".txt") && !lowerName.endsWith(".md")) {
+      setContentStrategyStatus(
+        "Could only auto-read a plain .txt/.md file — paste this document's text into the box below instead, then save.",
+      );
+      return;
+    }
+    const reader = new FileReader();
+    reader.onload = () => {
+      setContentStrategy(String(reader.result ?? ""));
+      setContentStrategyStatus("Loaded from file — click Save to keep it.");
+    };
+    reader.onerror = () => setContentStrategyStatus("Couldn't read that file.");
+    reader.readAsText(file);
   }
 
   // Rotate the "reading your personality..." messages while generating.
@@ -672,25 +754,161 @@ function VoiceWorkspace({
                 </div>
                 <div className="min-w-0 flex-1">
                   <p className="text-sm font-medium">{slot.label}</p>
-                  <label className="mt-1.5 inline-block cursor-pointer rounded-full border border-border bg-glass px-3 py-1.5 text-xs font-semibold transition-colors hover:bg-secondary">
-                    {uploadingKind === slot.kind ? "Uploading…" : slot.url ? "Replace" : "Choose file"}
-                    <input
-                      type="file"
-                      accept="image/*"
-                      className="hidden"
-                      disabled={uploadingKind !== null}
-                      onChange={(e) => {
-                        const file = e.target.files?.[0];
-                        e.target.value = "";
-                        if (file) uploadBrandAsset(file, slot.kind);
-                      }}
-                    />
-                  </label>
+                  <div className="mt-1.5 flex flex-wrap items-center gap-2">
+                    <label className="inline-block cursor-pointer rounded-full border border-border bg-glass px-3 py-1.5 text-xs font-semibold transition-colors hover:bg-secondary">
+                      {uploadingKind === slot.kind ? "Uploading…" : slot.url ? "Replace" : "Choose file"}
+                      <input
+                        type="file"
+                        accept="image/*"
+                        className="hidden"
+                        disabled={uploadingKind !== null}
+                        onChange={(e) => {
+                          const file = e.target.files?.[0];
+                          e.target.value = "";
+                          if (file) uploadBrandAsset(file, slot.kind);
+                        }}
+                      />
+                    </label>
+                    {/* Downloadable (2026-10-22) per Mike: "when somebody
+                        uploads their headshot and their logo, we need it to
+                        be downloadable so that we can download it from
+                        there and then use it." These are already public
+                        Storage URLs (see finalizeBrandAssetUpload in
+                        voice-dna.ts) - this just gives an explicit download
+                        affordance instead of relying on right-click-save. */}
+                    {slot.url && (
+                      <a
+                        href={slot.url}
+                        download
+                        className="inline-block rounded-full border border-border bg-glass px-3 py-1.5 text-xs font-semibold transition-colors hover:bg-secondary"
+                      >
+                        Download
+                      </a>
+                    )}
+                  </div>
                 </div>
               </div>
             ))}
           </div>
           {brandAssetError && <p className="mt-3 text-xs text-destructive">{brandAssetError}</p>}
+        </div>
+
+        {/* Business Info (2026-10-22) — per Mike: "beneath the headshot logo
+            section, we should put in the rest of their information, where
+            they could put their phone number, their website, their license
+            number if applicable, their email address, and the address, like
+            where their office location is." Live independent of interview
+            stage, same as Headshot & Logo above — saved with its own
+            button, not gated behind finishing the 16-question interview.
+            Phone is the same canonical number the interview's own Basics
+            step edits (see handleSaveBusinessInfo). */}
+        <div className="mb-5 rounded-3xl border border-border bg-glass p-6 backdrop-blur-2xl">
+          <h2 className="font-display text-lg font-semibold">Business Info</h2>
+          <p className="mt-1 text-sm text-muted-foreground">
+            The contact details your brand assets and bio will be built from.
+          </p>
+          <div className="mt-4 grid grid-cols-1 gap-3 sm:grid-cols-2">
+            <label className="block">
+              <span className="text-xs font-medium text-muted-foreground">Phone</span>
+              <input
+                value={basics.phone}
+                onChange={(e) => setBasics((b) => ({ ...b, phone: e.target.value }))}
+                className="mt-1 w-full rounded-xl border border-border bg-background/60 px-3 py-2 text-sm outline-none ring-ring transition focus:ring-2"
+              />
+            </label>
+            <label className="block">
+              <span className="text-xs font-medium text-muted-foreground">Website</span>
+              <input
+                value={businessInfo.website}
+                onChange={(e) => setBusinessInfo((b) => ({ ...b, website: e.target.value }))}
+                className="mt-1 w-full rounded-xl border border-border bg-background/60 px-3 py-2 text-sm outline-none ring-ring transition focus:ring-2"
+              />
+            </label>
+            <label className="block">
+              <span className="text-xs font-medium text-muted-foreground">License number (if applicable)</span>
+              <input
+                value={businessInfo.licenseNumber}
+                onChange={(e) => setBusinessInfo((b) => ({ ...b, licenseNumber: e.target.value }))}
+                className="mt-1 w-full rounded-xl border border-border bg-background/60 px-3 py-2 text-sm outline-none ring-ring transition focus:ring-2"
+              />
+            </label>
+            <label className="block">
+              <span className="text-xs font-medium text-muted-foreground">Email</span>
+              <input
+                value={businessInfo.email}
+                onChange={(e) => setBusinessInfo((b) => ({ ...b, email: e.target.value }))}
+                className="mt-1 w-full rounded-xl border border-border bg-background/60 px-3 py-2 text-sm outline-none ring-ring transition focus:ring-2"
+              />
+            </label>
+            <label className="block sm:col-span-2">
+              <span className="text-xs font-medium text-muted-foreground">Office address</span>
+              <input
+                value={businessInfo.officeAddress}
+                onChange={(e) => setBusinessInfo((b) => ({ ...b, officeAddress: e.target.value }))}
+                className="mt-1 w-full rounded-xl border border-border bg-background/60 px-3 py-2 text-sm outline-none ring-ring transition focus:ring-2"
+              />
+            </label>
+          </div>
+          <div className="mt-4 flex items-center gap-3">
+            <button
+              onClick={handleSaveBusinessInfo}
+              disabled={businessInfoSaving}
+              className="rounded-xl bg-primary px-4 py-2 text-xs font-semibold text-primary-foreground shadow-lg shadow-primary/30 transition-transform hover:-translate-y-0.5 disabled:opacity-60"
+            >
+              {businessInfoSaving ? "Saving…" : "Save business info"}
+            </button>
+            {businessInfoStatus && <p className="text-xs text-muted-foreground">{businessInfoStatus}</p>}
+          </div>
+        </div>
+
+        {/* Content Branding Strategy (2026-10-22) — per Mike: "once somebody
+            is finished with the interview... I want to add a section...
+            called their content branding strategy. This section will just
+            have a document that I can upload inside of here that'll also
+            play into their voice DNA profile." Also live independent of
+            interview stage. Auto-reads plain .txt/.md files straight into
+            the box below; anything else (Word, PDF) gets pasted in by hand
+            for now — see handleContentStrategyFile for why. Once saved,
+            this gets woven into every content-generation prompt built from
+            this agent's Voice DNA (see withContentBrandingStrategy in
+            marketing.ts). */}
+        <div className="mb-5 rounded-3xl border border-border bg-glass p-6 backdrop-blur-2xl">
+          <h2 className="font-display text-lg font-semibold">Content Branding Strategy</h2>
+          <p className="mt-1 text-sm text-muted-foreground">
+            Optional — a content/brand strategy doc for this agent (recurring series ideas, content pillars, tone
+            notes). Upload a plain text file or paste it below; it gets factored in alongside their Voice DNA every time
+            we write for them.
+          </p>
+          <label className="mt-3 inline-block cursor-pointer rounded-full border border-border bg-glass px-3 py-1.5 text-xs font-semibold transition-colors hover:bg-secondary">
+            Upload a .txt/.md file
+            <input
+              type="file"
+              accept=".txt,.md,text/plain,text/markdown"
+              className="hidden"
+              onChange={(e) => {
+                const file = e.target.files?.[0];
+                e.target.value = "";
+                if (file) handleContentStrategyFile(file);
+              }}
+            />
+          </label>
+          <textarea
+            value={contentStrategy}
+            onChange={(e) => setContentStrategy(e.target.value)}
+            placeholder="Paste or upload this agent's content branding strategy here…"
+            rows={8}
+            className="mt-3 w-full resize-y rounded-2xl border border-border bg-background/60 px-4 py-3 text-sm outline-none ring-ring transition focus:ring-2"
+          />
+          <div className="mt-3 flex items-center gap-3">
+            <button
+              onClick={handleSaveContentStrategy}
+              disabled={contentStrategySaving}
+              className="rounded-xl bg-primary px-4 py-2 text-xs font-semibold text-primary-foreground shadow-lg shadow-primary/30 transition-transform hover:-translate-y-0.5 disabled:opacity-60"
+            >
+              {contentStrategySaving ? "Saving…" : "Save content strategy"}
+            </button>
+            {contentStrategyStatus && <p className="text-xs text-muted-foreground">{contentStrategyStatus}</p>}
+          </div>
         </div>
 
         {stage === "intro" && (

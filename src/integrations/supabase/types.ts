@@ -398,6 +398,39 @@ export type Database = {
           },
         ]
       }
+      sso_nonces: {
+        Row: {
+          created_at: string
+          nonce: string
+        }
+        Insert: {
+          created_at?: string
+          nonce: string
+        }
+        Update: {
+          created_at?: string
+          nonce?: string
+        }
+        Relationships: []
+      }
+      sso_rate_limits: {
+        Row: {
+          bucket: string
+          count: number
+          window_start: string
+        }
+        Insert: {
+          bucket: string
+          count?: number
+          window_start: string
+        }
+        Update: {
+          bucket?: string
+          count?: number
+          window_start?: string
+        }
+        Relationships: []
+      }
       user_roles: {
         Row: {
           created_at: string
@@ -430,6 +463,18 @@ export type Database = {
           _user_id: string
         }
         Returns: boolean
+      }
+      sso_bump_rate_limit: {
+        Args: { _bucket: string; _window_start: string }
+        Returns: number
+      }
+      sso_find_auth_user: {
+        Args: { _email: string }
+        Returns: {
+          email: string
+          email_confirmed_at: string
+          id: string
+        }[]
       }
     }
     Enums: {

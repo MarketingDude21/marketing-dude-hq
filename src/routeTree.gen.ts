@@ -11,6 +11,7 @@
 import { Route as rootRouteImport } from './routes/__root'
 import { Route as IndexRouteImport } from './routes/index'
 import { Route as AccountRouteImport } from './routes/account'
+import { Route as DatabaseRouteImport } from './routes/database'
 import { Route as LoginRouteImport } from './routes/login'
 import { Route as MarketingRouteImport } from './routes/marketing'
 import { Route as ResetPasswordRouteImport } from './routes/reset-password'
@@ -27,6 +28,11 @@ const IndexRoute = IndexRouteImport.update({
 const AccountRoute = AccountRouteImport.update({
   id: '/account',
   path: '/account',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const DatabaseRoute = DatabaseRouteImport.update({
+  id: '/database',
+  path: '/database',
   getParentRoute: () => rootRouteImport,
 } as any)
 const LoginRoute = LoginRouteImport.update({
@@ -68,6 +74,7 @@ const ReviewTokenRoute = ReviewTokenRouteImport.update({
 export interface FileRoutesByFullPath {
   '/': typeof IndexRoute
   '/account': typeof AccountRoute
+  '/database': typeof DatabaseRoute
   '/login': typeof LoginRoute
   '/marketing': typeof MarketingRoute
   '/reset-password': typeof ResetPasswordRoute
@@ -79,6 +86,7 @@ export interface FileRoutesByFullPath {
 export interface FileRoutesByTo {
   '/': typeof IndexRoute
   '/account': typeof AccountRoute
+  '/database': typeof DatabaseRoute
   '/login': typeof LoginRoute
   '/marketing': typeof MarketingRoute
   '/reset-password': typeof ResetPasswordRoute
@@ -91,6 +99,7 @@ export interface FileRoutesById {
   __root__: typeof rootRouteImport
   '/': typeof IndexRoute
   '/account': typeof AccountRoute
+  '/database': typeof DatabaseRoute
   '/login': typeof LoginRoute
   '/marketing': typeof MarketingRoute
   '/reset-password': typeof ResetPasswordRoute
@@ -104,6 +113,7 @@ export interface FileRouteTypes {
   fullPaths:
     | '/'
     | '/account'
+    | '/database'
     | '/login'
     | '/marketing'
     | '/reset-password'
@@ -115,6 +125,7 @@ export interface FileRouteTypes {
   to:
     | '/'
     | '/account'
+    | '/database'
     | '/login'
     | '/marketing'
     | '/reset-password'
@@ -126,6 +137,7 @@ export interface FileRouteTypes {
     | '__root__'
     | '/'
     | '/account'
+    | '/database'
     | '/login'
     | '/marketing'
     | '/reset-password'
@@ -138,6 +150,7 @@ export interface FileRouteTypes {
 export interface RootRouteChildren {
   IndexRoute: typeof IndexRoute
   AccountRoute: typeof AccountRoute
+  DatabaseRoute: typeof DatabaseRoute
   LoginRoute: typeof LoginRoute
   MarketingRoute: typeof MarketingRoute
   ResetPasswordRoute: typeof ResetPasswordRoute
@@ -161,6 +174,13 @@ declare module '@tanstack/react-router' {
       path: '/account'
       fullPath: '/account'
       preLoaderRoute: typeof AccountRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/database': {
+      id: '/database'
+      path: '/database'
+      fullPath: '/database'
+      preLoaderRoute: typeof DatabaseRouteImport
       parentRoute: typeof rootRouteImport
     }
     '/login': {
@@ -218,6 +238,7 @@ declare module '@tanstack/react-router' {
 const rootRouteChildren: RootRouteChildren = {
   IndexRoute: IndexRoute,
   AccountRoute: AccountRoute,
+  DatabaseRoute: DatabaseRoute,
   LoginRoute: LoginRoute,
   MarketingRoute: MarketingRoute,
   ResetPasswordRoute: ResetPasswordRoute,

@@ -50,3 +50,10 @@ The app's browser sign-in client is the standard one with no flow type set (vers
 - In Playwright, open a returned link in a fresh browser and confirm /marketing shows that user signed in.
 - Then open a link for user B while signed in as user A, and confirm the page switches to user B. If it doesn't, add the handler and report it.
 - Hand over a curl example at the end.
+
+## Test accounts (condition)
+- Every test that reaches link generation uses only two test accounts: qaqctest@mailinator.com and ymd-sso-test-b@mailinator.com.
+  - This covers the 200s with both secrets, the 6-calls-per-email test and both Playwright tests.
+  - Any of these accounts that doesn't exist yet is created as already confirmed, with no email sent, through the admin client.
+- The only real account the tests touch is michelle@millerregroup.com, for the ambiguous_user check, which never gets a link.
+- Full links are never printed in the summary. Nothing is published.

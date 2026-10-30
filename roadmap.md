@@ -5,3 +5,4 @@
 - [x] yourmarketingdude.com forwards here — login is the entry point; no marketing site needed
 - [x] Modules: embed all 3 live tools in the same window
 - [x] SOI Builder native integration at src/lib/soi-builder.ts (email identity bridge, team/client access, uploads, process, review flags, export)
+- [ ] Sweet Assist SSO endpoint POST /api/public/sso/exchange (HMAC, nonce, rate limits, magic link) — test on preview only with test accounts, do not publish

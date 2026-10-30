@@ -19,6 +19,7 @@ import { Route as SweetAssistRouteImport } from './routes/sweet-assist'
 import { Route as VoiceRouteImport } from './routes/voice'
 import { Route as MediaUploadTokenRouteImport } from './routes/media-upload.$token'
 import { Route as ReviewTokenRouteImport } from './routes/review.$token'
+import { Route as ApiPublicSsoExchangeRouteImport } from './routes/api/public/sso/exchange'
 
 const IndexRoute = IndexRouteImport.update({
   id: '/',
@@ -70,6 +71,11 @@ const ReviewTokenRoute = ReviewTokenRouteImport.update({
   path: '/review/$token',
   getParentRoute: () => rootRouteImport,
 } as any)
+const ApiPublicSsoExchangeRoute = ApiPublicSsoExchangeRouteImport.update({
+  id: '/api/public/sso/exchange',
+  path: '/api/public/sso/exchange',
+  getParentRoute: () => rootRouteImport,
+} as any)
 
 export interface FileRoutesByFullPath {
   '/': typeof IndexRoute
@@ -82,6 +88,7 @@ export interface FileRoutesByFullPath {
   '/voice': typeof VoiceRoute
   '/media-upload/$token': typeof MediaUploadTokenRoute
   '/review/$token': typeof ReviewTokenRoute
+  '/api/public/sso/exchange': typeof ApiPublicSsoExchangeRoute
 }
 export interface FileRoutesByTo {
   '/': typeof IndexRoute
@@ -94,6 +101,7 @@ export interface FileRoutesByTo {
   '/voice': typeof VoiceRoute
   '/media-upload/$token': typeof MediaUploadTokenRoute
   '/review/$token': typeof ReviewTokenRoute
+  '/api/public/sso/exchange': typeof ApiPublicSsoExchangeRoute
 }
 export interface FileRoutesById {
   __root__: typeof rootRouteImport
@@ -107,6 +115,7 @@ export interface FileRoutesById {
   '/voice': typeof VoiceRoute
   '/media-upload/$token': typeof MediaUploadTokenRoute
   '/review/$token': typeof ReviewTokenRoute
+  '/api/public/sso/exchange': typeof ApiPublicSsoExchangeRoute
 }
 export interface FileRouteTypes {
   fileRoutesByFullPath: FileRoutesByFullPath
@@ -121,6 +130,7 @@ export interface FileRouteTypes {
     | '/voice'
     | '/media-upload/$token'
     | '/review/$token'
+    | '/api/public/sso/exchange'
   fileRoutesByTo: FileRoutesByTo
   to:
     | '/'
@@ -133,6 +143,7 @@ export interface FileRouteTypes {
     | '/voice'
     | '/media-upload/$token'
     | '/review/$token'
+    | '/api/public/sso/exchange'
   id:
     | '__root__'
     | '/'
@@ -145,6 +156,7 @@ export interface FileRouteTypes {
     | '/voice'
     | '/media-upload/$token'
     | '/review/$token'
+    | '/api/public/sso/exchange'
   fileRoutesById: FileRoutesById
 }
 export interface RootRouteChildren {
@@ -158,6 +170,7 @@ export interface RootRouteChildren {
   VoiceRoute: typeof VoiceRoute
   MediaUploadTokenRoute: typeof MediaUploadTokenRoute
   ReviewTokenRoute: typeof ReviewTokenRoute
+  ApiPublicSsoExchangeRoute: typeof ApiPublicSsoExchangeRoute
 }
 
 declare module '@tanstack/react-router' {
@@ -232,6 +245,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof ReviewTokenRouteImport
       parentRoute: typeof rootRouteImport
     }
+    '/api/public/sso/exchange': {
+      id: '/api/public/sso/exchange'
+      path: '/api/public/sso/exchange'
+      fullPath: '/api/public/sso/exchange'
+      preLoaderRoute: typeof ApiPublicSsoExchangeRouteImport
+      parentRoute: typeof rootRouteImport
+    }
   }
 }
 
@@ -246,6 +266,7 @@ const rootRouteChildren: RootRouteChildren = {
   VoiceRoute: VoiceRoute,
   MediaUploadTokenRoute: MediaUploadTokenRoute,
   ReviewTokenRoute: ReviewTokenRoute,
+  ApiPublicSsoExchangeRoute: ApiPublicSsoExchangeRoute,
 }
 export const routeTree = rootRouteImport
   ._addFileChildren(rootRouteChildren)

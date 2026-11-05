@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { createFileRoute } from "@tanstack/react-router";
+import { Pencil, Check, X } from "lucide-react";
 import { AppShell } from "@/components/AppShell";
 import {
   getSoiAccess,
@@ -25,8 +26,10 @@ import {
   saveAppendDataCheckedRows,
   clearAppendDataStaging,
   cleanContactRows,
+  updateReviewContact,
   type SoiAccess,
   type ContactCleanupReport,
+  type DatazappRowOverride,
 } from "@/lib/soi-builder";
 
 export const Route = createFileRoute("/database")({
@@ -261,6 +264,102 @@ function Button({
       {children}
     </button>
   );
+}
+
+// Shared inline-edit pieces for every review table in this file (the main
+// Review tab, the Final Combined List's Needs Data table, and both Append
+// Data stages) - added 2026-11-05 per Mike: "Add an edit feature on all
+// screens that have data displayed like this so that if there is an error
+// uploaded we can easily click edit and fix it vs having to download it or
+// fix later... Add a pencil icon next to the Keep check box im thinking.
+// People know how that works already." Each table still owns its own
+// editing state and save logic (they save to genuinely different places -
+// a real contact record on two of them, a client-side override on the
+// other two - see updateReviewContact and DatazappRowOverride in
+// soi-builder.ts for why), but they all look and behave the same way.
+function EditIconButton({ onClick }: { onClick: () => void }) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      title="Edit this row"
+      aria-label="Edit this row"
+      className="rounded-full p-1 text-muted-foreground transition-colors hover:bg-secondary hover:text-foreground"
+    >
+      <Pencil size={14} />
+    </button>
+  );
+}
+
+function SaveCancelIconButtons({
+  onSave,
+  onCancel,
+  saving,
+}: {
+  onSave: () => void;
+  onCancel: () => void;
+  saving?: boolean;
+}) {
+  return (
+    <div className="flex items-center gap-1">
+      <button
+        type="button"
+        onClick={onSave}
+        disabled={saving}
+        title="Save"
+        aria-label="Save"
+        className="rounded-full p-1 text-primary transition-colors hover:bg-primary/10 disabled:cursor-not-allowed disabled:opacity-50"
+      >
+        <Check size={14} />
+      </button>
+      <button
+        type="button"
+        onClick={onCancel}
+        disabled={saving}
+        title="Cancel"
+        aria-label="Cancel"
+        className="rounded-full p-1 text-muted-foreground transition-colors hover:bg-secondary disabled:cursor-not-allowed disabled:opacity-50"
+      >
+        <X size={14} />
+      </button>
+    </div>
+  );
+}
+
+function EditableTextCell({
+  value,
+  editing,
+  draftValue,
+  onDraftChange,
+  title,
+}: {
+  value: React.ReactNode;
+  editing: boolean;
+  draftValue: string;
+  onDraftChange: (v: string) => void;
+  title?: string;
+}) {
+  if (editing) {
+    return (
+      <input
+        value={draftValue}
+        onChange={(e) => onDraftChange(e.target.value)}
+        className="w-full min-w-24 rounded-lg border border-border bg-background px-2 py-1 text-sm outline-none ring-ring transition focus:ring-2"
+      />
+    );
+  }
+  return <span title={title}>{value}</span>;
+}
+
+// Object.fromEntries(aMap) types its result as Record<string, V>, not
+// Record<number, V>, which the two Append Data finalize server functions'
+// `overrides` param expects (keyed by rowIndex) - this builds the same
+// object with the right type instead of fighting that mismatch at every
+// call site.
+function overridesToRecord(map: Map<number, DatazappRowOverride>): Record<number, DatazappRowOverride> {
+  const out: Record<number, DatazappRowOverride> = {};
+  for (const [rowIndex, value] of map) out[rowIndex] = value;
+  return out;
 }
 
 function fileToBase64(file: File): Promise<string> {
@@ -1319,6 +1418,61 @@ function AppendDataTab({ clientId, clientName }: { clientId: string; clientName:
   const [emailError, setEmailError] = useState<string | null>(null);
   const [emailStageOpen, setEmailStageOpen] = useState(false);
 
+  // Inline pencil-icon editing, 2026-11-05 per Mike: "Add an edit feature on
+  // all screens that have data displayed like this... Add a pencil icon next
+  // to the Keep checkbox." Both Stage 1 and Stage 2 tables index into the
+  // SAME underlying `rows` array by rowIndex, and Stage 2's preview is always
+  // built from rows Stage 1 didn't keep - so the two stages' rowIndex sets
+  // never overlap, and one shared `overrides` map keyed by rowIndex is safe
+  // to use for both tables. This is a client-side patch only (see
+  // DatazappRowOverride in soi-builder.ts) - it never touches the uploaded
+  // file or the matching logic, and only takes effect once a row gets
+  // finalized/downloaded (handleFinalize/handleEmailFinalize pass it along).
+  const [overrides, setOverrides] = useState<Map<number, DatazappRowOverride>>(new Map());
+  const [editingRowIndex, setEditingRowIndex] = useState<number | null>(null);
+  const [editDraft, setEditDraft] = useState<DatazappRowOverride>({});
+
+  function startEditRow(r: DatazappReviewRow) {
+    const existing = overrides.get(r.rowIndex);
+    setEditDraft({
+      firstName: existing?.firstName ?? r.firstName,
+      lastName: existing?.lastName ?? r.lastName,
+      phone: existing?.phone ?? r.phone,
+      email: existing?.email ?? r.finalEmail,
+      address: existing?.address ?? r.finalAddress,
+      city: existing?.city ?? r.finalCity,
+      state: existing?.state ?? r.finalState,
+      zip: existing?.zip ?? r.finalZip,
+    });
+    setEditingRowIndex(r.rowIndex);
+  }
+
+  function startEditEmailRow(r: DatazappEmailReviewRow) {
+    const existing = overrides.get(r.rowIndex);
+    setEditDraft({
+      firstName: existing?.firstName ?? r.firstName,
+      lastName: existing?.lastName ?? r.lastName,
+      phone: existing?.phone ?? r.phone,
+      email: existing?.email ?? r.email,
+    });
+    setEditingRowIndex(r.rowIndex);
+  }
+
+  function cancelEdit() {
+    setEditingRowIndex(null);
+    setEditDraft({});
+  }
+
+  function saveEdit(rowIndex: number) {
+    setOverrides((cur) => {
+      const copy = new Map(cur);
+      copy.set(rowIndex, editDraft);
+      return copy;
+    });
+    setEditingRowIndex(null);
+    setEditDraft({});
+  }
+
   useEffect(() => {
     let cancelled = false;
     setRestoring(true);
@@ -1374,6 +1528,9 @@ function AppendDataTab({ clientId, clientName }: { clientId: string; clientName:
     setFileName(file.name);
     setBusy(true);
     resetEmailStage();
+    setOverrides(new Map());
+    setEditingRowIndex(null);
+    setEditDraft({});
     try {
       const lowerName = file.name.toLowerCase();
       const parsed = SPREADSHEET_EXTENSIONS.some((ext) => lowerName.endsWith(ext))
@@ -1442,6 +1599,9 @@ function AppendDataTab({ clientId, clientName }: { clientId: string; clientName:
     setSearch("");
     setError(null);
     resetEmailStage();
+    setOverrides(new Map());
+    setEditingRowIndex(null);
+    setEditDraft({});
     clearAppendDataStaging({ data: { clientId } }).catch(() => {});
   }
 
@@ -1451,7 +1611,7 @@ function AppendDataTab({ clientId, clientName }: { clientId: string; clientName:
     setError(null);
     try {
       const result = await finalizeDatazappAppend({
-        data: { clientId, rows, includedRowIndexes: Array.from(checkedRows) },
+        data: { clientId, rows, includedRowIndexes: Array.from(checkedRows), overrides: overridesToRecord(overrides) },
       });
       setFinalizeResult(result);
       if (result.csv) {
@@ -1511,7 +1671,7 @@ function AppendDataTab({ clientId, clientName }: { clientId: string; clientName:
     setEmailError(null);
     try {
       const result = await finalizeDatazappEmailList({
-        data: { clientId, rows, includedRowIndexes: Array.from(emailChecked) },
+        data: { clientId, rows, includedRowIndexes: Array.from(emailChecked), overrides: overridesToRecord(overrides) },
       });
       setEmailFinalizeResult(result);
       if (result.csv) {
@@ -1681,48 +1841,117 @@ function AppendDataTab({ clientId, clientName }: { clientId: string; clientName:
                       </tr>
                     </thead>
                     <tbody>
-                      {filtered.map((r) => (
-                        <tr key={r.rowIndex} className="border-t border-border">
-                          <td
-                            title={r.firstName || undefined}
-                            className="sticky left-0 z-10 w-24 min-w-24 max-w-24 truncate bg-background py-2 pr-4"
-                          >
-                            {r.firstName}
-                          </td>
-                          <td
-                            title={r.lastName || undefined}
-                            className="sticky left-24 z-10 w-28 min-w-28 max-w-28 truncate border-r border-border bg-background py-2 pr-4"
-                          >
-                            {r.lastName}
-                          </td>
-                          <td className="whitespace-nowrap py-2 pr-4">{r.phone}</td>
-                          <td className="py-2 pr-4">
-                            <span className="rounded-full bg-muted px-2.5 py-1 text-xs font-semibold uppercase tracking-wide text-muted-foreground">
-                              {r.tier === "confirmed" ? "Confirmed" : "Household"}
-                            </span>
-                          </td>
-                          <td className="py-2 pr-4">
-                            {r.finalEmail || (
-                              <span className="text-muted-foreground">
-                                {r.tier === "household" ? "— (withheld, household match)" : "—"}
+                      {filtered.map((r) => {
+                        const ov = overrides.get(r.rowIndex);
+                        const isEditing = editingRowIndex === r.rowIndex;
+                        const firstName = ov?.firstName ?? r.firstName;
+                        const lastName = ov?.lastName ?? r.lastName;
+                        const phone = ov?.phone ?? r.phone;
+                        const finalEmail = ov?.email ?? r.finalEmail;
+                        const finalAddress = ov?.address ?? r.finalAddress;
+                        const finalCity = ov?.city ?? r.finalCity;
+                        const finalState = ov?.state ?? r.finalState;
+                        const finalZip = ov?.zip ?? r.finalZip;
+                        return (
+                          <tr key={r.rowIndex} className="border-t border-border">
+                            <td
+                              title={firstName || undefined}
+                              className="sticky left-0 z-10 w-24 min-w-24 max-w-24 truncate bg-background py-2 pr-4"
+                            >
+                              <EditableTextCell
+                                value={firstName}
+                                editing={isEditing}
+                                draftValue={editDraft.firstName ?? ""}
+                                onDraftChange={(v) => setEditDraft((d) => ({ ...d, firstName: v }))}
+                              />
+                            </td>
+                            <td
+                              title={lastName || undefined}
+                              className="sticky left-24 z-10 w-28 min-w-28 max-w-28 truncate border-r border-border bg-background py-2 pr-4"
+                            >
+                              <EditableTextCell
+                                value={lastName}
+                                editing={isEditing}
+                                draftValue={editDraft.lastName ?? ""}
+                                onDraftChange={(v) => setEditDraft((d) => ({ ...d, lastName: v }))}
+                              />
+                            </td>
+                            <td className="whitespace-nowrap py-2 pr-4">
+                              <EditableTextCell
+                                value={phone}
+                                editing={isEditing}
+                                draftValue={editDraft.phone ?? ""}
+                                onDraftChange={(v) => setEditDraft((d) => ({ ...d, phone: v }))}
+                              />
+                            </td>
+                            <td className="py-2 pr-4">
+                              <span className="rounded-full bg-muted px-2.5 py-1 text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+                                {r.tier === "confirmed" ? "Confirmed" : "Household"}
                               </span>
-                            )}
-                          </td>
-                          <td className="py-2 pr-4">
-                            {r.finalAddress || <span className="text-muted-foreground">—</span>}
-                          </td>
-                          <td className="whitespace-nowrap py-2 pr-4">{r.finalCity}</td>
-                          <td className="whitespace-nowrap py-2 pr-4">{r.finalState}</td>
-                          <td className="whitespace-nowrap py-2 pr-4">{r.finalZip}</td>
-                          <td className="sticky right-0 z-10 border-l border-border bg-background py-2 pl-3">
-                            <input
-                              type="checkbox"
-                              checked={checkedRows.has(r.rowIndex)}
-                              onChange={(e) => toggleRow(r.rowIndex, e.target.checked)}
-                            />
-                          </td>
-                        </tr>
-                      ))}
+                            </td>
+                            <td className="py-2 pr-4">
+                              <EditableTextCell
+                                value={
+                                  finalEmail || (
+                                    <span className="text-muted-foreground">
+                                      {r.tier === "household" ? "— (withheld, household match)" : "—"}
+                                    </span>
+                                  )
+                                }
+                                editing={isEditing}
+                                draftValue={editDraft.email ?? ""}
+                                onDraftChange={(v) => setEditDraft((d) => ({ ...d, email: v }))}
+                              />
+                            </td>
+                            <td className="py-2 pr-4">
+                              <EditableTextCell
+                                value={finalAddress || <span className="text-muted-foreground">—</span>}
+                                editing={isEditing}
+                                draftValue={editDraft.address ?? ""}
+                                onDraftChange={(v) => setEditDraft((d) => ({ ...d, address: v }))}
+                              />
+                            </td>
+                            <td className="whitespace-nowrap py-2 pr-4">
+                              <EditableTextCell
+                                value={finalCity}
+                                editing={isEditing}
+                                draftValue={editDraft.city ?? ""}
+                                onDraftChange={(v) => setEditDraft((d) => ({ ...d, city: v }))}
+                              />
+                            </td>
+                            <td className="whitespace-nowrap py-2 pr-4">
+                              <EditableTextCell
+                                value={finalState}
+                                editing={isEditing}
+                                draftValue={editDraft.state ?? ""}
+                                onDraftChange={(v) => setEditDraft((d) => ({ ...d, state: v }))}
+                              />
+                            </td>
+                            <td className="whitespace-nowrap py-2 pr-4">
+                              <EditableTextCell
+                                value={finalZip}
+                                editing={isEditing}
+                                draftValue={editDraft.zip ?? ""}
+                                onDraftChange={(v) => setEditDraft((d) => ({ ...d, zip: v }))}
+                              />
+                            </td>
+                            <td className="sticky right-0 z-10 border-l border-border bg-background py-2 pl-3">
+                              <div className="flex items-center gap-2">
+                                <input
+                                  type="checkbox"
+                                  checked={checkedRows.has(r.rowIndex)}
+                                  onChange={(e) => toggleRow(r.rowIndex, e.target.checked)}
+                                />
+                                {isEditing ? (
+                                  <SaveCancelIconButtons onSave={() => saveEdit(r.rowIndex)} onCancel={cancelEdit} />
+                                ) : (
+                                  <EditIconButton onClick={() => startEditRow(r)} />
+                                )}
+                              </div>
+                            </td>
+                          </tr>
+                        );
+                      })}
                     </tbody>
                   </table>
                   {filtered.length === 0 && (
@@ -1862,26 +2091,69 @@ function AppendDataTab({ clientId, clientName }: { clientId: string; clientName:
                       </tr>
                     </thead>
                     <tbody>
-                      {emailFiltered.map((r) => (
-                        <tr key={r.rowIndex} className="border-t border-border">
-                          <td className="py-2 pr-4">{r.firstName}</td>
-                          <td className="py-2 pr-4">{r.lastName}</td>
-                          <td className="py-2 pr-4">{r.email}</td>
-                          <td className="whitespace-nowrap py-2 pr-4">{r.phone}</td>
-                          <td className="py-2 pr-4">
-                            <span className="rounded-full bg-muted px-2.5 py-1 text-xs font-semibold uppercase tracking-wide text-muted-foreground">
-                              {DATAZAPP_TIER_LABELS[r.originalTier]}
-                            </span>
-                          </td>
-                          <td className="border-l border-border py-2 pl-3">
-                            <input
-                              type="checkbox"
-                              checked={emailChecked.has(r.rowIndex)}
-                              onChange={(e) => toggleEmailRow(r.rowIndex, e.target.checked)}
-                            />
-                          </td>
-                        </tr>
-                      ))}
+                      {emailFiltered.map((r) => {
+                        const ov = overrides.get(r.rowIndex);
+                        const isEditing = editingRowIndex === r.rowIndex;
+                        const firstName = ov?.firstName ?? r.firstName;
+                        const lastName = ov?.lastName ?? r.lastName;
+                        const email = ov?.email ?? r.email;
+                        const phone = ov?.phone ?? r.phone;
+                        return (
+                          <tr key={r.rowIndex} className="border-t border-border">
+                            <td className="py-2 pr-4">
+                              <EditableTextCell
+                                value={firstName}
+                                editing={isEditing}
+                                draftValue={editDraft.firstName ?? ""}
+                                onDraftChange={(v) => setEditDraft((d) => ({ ...d, firstName: v }))}
+                              />
+                            </td>
+                            <td className="py-2 pr-4">
+                              <EditableTextCell
+                                value={lastName}
+                                editing={isEditing}
+                                draftValue={editDraft.lastName ?? ""}
+                                onDraftChange={(v) => setEditDraft((d) => ({ ...d, lastName: v }))}
+                              />
+                            </td>
+                            <td className="py-2 pr-4">
+                              <EditableTextCell
+                                value={email}
+                                editing={isEditing}
+                                draftValue={editDraft.email ?? ""}
+                                onDraftChange={(v) => setEditDraft((d) => ({ ...d, email: v }))}
+                              />
+                            </td>
+                            <td className="whitespace-nowrap py-2 pr-4">
+                              <EditableTextCell
+                                value={phone}
+                                editing={isEditing}
+                                draftValue={editDraft.phone ?? ""}
+                                onDraftChange={(v) => setEditDraft((d) => ({ ...d, phone: v }))}
+                              />
+                            </td>
+                            <td className="py-2 pr-4">
+                              <span className="rounded-full bg-muted px-2.5 py-1 text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+                                {DATAZAPP_TIER_LABELS[r.originalTier]}
+                              </span>
+                            </td>
+                            <td className="border-l border-border py-2 pl-3">
+                              <div className="flex items-center gap-2">
+                                <input
+                                  type="checkbox"
+                                  checked={emailChecked.has(r.rowIndex)}
+                                  onChange={(e) => toggleEmailRow(r.rowIndex, e.target.checked)}
+                                />
+                                {isEditing ? (
+                                  <SaveCancelIconButtons onSave={() => saveEdit(r.rowIndex)} onCancel={cancelEdit} />
+                                ) : (
+                                  <EditIconButton onClick={() => startEditEmailRow(r)} />
+                                )}
+                              </div>
+                            </td>
+                          </tr>
+                        );
+                      })}
                     </tbody>
                   </table>
                   {emailFiltered.length === 0 && (
@@ -1947,6 +2219,20 @@ type ReviewContact = {
   flagged: boolean;
 };
 
+// Matches updateReviewContact's `fields` param exactly (see soi-builder.ts) -
+// shared between ReviewTab and FinalCombinedListStep, the two tables that
+// edit real, saved contacts directly.
+type ReviewEditDraft = Partial<{
+  first_name: string;
+  last_name: string;
+  email: string;
+  phone: string;
+  address: string;
+  city: string;
+  state: string;
+  zip: string;
+}>;
+
 function positionKey(clientId: string, stepKey: string): string {
   return `soi-review-position:${clientId}:${stepKey}`;
 }
@@ -1975,10 +2261,21 @@ function ReviewTab({
   const [refreshSignal, setRefreshSignal] = useState(0);
   const rowRefs = useMemo(() => new Map<string, HTMLTableRowElement>(), []);
 
+  // Inline pencil-icon editing, 2026-11-05 (see the shared helpers' header
+  // comment above EditIconButton for the full "why"). This table reads real,
+  // already-saved `contacts` rows with a stable id, so an edit here is a
+  // direct `updateReviewContact` write, not a client-side override like the
+  // Append Data tables use.
+  const [editingContactId, setEditingContactId] = useState<string | null>(null);
+  const [editDraft, setEditDraft] = useState<ReviewEditDraft>({});
+  const [savingEdit, setSavingEdit] = useState(false);
+
   useEffect(() => {
     setSearch("");
     setJumpTo(null);
     setLoadError(null);
+    setEditingContactId(null);
+    setEditDraft({});
 
     // "Final Combined List" gets its own dedicated Full Contact / Needs Data
     // component below (FinalCombinedListStep) instead of the generic table -
@@ -2040,6 +2337,40 @@ function ReviewTab({
       ids.map((id) => setSoiReviewFlag({ data: { clientId, contactId: id, reviewType: "primary", flagged: next } })),
     );
     setRefreshSignal((n) => n + 1);
+  }
+
+  function startEdit(c: ReviewContact) {
+    setEditingContactId(c.id);
+    setEditDraft({
+      first_name: c.first_name ?? "",
+      last_name: c.last_name ?? "",
+      email: c.email ?? "",
+      phone: c.phone ?? "",
+      address: c.address ?? "",
+      city: c.city ?? "",
+      state: c.state ?? "",
+      zip: c.zip ?? "",
+    });
+  }
+
+  function cancelEdit() {
+    setEditingContactId(null);
+    setEditDraft({});
+  }
+
+  async function saveEdit(contactId: string) {
+    setSavingEdit(true);
+    try {
+      const fields = editDraft;
+      await updateReviewContact({ data: { clientId, contactId, fields } });
+      setContacts((cs) => cs.map((c) => (c.id === contactId ? { ...c, ...fields } : c)));
+      setEditingContactId(null);
+      setEditDraft({});
+    } catch (e) {
+      setLoadError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setSavingEdit(false);
+    }
   }
 
   const q = search.trim().toLowerCase();
@@ -2203,59 +2534,127 @@ function ReviewTab({
                     </tr>
                   </thead>
                   <tbody>
-                    {filtered.map((c) => (
-                      <tr
-                        key={c.id}
-                        ref={(el) => {
-                          if (el) rowRefs.set(c.id, el);
-                          else rowRefs.delete(c.id);
-                        }}
-                        className={`border-t border-border ${c.id === leftOffId ? "bg-secondary/40" : ""}`}
-                      >
-                        {/* Sticky cells stay fully opaque (not the row's
-                            bg-secondary/40 "left off" tint) on purpose —
-                            they need a solid backing so the columns
-                            scrolling underneath them don't show through. */}
-                        <td
-                          title={c.first_name || undefined}
-                          className="sticky left-0 z-10 w-24 min-w-24 max-w-24 truncate bg-background py-2 pr-4"
+                    {filtered.map((c) => {
+                      const isEditing = editable && editingContactId === c.id;
+                      return (
+                        <tr
+                          key={c.id}
+                          ref={(el) => {
+                            if (el) rowRefs.set(c.id, el);
+                            else rowRefs.delete(c.id);
+                          }}
+                          className={`border-t border-border ${c.id === leftOffId ? "bg-secondary/40" : ""}`}
                         >
-                          {c.first_name}
-                        </td>
-                        <td
-                          title={c.last_name || undefined}
-                          className="sticky left-24 z-10 w-28 min-w-28 max-w-28 truncate border-r border-border bg-background py-2 pr-4"
-                        >
-                          {c.last_name}
-                        </td>
-                        <td className="py-2 pr-4">{c.email}</td>
-                        <td className="whitespace-nowrap py-2 pr-4">{c.phone}</td>
-                        {showAddressColumns && <td className="py-2 pr-4">{c.address}</td>}
-                        <td className="whitespace-nowrap py-2 pr-4">{c.city}</td>
-                        {showAddressColumns && (
-                          <>
-                            <td className="whitespace-nowrap py-2 pr-4">{c.state}</td>
-                            <td className="whitespace-nowrap py-2 pr-4">{c.zip}</td>
-                          </>
-                        )}
-                        {showListColumn && (
-                          <td className="whitespace-nowrap py-2 pr-4">
-                            <span className="rounded-full bg-muted px-2.5 py-1 text-xs font-semibold uppercase tracking-wide text-muted-foreground">
-                              {LIST_LABELS[c.list_assignment ?? ""] ?? c.list_assignment}
-                            </span>
-                          </td>
-                        )}
-                        {editable && (
-                          <td className="sticky right-0 z-10 border-l border-border bg-background py-2 pl-3">
-                            <input
-                              type="checkbox"
-                              checked={c.flagged}
-                              onChange={(e) => toggle(c.id, e.target.checked)}
+                          {/* Sticky cells stay fully opaque (not the row's
+                              bg-secondary/40 "left off" tint) on purpose —
+                              they need a solid backing so the columns
+                              scrolling underneath them don't show through. */}
+                          <td
+                            title={c.first_name || undefined}
+                            className="sticky left-0 z-10 w-24 min-w-24 max-w-24 truncate bg-background py-2 pr-4"
+                          >
+                            <EditableTextCell
+                              value={c.first_name}
+                              editing={isEditing}
+                              draftValue={editDraft.first_name ?? ""}
+                              onDraftChange={(v) => setEditDraft((d) => ({ ...d, first_name: v }))}
                             />
                           </td>
-                        )}
-                      </tr>
-                    ))}
+                          <td
+                            title={c.last_name || undefined}
+                            className="sticky left-24 z-10 w-28 min-w-28 max-w-28 truncate border-r border-border bg-background py-2 pr-4"
+                          >
+                            <EditableTextCell
+                              value={c.last_name}
+                              editing={isEditing}
+                              draftValue={editDraft.last_name ?? ""}
+                              onDraftChange={(v) => setEditDraft((d) => ({ ...d, last_name: v }))}
+                            />
+                          </td>
+                          <td className="py-2 pr-4">
+                            <EditableTextCell
+                              value={c.email}
+                              editing={isEditing}
+                              draftValue={editDraft.email ?? ""}
+                              onDraftChange={(v) => setEditDraft((d) => ({ ...d, email: v }))}
+                            />
+                          </td>
+                          <td className="whitespace-nowrap py-2 pr-4">
+                            <EditableTextCell
+                              value={c.phone}
+                              editing={isEditing}
+                              draftValue={editDraft.phone ?? ""}
+                              onDraftChange={(v) => setEditDraft((d) => ({ ...d, phone: v }))}
+                            />
+                          </td>
+                          {showAddressColumns && (
+                            <td className="py-2 pr-4">
+                              <EditableTextCell
+                                value={c.address}
+                                editing={isEditing}
+                                draftValue={editDraft.address ?? ""}
+                                onDraftChange={(v) => setEditDraft((d) => ({ ...d, address: v }))}
+                              />
+                            </td>
+                          )}
+                          <td className="whitespace-nowrap py-2 pr-4">
+                            <EditableTextCell
+                              value={c.city}
+                              editing={isEditing}
+                              draftValue={editDraft.city ?? ""}
+                              onDraftChange={(v) => setEditDraft((d) => ({ ...d, city: v }))}
+                            />
+                          </td>
+                          {showAddressColumns && (
+                            <>
+                              <td className="whitespace-nowrap py-2 pr-4">
+                                <EditableTextCell
+                                  value={c.state}
+                                  editing={isEditing}
+                                  draftValue={editDraft.state ?? ""}
+                                  onDraftChange={(v) => setEditDraft((d) => ({ ...d, state: v }))}
+                                />
+                              </td>
+                              <td className="whitespace-nowrap py-2 pr-4">
+                                <EditableTextCell
+                                  value={c.zip}
+                                  editing={isEditing}
+                                  draftValue={editDraft.zip ?? ""}
+                                  onDraftChange={(v) => setEditDraft((d) => ({ ...d, zip: v }))}
+                                />
+                              </td>
+                            </>
+                          )}
+                          {showListColumn && (
+                            <td className="whitespace-nowrap py-2 pr-4">
+                              <span className="rounded-full bg-muted px-2.5 py-1 text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+                                {LIST_LABELS[c.list_assignment ?? ""] ?? c.list_assignment}
+                              </span>
+                            </td>
+                          )}
+                          {editable && (
+                            <td className="sticky right-0 z-10 border-l border-border bg-background py-2 pl-3">
+                              <div className="flex items-center gap-2">
+                                <input
+                                  type="checkbox"
+                                  checked={c.flagged}
+                                  onChange={(e) => toggle(c.id, e.target.checked)}
+                                />
+                                {isEditing ? (
+                                  <SaveCancelIconButtons
+                                    onSave={() => saveEdit(c.id)}
+                                    onCancel={cancelEdit}
+                                    saving={savingEdit}
+                                  />
+                                ) : (
+                                  <EditIconButton onClick={() => startEdit(c)} />
+                                )}
+                              </div>
+                            </td>
+                          )}
+                        </tr>
+                      );
+                    })}
                   </tbody>
                 </table>
                 {filtered.length === 0 && (
@@ -2287,6 +2686,13 @@ function FinalCombinedListStep({ clientId, clientName }: { clientId: string; cli
   const [downloading, setDownloading] = useState<string | null>(null);
   const [search, setSearch] = useState("");
   const [selectAllBusy, setSelectAllBusy] = useState(false);
+
+  // Inline pencil-icon editing, 2026-11-05 - same direct updateReviewContact
+  // write as ReviewTab above (this table also reads real, saved `contacts`
+  // rows with a stable id).
+  const [editingContactId, setEditingContactId] = useState<string | null>(null);
+  const [editDraft, setEditDraft] = useState<ReviewEditDraft>({});
+  const [savingEdit, setSavingEdit] = useState(false);
 
   useEffect(() => {
     setView("summary");
@@ -2358,6 +2764,40 @@ function FinalCombinedListStep({ clientId, clientName }: { clientId: string; cli
           setSoiReviewFlag({ data: { clientId, contactId: c.id, reviewType: "datazap_append", flagged: next } }),
         ),
     );
+  }
+
+  function startEdit(c: NeedsDataContact) {
+    setEditingContactId(c.id);
+    setEditDraft({
+      first_name: c.first_name ?? "",
+      last_name: c.last_name ?? "",
+      email: c.email ?? "",
+      phone: c.phone ?? "",
+      address: c.address ?? "",
+      city: c.city ?? "",
+      state: c.state ?? "",
+      zip: c.zip ?? "",
+    });
+  }
+
+  function cancelEdit() {
+    setEditingContactId(null);
+    setEditDraft({});
+  }
+
+  async function saveEdit(contactId: string) {
+    setSavingEdit(true);
+    try {
+      const fields = editDraft;
+      await updateReviewContact({ data: { clientId, contactId, fields } });
+      setNeedsData((cur) => (cur ? cur.map((c) => (c.id === contactId ? { ...c, ...fields } : c)) : cur));
+      setEditingContactId(null);
+      setEditDraft({});
+    } catch (e) {
+      setLoadError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setSavingEdit(false);
+    }
   }
 
   if (loadError) {
@@ -2467,40 +2907,106 @@ function FinalCombinedListStep({ clientId, clientName }: { clientId: string; cli
                 </tr>
               </thead>
               <tbody>
-                {filtered.map((c) => (
-                  <tr key={c.id} className="border-t border-border">
-                    <td
-                      title={c.first_name || undefined}
-                      className="sticky left-0 z-10 w-24 min-w-24 max-w-24 truncate bg-background py-2 pr-4"
-                    >
-                      {c.first_name}
-                    </td>
-                    <td
-                      title={c.last_name || undefined}
-                      className="sticky left-24 z-10 w-28 min-w-28 max-w-28 truncate border-r border-border bg-background py-2 pr-4"
-                    >
-                      {c.last_name}
-                    </td>
-                    <td className="py-2 pr-4">{c.email}</td>
-                    <td className="whitespace-nowrap py-2 pr-4">{c.phone}</td>
-                    <td className="py-2 pr-4">{c.address}</td>
-                    <td className="whitespace-nowrap py-2 pr-4">{c.city}</td>
-                    <td className="whitespace-nowrap py-2 pr-4">{c.state}</td>
-                    <td className="whitespace-nowrap py-2 pr-4">{c.zip}</td>
-                    <td className="py-2 pr-4">
-                      <span className="rounded-full bg-muted px-2.5 py-1 text-xs font-semibold uppercase tracking-wide text-muted-foreground">
-                        {c.missing.join(", ") || "—"}
-                      </span>
-                    </td>
-                    <td className="sticky right-0 z-10 border-l border-border bg-background py-2 pl-3">
-                      <input
-                        type="checkbox"
-                        checked={c.already_selected}
-                        onChange={(e) => toggleSelected(c.id, e.target.checked)}
-                      />
-                    </td>
-                  </tr>
-                ))}
+                {filtered.map((c) => {
+                  const isEditing = editingContactId === c.id;
+                  return (
+                    <tr key={c.id} className="border-t border-border">
+                      <td
+                        title={c.first_name || undefined}
+                        className="sticky left-0 z-10 w-24 min-w-24 max-w-24 truncate bg-background py-2 pr-4"
+                      >
+                        <EditableTextCell
+                          value={c.first_name}
+                          editing={isEditing}
+                          draftValue={editDraft.first_name ?? ""}
+                          onDraftChange={(v) => setEditDraft((d) => ({ ...d, first_name: v }))}
+                        />
+                      </td>
+                      <td
+                        title={c.last_name || undefined}
+                        className="sticky left-24 z-10 w-28 min-w-28 max-w-28 truncate border-r border-border bg-background py-2 pr-4"
+                      >
+                        <EditableTextCell
+                          value={c.last_name}
+                          editing={isEditing}
+                          draftValue={editDraft.last_name ?? ""}
+                          onDraftChange={(v) => setEditDraft((d) => ({ ...d, last_name: v }))}
+                        />
+                      </td>
+                      <td className="py-2 pr-4">
+                        <EditableTextCell
+                          value={c.email}
+                          editing={isEditing}
+                          draftValue={editDraft.email ?? ""}
+                          onDraftChange={(v) => setEditDraft((d) => ({ ...d, email: v }))}
+                        />
+                      </td>
+                      <td className="whitespace-nowrap py-2 pr-4">
+                        <EditableTextCell
+                          value={c.phone}
+                          editing={isEditing}
+                          draftValue={editDraft.phone ?? ""}
+                          onDraftChange={(v) => setEditDraft((d) => ({ ...d, phone: v }))}
+                        />
+                      </td>
+                      <td className="py-2 pr-4">
+                        <EditableTextCell
+                          value={c.address}
+                          editing={isEditing}
+                          draftValue={editDraft.address ?? ""}
+                          onDraftChange={(v) => setEditDraft((d) => ({ ...d, address: v }))}
+                        />
+                      </td>
+                      <td className="whitespace-nowrap py-2 pr-4">
+                        <EditableTextCell
+                          value={c.city}
+                          editing={isEditing}
+                          draftValue={editDraft.city ?? ""}
+                          onDraftChange={(v) => setEditDraft((d) => ({ ...d, city: v }))}
+                        />
+                      </td>
+                      <td className="whitespace-nowrap py-2 pr-4">
+                        <EditableTextCell
+                          value={c.state}
+                          editing={isEditing}
+                          draftValue={editDraft.state ?? ""}
+                          onDraftChange={(v) => setEditDraft((d) => ({ ...d, state: v }))}
+                        />
+                      </td>
+                      <td className="whitespace-nowrap py-2 pr-4">
+                        <EditableTextCell
+                          value={c.zip}
+                          editing={isEditing}
+                          draftValue={editDraft.zip ?? ""}
+                          onDraftChange={(v) => setEditDraft((d) => ({ ...d, zip: v }))}
+                        />
+                      </td>
+                      <td className="py-2 pr-4">
+                        <span className="rounded-full bg-muted px-2.5 py-1 text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+                          {c.missing.join(", ") || "—"}
+                        </span>
+                      </td>
+                      <td className="sticky right-0 z-10 border-l border-border bg-background py-2 pl-3">
+                        <div className="flex items-center gap-2">
+                          <input
+                            type="checkbox"
+                            checked={c.already_selected}
+                            onChange={(e) => toggleSelected(c.id, e.target.checked)}
+                          />
+                          {isEditing ? (
+                            <SaveCancelIconButtons
+                              onSave={() => saveEdit(c.id)}
+                              onCancel={cancelEdit}
+                              saving={savingEdit}
+                            />
+                          ) : (
+                            <EditIconButton onClick={() => startEdit(c)} />
+                          )}
+                        </div>
+                      </td>
+                    </tr>
+                  );
+                })}
               </tbody>
             </table>
             {filtered.length === 0 && (
@@ -2644,8 +3150,10 @@ function ExportTab({ clientId, clientName }: { clientId: string; clientName: str
             {busyScope === "combine_marketable" ? "Preparing…" : "Combine all into one final database"}
           </Button>
           <p className="mt-2 text-sm text-muted-foreground">
-            Combines the 4 lists above into one CSV, matching and merging anyone who shows up more than once (by email,
-            then phone, then name) instead of listing them twice.
+            Combines everyone you kept on Direct Mail, Email/Phone, Email List, and Incomplete — plus Appended Full Data
+            and Appended Email above — into one CSV, matching and merging anyone who shows up more than once (by email,
+            then phone, then name) instead of listing them twice. Being incomplete, or not yet selected for Datazap
+            research, never keeps someone off this list — they just show up with whatever fields they already have.
           </p>
         </div>
       </Card>

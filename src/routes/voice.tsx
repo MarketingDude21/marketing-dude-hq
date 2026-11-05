@@ -1,5 +1,13 @@
 import { createFileRoute, Link } from "@tanstack/react-router";
 import { useEffect, useRef, useState } from "react";
+// Loaded lazily inside handleContentStrategyFile (.docx/.pdf extraction is
+// rare enough, and pdfjs-dist in particular is large enough, that neither
+// belongs in the main bundle) — this top-level import is just a resolved
+// asset URL string for pdf.js's worker file, not the worker code itself, so
+// it's cheap to keep static. Its version MUST match pdfjs-dist's own
+// version exactly (pdfjs-dist enforces this at runtime), which importing it
+// from the same package guarantees.
+import pdfWorkerUrl from "pdfjs-dist/build/pdf.worker.min.mjs?url";
 import { AppShell } from "@/components/AppShell";
 import { useAuth } from "@/hooks/useAuth";
 import { supabase } from "@/integrations/supabase/client";
@@ -379,26 +387,94 @@ function VoiceWorkspace({
     }
   }
 
-  // Auto-reads a plain-text file straight into the textarea below, client
-  // side, with zero new dependencies — covers .txt/.md. A real Word/PDF
-  // upload-and-extract needs an actual parsing library, which is a bigger,
-  // separate build; the textarea itself is always there either way, so
-  // pasting a doc's text in by hand works right now for any file type.
-  function handleContentStrategyFile(file: File) {
-    const lowerName = file.name.toLowerCase();
-    if (!lowerName.endsWith(".txt") && !lowerName.endsWith(".md")) {
-      setContentStrategyStatus(
-        "Could only auto-read a plain .txt/.md file — paste this document's text into the box below instead, then save.",
-      );
-      return;
+  // Reads a plain-text file straight into the textarea, client side —
+  // covers .txt/.md with zero dependencies.
+  function readPlainTextFile(file: File): Promise<string> {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(String(reader.result ?? ""));
+      reader.onerror = () => reject(new Error("Couldn't read that file."));
+      reader.readAsText(file);
+    });
+  }
+
+  // Extracts the plain text out of a .docx file, entirely client side, via
+  // mammoth (only loaded when a .docx is actually picked — see the comment
+  // on the pdfWorkerUrl import above for why these stay out of the main
+  // bundle). mammoth's own "browser" field swaps in its browser-safe
+  // internals automatically when bundled by Vite, same as heic2any — no
+  // server round trip needed.
+  async function extractDocxText(file: File): Promise<string> {
+    const mammoth = await import("mammoth");
+    const arrayBuffer = await file.arrayBuffer();
+    const { value } = await mammoth.extractRawText({ arrayBuffer });
+    return value;
+  }
+
+  // Extracts the plain text out of a .pdf file, entirely client side, via
+  // pdf.js (Mozilla's own PDF library) — one page at a time, joining each
+  // page's text items with a blank line between pages so a multi-page brand
+  // doc still reads as distinct sections rather than one unbroken run-on.
+  async function extractPdfText(file: File): Promise<string> {
+    const pdfjsLib = await import("pdfjs-dist");
+    pdfjsLib.GlobalWorkerOptions.workerSrc = pdfWorkerUrl;
+    const arrayBuffer = await file.arrayBuffer();
+    const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
+    const pageTexts: string[] = [];
+    for (let i = 1; i <= pdf.numPages; i++) {
+      const page = await pdf.getPage(i);
+      const content = await page.getTextContent();
+      const pageText = content.items.map((item) => ("str" in item ? item.str : "")).join(" ");
+      pageTexts.push(pageText.trim());
     }
-    const reader = new FileReader();
-    reader.onload = () => {
-      setContentStrategy(String(reader.result ?? ""));
+    return pageTexts.join("\n\n").trim();
+  }
+
+  // Added 2026-11-05 per Mike: once he's built a brand kit / content
+  // strategy for an agent himself (or an agent brings one they already made
+  // with their own custom GPT or Claude project), it almost always exists
+  // as a real Word doc or PDF, not hand-typed plain text — the old
+  // .txt/.md-only version of this made every one of those a manual
+  // copy-paste job first. Now auto-extracts .docx (via mammoth) and .pdf
+  // (via pdf.js) client side, same as .txt/.md always has, so uploading the
+  // actual file is enough. Legacy binary .doc (pre-2007 Word format, a
+  // completely different file format from .docx under the hood) isn't
+  // supported by either library — told explicitly rather than silently
+  // failing, since "Word document" covers both formats from a user's
+  // perspective but they're nothing alike to a parser.
+  async function handleContentStrategyFile(file: File) {
+    const lowerName = file.name.toLowerCase();
+    setContentStrategyStatus("Reading file…");
+    try {
+      let text: string;
+      if (lowerName.endsWith(".txt") || lowerName.endsWith(".md")) {
+        text = await readPlainTextFile(file);
+      } else if (lowerName.endsWith(".docx")) {
+        text = await extractDocxText(file);
+      } else if (lowerName.endsWith(".pdf")) {
+        text = await extractPdfText(file);
+      } else if (lowerName.endsWith(".doc")) {
+        setContentStrategyStatus(
+          "That's the old .doc Word format — re-save it as .docx (File → Save As in Word) and upload that instead, or paste the text into the box below.",
+        );
+        return;
+      } else {
+        setContentStrategyStatus(
+          "Couldn't read that file type — upload a .txt, .md, .docx, or .pdf file, or paste the text into the box below.",
+        );
+        return;
+      }
+      if (!text.trim()) {
+        setContentStrategyStatus("That file came back empty — try pasting the text into the box below instead.");
+        return;
+      }
+      setContentStrategy(text.trim());
       setContentStrategyStatus("Loaded from file — click Save to keep it.");
-    };
-    reader.onerror = () => setContentStrategyStatus("Couldn't read that file.");
-    reader.readAsText(file);
+    } catch (e) {
+      setContentStrategyStatus(
+        e instanceof Error ? `Couldn't read that file: ${e.message}` : "Couldn't read that file.",
+      );
+    }
   }
 
   // Rotate the "reading your personality..." messages while generating.
@@ -866,24 +942,35 @@ function VoiceWorkspace({
             called their content branding strategy. This section will just
             have a document that I can upload inside of here that'll also
             play into their voice DNA profile." Also live independent of
-            interview stage. Auto-reads plain .txt/.md files straight into
-            the box below; anything else (Word, PDF) gets pasted in by hand
-            for now — see handleContentStrategyFile for why. Once saved,
-            this gets woven into every content-generation prompt built from
-            this agent's Voice DNA (see withContentBrandingStrategy in
-            marketing.ts). */}
+            interview stage. UPDATED 2026-11-05 — Mike asked whether this
+            could "connect to" an agent's own existing custom GPT or Claude
+            project directly; neither OpenAI nor Anthropic expose an API for
+            a third party to read someone else's account that way, so this
+            is the real answer instead: paste or upload whatever you already
+            gave your GPT/Claude (its instructions, its knowledge files)
+            right here. Now auto-extracts .docx and .pdf client side too
+            (mammoth/pdf.js), not just .txt/.md, since a brand kit or a
+            custom GPT's knowledge file is almost always one of those — see
+            handleContentStrategyFile. Also doubles as where Mike uploads a
+            brand kit/content strategy HE builds for an agent himself — the
+            admin "Change agent" picker above switches this whole page to
+            any agent, Content Branding Strategy included, same as Business
+            Info already does. Once saved, this gets woven into every
+            content-generation prompt built from this agent's Voice DNA (see
+            withContentBrandingStrategy in marketing.ts). */}
         <div className="mb-5 rounded-3xl border border-border bg-glass p-6 backdrop-blur-2xl">
           <h2 className="font-display text-lg font-semibold">Content Branding Strategy</h2>
           <p className="mt-1 text-sm text-muted-foreground">
             Optional — a content/brand strategy doc for this agent (recurring series ideas, content pillars, tone
-            notes). Upload a plain text file or paste it below; it gets factored in alongside their Voice DNA every time
-            we write for them.
+            notes). Already built a custom GPT or a Claude project for this agent's brand voice? Paste its instructions
+            here, or upload the file(s) you gave it — this is where that goes. Upload a file or paste below; it gets
+            factored in alongside their Voice DNA every time we write for them.
           </p>
           <label className="mt-3 inline-block cursor-pointer rounded-full border border-border bg-glass px-3 py-1.5 text-xs font-semibold transition-colors hover:bg-secondary">
-            Upload a .txt/.md file
+            Upload a .txt/.md/.docx/.pdf file
             <input
               type="file"
-              accept=".txt,.md,text/plain,text/markdown"
+              accept=".txt,.md,.docx,.pdf,text/plain,text/markdown,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document"
               className="hidden"
               onChange={(e) => {
                 const file = e.target.files?.[0];

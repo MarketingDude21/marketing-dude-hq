@@ -1,6 +1,7 @@
 import { createServerFn } from "@tanstack/react-start";
 import { createClient, type SupabaseClient } from "@supabase/supabase-js";
 import { requireSupabaseAuth } from "@/integrations/supabase/auth-middleware";
+import { callClaude } from "@/lib/marketing";
 
 // ============================================================================
 // Build My Database / SOI Builder — native integration
@@ -1908,3 +1909,299 @@ export const exportSoiListLocal = createServerFn({ method: "POST" })
       count: combined.length,
     };
   });
+
+// ============================================================================
+// Clean & Standardize — AI-assisted upload cleanup (2026-11-05)
+//
+// Mike's own words on what actually shows up in a real contacts export,
+// most commonly a phone contacts dump or a Gmail contacts export (the
+// messiest sources by far): "we see city name, state, zip, all in the
+// address field... combined first name, last name into one field... It's
+// really just a matter of having all kinds of just crap everywhere."
+//
+// The mapping step in database.tsx (guessColumnMapping et al) only ever
+// matches COLUMN HEADERS to a canonical field - it has never touched what's
+// actually sitting inside a cell. That's exactly where files like this fall
+// apart: a single "Name" column with "Anna Gapasin Newport Rentals" or
+// "Arthur Tyszka - KW" in it, or one "Address" column holding the full
+// street + city + state + zip jammed together with no way to split it into
+// the separate columns the real process-upload Edge Function (over in the
+// separate SOI Builder project, not reachable from here) needs in order to
+// mark a contact Marketable instead of Incomplete/Nonqualified.
+//
+// This runs from uploadOneFile in database.tsx, right after the existing
+// header mapping is guessed and right before the file is handed to the real
+// upload-file Edge Function - so by the time it reaches that already-working
+// backend, it looks like a normal, already-separated export, and nothing
+// downstream (the real segmentation/dedupe/completeness rules, which
+// already exist and already work - see dedupe_stats/address_corrections on
+// ProcessUploadReport above) has to change at all.
+//
+// Two different kinds of fix, split deliberately:
+//   - Phone formatting and dropping an unambiguous international number is
+//     fully mechanical (digit-counting, a "+" country-code prefix) - no AI
+//     needed, instant, free, and always applied when a phone column exists.
+//   - Splitting a combined name or a jammed-together address needs real
+//     judgment (is "- KW" a brokerage tag or could it be part of someone's
+//     actual name? is "92101" the zip or a stray apartment number?) - that
+//     uses the same Claude API this app already calls for content
+//     generation (callClaude, imported from marketing.ts), sent in small
+//     batches so a file with thousands of rows still finishes in a
+//     reasonable time. It is DELIBERATELY NARROW: it only runs on a column
+//     when the file genuinely has nothing better - i.e. only when there's a
+//     combined full_name column and NO separate first_name/last_name
+//     columns, and only when there's an address column but NONE of
+//     city/state/zip are already their own columns. A file that already has
+//     proper separate columns (the normal case for most real CRM exports)
+//     is left completely alone, untouched, no AI call made.
+//
+// Deliberately conservative on the one truly destructive action (dropping a
+// contact entirely for being international): only an unambiguous "+"
+// followed by a non-"1" country code triggers it. A malformed or
+// too-short/too-long domestic number is left exactly as it was rather than
+// guessed at and possibly deleted - this step is supposed to recover data
+// that would otherwise be lost, not lose more of it on a shaky heuristic.
+// ============================================================================
+
+export type ContactCleanupReport = {
+  namesCleaned: number;
+  addressesSplit: number;
+  phonesFormatted: number;
+  internationalRemoved: number;
+};
+
+// A clear "+" followed by a digit that isn't "1" is the only signal this
+// trusts enough to delete a whole contact over (Mike's explicit example:
+// "+91"). A "+1" number, even written with 11 digits total, is just a
+// US/Canada number with its country code spelled out and gets formatted
+// normally below instead of flagged.
+function isUnambiguouslyInternational(raw: string): boolean {
+  const match = /^\s*\+(\d)/.exec(raw);
+  if (!match) return false;
+  return match[1] !== "1";
+}
+
+function normalizePhone(raw: string): { formatted: string; isInternational: boolean; wasFormatted: boolean } {
+  const trimmed = raw.trim();
+  if (!trimmed) return { formatted: "", isInternational: false, wasFormatted: false };
+  if (isUnambiguouslyInternational(trimmed)) {
+    return { formatted: trimmed, isInternational: true, wasFormatted: false };
+  }
+  const digits = trimmed.replace(/\D/g, "");
+  let core = digits;
+  if (core.length === 11 && core.startsWith("1")) core = core.slice(1);
+  if (core.length === 10) {
+    const formatted = `(${core.slice(0, 3)}) ${core.slice(3, 6)}-${core.slice(6)}`;
+    return { formatted, isInternational: false, wasFormatted: formatted !== trimmed };
+  }
+  // Anything else (too short, too long with no clear "+" country code, a
+  // stray extension, etc.) - leave it exactly as it was rather than guess.
+  return { formatted: trimmed, isInternational: false, wasFormatted: false };
+}
+
+// Claude is told to reply with ONLY a JSON array, but this strips a
+// markdown code fence defensively in case it wraps the answer in one
+// anyway - a parse failure here just means that one batch's rows come back
+// uncleaned (the caller falls back to the original raw value), not that the
+// whole upload fails.
+function parseJsonArray(raw: string): unknown[] {
+  const stripped = raw
+    .trim()
+    .replace(/^```(?:json)?\s*/i, "")
+    .replace(/\s*```$/i, "");
+  const parsed: unknown = JSON.parse(stripped);
+  if (!Array.isArray(parsed)) throw new Error("Expected a JSON array");
+  return parsed;
+}
+
+function chunkRows<T>(items: T[], size: number): T[][] {
+  const out: T[][] = [];
+  for (let i = 0; i < items.length; i += size) out.push(items.slice(i, i + size));
+  return out;
+}
+
+async function cleanNameBatch(
+  apiKey: string,
+  items: { i: number; raw: string }[],
+): Promise<Map<number, { first: string; last: string }>> {
+  const out = new Map<number, { first: string; last: string }>();
+  if (items.length === 0) return out;
+  const prompt = `You are cleaning a "name" column exported from someone's phone contacts or a CRM, for a real estate marketing database. Each entry below should just be one person's first and last name - but these exports are messy: some have a company or brokerage name tacked on ("Anna Gapasin Newport Rentals"), a role tag ("Arthur Tyszka - KW", "Danielle Genovese - Cell"), or other junk mixed in with the real name.
+
+Split each entry into a first name and a last name, with any of that junk removed. Rules:
+- Never invent a name that isn't in the text.
+- If the entry is clearly a business/company with no personal name in it at all, return "" for both first and last.
+- Keep a real suffix (Jr, Sr, II, III) attached to the last name.
+- If there are multiple people in one entry (e.g. "John & Jane Smith"), just use the first person named.
+- When in doubt about whether something is part of the name or junk, prefer keeping it attached to the name rather than guessing it should be removed.
+
+Reply with ONLY a JSON array, no markdown, no explanation. Each item: {"i": <number>, "first": "<first name>", "last": "<last name>"}.
+
+Input:
+${JSON.stringify(items)}`;
+  try {
+    const raw = await callClaude(apiKey, prompt, 4000);
+    const parsed = parseJsonArray(raw) as { i?: number; first?: string; last?: string }[];
+    for (const p of parsed) {
+      if (typeof p.i !== "number") continue;
+      out.set(p.i, { first: (p.first ?? "").trim(), last: (p.last ?? "").trim() });
+    }
+  } catch {
+    // Leave this batch unmapped - the caller falls back to the original
+    // raw value for any row with no entry in this map.
+  }
+  return out;
+}
+
+async function cleanAddressBatch(
+  apiKey: string,
+  items: { i: number; raw: string }[],
+): Promise<Map<number, { address: string; city: string; state: string; zip: string }>> {
+  const out = new Map<number, { address: string; city: string; state: string; zip: string }>();
+  if (items.length === 0) return out;
+  const prompt = `You are splitting a single "address" column from a contacts export into separate Address, City, State, and ZIP fields for a US CRM import. These fields often jam the street address, city, state, and zip together in one line, sometimes with a junk prefix like "Home" or "Home:" in front of the street address.
+
+For each entry, split out the street address (just the street number and name, no city/state/zip, with any "Home"-type prefix removed), city, state (use the two-letter abbreviation), and zip code.
+
+If you can't confidently tell what a part is, leave that specific part as an empty string rather than guessing - a wrong guess is worse than a blank field.
+
+Reply with ONLY a JSON array, no markdown, no explanation. Each item: {"i": <number>, "address": "<street address>", "city": "<city>", "state": "<state>", "zip": "<zip>"}.
+
+Input:
+${JSON.stringify(items)}`;
+  try {
+    const raw = await callClaude(apiKey, prompt, 4000);
+    const parsed = parseJsonArray(raw) as {
+      i?: number;
+      address?: string;
+      city?: string;
+      state?: string;
+      zip?: string;
+    }[];
+    for (const p of parsed) {
+      if (typeof p.i !== "number") continue;
+      out.set(p.i, {
+        address: (p.address ?? "").trim(),
+        city: (p.city ?? "").trim(),
+        state: (p.state ?? "").trim(),
+        zip: (p.zip ?? "").trim(),
+      });
+    }
+  } catch {
+    // Same fallback as cleanNameBatch.
+  }
+  return out;
+}
+
+// Runs a batch of independent async calls with the same bounded-concurrency
+// pattern already used above for the bulk contact updates (see the "Bounded
+// concurrency rather than one giant Promise.all" comment on the appended-data
+// merge) - 4 at a time keeps a file with thousands of rows finishing in a
+// reasonable time without firing dozens of Claude calls simultaneously.
+async function runBatched<T>(calls: (() => Promise<T>)[]): Promise<T[]> {
+  const results: T[] = [];
+  for (let i = 0; i < calls.length; i += 4) {
+    results.push(...(await Promise.all(calls.slice(i, i + 4).map((fn) => fn()))));
+  }
+  return results;
+}
+
+export const cleanContactRows = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator((data: { rows: Record<string, string>[]; mapping: Record<string, string> }) => data)
+  .handler(
+    async ({
+      data,
+    }): Promise<{ rows: Record<string, string>[]; mapping: Record<string, string>; report: ContactCleanupReport }> => {
+      const report: ContactCleanupReport = {
+        namesCleaned: 0,
+        addressesSplit: 0,
+        phonesFormatted: 0,
+        internationalRemoved: 0,
+      };
+      let rows = data.rows.map((r) => ({ ...r }));
+      const mapping = { ...data.mapping };
+
+      // Phone: always applied when a phone column exists - mechanical, no
+      // AI needed. Runs before the name/address AI steps below so those
+      // only ever process rows that are actually going to survive.
+      const phoneKey = mapping["phone"];
+      if (phoneKey) {
+        const kept: Record<string, string>[] = [];
+        for (const row of rows) {
+          const result = normalizePhone(row[phoneKey] ?? "");
+          if (result.isInternational) {
+            report.internationalRemoved++;
+            continue;
+          }
+          if (result.wasFormatted) report.phonesFormatted++;
+          row[phoneKey] = result.formatted;
+          kept.push(row);
+        }
+        rows = kept;
+      }
+
+      const anthropicKey = process.env["ANTHROPIC_API_KEY"];
+
+      // Name: only when the file has nothing but a combined full_name
+      // column - a file with real, separate first_name/last_name columns
+      // is left completely alone.
+      const fullNameKey = mapping["full_name"];
+      if (anthropicKey && fullNameKey && !mapping["first_name"] && !mapping["last_name"]) {
+        const items = rows.map((row, i) => ({ i, raw: (row[fullNameKey] ?? "").trim() })).filter((item) => item.raw);
+        const batches = chunkRows(items, 50).map((b) => () => cleanNameBatch(anthropicKey, b));
+        const maps = await runBatched(batches);
+        const merged = new Map<number, { first: string; last: string }>();
+        for (const m of maps) for (const [k, v] of m) merged.set(k, v);
+        rows.forEach((row, i) => {
+          const result = merged.get(i);
+          if (result) {
+            row["__clean_first_name"] = result.first;
+            row["__clean_last_name"] = result.last;
+            report.namesCleaned++;
+          } else {
+            // No AI result for this row (blank to begin with, or that
+            // batch failed) - fall back to the original combined value as
+            // the first name so nothing just disappears.
+            row["__clean_first_name"] = row[fullNameKey] ?? "";
+            row["__clean_last_name"] = "";
+          }
+        });
+        mapping["first_name"] = "__clean_first_name";
+        mapping["last_name"] = "__clean_last_name";
+      }
+
+      // Address: only when address is mapped but NONE of city/state/zip
+      // are their own separate columns - i.e. the file genuinely has
+      // everything jammed into one field, not just missing one piece.
+      const addressKey = mapping["address"];
+      if (anthropicKey && addressKey && !mapping["city"] && !mapping["state"] && !mapping["zip"]) {
+        const items = rows.map((row, i) => ({ i, raw: (row[addressKey] ?? "").trim() })).filter((item) => item.raw);
+        const batches = chunkRows(items, 50).map((b) => () => cleanAddressBatch(anthropicKey, b));
+        const maps = await runBatched(batches);
+        const merged = new Map<number, { address: string; city: string; state: string; zip: string }>();
+        for (const m of maps) for (const [k, v] of m) merged.set(k, v);
+        rows.forEach((row, i) => {
+          const result = merged.get(i);
+          if (result) {
+            row["__clean_address"] = result.address || (row[addressKey] ?? "");
+            row["__clean_city"] = result.city;
+            row["__clean_state"] = result.state;
+            row["__clean_zip"] = result.zip;
+            report.addressesSplit++;
+          } else {
+            row["__clean_address"] = row[addressKey] ?? "";
+            row["__clean_city"] = "";
+            row["__clean_state"] = "";
+            row["__clean_zip"] = "";
+          }
+        });
+        mapping["address"] = "__clean_address";
+        mapping["city"] = "__clean_city";
+        mapping["state"] = "__clean_state";
+        mapping["zip"] = "__clean_zip";
+      }
+
+      return { rows, mapping, report };
+    },
+  );

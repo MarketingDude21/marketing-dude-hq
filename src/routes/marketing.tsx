@@ -25,6 +25,7 @@ import {
   listMarketingMedia,
   createMediaUploadUrl,
   finalizeMediaUpload,
+  replaceMediaFile,
   setMediaTags,
   markMediaUsed,
   restoreMediaToAvailable,
@@ -43,10 +44,12 @@ import {
   setCalendarMonthArchived,
   listCalendarItems,
   addCalendarItem,
+  updateCalendarItem,
   removeCalendarItem,
   readContentCalendar,
   generateMonthlyBatch,
   deleteMonthContent,
+  deleteGeneratedPost,
   archiveMonthContent,
   listArchivedBatchesForMonth,
   restoreArchivedBatch,
@@ -2365,6 +2368,33 @@ function PostCard({
   const [notes, setNotes] = useState("");
   const [busy, setBusy] = useState(false);
   const [saveError, setSaveError] = useState<string | null>(null);
+  // Added 2026-11-04 per Mike: "we need a place where the admin or user can
+  // delete a certain post if they do not like concept. They can then
+  // rescan a photo to add new concepts. But for any post we need the
+  // ability to do that." Previously there was no way to remove a single
+  // post outright — only Approve/Flag/Rewrite it, or delete the WHOLE
+  // month's batch at once (MonthWorkspace's own Delete button, further
+  // up). Same inline arm/confirm pattern as every other destructive action
+  // in this app (no native confirm() dialog).
+  const [deleteArmed, setDeleteArmed] = useState(false);
+  const [deleting, setDeleting] = useState(false);
+
+  async function deletePost() {
+    if (!deleteArmed) {
+      setDeleteArmed(true);
+      return;
+    }
+    setDeleting(true);
+    setSaveError(null);
+    try {
+      await deleteGeneratedPost({ data: { agentId, postId: post.id } });
+      onChanged();
+    } catch (e) {
+      setSaveError(e instanceof Error ? e.message : String(e));
+      setDeleting(false);
+      setDeleteArmed(false);
+    }
+  }
   // Post's own single-photo picker — Media Library + Google Drive (if
   // enabled) only. Stock Photos (Unsplash) was dropped from here 2026-09-21
   // per Mike ("No need for stock photos here. But they do need ability to
@@ -2996,6 +3026,14 @@ function PostCard({
           >
             {editorOpen ? "Close" : "Edit / Feedback"}
           </Button>
+          <Button variant="danger" onClick={deletePost} disabled={busy || deleting}>
+            {deleting ? "Deleting…" : deleteArmed ? "Click again to confirm delete" : "Delete"}
+          </Button>
+          {deleteArmed && !deleting && (
+            <Button variant="secondary" onClick={() => setDeleteArmed(false)}>
+              Cancel
+            </Button>
+          )}
         </div>
 
         {editorOpen && (
@@ -3072,11 +3110,43 @@ function PostCard({
 // social content (which gets downsized again on posting anyway) but cuts
 // storage 70-90% versus a raw phone photo. Runs entirely client-side via
 // canvas, no library needed.
+// Formats every browser already decodes and displays directly in an <img> —
+// anything else (above all iPhone HEIC/HEIF, but also odd ones like TIFF/BMP)
+// gets normalized to JPEG below so it actually shows up in the Media Library
+// grid regardless of which device or app produced it. Added 2026-11-04 per
+// Mike: "HEIC images do not display in media center... CAN WE CONVERT ALL
+// IMAGES REGARDLESS OF THEIR FILE TYPE TO A PNG OR JPEG. We need all images
+// to display."
+const WEB_SAFE_IMAGE_TYPES = new Set(["image/jpeg", "image/png", "image/webp", "image/gif"]);
+
 async function resizeImage(file: File, maxEdge = 2000, quality = 0.85): Promise<File> {
-  const bitmap = await createImageBitmap(file).catch(() => null);
-  if (!bitmap) return file; // not a decodable image — upload as-is
+  let source: File | Blob = file;
+  // HEIC/HEIF can't be decoded by createImageBitmap in Chrome/Firefox/Edge
+  // (only Safari supports it natively) — exactly why these showed up blank.
+  // Phones and browsers are inconsistent about the MIME type they report for
+  // these (often "", "image/heic", "image/heif", even
+  // "application/octet-stream"), so detect by extension too.
+  const looksHeic = file.type === "image/heic" || file.type === "image/heif" || /\.hei[cf]$/i.test(file.name);
+  if (looksHeic) {
+    try {
+      const heic2any = (await import("heic2any")).default;
+      const converted = await heic2any({ blob: file, toType: "image/jpeg", quality });
+      source = Array.isArray(converted) ? converted[0]! : converted;
+    } catch {
+      // Conversion failed (corrupt file, decoder hiccup) — fall through to
+      // the normal decode path below; worst case the original HEIC uploads
+      // as-is and the grid's existing "couldn't preview" fallback applies.
+    }
+  }
+
+  const bitmap = await createImageBitmap(source).catch(() => null);
+  if (!bitmap) {
+    // Still not decodable even after a HEIC conversion attempt — upload
+    // whatever we have rather than losing the file outright.
+    return source === file ? file : new File([source], file.name.replace(/\.\w+$/, ".jpg"), { type: "image/jpeg" });
+  }
   const scale = Math.min(1, maxEdge / Math.max(bitmap.width, bitmap.height));
-  if (scale === 1) return file; // already small enough
+  if (scale === 1 && source === file && WEB_SAFE_IMAGE_TYPES.has(file.type)) return file; // already web-safe and small enough
   const canvas = document.createElement("canvas");
   canvas.width = Math.round(bitmap.width * scale);
   canvas.height = Math.round(bitmap.height * scale);
@@ -3356,6 +3426,10 @@ function MediaTab({ agentId, isAdmin }: { agentId: string; isAdmin: boolean }) {
   // can't decode (almost always an iPhone HEIC upload), even though it's a
   // perfectly real, working photo underneath.
   const [failedThumbs, setFailedThumbs] = useState<Set<string>>(new Set());
+  // Added 2026-11-04 alongside the HEIC upload fix — lets an already-broken
+  // existing photo (uploaded before that fix existed) be repaired in place
+  // instead of needing to be deleted and re-uploaded by hand.
+  const [fixingId, setFixingId] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   function reload() {
@@ -3449,6 +3523,40 @@ function MediaTab({ agentId, isAdmin }: { agentId: string; isAdmin: boolean }) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
       setBusyId(null);
+    }
+  }
+
+  // Repairs an already-broken photo already sitting in the grid (uploaded
+  // before the HEIC fix above existed) — downloads the original bytes,
+  // converts them client-side the same way a fresh upload now would, then
+  // points the existing row at the converted file via replaceMediaFile so
+  // its tags/status aren't lost the way a delete-and-re-upload would lose
+  // them.
+  async function fixBrokenThumb(m: MediaRow) {
+    if (!m.url) return;
+    setFixingId(m.id);
+    setError(null);
+    try {
+      const res = await fetch(m.url);
+      if (!res.ok) throw new Error("Couldn't download the original file to convert it.");
+      const original = await res.blob();
+      const originalName = m.url.split("/").pop() || "photo";
+      const file = new File([original], originalName, { type: original.type || "image/heic" });
+      const fixed = await resizeImage(file);
+      const { path, token } = await createMediaUploadUrl({ data: { agentId, fileName: fixed.name } });
+      const { error: uploadErr } = await supabase.storage.from("media").uploadToSignedUrl(path, token, fixed);
+      if (uploadErr) throw uploadErr;
+      await replaceMediaFile({ data: { agentId, mediaId: m.id, storagePath: path } });
+      setFailedThumbs((s) => {
+        const next = new Set(s);
+        next.delete(m.id);
+        return next;
+      });
+      reload();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setFixingId(null);
     }
   }
 
@@ -3547,6 +3655,13 @@ function MediaTab({ agentId, isAdmin }: { agentId: string; isAdmin: boolean }) {
               ) : (
                 <div className="flex aspect-square w-full flex-col items-center justify-center gap-1 bg-muted p-2 text-center text-[10px] text-muted-foreground">
                   <span>Couldn't preview this photo (likely an iPhone HEIC file)</span>
+                  <button
+                    onClick={() => fixBrokenThumb(m)}
+                    disabled={fixingId === m.id}
+                    className="mt-1 rounded-full border border-border bg-background px-2 py-1 text-[10px] font-semibold text-foreground transition-colors hover:bg-secondary disabled:opacity-50"
+                  >
+                    {fixingId === m.id ? "Fixing…" : "Fix this photo"}
+                  </button>
                 </div>
               )}
               <div className="flex items-center justify-between gap-1 px-2 pt-2">
@@ -4076,9 +4191,20 @@ function CalendarMonthItemsScreen({ month, onBack }: { month: CalendarMonth; onB
   const [items, setItems] = useState<CalendarItem[] | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [addOpen, setAddOpen] = useState(false);
+  // Added 2026-11-04 per Mike: "in content calendar creation we can edit
+  // existing posts" — the Add form below is reused for editing too; when
+  // this is set, Add becomes Save and submitting calls updateCalendarItem
+  // on this id instead of inserting a new item.
+  const [editingId, setEditingId] = useState<string | null>(null);
   const [docType, setDocType] = useState<CalendarItem["docType"]>("post");
   const [title, setTitle] = useState("");
   const [rawText, setRawText] = useState("");
+  // Optional per-item target date, same request: "the ability to suggest a
+  // date on it so that when we are scheduling... we can specific the date
+  // it should go live." Flows into the generated post's scheduled_for at
+  // generation time, and that in turn drives the review screen's ordering
+  // — see updateCalendarItem/generateMonthlyBatch/listMarketingPosts.
+  const [targetDate, setTargetDate] = useState("");
   const [addBusy, setAddBusy] = useState(false);
   const [addError, setAddError] = useState<string | null>(null);
   const [busyItemId, setBusyItemId] = useState<string | null>(null);
@@ -4096,7 +4222,27 @@ function CalendarMonthItemsScreen({ month, onBack }: { month: CalendarMonth; onB
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [month.id]);
 
-  async function addItem() {
+  function closeForm() {
+    setAddOpen(false);
+    setEditingId(null);
+    setDocType("post");
+    setTitle("");
+    setRawText("");
+    setTargetDate("");
+    setAddError(null);
+  }
+
+  function startEdit(it: CalendarItem) {
+    setEditingId(it.id);
+    setDocType(it.docType);
+    setTitle(it.title);
+    setRawText(it.rawText);
+    setTargetDate(it.targetDate ?? "");
+    setAddError(null);
+    setAddOpen(true);
+  }
+
+  async function saveItem() {
     if (!title.trim() || !rawText.trim()) {
       setAddError("Give this piece a title and the brief/copy to generate from.");
       return;
@@ -4104,12 +4250,28 @@ function CalendarMonthItemsScreen({ month, onBack }: { month: CalendarMonth; onB
     setAddBusy(true);
     setAddError(null);
     try {
-      await addCalendarItem({
-        data: { monthId: month.id, docType, title: title.trim(), rawText: rawText.trim() },
-      });
-      setTitle("");
-      setRawText("");
-      setAddOpen(false);
+      if (editingId) {
+        await updateCalendarItem({
+          data: {
+            itemId: editingId,
+            docType,
+            title: title.trim(),
+            rawText: rawText.trim(),
+            targetDate: targetDate || null,
+          },
+        });
+      } else {
+        await addCalendarItem({
+          data: {
+            monthId: month.id,
+            docType,
+            title: title.trim(),
+            rawText: rawText.trim(),
+            targetDate: targetDate || null,
+          },
+        });
+      }
+      closeForm();
       reload();
     } catch (e) {
       setAddError(e instanceof Error ? e.message : String(e));
@@ -4123,6 +4285,7 @@ function CalendarMonthItemsScreen({ month, onBack }: { month: CalendarMonth; onB
     try {
       await removeCalendarItem({ data: { itemId } });
       setItems((prev) => (prev ?? []).filter((it) => it.id !== itemId));
+      if (editingId === itemId) closeForm();
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -4173,6 +4336,24 @@ function CalendarMonthItemsScreen({ month, onBack }: { month: CalendarMonth; onB
               placeholder="Title"
               className="w-full rounded-xl border border-border bg-glass px-3 py-2 text-sm outline-none"
             />
+            {/* Optional target date, added 2026-11-04 — see the state
+                declaration above for the full request. Left blank, this
+                piece's generated content shows up wherever the review
+                screen's normal order already puts it. */}
+            <label className="flex items-center gap-2 text-xs text-muted-foreground">
+              Suggested date to go live (optional)
+              <input
+                type="date"
+                value={targetDate}
+                onChange={(e) => setTargetDate(e.target.value)}
+                className="rounded-xl border border-border bg-glass px-3 py-1.5 text-sm outline-none"
+              />
+              {targetDate && (
+                <button onClick={() => setTargetDate("")} className="text-[11px] font-semibold hover:underline">
+                  Clear
+                </button>
+              )}
+            </label>
             <div className="flex justify-end">
               <MicButton value={rawText} onChange={setRawText} />
             </div>
@@ -4185,10 +4366,10 @@ function CalendarMonthItemsScreen({ month, onBack }: { month: CalendarMonth; onB
             />
             {addError && <p className="text-xs text-destructive">{addError}</p>}
             <div className="flex gap-2">
-              <Button onClick={addItem} disabled={addBusy}>
-                {addBusy ? "Adding…" : "Add"}
+              <Button onClick={saveItem} disabled={addBusy}>
+                {addBusy ? "Saving…" : editingId ? "Save" : "Add"}
               </Button>
-              <Button variant="secondary" onClick={() => setAddOpen(false)} disabled={addBusy}>
+              <Button variant="secondary" onClick={closeForm} disabled={addBusy}>
                 Cancel
               </Button>
             </div>
@@ -4211,15 +4392,29 @@ function CalendarMonthItemsScreen({ month, onBack }: { month: CalendarMonth; onB
                   <span className="rounded-full bg-muted px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">
                     {DOC_TYPE_LABEL[it.docType]}
                   </span>
+                  {it.targetDate && (
+                    <span className="ml-1 rounded-full bg-muted px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">
+                      {it.targetDate}
+                    </span>
+                  )}
                   <p className="mt-1 text-sm font-semibold">{it.title}</p>
                 </div>
-                <button
-                  onClick={() => removeItem(it.id)}
-                  disabled={busyItemId === it.id}
-                  className="shrink-0 text-[11px] font-semibold text-destructive hover:underline disabled:opacity-50"
-                >
-                  Remove
-                </button>
+                <div className="flex shrink-0 items-center gap-3">
+                  <button
+                    onClick={() => startEdit(it)}
+                    disabled={busyItemId === it.id}
+                    className="text-[11px] font-semibold text-muted-foreground hover:text-foreground hover:underline disabled:opacity-50"
+                  >
+                    Edit
+                  </button>
+                  <button
+                    onClick={() => removeItem(it.id)}
+                    disabled={busyItemId === it.id}
+                    className="text-[11px] font-semibold text-destructive hover:underline disabled:opacity-50"
+                  >
+                    Remove
+                  </button>
+                </div>
               </div>
             ))}
           </div>
@@ -4689,6 +4884,11 @@ function MonthWorkspace({
   const [docs, setDocs] = useState<CalendarDoc[] | null>(null);
   const [docsError, setDocsError] = useState<string | null>(null);
   const [useHashtags, setUseHashtags] = useState(false);
+  // Added 2026-11-04 per Mike: "NEED ABILITY TO ADD EMJOIS TO CONTENT IF
+  // USER CHOOSES SO LEAVE A CHECK BOX TO ADD EMOJIS OR NOT WHEN GENERATING
+  // NEW CONTENT." Same shape and same scope as useHashtags right above it —
+  // only threads through generateMonthlyBatch, same as hashtags do today.
+  const [useEmojis, setUseEmojis] = useState(false);
   const [generating, setGenerating] = useState(false);
   const [genError, setGenError] = useState<string | null>(null);
   const [lastBatchId, setLastBatchId] = useState<string | null>(null);
@@ -4719,6 +4919,20 @@ function MonthWorkspace({
   const [deleting, setDeleting] = useState(false);
   const [deleteArmed, setDeleteArmed] = useState(false);
   const [deleteNote, setDeleteNote] = useState<string | null>(null);
+  // Added 2026-11-04 per Mike: "if someone presses generate now after their
+  // content has already been generated it asks them 'are you sure you want
+  // to regenerate'. If they do so it regenerates over any saved content."
+  // Before this, Generate Now on a month that already had content just
+  // silently inserted a SECOND full batch on top of the first (every click
+  // only ever inserted, never checked for or cleared existing rows — see
+  // generateMonthlyBatch's own header comment) — nothing was technically
+  // overwritten, but the review screen ended up showing old and new copies
+  // of everything mixed together, which reads exactly like this. Mike's
+  // explicit choice when asked: warn first, then on confirm actually
+  // replace everything — not silently skip already-approved items. Same
+  // inline arm/confirm pattern Delete below already uses (this app avoids
+  // native confirm() dialogs), not a second, different UI idiom.
+  const [generateArmed, setGenerateArmed] = useState(false);
   // Added 2026-09-20 per Mike: "the admin and or the user needs the ability
   // to archive the month's monthly content... I can't retest without the
   // ability to archive the monthly content." Unlike Delete above, this is
@@ -4861,11 +5075,26 @@ function MonthWorkspace({
   const allApproved = batchPosts.length > 0 && batchPosts.every((p) => p.status === "approved");
 
   async function generate() {
+    // First click on a month that already has content only arms the
+    // warning — see generateArmed's header comment above for why.
+    if (batchPosts.length > 0 && !generateArmed) {
+      setGenerateArmed(true);
+      return;
+    }
+    setGenerateArmed(false);
     setGenerating(true);
     setGenError(null);
     try {
+      // Confirmed replace: clear this month's existing batch first (the
+      // same deleteMonthContent the manual Delete button below already
+      // calls — one way to clear a month's content, not two), then
+      // generate a completely fresh one, so the review screen never ends
+      // up with two overlapping batches mixed together.
+      if (batchPosts.length > 0) {
+        await deleteMonthContent({ data: { agentId, month: folder.month } });
+      }
       const res = await generateMonthlyBatch({
-        data: { agentId, monthId: folder.id, month: folder.month, useHashtags },
+        data: { agentId, monthId: folder.id, month: folder.month, useHashtags, useEmojis },
       });
       setLastBatchId(res.batchId);
       loadPosts();
@@ -4959,11 +5188,30 @@ function MonthWorkspace({
               <input type="checkbox" checked={useHashtags} onChange={(e) => setUseHashtags(e.target.checked)} />
               Add hashtags to posts
             </label>
+            <label className="flex items-center gap-2 text-xs text-muted-foreground">
+              <input type="checkbox" checked={useEmojis} onChange={(e) => setUseEmojis(e.target.checked)} />
+              Add emojis to content
+            </label>
             <Button onClick={generate} disabled={generating || docs === null}>
-              {generating ? "Generating…" : "Generate Now"}
+              {generating
+                ? "Generating…"
+                : generateArmed
+                  ? "Click again to replace this month's content"
+                  : "Generate Now"}
             </Button>
+            {generateArmed && !generating && (
+              <Button variant="secondary" onClick={() => setGenerateArmed(false)}>
+                Cancel
+              </Button>
+            )}
           </div>
         </div>
+        {generateArmed && !generating && (
+          <p className="mt-2 text-xs text-destructive">
+            This month already has generated content. Clicking again deletes all of it — including anything already
+            approved or edited — and generates a completely fresh batch.
+          </p>
+        )}
         {genError && <p className="mt-2 text-xs text-destructive">{genError}</p>}
       </Card>
 

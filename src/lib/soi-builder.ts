@@ -1200,8 +1200,26 @@ function formatZip(zip: string, zip4: string): string {
 // writes any contact record - see this section's header comment for why
 // that's the point of this redesign, not an oversight.
 function matchDatazappRow(row: DatazappRawRow): DatazappMatchResult {
-  const firstName = dzField(row, "First Name");
-  const lastName = dzField(row, "Last Name");
+  // Bug fix, 2026-11-05 - Mike reported a file that "showed everything fine
+  // and was working" the first time, then came back 0 confirmed matches (109
+  // "name doesn't match", 61 "nothing to add") on a reupload he said was the
+  // same data. The file he sent had first_name/last_name (lowercase,
+  // underscore - this app's own `contacts` table column names, not this
+  // app's own CSV export's "First Name"/"Last Name" header style) instead of
+  // the exact "First Name"/"Last Name" this always required with no
+  // fallback - so firstName/lastName read as "" for every single row, and
+  // "Blank on either side never counts as a match" (see firstNamesEquivalent
+  // above) silently failed every row as a mismatch instead of a confirmed
+  // match, with nothing in the UI to explain why. phone/originalEmail just
+  // below already had a tolerant regex fallback (firstNonBlankMatching) for
+  // exactly this kind of header-spelling variance; first/last name never
+  // did. Same fix, same pattern: try the exact header this app's own export
+  // always uses first (zero behavior change for the normal case), then fall
+  // back to any column spelled "first name"/"first_name"/"firstname" (any
+  // case, space or underscore or nothing between the words) before giving
+  // up and reading as blank.
+  const firstName = dzField(row, "First Name") || firstNonBlankMatching(row, /^first[\s_]*name$/i);
+  const lastName = dzField(row, "Last Name") || firstNonBlankMatching(row, /^last[\s_]*name$/i);
   const phone =
     dzField(row, "FORMATTED_PHONE_Phone 1") || dzField(row, "Phone 1") || firstNonBlankMatching(row, /^phone\s*\d*$/i);
   const originalEmail = dzField(row, "Email 1") || firstNonBlankMatching(row, /^email\s*\d*$/i);
@@ -2143,63 +2161,124 @@ export const cleanContactRows = createServerFn({ method: "POST" })
 
       const anthropicKey = process.env["ANTHROPIC_API_KEY"];
 
-      // Name: only when the file has nothing but a combined full_name
-      // column - a file with real, separate first_name/last_name columns
-      // is left completely alone.
+      // Name: was gated on "the file has NO first_name/last_name columns at
+      // all" - but a real export (a Gmail contacts CSV in particular) can
+      // have those columns recognized AND still be blank on a given row,
+      // with the only usable name sitting in a combined full_name-ish
+      // column for that same row. Mike's own screenshot showed exactly this
+      // (a combined address slipping through) for the same reason on the
+      // address side below - so both are now judged ROW BY ROW: only a row
+      // that's actually missing a first or last name gets sent to the AI,
+      // and a row that already has both is left completely untouched, no
+      // AI call made for it.
+      const firstNameKey = mapping["first_name"];
+      const lastNameKey = mapping["last_name"];
       const fullNameKey = mapping["full_name"];
-      if (anthropicKey && fullNameKey && !mapping["first_name"] && !mapping["last_name"]) {
-        const items = rows.map((row, i) => ({ i, raw: (row[fullNameKey] ?? "").trim() })).filter((item) => item.raw);
-        const batches = chunkRows(items, 50).map((b) => () => cleanNameBatch(anthropicKey, b));
-        const maps = await runBatched(batches);
-        const merged = new Map<number, { first: string; last: string }>();
-        for (const m of maps) for (const [k, v] of m) merged.set(k, v);
-        rows.forEach((row, i) => {
-          const result = merged.get(i);
-          if (result) {
-            row["__clean_first_name"] = result.first;
-            row["__clean_last_name"] = result.last;
-            report.namesCleaned++;
-          } else {
-            // No AI result for this row (blank to begin with, or that
-            // batch failed) - fall back to the original combined value as
-            // the first name so nothing just disappears.
-            row["__clean_first_name"] = row[fullNameKey] ?? "";
-            row["__clean_last_name"] = "";
-          }
-        });
-        mapping["first_name"] = "__clean_first_name";
-        mapping["last_name"] = "__clean_last_name";
+      if (anthropicKey && fullNameKey) {
+        const existingFirst = (row: Record<string, string>) => (firstNameKey ? (row[firstNameKey] ?? "").trim() : "");
+        const existingLast = (row: Record<string, string>) => (lastNameKey ? (row[lastNameKey] ?? "").trim() : "");
+        const items = rows
+          .map((row, i) => ({
+            i,
+            raw: (row[fullNameKey] ?? "").trim(),
+            needsHelp: !existingFirst(row) || !existingLast(row),
+          }))
+          .filter((item) => item.raw && item.needsHelp);
+        if (items.length > 0) {
+          const batches = chunkRows(
+            items.map(({ i, raw }) => ({ i, raw })),
+            50,
+          ).map((b) => () => cleanNameBatch(anthropicKey, b));
+          const maps = await runBatched(batches);
+          const merged = new Map<number, { first: string; last: string }>();
+          for (const m of maps) for (const [k, v] of m) merged.set(k, v);
+          rows.forEach((row, i) => {
+            const first = existingFirst(row);
+            const last = existingLast(row);
+            if (first && last) {
+              // Already complete on this row - leave it exactly as it was.
+              row["__clean_first_name"] = first;
+              row["__clean_last_name"] = last;
+              return;
+            }
+            const result = merged.get(i);
+            if (result) {
+              row["__clean_first_name"] = first || result.first;
+              row["__clean_last_name"] = last || result.last;
+              report.namesCleaned++;
+            } else {
+              // Nothing to fill in from (blank full_name too, or that batch
+              // failed) - keep whatever partial value already existed
+              // rather than losing it.
+              row["__clean_first_name"] = first || row[fullNameKey] || "";
+              row["__clean_last_name"] = last;
+            }
+          });
+          mapping["first_name"] = "__clean_first_name";
+          mapping["last_name"] = "__clean_last_name";
+        }
       }
 
-      // Address: only when address is mapped but NONE of city/state/zip
-      // are their own separate columns - i.e. the file genuinely has
-      // everything jammed into one field, not just missing one piece.
+      // Address: same row-by-row fix as names above, for the same reason -
+      // a file can have real City/State/Zip columns that are only
+      // populated for SOME rows, with the rest jammed into the address
+      // field. Only a row actually missing one of city/state/zip gets sent
+      // to the AI; a row that's already complete is left untouched.
+      const cityKey = mapping["city"];
+      const stateKey = mapping["state"];
+      const zipKey = mapping["zip"];
       const addressKey = mapping["address"];
-      if (anthropicKey && addressKey && !mapping["city"] && !mapping["state"] && !mapping["zip"]) {
-        const items = rows.map((row, i) => ({ i, raw: (row[addressKey] ?? "").trim() })).filter((item) => item.raw);
-        const batches = chunkRows(items, 50).map((b) => () => cleanAddressBatch(anthropicKey, b));
-        const maps = await runBatched(batches);
-        const merged = new Map<number, { address: string; city: string; state: string; zip: string }>();
-        for (const m of maps) for (const [k, v] of m) merged.set(k, v);
-        rows.forEach((row, i) => {
-          const result = merged.get(i);
-          if (result) {
-            row["__clean_address"] = result.address || (row[addressKey] ?? "");
-            row["__clean_city"] = result.city;
-            row["__clean_state"] = result.state;
-            row["__clean_zip"] = result.zip;
-            report.addressesSplit++;
-          } else {
-            row["__clean_address"] = row[addressKey] ?? "";
-            row["__clean_city"] = "";
-            row["__clean_state"] = "";
-            row["__clean_zip"] = "";
-          }
-        });
-        mapping["address"] = "__clean_address";
-        mapping["city"] = "__clean_city";
-        mapping["state"] = "__clean_state";
-        mapping["zip"] = "__clean_zip";
+      if (anthropicKey && addressKey) {
+        const existingCity = (row: Record<string, string>) => (cityKey ? (row[cityKey] ?? "").trim() : "");
+        const existingState = (row: Record<string, string>) => (stateKey ? (row[stateKey] ?? "").trim() : "");
+        const existingZip = (row: Record<string, string>) => (zipKey ? (row[zipKey] ?? "").trim() : "");
+        const items = rows
+          .map((row, i) => ({
+            i,
+            raw: (row[addressKey] ?? "").trim(),
+            needsHelp: !existingCity(row) || !existingState(row) || !existingZip(row),
+          }))
+          .filter((item) => item.raw && item.needsHelp);
+        if (items.length > 0) {
+          const batches = chunkRows(
+            items.map(({ i, raw }) => ({ i, raw })),
+            50,
+          ).map((b) => () => cleanAddressBatch(anthropicKey, b));
+          const maps = await runBatched(batches);
+          const merged = new Map<number, { address: string; city: string; state: string; zip: string }>();
+          for (const m of maps) for (const [k, v] of m) merged.set(k, v);
+          rows.forEach((row, i) => {
+            const city = existingCity(row);
+            const state = existingState(row);
+            const zip = existingZip(row);
+            const result = merged.get(i);
+            if (city && state && zip) {
+              // Already complete on this row - keep the address field as-is
+              // too, since it wasn't sent to the AI at all.
+              row["__clean_address"] = row[addressKey] ?? "";
+              row["__clean_city"] = city;
+              row["__clean_state"] = state;
+              row["__clean_zip"] = zip;
+              return;
+            }
+            if (result) {
+              row["__clean_address"] = result.address || (row[addressKey] ?? "");
+              row["__clean_city"] = city || result.city;
+              row["__clean_state"] = state || result.state;
+              row["__clean_zip"] = zip || result.zip;
+              report.addressesSplit++;
+            } else {
+              row["__clean_address"] = row[addressKey] ?? "";
+              row["__clean_city"] = city;
+              row["__clean_state"] = state;
+              row["__clean_zip"] = zip;
+            }
+          });
+          mapping["address"] = "__clean_address";
+          mapping["city"] = "__clean_city";
+          mapping["state"] = "__clean_state";
+          mapping["zip"] = "__clean_zip";
+        }
       }
 
       return { rows, mapping, report };

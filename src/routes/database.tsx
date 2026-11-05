@@ -24,7 +24,9 @@ import {
   getAppendDataStaging,
   saveAppendDataCheckedRows,
   clearAppendDataStaging,
+  cleanContactRows,
   type SoiAccess,
+  type ContactCleanupReport,
 } from "@/lib/soi-builder";
 
 export const Route = createFileRoute("/database")({
@@ -693,7 +695,50 @@ type BatchItem = {
   file: File;
   status: "pending" | "uploading" | "done" | "error" | "needs_conversion";
   error?: string;
+  cleanupSummary?: string;
 };
+
+// Bug fix, 2026-11-05 - Mike hit "StorageApiError: Invalid key" trying to
+// upload a real Gmail contacts export named "Gmail sweep - Jan 2024-Oct
+// 2026 • Review & Duplicates (1).xlsx" - the bullet character (and likely
+// any other non-ASCII punctuation) breaks whatever builds the Storage
+// object key over in the separate SOI Builder backend, which isn't
+// reachable from here to fix directly. Sanitized defensively on this side
+// instead: strip anything that isn't a plain ASCII filename character
+// before fileName/sourceLabel are ever sent, so a messy real-world
+// filename (smart quotes, bullets, emoji, stray symbols) can never trip
+// this again, regardless of what the remote key-builder does internally.
+function sanitizeStorageFileName(name: string): string {
+  const dotIdx = name.lastIndexOf(".");
+  const base = dotIdx > 0 ? name.slice(0, dotIdx) : name;
+  const ext = dotIdx > 0 ? name.slice(dotIdx) : "";
+  const cleanedBase = base
+    .replace(/[^\x20-\x7E]/g, "") // strip non-ASCII (bullets, smart quotes, emoji, etc.)
+    .replace(/[^A-Za-z0-9 ._()-]/g, "-") // swap remaining unsafe punctuation (&, :, /, etc.)
+    .replace(/\s+/g, " ")
+    .trim();
+  const cleanedExt = ext.replace(/[^A-Za-z0-9.]/g, "");
+  return `${cleanedBase || "upload"}${cleanedExt}`;
+}
+
+// Turns a ContactCleanupReport into the one-line "what changed" summary
+// shown under each uploaded file - Mike's call (see the cleanContactRows
+// comment in soi-builder.ts for the full reasoning) was a short summary
+// rather than nothing at all or a full row-by-row review.
+function formatCleanupSummary(report: ContactCleanupReport): string | null {
+  const parts: string[] = [];
+  if (report.namesCleaned > 0) parts.push(`${report.namesCleaned} name${report.namesCleaned === 1 ? "" : "s"} split`);
+  if (report.addressesSplit > 0)
+    parts.push(`${report.addressesSplit} address${report.addressesSplit === 1 ? "" : "es"} parsed`);
+  if (report.phonesFormatted > 0)
+    parts.push(`${report.phonesFormatted} phone${report.phonesFormatted === 1 ? "" : "s"} reformatted`);
+  if (report.internationalRemoved > 0)
+    parts.push(
+      `${report.internationalRemoved} international contact${report.internationalRemoved === 1 ? "" : "s"} removed`,
+    );
+  if (parts.length === 0) return null;
+  return `Cleaned: ${parts.join(", ")}`;
+}
 
 function UploadTab({
   clientId,
@@ -742,13 +787,16 @@ function UploadTab({
     refresh();
   }, [clientId]);
 
-  async function uploadOneFile(file: File): Promise<void> {
+  async function uploadOneFile(file: File): Promise<string | null> {
     const lowerName = file.name.toLowerCase();
-    const sourceLabel = file.name.replace(/\.[^.]+$/, "");
+    // Sanitized before either is ever sent - see sanitizeStorageFileName's
+    // own comment for the real "StorageApiError: Invalid key" this fixes.
+    const fileName = sanitizeStorageFileName(file.name);
+    const sourceLabel = sanitizeStorageFileName(file.name.replace(/\.[^.]+$/, ""));
     if (lowerName.endsWith(".vcf")) {
       const content = await fileToBase64(file);
-      await uploadSoiFile({ data: { clientId, fileName: file.name, sourceLabel, kind: "vcf", content } });
-      return;
+      await uploadSoiFile({ data: { clientId, fileName, sourceLabel, kind: "vcf", content } });
+      return null;
     }
     let preview: { headers: string[]; rows: Record<string, string>[] };
     if (SPREADSHEET_EXTENSIONS.some((ext) => lowerName.endsWith(ext))) {
@@ -775,16 +823,34 @@ function UploadTab({
     // etc.) — see guessColumnMapping's comment for what counts as
     // recognizable. No manual mapping step; this is what lets a batch go
     // straight through without stopping for each file.
-    const mapping = guessColumnMapping(headers);
+    let mapping = guessColumnMapping(headers);
+    let rows = preview.rows;
+    let cleanupSummary: string | null = null;
+    // Clean & Standardize — splits a combined name/address field and fixes
+    // up phone formatting before this ever reaches the real backend. See
+    // cleanContactRows' own comment in soi-builder.ts for the full
+    // reasoning. Non-fatal on purpose: if this fails for any reason (AI
+    // unreachable, etc.) the upload still goes through with whatever
+    // header-only mapping was already guessed, same as before this feature
+    // existed, rather than blocking the whole upload on it.
+    try {
+      const cleaned = await cleanContactRows({ data: { rows, mapping } });
+      rows = cleaned.rows;
+      mapping = cleaned.mapping;
+      cleanupSummary = formatCleanupSummary(cleaned.report);
+    } catch {
+      // Falls through with the original rows/mapping, untouched.
+    }
     await uploadSoiFile({
       data: {
         clientId,
-        fileName: file.name,
+        fileName,
         sourceLabel,
         kind: "mapped_csv",
-        content: JSON.stringify({ mapping, rows: preview.rows }),
+        content: JSON.stringify({ mapping, rows }),
       },
     });
+    return cleanupSummary;
   }
 
   async function handleFilesPicked(files: File[]) {
@@ -812,8 +878,12 @@ function UploadTab({
       }
       setBatch((cur) => cur.map((it, idx) => (idx === i ? { ...it, status: "uploading" } : it)));
       try {
-        await uploadOneFile(item.file);
-        setBatch((cur) => cur.map((it, idx) => (idx === i ? { ...it, status: "done" } : it)));
+        const cleanupSummary = await uploadOneFile(item.file);
+        setBatch((cur) =>
+          cur.map((it, idx) =>
+            idx === i ? { ...it, status: "done", ...(cleanupSummary ? { cleanupSummary } : {}) } : it,
+          ),
+        );
       } catch (e) {
         const message = e instanceof Error ? e.message : String(e);
         setBatch((cur) => cur.map((it, idx) => (idx === i ? { ...it, status: "error", error: message } : it)));
@@ -911,22 +981,30 @@ function UploadTab({
                   </ol>
                 </li>
               ) : (
-                <li key={idx} className="flex items-center justify-between gap-2 text-sm">
-                  <span className="truncate">{item.file.name}</span>
-                  <span
-                    className={
-                      item.status === "done"
-                        ? "text-xs font-medium text-primary"
-                        : item.status === "error"
-                          ? "text-xs font-medium text-destructive"
-                          : "text-xs text-muted-foreground"
-                    }
-                  >
-                    {item.status === "pending" && "Waiting…"}
-                    {item.status === "uploading" && "Uploading…"}
-                    {item.status === "done" && "Uploaded ✓"}
-                    {item.status === "error" && (item.error ?? "Failed")}
-                  </span>
+                <li key={idx} className="text-sm">
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="truncate">{item.file.name}</span>
+                    <span
+                      className={
+                        item.status === "done"
+                          ? "text-xs font-medium text-primary"
+                          : item.status === "error"
+                            ? "text-xs font-medium text-destructive"
+                            : "text-xs text-muted-foreground"
+                      }
+                    >
+                      {item.status === "pending" && "Waiting…"}
+                      {item.status === "uploading" && "Uploading…"}
+                      {item.status === "done" && "Uploaded ✓"}
+                      {item.status === "error" && (item.error ?? "Failed")}
+                    </span>
+                  </div>
+                  {/* Clean & Standardize's short summary of what it changed
+                      in this file (names split, addresses parsed, phones
+                      reformatted, international contacts dropped) - see
+                      formatCleanupSummary's own comment for why this is a
+                      one-line count rather than nothing or a full review. */}
+                  {item.cleanupSummary && <p className="mt-0.5 text-xs text-muted-foreground">{item.cleanupSummary}</p>}
                 </li>
               ),
             )}

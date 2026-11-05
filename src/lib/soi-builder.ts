@@ -871,6 +871,51 @@ export const setSoiReviewFlag = createServerFn({ method: "POST" })
     return { ok: true };
   });
 
+// Lets one field on one contact be fixed in place from a review screen,
+// 2026-11-05 per Mike: "Add an edit feature on all screens that have data
+// displayed like this so that if there is an error uploaded we can easily
+// click edit and fix it vs having to download it or fix later... Add a
+// pencil icon next to the Keep checkbox." Covers the two review screens that
+// read real, already-saved `contacts` rows (the main Review tab, and the
+// Final Combined List's Needs Data table) - the two Append Data screens use
+// a different mechanism (DatazappRowOverride, passed straight into
+// finalizeDatazappAppend/finalizeDatazappEmailList above) since those tables
+// show a live preview re-derived from an uploaded file each time, not a
+// saved contact row with an id yet.
+export const updateReviewContact = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator(
+    (data: {
+      clientId: string;
+      contactId: string;
+      fields: Partial<{
+        first_name: string;
+        last_name: string;
+        email: string;
+        phone: string;
+        address: string;
+        city: string;
+        state: string;
+        zip: string;
+      }>;
+    }) => data,
+  )
+  .handler(async ({ data, context }) => {
+    const admin = getSoiAdminClient();
+    const email = (context.claims as { email?: string } | undefined)?.email;
+    await requireClientAccess(admin, email, data.clientId);
+
+    // Scoped to both the contact id AND this client - never trust contactId
+    // alone, same boundary setSoiReviewFlag enforces just above.
+    const { error } = await admin
+      .from("contacts")
+      .update(data.fields)
+      .eq("id", data.contactId)
+      .eq("client_id", data.clientId);
+    if (error) throw error;
+    return { ok: true };
+  });
+
 export const exportSoiList = createServerFn({ method: "POST" })
   .middleware([requireSupabaseAuth])
   .inputValidator((data: { clientId: string; scope: string }) => data)
@@ -1606,6 +1651,25 @@ async function upsertAppendedContacts(
   return { updated: updates.length, inserted: toInsert.length };
 }
 
+// A manual correction to one row made in the review table, 2026-11-05 - Mike
+// asked for an edit/pencil icon on "all screens that have data displayed
+// like this" rather than making someone download, fix in Excel, and
+// re-upload just to correct one bad field (his real example: a phone number
+// that came back concatenated/duplicated, like "15088893321150888933211").
+// Keyed by the same rowIndex used everywhere else in this file. Undefined
+// fields mean "leave whatever the matching logic already produced alone" -
+// this is a patch, not a full replacement of the row.
+export type DatazappRowOverride = Partial<{
+  firstName: string;
+  lastName: string;
+  phone: string;
+  email: string;
+  address: string;
+  city: string;
+  state: string;
+  zip: string;
+}>;
+
 // Finalizes exactly the rows Mike's team kept checked in the review wizard -
 // `includedRowIndexes` are positions in `rows` (same indexing
 // previewDatazappAppend's `reviewRows[].rowIndex` used). Re-runs the same
@@ -1614,10 +1678,20 @@ async function upsertAppendedContacts(
 // useful - Mike's own words, "ready to upload wherever you need it, Suite
 // Assist or anywhere else"), and ALSO writes the kept rows into `contacts`
 // as list_assignment "appended_full_data" (see upsertAppendedContacts above
-// for why this is no longer a no-DB-write operation).
+// for why this is no longer a no-DB-write operation). `overrides` (see
+// DatazappRowOverride above) lets a row the matching logic got slightly
+// wrong - a mangled phone number, a misspelled city - go out corrected
+// without touching the underlying file or the matching logic itself.
 export const finalizeDatazappAppend = createServerFn({ method: "POST" })
   .middleware([requireSupabaseAuth])
-  .inputValidator((data: { clientId: string; rows: DatazappRawRow[]; includedRowIndexes: number[] }) => data)
+  .inputValidator(
+    (data: {
+      clientId: string;
+      rows: DatazappRawRow[];
+      includedRowIndexes: number[];
+      overrides?: Record<number, DatazappRowOverride>;
+    }) => data,
+  )
   .handler(async ({ data, context }) => {
     const admin = getSoiAdminClient();
     const email = (context.claims as { email?: string } | undefined)?.email;
@@ -1633,16 +1707,17 @@ export const finalizeDatazappAppend = createServerFn({ method: "POST" })
     results.forEach((r, rowIndex) => {
       const canKeep = (r.tier === "confirmed" || r.tier === "household") && included.has(rowIndex);
       if (!canKeep) return;
+      const o = data.overrides?.[rowIndex];
       keptRows.push({
-        first_name: r.firstName,
-        last_name: r.lastName,
-        email: r.finalFields.email,
-        phone: r.phone,
-        address: r.finalFields.address,
+        first_name: o?.firstName ?? r.firstName,
+        last_name: o?.lastName ?? r.lastName,
+        email: o?.email ?? r.finalFields.email,
+        phone: o?.phone ?? r.phone,
+        address: o?.address ?? r.finalFields.address,
         address_2: r.finalFields.address_2,
-        city: r.finalFields.city,
-        state: r.finalFields.state,
-        zip: r.finalFields.zip,
+        city: o?.city ?? r.finalFields.city,
+        state: o?.state ?? r.finalFields.state,
+        zip: o?.zip ?? r.finalFields.zip,
       });
     });
 
@@ -1743,9 +1818,19 @@ function buildDatazappEmailCsv(rows: { first_name: string; last_name: string; em
   return lines.join("\n");
 }
 
+// Same `overrides` mechanism as finalizeDatazappAppend above (same
+// DatazappRowOverride type, same rowIndex keying) - a Stage 2 row can be
+// edited the same way a Stage 1 row can, in the same client component.
 export const finalizeDatazappEmailList = createServerFn({ method: "POST" })
   .middleware([requireSupabaseAuth])
-  .inputValidator((data: { clientId: string; rows: DatazappRawRow[]; includedRowIndexes: number[] }) => data)
+  .inputValidator(
+    (data: {
+      clientId: string;
+      rows: DatazappRawRow[];
+      includedRowIndexes: number[];
+      overrides?: Record<number, DatazappRowOverride>;
+    }) => data,
+  )
   .handler(async ({ data, context }) => {
     const admin = getSoiAdminClient();
     const email = (context.claims as { email?: string } | undefined)?.email;
@@ -1758,7 +1843,13 @@ export const finalizeDatazappEmailList = createServerFn({ method: "POST" })
     results.forEach((r, rowIndex) => {
       const usableEmail = bestStage2Email(r);
       if (!included.has(rowIndex) || !usableEmail) return;
-      keptRows.push({ first_name: r.firstName, last_name: r.lastName, email: usableEmail, phone: r.phone });
+      const o = data.overrides?.[rowIndex];
+      keptRows.push({
+        first_name: o?.firstName ?? r.firstName,
+        last_name: o?.lastName ?? r.lastName,
+        email: o?.email ?? usableEmail,
+        phone: o?.phone ?? r.phone,
+      });
     });
 
     const written = await upsertAppendedContacts(
@@ -1919,9 +2010,53 @@ export const exportSoiListLocal = createServerFn({ method: "POST" })
     }
 
     // combine_marketable
-    const lists = ["direct_mail", "email_phone", "email_list", "appended_full_data", "appended_email"] as const;
-    const groups = await Promise.all(lists.map((l) => fetchContactsForList(admin, data.clientId, l)));
-    const combined = dedupeContactRows(groups.flat());
+    // Fixed 2026-11-05 per Mike, after walking through the Needs Data /
+    // Export flow together: "every contact on here makes the final lists
+    // into marketable... whether we're getting data for them or not is not
+    // relevant." Two real gaps closed here, both found while tracing through
+    // exactly what this button pulls together. (1) direct_mail/email_phone/
+    // email_list previously went straight through fetchContactsForList with
+    // NO review-flag check at all - someone explicitly unchecked (removed)
+    // during their review step was still slipping into the final marketable
+    // database, since list_assignment alone doesn't track keep/remove.
+    // (2) "incomplete" survivors (checked "keep" on the Incomplete review
+    // step) were excluded from this list entirely - the ONLY way an
+    // Incomplete contact ever reached Marketable was by being selected in
+    // Needs Data, sent off to Datazap, and coming back through Append Data
+    // as a brand-new appended_full_data/appended_email row. Mike doesn't
+    // want that detour to be the only path: "just because they need data
+    // doesn't mean they're not gonna be part of the final list... I want to
+    // make sure that no matter what, every contact on here makes the final
+    // lists into marketable." A kept Incomplete contact now belongs on the
+    // final marketable list on its own, complete or not - getting data
+    // appended for them (or edited in via the new pencil icon) is optional
+    // enrichment layered on top, never a gate on whether they count.
+    // Both gaps are closed the same way: direct_mail/email_phone/email_list/
+    // incomplete all now go through the same isPrimaryReviewSurvivor check
+    // every other export in this file already uses (fetchContactsWithFlags +
+    // isPrimaryReviewSurvivor, same pair the final_full_contact branch above
+    // already relies on), so "kept" means exactly the same thing everywhere
+    // in the app, with no separate no-flag-check code path left anywhere.
+    // appended_full_data/appended_email are unchanged - those rows only ever
+    // exist because they were explicitly included at Append Data finalize
+    // time, so there's no separate review flag to check for them.
+    // This is also exactly what keeps "duplicates" (Mike's other worry) from
+    // appearing when a kept Incomplete contact DOES later get appended: the
+    // dedupeContactRows merge below matches by email then phone, so the
+    // original (less complete) row and the later appended (more complete)
+    // row collapse into one - blank-fill-only, never overwriting a real
+    // value either side already had.
+    const surveyedLists = ["direct_mail", "email_phone", "email_list", "incomplete"] as const;
+    const surveyedGroups = await Promise.all(
+      surveyedLists.map((l) => fetchContactsWithFlags(admin, data.clientId, l, "primary")),
+    );
+    const keptRows: SoiContactRow[] = surveyedGroups
+      .flat()
+      .filter((c) => isPrimaryReviewSurvivor(c))
+      .map(({ flagged, ...rest }) => rest);
+    const appendedLists = ["appended_full_data", "appended_email"] as const;
+    const appendedGroups = await Promise.all(appendedLists.map((l) => fetchContactsForList(admin, data.clientId, l)));
+    const combined = dedupeContactRows([...keptRows, ...appendedGroups.flat()]);
     return {
       files: { [`final-marketable-database-${stamp}.csv`]: buildContactsCsvV2(combined) },
       count: combined.length,

@@ -507,6 +507,18 @@ export const listMarketingPosts = createServerFn({ method: "GET" })
       // row, only the on-screen ordering was unstable. Adding `id` as a
       // secondary sort gives every fetch of this list one single, repeatable
       // order regardless of ties or intervening updates.
+      //
+      // Primary sort on scheduled_for added 2026-11-04 per Mike: "WHEN THE
+      // MONTHLY CONTENT IS CREATED IT'S IN SEQUENTIAL ORDER IF THERE IS A
+      // DATE THERE... POSTS EARLIEST IN MONTH APPEAR FIRST... IF THERE'S NO
+      // DATE ASSOCIATED THEN IT CAN APPEAR WHEREVER." A calendar item's
+      // optional target date (see CalendarDoc.targetDate / updateCalendarItem)
+      // flows onto its generated post's scheduled_for at generation time
+      // (generateMonthlyBatch) — sorting on it here, NULLS LAST, puts every
+      // dated post in date order up front and leaves undated posts exactly
+      // where the existing created_at/id order already puts them, which is
+      // "wherever" in the sense Mike means (stable, just not date-driven).
+      .order("scheduled_for", { ascending: true, nullsFirst: false })
       .order("created_at", { ascending: true })
       .order("id", { ascending: true });
     if (data.month) query = query.eq("month", data.month);
@@ -1723,6 +1735,47 @@ export const finalizeMediaUpload = createServerFn({ method: "POST" })
     return { ok: true, id: row.id };
   });
 
+// Swaps the file behind an EXISTING media row in place — added 2026-11-04
+// alongside the HEIC-aware upload fix (resizeImage, marketing.tsx) to also
+// repair photos that were already uploaded before that fix existed and are
+// sitting in the grid as "Couldn't preview this photo." The Media tab
+// downloads the original bytes, converts them client-side, uploads the
+// result through the normal signed-URL flow, then calls this to point the
+// existing row at the new file (keeping its tags/status/created_at — a
+// plain finalizeMediaUpload would instead insert a brand-new untagged row)
+// and remove the old broken object from Storage.
+export const replaceMediaFile = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator((data: { agentId: string; mediaId: string; storagePath: string }) => data)
+  .handler(async ({ data, context }): Promise<{ ok: true }> => {
+    const email = (context.claims as { email?: string } | undefined)?.email;
+    await requireAgentAccess(context.userId, email, data.agentId);
+    if (!data.storagePath.startsWith(`${data.agentId}/`)) {
+      throw new Error("Upload path does not belong to this agent.");
+    }
+    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+    const { data: existing, error: fetchErr } = await supabaseAdmin
+      .from("agent_photos")
+      .select("agent_id, storage_path")
+      .eq("id", data.mediaId)
+      .maybeSingle();
+    if (fetchErr) throw fetchErr;
+    if (!existing || existing.agent_id !== data.agentId) {
+      throw new Error("Media not found for this agent.");
+    }
+    const { data: pub } = supabaseAdmin.storage.from("media").getPublicUrl(data.storagePath);
+    const { error: updErr } = await supabaseAdmin
+      .from("agent_photos")
+      .update({ url: pub.publicUrl, storage_path: data.storagePath })
+      .eq("id", data.mediaId);
+    if (updErr) throw updErr;
+    const oldPath = existing.storage_path;
+    if (oldPath && oldPath !== data.storagePath) {
+      await supabaseAdmin.storage.from("media").remove([oldPath]);
+    }
+    return { ok: true };
+  });
+
 // Sets a media item's tags from the Media tab's tag-chip editor — added per
 // Mike's request (2026-09-17) as the native equivalent of the old app's
 // separate "Tag Photos" screen, folded into the Media tab itself since
@@ -2088,6 +2141,10 @@ export const listPublicReviewPosts = createServerFn({ method: "POST" })
       .eq("agent_id", agentId)
       .eq("month", data.month)
       .eq("archived", false)
+      // Same scheduled_for-first ordering as listMarketingPosts above
+      // (2026-11-04) — this public review link shows the same list, so it
+      // should show it in the same date order.
+      .order("scheduled_for", { ascending: true, nullsFirst: false })
       .order("created_at", { ascending: true })
       .order("id", { ascending: true });
     if (error) throw error;
@@ -4101,7 +4158,36 @@ export const removeCalendarMonth = createServerFn({ method: "POST" })
 // and structured exactly the way a Drive Doc for that type was (see the
 // parsing functions below); admin picks the type explicitly instead of it
 // being sniffed from a filename.
-export type CalendarItem = { id: string; docType: "post" | "email" | "video"; title: string; rawText: string };
+export type CalendarItem = {
+  id: string;
+  docType: "post" | "email" | "video";
+  title: string;
+  rawText: string;
+  targetDate: string | null;
+};
+
+// content_calendar_items has no spare jsonb column the way agents.voice_answers
+// does (see the Business Info / Content Branding Strategy fields for that
+// established pattern) — so an optional per-item target date, added
+// 2026-11-04 per Mike ("we need the ability to suggest a date on it so that
+// when we are scheduling and there is a date specific we can specific the
+// date it should go live"), is encoded as a single marker line at the very
+// top of raw_text instead: "TARGET_DATE: 2026-11-15". The Add/Edit form
+// below composes this in and every reader strips it back out before the
+// text ever reaches the normal Post/Email/Video section parsers, so it
+// never leaks into a generated piece's content.
+const TARGET_DATE_RE = /^TARGET_DATE:\s*(\d{4}-\d{2}-\d{2})\s*\n?/;
+
+function splitTargetDate(rawText: string): { targetDate: string | null; rawText: string } {
+  const m = rawText.match(TARGET_DATE_RE);
+  if (!m) return { targetDate: null, rawText };
+  return { targetDate: m[1]!, rawText: rawText.slice(m[0].length) };
+}
+
+function composeRawText(targetDate: string | null | undefined, rawText: string): string {
+  const trimmed = rawText.trim();
+  return targetDate ? `TARGET_DATE: ${targetDate}\n${trimmed}` : trimmed;
+}
 
 export const listCalendarItems = createServerFn({ method: "GET" })
   .middleware([requireSupabaseAuth])
@@ -4117,18 +4203,22 @@ export const listCalendarItems = createServerFn({ method: "GET" })
       .order("sort_order", { ascending: true })
       .order("created_at", { ascending: true });
     if (error) throw error;
-    return (rows ?? []).map((r) => ({
-      id: r.id,
-      docType: r.doc_type as CalendarItem["docType"],
-      title: r.title,
-      rawText: r.raw_text,
-    }));
+    return (rows ?? []).map((r) => {
+      const { targetDate, rawText } = splitTargetDate(r.raw_text);
+      return { id: r.id, docType: r.doc_type as CalendarItem["docType"], title: r.title, rawText, targetDate };
+    });
   });
 
 export const addCalendarItem = createServerFn({ method: "POST" })
   .middleware([requireSupabaseAuth])
   .inputValidator(
-    (data: { monthId: string; docType: "post" | "email" | "video"; title: string; rawText: string }) => data,
+    (data: {
+      monthId: string;
+      docType: "post" | "email" | "video";
+      title: string;
+      rawText: string;
+      targetDate?: string | null;
+    }) => data,
   )
   .handler(async ({ data, context }): Promise<{ ok: true }> => {
     const email = (context.claims as { email?: string } | undefined)?.email;
@@ -4141,9 +4231,44 @@ export const addCalendarItem = createServerFn({ method: "POST" })
       month_id: data.monthId,
       doc_type: data.docType,
       title: data.title.trim(),
-      raw_text: data.rawText.trim(),
+      raw_text: composeRawText(data.targetDate, data.rawText),
     };
     const { error } = await supabaseAdmin.from("content_calendar_items").insert(row);
+    if (error) throw error;
+    return { ok: true };
+  });
+
+// Edits an existing calendar item in place — added 2026-11-04 per Mike: "in
+// content calendar creation we can edit existing posts" (screenshot showed
+// the list only ever offering Remove, never a way to fix a typo or update
+// the brief without deleting and re-adding it from scratch). Same
+// admin-only boundary and same validation as addCalendarItem above.
+export const updateCalendarItem = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator(
+    (data: {
+      itemId: string;
+      docType: "post" | "email" | "video";
+      title: string;
+      rawText: string;
+      targetDate?: string | null;
+    }) => data,
+  )
+  .handler(async ({ data, context }): Promise<{ ok: true }> => {
+    const email = (context.claims as { email?: string } | undefined)?.email;
+    await requireAdmin(context.userId, email);
+    if (!data.title.trim() || !data.rawText.trim()) {
+      throw new Error("Give this piece a title and the brief/copy to generate from.");
+    }
+    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+    const { error } = await supabaseAdmin
+      .from("content_calendar_items")
+      .update({
+        doc_type: data.docType,
+        title: data.title.trim(),
+        raw_text: composeRawText(data.targetDate, data.rawText),
+      })
+      .eq("id", data.itemId);
     if (error) throw error;
     return { ok: true };
   });
@@ -4164,7 +4289,15 @@ export const removeCalendarItem = createServerFn({ method: "POST" })
 // from the old app's Drive-doc parser (content-calendar.js), just applied to
 // natively-authored text instead of a Drive Doc export ─────────────────────
 
-export type CalendarDoc =
+// Split into a base union (what the text parsers below actually produce)
+// and the full CalendarDoc (with targetDate attached by parseCalendarItem) —
+// targetDate added 2026-11-04 alongside updateCalendarItem above, so
+// generateMonthlyBatch can carry a calendar item's suggested go-live date
+// through onto the generated post's own scheduled_for (see there, and the
+// ordering change on listMarketingPosts). It comes from the item's own
+// row, not from anything in the parsed text, so the parsers themselves
+// don't need to know about it.
+type CalendarDocBase =
   | {
       type: "post";
       title: string;
@@ -4176,6 +4309,8 @@ export type CalendarDoc =
     }
   | { type: "email"; title: string; goal: string; subjects: string[]; instructions: string }
   | { type: "video"; title: string; goal: string; hook: string; script: string };
+
+export type CalendarDoc = CalendarDocBase & { targetDate: string | null };
 
 function extractSection(text: string, startLabel: string, endLabels: string[]): string {
   const startRe = new RegExp("(?:\\d+\\.\\s*)?" + startLabel, "i");
@@ -4249,7 +4384,7 @@ function toBullets(sectionText: string): string[] {
   return bullets;
 }
 
-function parsePostDoc(text: string, title: string): CalendarDoc | null {
+function parsePostDoc(text: string, title: string): CalendarDocBase | null {
   const goal = extractSection(text, "Post Goal", [
     "Post Image",
     "Image\\s*/\\s*Video Suggestions",
@@ -4306,7 +4441,7 @@ function parsePostDoc(text: string, title: string): CalendarDoc | null {
   return { type: "post", title, goal, image, canva, canvaDirection, copy };
 }
 
-function parseEmailDoc(text: string, title: string): CalendarDoc | null {
+function parseEmailDoc(text: string, title: string): CalendarDocBase | null {
   const goal = extractSection(text, "Email Goal", ["Subject Line Options", "Email Instructions", "SUBJECT LINE"]);
   const subjectSection =
     extractSection(text, "SUBJECT LINE OPTIONS?(?:\\s*\\([^)]*\\))?", [
@@ -4357,7 +4492,7 @@ function parseEmailDoc(text: string, title: string): CalendarDoc | null {
   return { type: "email", title, goal, subjects, instructions: instructionsText };
 }
 
-function parseVideoDoc(text: string, title: string): CalendarDoc | null {
+function parseVideoDoc(text: string, title: string): CalendarDocBase | null {
   const firstLine = text.split("\n")[0]!.trim();
   const isSimpleFormat = /^video[:\s]/i.test(firstLine);
   if (isSimpleFormat) {
@@ -4380,7 +4515,7 @@ function parseVideoDoc(text: string, title: string): CalendarDoc | null {
   return { type: "video", title, goal, hook, script };
 }
 
-function parseCalendarItem(item: { docType: string; title: string; rawText: string }): CalendarDoc | null {
+function parseCalendarItem(item: { docType: string; title: string; rawText: string }): CalendarDocBase | null {
   const cleaned = item.rawText
     .replace(/\r\n/g, "\n")
     .replace(/\\([[\]().*+?^${}|\\])/g, "$1")
@@ -4400,7 +4535,14 @@ async function fetchNativeCalendarDocs(monthId: string): Promise<CalendarDoc[]> 
     .order("created_at", { ascending: true });
   if (error) throw error;
   const docs = (data ?? [])
-    .map((row) => parseCalendarItem({ docType: row.doc_type, title: row.title, rawText: row.raw_text }))
+    .map((row) => {
+      // targetDate lives in a marker line at the top of raw_text (see
+      // splitTargetDate above) — strip it before the text ever reaches the
+      // section parsers, then reattach it to the parsed result below.
+      const { targetDate, rawText } = splitTargetDate(row.raw_text);
+      const parsed = parseCalendarItem({ docType: row.doc_type, title: row.title, rawText });
+      return parsed ? { ...parsed, targetDate } : null;
+    })
     .filter((d): d is CalendarDoc => Boolean(d));
   const typeOrder: Record<string, number> = { post: 0, video: 1, email: 2 };
   docs.sort((a, b) => (typeOrder[a.type] ?? 0) - (typeOrder[b.type] ?? 0));
@@ -4470,15 +4612,46 @@ async function callClaude(apiKey: string, prompt: string, maxTokens: number): Pr
 }
 
 function cleanCopy(text: string): string {
-  return text
-    .replace(/\*\*/g, "")
-    .replace(/^["']|["']$/g, "")
-    .trim();
+  return (
+    text
+      .replace(/\*\*/g, "")
+      .replace(/^["']|["']$/g, "")
+      // Added 2026-11-04 per Mike: "NEED TO REMOVE ALL DASHES IN ANY AI
+      // CONTENT. ITS STILL SPITTING SOME OUT FOR SOME CLIENTS." Every prompt
+      // above already tells Claude not to use dashes as punctuation ("No
+      // hyphens used as dashes anywhere") — that's a request, not a
+      // guarantee, and this is the hard backstop for when it ignores it.
+      // Targets a dash used AS PUNCTUATION — an em dash (—), an en dash (–),
+      // or a plain hyphen with a space on BOTH sides ("real estate - it
+      // shows") — and swaps it for a comma so the sentence still reads
+      // naturally. Deliberately leaves a bare hyphen with no surrounding
+      // spaces alone, since that's a real hyphen inside a word, a phone
+      // number, or an address (well-known, 555-1234, 123-A Main St), not what
+      // Mike means by "dashes" here.
+      .replace(/\s*[–—]\s*/g, ", ")
+      .replace(/\s+-\s+/g, ", ")
+      .replace(/^,\s*/, "") // a dash right at the start would otherwise leave a leading ", "
+      .replace(/,\s*,/g, ",") // two replacements back-to-back can double up
+      .replace(/,\s*([.!?])/g, "$1") // a dash right before end punctuation leaves ", ." — drop the comma
+      .trim()
+  );
+}
+
+// Converts a calendar item's optional target date (plain "YYYY-MM-DD") into
+// a timestamp for generated_posts.scheduled_for — noon UTC rather than
+// midnight so it never rolls back to the previous day in a negative-UTC-offset
+// timezone when displayed. Added 2026-11-04 alongside the date field on
+// calendar items (see CalendarDoc.targetDate above) and the
+// scheduled_for-first ordering on listMarketingPosts below.
+function targetDateToScheduledFor(targetDate: string | null): string | null {
+  return targetDate ? `${targetDate}T12:00:00.000Z` : null;
 }
 
 export const generateMonthlyBatch = createServerFn({ method: "POST" })
   .middleware([requireSupabaseAuth])
-  .inputValidator((data: { agentId: string; monthId: string; month: string; useHashtags?: boolean }) => data)
+  .inputValidator(
+    (data: { agentId: string; monthId: string; month: string; useHashtags?: boolean; useEmojis?: boolean }) => data,
+  )
   .handler(async ({ data, context }): Promise<{ ok: true; batchId: string; created: number }> => {
     const email = (context.claims as { email?: string } | undefined)?.email;
     await requireAgentAccess(context.userId, email, data.agentId);
@@ -4543,6 +4716,7 @@ export const generateMonthlyBatch = createServerFn({ method: "POST" })
         `- The post should remind people ${agentName} is in real estate — not sell them on it\n` +
         "- AUTHENTICITY CHECK: Read it out loud. If it sounds like an ad, rewrite it. If a real person would never say this, rewrite it.\n" +
         (data.useHashtags ? "- Add 2-3 relevant hashtags at the very end\n" : "- NO hashtags\n") +
+        (data.useEmojis ? "- A couple of relevant emojis are welcome if they feel natural\n" : "- NO emojis\n") +
         learnedFeedback +
         "\nFor each post below:\n1. Read the CONCEPT and ORIGINAL carefully\n2. Find the story or the human truth in it\n3. Write it clearly in the agent's voice\n4. Make sure the last sentence lands and the whole post makes sense\n\n" +
         "Output format for each post:\nPOST [N]: [TITLE]\nREWRITTEN: [complete caption]\n---\n\n" +
@@ -4568,6 +4742,7 @@ export const generateMonthlyBatch = createServerFn({ method: "POST" })
             title: doc.title,
             status: "pending",
             month: data.month,
+            scheduled_for: targetDateToScheduledFor(doc.targetDate),
             metadata: {
               batch_id: batchId,
               month: data.month,
@@ -4627,7 +4802,8 @@ export const generateMonthlyBatch = createServerFn({ method: "POST" })
               // with the agent's DNA profile fields swapped. Order here must
               // match the [CITY], [NAME] order named just before it.
               `This should read like a personal note from someone who lives in ${agentCity} and noticed a few things worth sharing. If it reads like a newsletter when done, it is wrong. Replace all [CITY], [NAME] placeholders with ${agentCity} and ${agentName}.\n` +
-              "NO hyphens. NO corporate language. NO AI tell phrases. Standard capitalization always." +
+              "NO hyphens. NO corporate language. NO AI tell phrases. Standard capitalization always. " +
+              (data.useEmojis ? "A couple of relevant emojis are welcome if they feel natural." : "NO emojis.") +
               learnedFeedback +
               "\n\nOutput format:\nSUBJECT OPTIONS:\n1. [subject]\n2. [subject]\n3. [subject]\n\nEMAIL BODY:\n[full email — reads like a note, not a newsletter]";
           } else {
@@ -4639,7 +4815,8 @@ export const generateMonthlyBatch = createServerFn({ method: "POST" })
               // Same [CITY]/[NAME] swap fixed here (2026-09-29) — see the
               // Local Letter branch above for the full explanation.
               `Write this email EXACTLY as ${agentName} would write it based on their Voice DNA above. Replace all [CITY], [NAME], [CITY, STATE] placeholders with ${agentCity} and ${agentName}.\n` +
-              "NO hyphens. NO corporate language. NO AI-tell phrases. Standard capitalization always." +
+              "NO hyphens. NO corporate language. NO AI-tell phrases. Standard capitalization always. " +
+              (data.useEmojis ? "A couple of relevant emojis are welcome if they feel natural." : "NO emojis.") +
               learnedFeedback +
               "\n\n" +
               "Output format:\nSUBJECT OPTIONS:\n1. [subject]\n2. [subject]\n3. [subject]\n\nEMAIL BODY:\n[full email in plain text, no HTML tags]";
@@ -4658,7 +4835,10 @@ export const generateMonthlyBatch = createServerFn({ method: "POST" })
             // — was the one place learnedFeedback never got folded in, so
             // reviewer-taught lessons silently never reached these emails
             // while post/video/the other two email branches always got them.
-            `Rules:\n- Do NOT rewrite or restructure this email\n- Replace [CITY], [NAME], [CITY, STATE] with ${agentCity} and ${agentName}\n- Fix any placeholder brackets that are still unfilled\n- NO hyphens. NO corporate language. Standard capitalization.\n\n` +
+            `Rules:\n- Do NOT rewrite or restructure this email\n- Replace [CITY], [NAME], [CITY, STATE] with ${agentCity} and ${agentName}\n- Fix any placeholder brackets that are still unfilled\n- NO hyphens. NO corporate language. Standard capitalization.\n` +
+            (data.useEmojis
+              ? "- A couple of relevant emojis are welcome if they feel natural\n\n"
+              : "- NO emojis\n\n") +
             learnedFeedback +
             `\n\nOutput format:\nSUBJECT OPTIONS:\n${subjectBlock}\n\nEMAIL BODY:\n[the personalized email]`;
         }
@@ -4690,6 +4870,7 @@ export const generateMonthlyBatch = createServerFn({ method: "POST" })
             title: ed.title.replace("Email — ", ""),
             status: "pending",
             month: data.month,
+            scheduled_for: targetDateToScheduledFor(ed.targetDate),
             metadata: { batch_id: batchId, month: data.month, goal: ed.goal, source: "content_calendar" },
           };
         } catch {
@@ -4715,7 +4896,10 @@ export const generateMonthlyBatch = createServerFn({ method: "POST" })
           `${vd.script}\n\n` +
           `Write a 60 second video script in ${agentName}'s voice. Format:\n` +
           "HOOK (first 3 seconds — grab attention):\n[hook line]\n\nBODY (main point, story, or insight):\n[15 to 45 seconds of content]\n\nCLOSE (natural ending, no hard sell):\n[closing line]\n\n" +
-          `Rules:\n- Sounds exactly like ${agentName} based on their Voice DNA\n- Written to be SPOKEN, not read — short sentences, natural pauses\n- NO hyphens, NO corporate language, NO AI phrases\n- Standard capitalization, never all lowercase\n- Real estate reminder energy — top of mind, not a pitch\n- 150 words maximum` +
+          `Rules:\n- Sounds exactly like ${agentName} based on their Voice DNA\n- Written to be SPOKEN, not read — short sentences, natural pauses\n- NO hyphens, NO corporate language, NO AI phrases\n- Standard capitalization, never all lowercase\n- Real estate reminder energy — top of mind, not a pitch\n- 150 words maximum\n` +
+          (data.useEmojis
+            ? "- A couple of relevant emojis in the on-screen text are welcome if they feel natural"
+            : "- NO emojis") +
           learnedFeedback;
 
         try {
@@ -4727,6 +4911,7 @@ export const generateMonthlyBatch = createServerFn({ method: "POST" })
             title: vd.title,
             status: "pending",
             month: data.month,
+            scheduled_for: targetDateToScheduledFor(vd.targetDate),
             metadata: { batch_id: batchId, month: data.month, goal: vd.goal, source: "content_calendar" },
           };
         } catch {
@@ -4790,6 +4975,37 @@ export const deleteMonthContent = createServerFn({ method: "POST" })
     const { error: delErr } = await supabaseAdmin.from("generated_posts").delete().in("id", idsToDelete);
     if (delErr) throw delErr;
     return { ok: true, deleted: idsToDelete.length };
+  });
+
+// Deletes a single generated post/email/video outright — added 2026-11-04
+// per Mike: "we need a place where the admin or user can delete a certain
+// post if they do not like concept. They can then rescan a photo to add new
+// concepts. But for any post we need the ability to do that." Unlike
+// deleteMonthContent above (admin-only, whole-month, requireAdmin), this is
+// scoped to one post and open to the agent themselves too — same
+// agentAccess boundary as approve/rewrite/edit elsewhere in this file, not
+// requireAdmin. Fetches the existing row first and checks agent_id before
+// deleting, same "fetch existing, verify it belongs to this agent" pattern
+// rewritePostContent above already uses, rather than trusting postId alone.
+export const deleteGeneratedPost = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator((data: { agentId: string; postId: string }) => data)
+  .handler(async ({ data, context }): Promise<{ ok: true }> => {
+    const email = (context.claims as { email?: string } | undefined)?.email;
+    await requireAgentAccess(context.userId, email, data.agentId);
+    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+    const { data: existing, error: fetchErr } = await supabaseAdmin
+      .from("generated_posts")
+      .select("agent_id")
+      .eq("id", data.postId)
+      .maybeSingle();
+    if (fetchErr) throw fetchErr;
+    if (!existing || existing.agent_id !== data.agentId) {
+      throw new Error("Post not found for this agent.");
+    }
+    const { error: delErr } = await supabaseAdmin.from("generated_posts").delete().eq("id", data.postId);
+    if (delErr) throw delErr;
+    return { ok: true };
   });
 
 // Archives a month's generated content for one agent — added 2026-09-20 per

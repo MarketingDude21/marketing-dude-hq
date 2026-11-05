@@ -4587,7 +4587,11 @@ async function fetchWithTimeout(url: string, options: RequestInit, timeoutMs: nu
   }
 }
 
-async function callClaude(apiKey: string, prompt: string, maxTokens: number): Promise<string> {
+// Exported (was module-private) 2026-11-05 so soi-builder.ts's new contact
+// cleanup step can reuse the exact same Claude call this file already makes
+// for content generation, instead of duplicating the fetch/timeout/error
+// handling boilerplate a second time.
+export async function callClaude(apiKey: string, prompt: string, maxTokens: number): Promise<string> {
   const res = await fetchWithTimeout(
     "https://api.anthropic.com/v1/messages",
     {

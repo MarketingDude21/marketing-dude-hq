@@ -1582,7 +1582,7 @@ export const rewritePostContent = createServerFn({ method: "POST" })
       "2. Apply the feedback exactly as described\n" +
       `3. Write in ${firstName}'s voice based on their Voice DNA above\n` +
       formatRule +
-      "5. No hyphens, no corporate language, sounds like a real person, not a brand\n" +
+      "5. No hyphens, including in compound modifiers (well known, not well-known), no corporate language, sounds like a real person, not a brand\n" +
       "6. Standard capitalization always — never write in all lowercase\n" +
       `7. AUTHENTICITY TEST: would ${firstName} actually say this?\n\n` +
       "Output ONLY the rewritten text. Nothing else. No explanation.";
@@ -2353,7 +2353,7 @@ export const rewritePublicReviewPost = createServerFn({ method: "POST" })
       "2. Apply the feedback exactly as described\n" +
       `3. Write in ${firstName}'s voice based on their Voice DNA above\n` +
       formatRule +
-      "5. No hyphens, no corporate language, sounds like a real person, not a brand\n" +
+      "5. No hyphens, including in compound modifiers (well known, not well-known), no corporate language, sounds like a real person, not a brand\n" +
       "6. Standard capitalization always — never write in all lowercase\n" +
       `7. AUTHENTICITY TEST: would ${firstName} actually say this?\n\n` +
       "Output ONLY the rewritten text. Nothing else. No explanation.";
@@ -3639,9 +3639,11 @@ function buildContentPrompt(
       `WHAT THIS POST IS ABOUT:\n${input.goal}${extra}\n\n` +
       "RULES — follow every one:\n" +
       "- Write a COMPLETE post. Every sentence must connect to the next. The post must make full sense start to finish.\n" +
+      "- Open with a scene or a pain point — never a summary or a general statement.\n" +
+      "- Write to ONE person, not an audience — like you're talking to one friend, not posting to a crowd.\n" +
       "- Tell a story or make a single clear point.\n" +
       "- 2 to 4 sentences max. Short. Punchy. Human.\n" +
-      "- No hyphens used as dashes anywhere\n" +
+      "- No hyphens used as dashes anywhere, and no hyphens in compound modifiers either (write well known, not well-known)\n" +
       '- No "As a real estate professional" or any version of that\n' +
       '- No "Navigating the market" — never\n' +
       "- No corporate language. No buzzwords. No filler.\n" +
@@ -3658,7 +3660,7 @@ function buildContentPrompt(
       `You are writing a real estate email for ${agentName} in ${agentCity}.\n\n` +
       `VOICE DNA:\n${voiceDna}\n\n` +
       `EMAIL GOAL:\n${input.goal}${extra}\n\n` +
-      "Write this email in the voice above. NO hyphens. NO corporate language. NO AI-tell phrases. Standard capitalization always.\n\n" +
+      "Write this email in the voice above, to ONE person, not an audience — like a personal note, not a newsletter blast. Open with a scene or a pain point, never a summary. NO hyphens, including in compound modifiers (well known, not well-known). NO corporate language. NO AI-tell phrases. Standard capitalization always.\n\n" +
       "Output format:\nSUBJECT OPTIONS:\n1. [subject]\n2. [subject]\n3. [subject]\n\nEMAIL BODY:\n[full email in plain text, no HTML tags]"
     );
   }
@@ -3672,7 +3674,7 @@ function buildContentPrompt(
     "HOOK (first 3 seconds — grab attention):\n[hook line]\n\n" +
     "BODY (main point, story, or insight):\n[15 to 45 seconds of content]\n\n" +
     "CLOSE (natural ending, no hard sell):\n[closing line]\n\n" +
-    "Rules: written to be SPOKEN, not read — short sentences, natural pauses. NO hyphens, NO corporate language, NO AI phrases. Standard capitalization, never all lowercase. 150 words maximum."
+    "Rules: the HOOK opens with a scene or a pain point, never a summary. Written to ONE person, not an audience. Written to be SPOKEN, not read — short sentences, natural pauses. NO hyphens, including in compound modifiers (well known, not well-known). NO corporate language, NO AI phrases. Standard capitalization, never all lowercase. 150 words maximum."
   );
 }
 
@@ -4630,6 +4632,19 @@ function cleanCopy(text: string): string {
       // Mike means by "dashes" here.
       .replace(/\s*[–—]\s*/g, ", ")
       .replace(/\s+-\s+/g, ", ")
+      // Added 2026-11-05 — Mike's own documented content standard
+      // (marketing-methodology notes) is actually stricter than the request
+      // above: "no hyphens in compound modifiers" at all, not just dashes used
+      // as punctuation. A hyphen directly between two letters with nothing
+      // else around it (well-known, high-end, state-of-the-art, move-in-ready)
+      // is a compound modifier — as opposed to a phone number or a street
+      // address, which always has a digit on at least one side (555-1234,
+      // 123-A Main St) and is left alone. Turned into a space rather than a
+      // comma since the two halves are one phrase, not separate clauses. One
+      // known tradeoff: a hyphenated surname (Smith-Jones) would also lose
+      // its hyphen — rare in this content, and there's no reliable way to
+      // tell a surname from a compound modifier by pattern alone.
+      .replace(/(?<=[A-Za-z])-(?=[A-Za-z])/g, " ")
       .replace(/^,\s*/, "") // a dash right at the start would otherwise leave a leading ", "
       .replace(/,\s*,/g, ",") // two replacements back-to-back can double up
       .replace(/,\s*([.!?])/g, "$1") // a dash right before end punctuation leaves ", ." — drop the comma
@@ -4705,9 +4720,11 @@ export const generateMonthlyBatch = createServerFn({ method: "POST" })
         `VOICE DNA:\n${dna}\n\n` +
         "RULES — follow every one:\n" +
         "- Write a COMPLETE post. Every sentence must connect to the next. The post must make full sense start to finish.\n" +
+        "- Open with a scene or a pain point — never a summary or a general statement.\n" +
+        "- Write to ONE person, not an audience — like you're talking to one friend, not posting to a crowd.\n" +
         "- Tell a story or make a single clear point. If you cannot explain what the post is about in one sentence, rewrite it.\n" +
         "- 2 to 4 sentences max. Short. Punchy. Human.\n" +
-        "- No hyphens used as dashes anywhere\n" +
+        "- No hyphens used as dashes anywhere, and no hyphens in compound modifiers either (write well known, not well-known)\n" +
         '- No "As a real estate professional" or any version of that\n' +
         '- No "Navigating the market" — never\n' +
         "- No corporate language. No buzzwords. No filler.\n" +
@@ -4795,14 +4812,14 @@ export const generateMonthlyBatch = createServerFn({ method: "POST" })
               `VOICE DNA:\n${dna}\n\n` +
               `EMAIL GOAL:\n${ed.goal || ""}\n\n` +
               `FULL BRIEF:\n${instructions}\n\n` +
-              "CRITICAL: Write this as three to four natural observations that flow into each other. Do NOT use headers. Do NOT use bullet lists. Do NOT structure this as a newsletter with named sections. Each observation transitions naturally into the next. The real estate mention is one short paragraph near the end, treated as a casual aside — not a featured section. End with one or two lines. No call to action. No pitch. " +
+              "CRITICAL: Write this as three to four natural observations that flow into each other. Open the first one with a scene or a specific moment, never a summary. Do NOT use headers. Do NOT use bullet lists. Do NOT structure this as a newsletter with named sections. Each observation transitions naturally into the next. The real estate mention is one short paragraph near the end, treated as a casual aside — not a featured section. End with one or two lines. No call to action. No pitch. " +
               // Fixed 2026-09-29 per Mike: this list was backwards — [CITY]
               // was being replaced with the agent's NAME and [NAME] with the
               // agent's CITY, so every "Local Letter" style email came out
               // with the agent's DNA profile fields swapped. Order here must
               // match the [CITY], [NAME] order named just before it.
               `This should read like a personal note from someone who lives in ${agentCity} and noticed a few things worth sharing. If it reads like a newsletter when done, it is wrong. Replace all [CITY], [NAME] placeholders with ${agentCity} and ${agentName}.\n` +
-              "NO hyphens. NO corporate language. NO AI tell phrases. Standard capitalization always. " +
+              "NO hyphens, including in compound modifiers (well known, not well-known). NO corporate language. NO AI tell phrases. Standard capitalization always. " +
               (data.useEmojis ? "A couple of relevant emojis are welcome if they feel natural." : "NO emojis.") +
               learnedFeedback +
               "\n\nOutput format:\nSUBJECT OPTIONS:\n1. [subject]\n2. [subject]\n3. [subject]\n\nEMAIL BODY:\n[full email — reads like a note, not a newsletter]";
@@ -4814,8 +4831,8 @@ export const generateMonthlyBatch = createServerFn({ method: "POST" })
               `BRIEF TO FOLLOW:\n${instructions}\n\n` +
               // Same [CITY]/[NAME] swap fixed here (2026-09-29) — see the
               // Local Letter branch above for the full explanation.
-              `Write this email EXACTLY as ${agentName} would write it based on their Voice DNA above. Replace all [CITY], [NAME], [CITY, STATE] placeholders with ${agentCity} and ${agentName}.\n` +
-              "NO hyphens. NO corporate language. NO AI-tell phrases. Standard capitalization always. " +
+              `Write this email EXACTLY as ${agentName} would write it based on their Voice DNA above, open with a scene or a pain point rather than a summary, and write to ONE person, not an audience. Replace all [CITY], [NAME], [CITY, STATE] placeholders with ${agentCity} and ${agentName}.\n` +
+              "NO hyphens, including in compound modifiers (well known, not well-known). NO corporate language. NO AI-tell phrases. Standard capitalization always. " +
               (data.useEmojis ? "A couple of relevant emojis are welcome if they feel natural." : "NO emojis.") +
               learnedFeedback +
               "\n\n" +
@@ -4835,7 +4852,7 @@ export const generateMonthlyBatch = createServerFn({ method: "POST" })
             // — was the one place learnedFeedback never got folded in, so
             // reviewer-taught lessons silently never reached these emails
             // while post/video/the other two email branches always got them.
-            `Rules:\n- Do NOT rewrite or restructure this email\n- Replace [CITY], [NAME], [CITY, STATE] with ${agentCity} and ${agentName}\n- Fix any placeholder brackets that are still unfilled\n- NO hyphens. NO corporate language. Standard capitalization.\n` +
+            `Rules:\n- Do NOT rewrite or restructure this email\n- Replace [CITY], [NAME], [CITY, STATE] with ${agentCity} and ${agentName}\n- Fix any placeholder brackets that are still unfilled\n- NO hyphens, including in compound modifiers (well known, not well-known). NO corporate language. Standard capitalization.\n` +
             (data.useEmojis
               ? "- A couple of relevant emojis are welcome if they feel natural\n\n"
               : "- NO emojis\n\n") +
@@ -4896,7 +4913,7 @@ export const generateMonthlyBatch = createServerFn({ method: "POST" })
           `${vd.script}\n\n` +
           `Write a 60 second video script in ${agentName}'s voice. Format:\n` +
           "HOOK (first 3 seconds — grab attention):\n[hook line]\n\nBODY (main point, story, or insight):\n[15 to 45 seconds of content]\n\nCLOSE (natural ending, no hard sell):\n[closing line]\n\n" +
-          `Rules:\n- Sounds exactly like ${agentName} based on their Voice DNA\n- Written to be SPOKEN, not read — short sentences, natural pauses\n- NO hyphens, NO corporate language, NO AI phrases\n- Standard capitalization, never all lowercase\n- Real estate reminder energy — top of mind, not a pitch\n- 150 words maximum\n` +
+          `Rules:\n- The HOOK opens with a scene or a pain point, never a summary\n- Written to ONE person, not an audience\n- Sounds exactly like ${agentName} based on their Voice DNA\n- Written to be SPOKEN, not read — short sentences, natural pauses\n- NO hyphens, including in compound modifiers (well known, not well-known). NO corporate language, NO AI phrases\n- Standard capitalization, never all lowercase\n- Real estate reminder energy — top of mind, not a pitch\n- 150 words maximum\n` +
           (data.useEmojis
             ? "- A couple of relevant emojis in the on-screen text are welcome if they feel natural"
             : "- NO emojis") +

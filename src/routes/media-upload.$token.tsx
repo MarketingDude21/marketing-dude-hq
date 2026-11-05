@@ -45,11 +45,33 @@ export const Route = createFileRoute("/media-upload/$token")({
 // duplicated here rather than shared, matching this file's existing pattern
 // of small, self-contained helpers per route (e.g. MicButton) since this
 // page intentionally has no dependency on the authenticated Workspace code.
+// Same HEIC-aware normalization as MediaTab's own upload box (marketing.tsx)
+// — duplicated here rather than shared, matching this file's existing
+// pattern. UPDATED 2026-11-04 per Mike: "HEIC images do not display in media
+// center... convert ALL images regardless of their file type to a PNG or
+// JPEG." This public page is the most common source of iPhone HEIC uploads
+// (a client sharing photos straight from their Photos app), so it needed the
+// same fix as the admin side.
+const WEB_SAFE_IMAGE_TYPES = new Set(["image/jpeg", "image/png", "image/webp", "image/gif"]);
+
 async function resizeImage(file: File, maxEdge = 2000, quality = 0.85): Promise<File> {
-  const bitmap = await createImageBitmap(file).catch(() => null);
-  if (!bitmap) return file;
+  let source: File | Blob = file;
+  const looksHeic = file.type === "image/heic" || file.type === "image/heif" || /\.hei[cf]$/i.test(file.name);
+  if (looksHeic) {
+    try {
+      const heic2any = (await import("heic2any")).default;
+      const converted = await heic2any({ blob: file, toType: "image/jpeg", quality });
+      source = Array.isArray(converted) ? converted[0]! : converted;
+    } catch {
+      // Fall through — upload the original if conversion fails.
+    }
+  }
+  const bitmap = await createImageBitmap(source).catch(() => null);
+  if (!bitmap) {
+    return source === file ? file : new File([source], file.name.replace(/\.\w+$/, ".jpg"), { type: "image/jpeg" });
+  }
   const scale = Math.min(1, maxEdge / Math.max(bitmap.width, bitmap.height));
-  if (scale === 1) return file;
+  if (scale === 1 && source === file && WEB_SAFE_IMAGE_TYPES.has(file.type)) return file;
   const canvas = document.createElement("canvas");
   canvas.width = Math.round(bitmap.width * scale);
   canvas.height = Math.round(bitmap.height * scale);

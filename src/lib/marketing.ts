@@ -4017,6 +4017,11 @@ export const logPhotoScanToChat = createServerFn({ method: "POST" })
       sourceId: string;
       thumbnailUrl: string;
       fileName: string;
+      // Added 2026-11-06 for the text-overlay tool — ride-along suggestions
+      // from the same scan, not a separate call. metadata's column only
+      // stores string values (see ChatMessageRow), so this gets JSON-encoded
+      // below rather than given its own array column.
+      textOverlaySuggestions?: string[];
     }) => data,
   )
   .handler(async ({ data, context }): Promise<{ ok: true; message: ChatMessageRow }> => {
@@ -4035,6 +4040,7 @@ export const logPhotoScanToChat = createServerFn({ method: "POST" })
           sourceId: data.sourceId,
           thumbnailUrl: data.thumbnailUrl,
           fileName: data.fileName,
+          textOverlaySuggestions: JSON.stringify(data.textOverlaySuggestions ?? []),
         },
       })
       .select("id, role, content, mode, metadata, created_at")
@@ -5156,6 +5162,13 @@ export type PhotoScanSuggestion = {
   thumbnailUrl: string;
   description: string;
   suggestedPost: string;
+  // Short on-screen text overlay options for this photo — see
+  // TEXT_ON_SCREEN_FRAMEWORKS below. Added 2026-11-06 per Mike: he wants
+  // overlay-text suggestions surfaced specifically where the app already
+  // "watches" a photo/video to create content (this scan), not as a
+  // separate generation step — these ride along on the same vision call
+  // that already writes the caption, rather than a second Claude call.
+  textOverlaySuggestions: string[];
 };
 
 // Shared with scanAgentLibraryPhotos below — one Claude vision call per
@@ -5164,6 +5177,26 @@ export type PhotoScanSuggestion = {
 // every caller checks against the exact same list rather than duplicating it.
 const CLAUDE_SUPPORTED_IMAGE_TYPES = ["image/jpeg", "image/png", "image/gif", "image/webp"];
 
+// Mike's own VIRALISH course notes (`viralish-notes.md` in the project),
+// specifically the "Text On Screen Masterclass" section — the five named
+// frameworks for short on-screen text over a photo/B-roll clip, plus the
+// B.I.N.S. hook check. Added 2026-11-06, scoped down from the original
+// "text tool" scoping doc per Mike: "really the only thing we're asking for
+// is to add text... I like the formulas here to utilize... they're just
+// going to provide suggestions, and the user can go ahead and decide for
+// themselves." This is grounding text for the vision prompt below, not a
+// template to fill in — the model picks whichever framework actually fits
+// what it sees in the photo.
+const TEXT_ON_SCREEN_FRAMEWORKS =
+  "1. Relatable — the viewer sees themselves immediately through a shared experience or common habit. " +
+  'Example: "That 8 minute window where your coffee tastes like everything might just work out."\n' +
+  "2. Situational — drops the viewer straight into a specific, high stakes moment, often as short dialogue-style text. " +
+  'Example: "I got the job." / "You got lucky."\n' +
+  "3. Contextual — recontextualizes the photo as a metaphor for something bigger than what's literally in frame.\n" +
+  "4. Transformational and Invitational — promises a before/after or reveal, or gives the viewer something specific to do (comment, guess, participate).\n" +
+  "5. Controversial or Contrarian — a defensible stand against a common belief. Only use this if it's genuinely defensible, not empty bait.\n\n" +
+  "Before finalizing each one, run it through B.I.N.S. — does it feel Big, Easy, New, and Safe. Keep every line under 8 words, no hyphens.";
+
 async function captionPhotoInVoice(
   imageBytes: ArrayBuffer,
   mediaType: string,
@@ -5171,7 +5204,7 @@ async function captionPhotoInVoice(
   agentName: string | undefined,
   agentCity: string | undefined,
   voiceDna: string | undefined,
-): Promise<{ description: string; suggestedPost: string } | null> {
+): Promise<{ description: string; suggestedPost: string; textOverlaySuggestions: string[] } | null> {
   const base64 = Buffer.from(imageBytes).toString("base64");
   // FIXED (2026-09-30) — per Mike: "when I rescan image it gives error,"
   // screenshotted "Could not process image." Root cause: this used to
@@ -5226,14 +5259,18 @@ async function captionPhotoInVoice(
     "Look at this photo and write a social media post that:\n1. Starts from what you actually see — the setting, the mood, the moment\n2. Sounds EXACTLY like this person based on their Voice DNA above\n3. Is 1-3 sentences max — short, human, texted-a-friend energy\n4. Leans playful, funny, or personality-driven by default — treat this as a chance to make them look like a real person with a life, not a corporate agent. But always work in a light, natural reminder that " +
     `${agentName ?? "this person"} is in real estate — a quick aside, a joke, a callback, a one-liner — even when the photo has nothing to do with real estate (a coffee, a kid's game, a sunset). Keep the real estate nod small: a wink, never the whole point of the post, and never a pitch or a listing plug. If the photo IS an unmistakable real estate moment (a listing, a closing, a sign, a showing), let real estate be more central, same playful voice. Only skip the real estate nod entirely on the rare photo where working one in would be genuinely awkward or forced.\n` +
     '5. Does NOT mention any specific location, city, neighborhood, or place name\n6. NO hyphens, NO corporate language, NO AI-tell phrases, no "As a real estate professional" or any version of that\n7. Standard capitalization — never write in all lowercase\n\n' +
-    "Also describe what you see in the photo in one short sentence.\n\nOutput format:\nDESCRIPTION: [one sentence of what you see]\nPOST: [the social media caption]";
+    "Also describe what you see in the photo in one short sentence.\n\n" +
+    "Separately, this photo may end up as a Reel with short text overlaid on screen — write 3 short text-overlay options for it (not captions, just the on-screen text itself), each using a different one of these frameworks, whichever actually fit what you see in THIS photo:\n\n" +
+    `${TEXT_ON_SCREEN_FRAMEWORKS}\n\n` +
+    "These are suggestions only — the agent will pick, edit, or ignore them, so give real variety across the 3 rather than three versions of the same line.\n\n" +
+    "Output format:\nDESCRIPTION: [one sentence of what you see]\nPOST: [the social media caption]\nTEXT OVERLAYS:\n1. [short overlay line]\n2. [short overlay line]\n3. [short overlay line]";
 
   const res = await fetch("https://api.anthropic.com/v1/messages", {
     method: "POST",
     headers: { "Content-Type": "application/json", "x-api-key": anthropicKey, "anthropic-version": "2023-06-01" },
     body: JSON.stringify({
       model: "claude-haiku-4-5-20251001",
-      max_tokens: 300,
+      max_tokens: 450,
       messages: [
         {
           role: "user",
@@ -5252,10 +5289,28 @@ async function captionPhotoInVoice(
     .join("")
     .trim();
   const descMatch = raw.match(/DESCRIPTION:\s*(.+)/i);
-  const postMatch = raw.match(/POST:\s*([\s\S]+)/i);
+  // Stops at TEXT OVERLAYS: (non-greedy, lookahead) instead of the old
+  // greedy [\s\S]+ to end of string — otherwise POST would swallow the new
+  // overlay section below it.
+  const postMatch = raw.match(/POST:\s*([\s\S]+?)(?=\n\s*TEXT OVERLAYS:|$)/i);
+  const overlaysMatch = raw.match(/TEXT OVERLAYS:\s*([\s\S]+)/i);
+  const textOverlaySuggestions = overlaysMatch
+    ? overlaysMatch[1]!
+        .split("\n")
+        .map(
+          (line) =>
+            line
+              .replace(/^\s*\d+[.)]\s*/, "") // strip a leading "1. " / "1) "
+              .trim()
+              .replace(/^["'""]+|["'""]+$/g, ""), // strip wrapping quotes, if any
+        )
+        .filter(Boolean)
+        .slice(0, 3)
+    : [];
   return {
     description: descMatch ? descMatch[1]!.trim() : "Photo",
     suggestedPost: postMatch ? postMatch[1]!.trim() : raw,
+    textOverlaySuggestions,
   };
 }
 
@@ -5354,7 +5409,7 @@ export const scanAgentDrivePhotos = createServerFn({ method: "POST" })
               voiceDna,
             );
             if (!caption) return null;
-            const { description, suggestedPost } = caption;
+            const { description, suggestedPost, textOverlaySuggestions } = caption;
             // The raw drive.google.com/thumbnail hotlink 403s now that
             // folders are privately shared with one OAuth account instead of
             // "anyone with the link" (same root cause as the picker-grid fix
@@ -5374,6 +5429,7 @@ export const scanAgentDrivePhotos = createServerFn({ method: "POST" })
               thumbnailUrl,
               description,
               suggestedPost,
+              textOverlaySuggestions,
             };
           } catch {
             return null;
@@ -5456,6 +5512,7 @@ export const scanAgentLibraryPhotos = createServerFn({ method: "POST" })
             thumbnailUrl: p.url!,
             description: caption.description,
             suggestedPost: caption.suggestedPost,
+            textOverlaySuggestions: caption.textOverlaySuggestions,
           };
         } catch {
           return null;

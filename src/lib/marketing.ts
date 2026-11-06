@@ -226,7 +226,16 @@ export type PostMetadata = {
   // own photos. See the ReelPhoto type and the addReelPhotoFrom.../
   // updateReelPhotoInstructions/removeReelPhoto functions below.
   reel_photos?: ReelPhoto[] | undefined;
-  [key: string]: string | number | boolean | null | undefined | EmailPhoto[] | ReelPhoto[];
+  // The AI's suggested on-screen-text lines for this post's photo/video,
+  // carried over from the Scan My Photos chat bubble that created it (see
+  // captionPhotoInVoice) — added 2026-11-06 alongside moving the text-overlay
+  // EDITOR itself into the Content Calendar (TextOverlayEditor, marketing.tsx)
+  // so those suggestions aren't lost now that the editor no longer opens
+  // right there in the chat thread. Empty/absent just means no suggestions
+  // (e.g. the post's photo didn't come from a scan) — the editor still works
+  // fine with a blank line to type into.
+  text_overlay_suggestions?: string[] | undefined;
+  [key: string]: string | number | boolean | null | undefined | EmailPhoto[] | ReelPhoto[] | string[];
 };
 
 // Fixed tag vocabulary for the native Media library, ported from the old
@@ -5539,6 +5548,9 @@ export const addPhotoPostsToBatch = createServerFn({ method: "POST" })
         source: "drive" | "library";
         sourceId: string;
         thumbnailUrl: string;
+        // Carried through so the post keeps its scan-time overlay suggestions
+        // for the Content Calendar's text editor — see PostMetadata.text_overlay_suggestions.
+        textOverlaySuggestions?: string[] | undefined;
       }[];
     }) => data,
   )
@@ -5563,6 +5575,7 @@ export const addPhotoPostsToBatch = createServerFn({ method: "POST" })
               drive_file_id: item.sourceId,
               drive_thumbnail_url: item.thumbnailUrl,
               drive_download_url: driveDownloadUrl(item.sourceId),
+              text_overlay_suggestions: item.textOverlaySuggestions ?? [],
             }
           : {
               batch_id: data.batchId ?? null,
@@ -5571,6 +5584,7 @@ export const addPhotoPostsToBatch = createServerFn({ method: "POST" })
               media_id: item.sourceId,
               media_url: item.thumbnailUrl,
               media_type: "image",
+              text_overlay_suggestions: item.textOverlaySuggestions ?? [],
             },
     }));
     const { error } = await supabaseAdmin.from("generated_posts").insert(rows);
@@ -5873,4 +5887,262 @@ export const sendContentToAgent = createServerFn({ method: "POST" })
     const ghlMessageId =
       emailData.emailMessageId ?? emailData.messageId ?? emailData.id ?? emailData.conversationId ?? null;
     return { ok: true, ghlMessageId };
+  });
+
+// ---------------------------------------------------------------------------
+// Video text-overlay rendering (Shotstack) — added 2026-11-06 alongside the
+// photo text tool's upgrade to drag-and-drop placement and its move into the
+// Content Calendar. Burning text into a PHOTO is free and instant (plain
+// <canvas>, see compositeTextOnPhoto in marketing.tsx) because a still image
+// is just pixels this app can draw on directly in the browser. A VIDEO is
+// not — actually encoding text into video frames needs a real video encoder,
+// and this app deploys through Lovable onto Cloudflare's edge runtime (see
+// vite.config.ts — nitro's "cloudflare" target), which can't run ffmpeg or
+// spawn any process at all. So this calls out to Shotstack (shotstack.io), a
+// hosted video-rendering API built for exactly this: send it a background
+// video plus a timeline of text clips, get back a finished, text-baked-in
+// mp4. Needs SHOTSTACK_API_KEY in Lovable Cloud → Secrets (free sandbox
+// signup at shotstack.io) and, once ready for real client-facing
+// (unwatermarked) output, SHOTSTACK_ENV=v1 on a paid plan — it defaults to
+// "stage," their free sandbox, which WATERMARKS every render.
+//
+// This is the one piece of this build that couldn't be fully tested
+// end-to-end here, since it needs a real Shotstack account/API key this
+// session never had access to (and never will — creating accounts on
+// someone else's behalf isn't something this assistant does). The request
+// shape below matches Shotstack's own documented Edit API (timeline/tracks/
+// clips, html-asset text overlays, the position+offset positioning model),
+// but the very first real render should be treated as a test: check the
+// output's timing, text position, and quality against what the editor
+// previewed before trusting it for client-facing content.
+const MAX_VIDEO_TEXT_SEGMENTS = 5;
+
+type VideoTextSegmentInput = {
+  text: string;
+  startSec: number;
+  endSec: number;
+  // 0-100, percentage position within the frame — matches the drag-and-drop
+  // editor in marketing.tsx exactly; converted below to Shotstack's 9-anchor
+  // + fractional-offset positioning model.
+  xPct: number;
+  yPct: number;
+};
+
+function shotstackBase(): string {
+  const env = (process.env["SHOTSTACK_ENV"] ?? "stage").trim() || "stage";
+  return `https://api.shotstack.io/${env}`;
+}
+
+function shotstackKey(): string {
+  const key = process.env["SHOTSTACK_API_KEY"]?.trim();
+  if (!key) {
+    throw new Error(
+      'Video text rendering isn\'t connected yet — add SHOTSTACK_API_KEY in Lovable Cloud → Secrets (free sandbox account at shotstack.io). Renders will carry a watermark until SHOTSTACK_ENV is also set to "v1" on a paid plan.',
+    );
+  }
+  return key;
+}
+
+// Shotstack positions a clip at one of 9 named anchors, then nudges it with a
+// small fractional offset — not a free x/y the way the editor's drag UI
+// works. This picks the nearest anchor by which third of the frame the
+// dropped point landed in, then expresses the remaining distance from that
+// anchor's nominal center as the same kind of small fraction Shotstack's own
+// examples use (roughly -0.5 to 0.5).
+const SHOTSTACK_POSITIONS: Record<string, string> = {
+  "top,left": "topLeft",
+  "top,center": "top",
+  "top,right": "topRight",
+  "center,left": "left",
+  "center,center": "center",
+  "center,right": "right",
+  "bottom,left": "bottomLeft",
+  "bottom,center": "bottom",
+  "bottom,right": "bottomRight",
+};
+
+function toShotstackPosition(xPct: number, yPct: number): { position: string; offset: { x: number; y: number } } {
+  const col = xPct < 33 ? "left" : xPct > 67 ? "right" : "center";
+  const row = yPct < 33 ? "top" : yPct > 67 ? "bottom" : "center";
+  const position = SHOTSTACK_POSITIONS[`${row},${col}`] ?? "center";
+  const anchorX = col === "left" ? 10 : col === "right" ? 90 : 50;
+  const anchorY = row === "top" ? 10 : row === "bottom" ? 90 : 50;
+  return { position, offset: { x: (xPct - anchorX) / 100, y: (yPct - anchorY) / 100 } };
+}
+
+// Matches the two looks the photo tool already offers (see
+// compositeTextOnPhoto) as closely as an html/css overlay clip can.
+function shotstackTextAsset(text: string, style: "white" | "box") {
+  const escaped = text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  const css =
+    style === "box"
+      ? "p { font-family: Arial, sans-serif; font-weight: 800; font-size: 54px; color: #15171c; background: rgba(255,255,255,0.95); border-radius: 10px; padding: 0.3em 0.6em; display: inline-block; text-align: center; }"
+      : "p { font-family: Arial, sans-serif; font-weight: 800; font-size: 54px; color: #ffffff; text-shadow: 0 2px 10px rgba(0,0,0,0.85); text-align: center; }";
+  return { type: "html" as const, html: `<p>${escaped}</p>`, css, width: 900, height: 300 };
+}
+
+// Step 1: submits the render job and returns immediately with Shotstack's
+// render id — deliberately NOT a long-blocking call that polls until done.
+// This app's Cloudflare Workers hosting can wait on an outbound fetch much
+// longer than it can burn CPU time, but keeping every individual request
+// short and simple is the safer bet, especially for a first-time
+// integration with a service this session couldn't test rendering against
+// directly. The client polls checkVideoTextRenderStatus below instead.
+export const submitVideoTextRender = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator(
+    (data: {
+      agentId: string;
+      videoUrl: string;
+      videoDurationSec: number;
+      style: "white" | "box";
+      segments: VideoTextSegmentInput[];
+    }) => data,
+  )
+  .handler(async ({ data, context }): Promise<{ renderId: string }> => {
+    const email = (context.claims as { email?: string } | undefined)?.email;
+    await requireAgentAccess(context.userId, email, data.agentId);
+
+    if (!data.segments.length) throw new Error("Add at least one text block before rendering.");
+    if (data.segments.length > MAX_VIDEO_TEXT_SEGMENTS) {
+      throw new Error(`Up to ${MAX_VIDEO_TEXT_SEGMENTS} text blocks at a time, for now.`);
+    }
+    const duration = Math.max(0.5, data.videoDurationSec);
+    for (const seg of data.segments) {
+      if (!seg.text.trim()) throw new Error("Every text block needs some text.");
+      if (seg.startSec < 0 || seg.endSec > duration + 0.25 || seg.endSec <= seg.startSec) {
+        throw new Error("A text block's timing doesn't fit within this video.");
+      }
+    }
+
+    const key = shotstackKey();
+    const base = shotstackBase();
+
+    const textTracks = data.segments.map((seg) => {
+      const { position, offset } = toShotstackPosition(seg.xPct, seg.yPct);
+      return {
+        clips: [
+          {
+            asset: shotstackTextAsset(seg.text.trim(), data.style),
+            start: Math.round(seg.startSec * 100) / 100,
+            length: Math.round((seg.endSec - seg.startSec) * 100) / 100,
+            position,
+            offset,
+          },
+        ],
+      };
+    });
+
+    const body = {
+      timeline: {
+        tracks: [
+          ...textTracks,
+          {
+            clips: [
+              {
+                asset: { type: "video", src: data.videoUrl },
+                start: 0,
+                length: Math.round(duration * 100) / 100,
+              },
+            ],
+          },
+        ],
+      },
+      // Deliberately no explicit resolution/aspectRatio override — the
+      // editor's drag positions are captured against the source video's own
+      // native frame (see TextOverlayEditor, marketing.tsx), so letting
+      // Shotstack's output follow the background clip's own dimensions keeps
+      // those coordinates meaning the same thing on both sides. Forcing a
+      // different output shape (e.g. a vertical 9:16 crop) would need the
+      // editor's preview to crop/letterbox to match first, or text could
+      // land in a different spot than previewed.
+      output: { format: "mp4" },
+    };
+
+    const res = await fetch(`${base}/render`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "x-api-key": key },
+      body: JSON.stringify(body),
+    });
+    const bodyText = await res.text();
+    let json: { response?: { id?: string; message?: string }; message?: string };
+    try {
+      json = JSON.parse(bodyText);
+    } catch {
+      throw new Error(`Shotstack returned an unexpected response (status ${res.status}): ${bodyText.slice(0, 200)}`);
+    }
+    if (!res.ok || !json.response?.id) {
+      throw new Error(
+        json.response?.message ?? json.message ?? `Shotstack render request failed (status ${res.status}).`,
+      );
+    }
+    return { renderId: json.response.id };
+  });
+
+// Step 2: one quick, cheap status check — called repeatedly from the client
+// on a timer while the editor shows a "Rendering…" state. Shotstack's
+// documented statuses include queued/fetching/rendering/saving/done/failed.
+export const checkVideoTextRenderStatus = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator((data: { agentId: string; renderId: string }) => data)
+  .handler(async ({ data, context }): Promise<{ status: string; url: string | null; error: string | null }> => {
+    const email = (context.claims as { email?: string } | undefined)?.email;
+    await requireAgentAccess(context.userId, email, data.agentId);
+    const key = shotstackKey();
+    const base = shotstackBase();
+    const res = await fetch(`${base}/render/${data.renderId}`, { headers: { "x-api-key": key } });
+    const bodyText = await res.text();
+    let json: { response?: { status?: string; url?: string; error?: string } };
+    try {
+      json = JSON.parse(bodyText);
+    } catch {
+      throw new Error(
+        `Shotstack returned an unexpected response (status ${res.status}) while checking render progress.`,
+      );
+    }
+    if (!res.ok) throw new Error(`Couldn't check render progress (status ${res.status}).`);
+    return {
+      status: json.response?.status ?? "unknown",
+      url: json.response?.url ?? null,
+      error: json.response?.error ?? null,
+    };
+  });
+
+// Step 3: once status is "done," pulls the finished mp4 into this app's own
+// Supabase storage (rather than pointing the post at Shotstack's own output
+// URL indefinitely — every other piece of media in this app lives in our
+// Storage, and Shotstack's hosted output isn't guaranteed to stay around
+// forever) and records it exactly like any other uploaded video.
+export const finalizeVideoTextRender = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator((data: { agentId: string; outputUrl: string; caption?: string }) => data)
+  .handler(async ({ data, context }): Promise<{ ok: true; id: string; url: string }> => {
+    const email = (context.claims as { email?: string } | undefined)?.email;
+    await requireAgentAccess(context.userId, email, data.agentId);
+    const res = await fetch(data.outputUrl);
+    if (!res.ok) throw new Error("Couldn't download the rendered video from Shotstack.");
+    const bytes = new Uint8Array(await res.arrayBuffer());
+    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+    const path = `${data.agentId}/${crypto.randomUUID()}-text-overlay.mp4`;
+    const { error: uploadErr } = await supabaseAdmin.storage
+      .from("media")
+      .upload(path, bytes, { contentType: "video/mp4" });
+    if (uploadErr) throw uploadErr;
+    const { data: pub } = supabaseAdmin.storage.from("media").getPublicUrl(path);
+    const { data: row, error } = await supabaseAdmin
+      .from("agent_photos")
+      .insert({
+        agent_id: data.agentId,
+        url: pub.publicUrl,
+        storage_path: path,
+        media_type: "video",
+        source: "upload",
+        status: "available",
+        caption: data.caption ?? null,
+        tags: [],
+      })
+      .select("id")
+      .single();
+    if (error) throw error;
+    return { ok: true, id: row.id, url: pub.publicUrl };
   });

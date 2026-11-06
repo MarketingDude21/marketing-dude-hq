@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { createFileRoute } from "@tanstack/react-router";
 import { AppShell } from "@/components/AppShell";
+import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { supabase } from "@/integrations/supabase/client";
 import {
   getMarketingAccess,
@@ -66,6 +67,9 @@ import {
   logPhotoScanToChat,
   getReviewLink,
   regenerateReviewLink,
+  submitVideoTextRender,
+  checkVideoTextRenderStatus,
+  finalizeVideoTextRender,
   type MarketingAccess,
   type MediaRow,
   type DriveFile,
@@ -1084,13 +1088,19 @@ function ChatMessageBubble({ msg, agentId, onSaved }: { msg: ChatMessageRow; age
     sourceId?: string;
     textOverlaySuggestions?: string;
   };
+  // Parsed back out here only to hand to addPhotoPostsToBatch below so the
+  // suggestions survive onto the post itself (PostMetadata.text_overlay_
+  // suggestions) — the actual "Add text" tool no longer lives on this bubble
+  // (2026-11-06, see TextOverlayEditor): it's reachable from the Content
+  // Calendar once this is saved as a post, per Mike: "take it out of the
+  // media library... it should be done right inside the content calendar."
   let overlaySuggestions: string[] = [];
   try {
     const parsed = meta.textOverlaySuggestions ? JSON.parse(meta.textOverlaySuggestions) : [];
     if (Array.isArray(parsed)) overlaySuggestions = parsed.filter((s): s is string => typeof s === "string");
   } catch {
     // Old messages logged before this field existed, or anything malformed
-    // — just show no suggestions rather than breaking the bubble.
+    // — just carry over no suggestions rather than breaking the bubble.
   }
 
   async function saveAsPost() {
@@ -1109,6 +1119,7 @@ function ChatMessageBubble({ msg, agentId, onSaved }: { msg: ChatMessageRow; age
                 source: meta.source,
                 sourceId: meta.sourceId,
                 thumbnailUrl: meta.thumbnailUrl ?? "",
+                textOverlaySuggestions: overlaySuggestions,
               },
             ],
           },
@@ -1131,8 +1142,6 @@ function ChatMessageBubble({ msg, agentId, onSaved }: { msg: ChatMessageRow; age
     }
   }
 
-  const [overlayOpen, setOverlayOpen] = useState(false);
-
   return (
     <div className={`flex ${isAssistant ? "justify-start" : "justify-end"}`}>
       <div
@@ -1151,179 +1160,14 @@ function ChatMessageBubble({ msg, agentId, onSaved }: { msg: ChatMessageRow; age
                 {saving ? "Saving…" : "Save as draft post"}
               </Button>
             ) : (
-              <span className="text-xs font-semibold text-primary">Saved — review it below</span>
-            )}
-            {/* "Add text" tool — photo_scan messages only, since this is
-                specifically wired into the scan flow per Mike (2026-11-06),
-                not a separate standalone entry point. */}
-            {isPhotoScan && meta.thumbnailUrl && (
-              <Button variant="secondary" onClick={() => setOverlayOpen((v) => !v)}>
-                {overlayOpen ? "Close text tool" : "Add text to this photo"}
-              </Button>
+              <span className="text-xs font-semibold text-primary">
+                Saved — add text to it from the Content Calendar below
+              </span>
             )}
           </div>
         )}
         {error && <p className="mt-1 text-xs text-destructive">{error}</p>}
-        {overlayOpen && meta.thumbnailUrl && (
-          <TextOverlayPanel
-            agentId={agentId}
-            imageUrl={meta.thumbnailUrl}
-            suggestions={overlaySuggestions}
-            onClose={() => setOverlayOpen(false)}
-          />
-        )}
       </div>
-    </div>
-  );
-}
-
-// The "add text to a photo" tool itself — opened from a photo_scan chat
-// bubble above. Deliberately simple per Mike (2026-11-06): pick or write a
-// line, pick one of two looks, save. No position picker, no multiple text
-// blocks, no cropping/filters — "we're not trying to do anything fancy,"
-// just text on the photo, saved so it's ready to drop straight into a Reel
-// (or any other post) from the Media Library like any other photo, without
-// ever leaving the app.
-function TextOverlayPanel({
-  agentId,
-  imageUrl,
-  suggestions,
-  onClose,
-  onSaved,
-}: {
-  agentId: string;
-  imageUrl: string;
-  suggestions: string[];
-  onClose: () => void;
-  // Optional — lets a caller that keeps its own list of photos (the Media
-  // tab) refresh it once the new texted photo lands, instead of the agent
-  // having to leave and come back to see it.
-  onSaved?: () => void;
-}) {
-  const [text, setText] = useState(suggestions[0] ?? "");
-  const [style, setStyle] = useState<TextOverlayStyle>("white");
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const [savedUrl, setSavedUrl] = useState<string | null>(null);
-
-  async function save() {
-    const trimmed = text.trim();
-    if (!trimmed) return;
-    setBusy(true);
-    setError(null);
-    try {
-      const blob = await compositeTextOnPhoto(imageUrl, trimmed, style);
-      const file = new File([blob], "text-overlay.jpg", { type: "image/jpeg" });
-      const { path, token } = await createMediaUploadUrl({ data: { agentId, fileName: file.name } });
-      const { error: uploadErr } = await supabase.storage.from("media").uploadToSignedUrl(path, token, file);
-      if (uploadErr) throw uploadErr;
-      await finalizeMediaUpload({ data: { agentId, storagePath: path, mediaType: "photo", caption: trimmed } });
-      setSavedUrl(path);
-      onSaved?.();
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  if (savedUrl) {
-    return (
-      <div className="mt-3 rounded-xl border border-border bg-background/40 p-3 text-xs">
-        <p className="font-semibold text-primary">Saved to your Media Library.</p>
-        <p className="mt-1 text-muted-foreground">
-          It's ready to pick from the Library next time you're building a Reel or any other post.
-        </p>
-        <div className="mt-2">
-          <Button variant="secondary" onClick={onClose}>
-            Done
-          </Button>
-        </div>
-      </div>
-    );
-  }
-
-  return (
-    <div className="mt-3 rounded-xl border border-border bg-background/40 p-3">
-      <div className="relative overflow-hidden rounded-lg bg-muted">
-        <img src={imageUrl} alt="" className="block max-h-64 w-full object-contain" />
-        <div
-          className="pointer-events-none absolute inset-x-0 flex items-center justify-center px-4 text-center"
-          style={{ top: "12%", bottom: "28%" }}
-        >
-          <span
-            className="whitespace-pre-wrap text-lg font-extrabold leading-tight"
-            style={
-              style === "white"
-                ? { color: "#fff", textShadow: "0 2px 6px rgba(0,0,0,0.85)" }
-                : {
-                    color: "#15171c",
-                    background: "rgba(255,255,255,0.95)",
-                    borderRadius: "6px",
-                    padding: "0.25em 0.5em",
-                  }
-            }
-          >
-            {text || " "}
-          </span>
-        </div>
-      </div>
-
-      {suggestions.length > 0 && (
-        <div className="mt-3 flex flex-wrap gap-1.5">
-          {suggestions.map((s, i) => (
-            <button
-              key={i}
-              onClick={() => setText(s)}
-              className={`rounded-full border px-3 py-1 text-xs transition-colors ${
-                text === s
-                  ? "border-primary bg-primary/10 text-primary"
-                  : "border-border bg-glass text-muted-foreground hover:text-foreground"
-              }`}
-            >
-              {s}
-            </button>
-          ))}
-        </div>
-      )}
-
-      <AutoResizeTextarea
-        value={text}
-        onChange={setText}
-        minHeightPx={44}
-        placeholder="Text to overlay on the photo…"
-        className="mt-2 w-full rounded-xl border border-border bg-glass px-3 py-2 text-sm outline-none"
-      />
-
-      <div className="mt-2 flex items-center gap-2">
-        <span className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">Style</span>
-        <button
-          onClick={() => setStyle("white")}
-          className={`rounded-full border px-3 py-1 text-xs transition-colors ${
-            style === "white" ? "border-primary bg-primary/10 text-primary" : "border-border text-muted-foreground"
-          }`}
-        >
-          White text
-        </button>
-        <button
-          onClick={() => setStyle("box")}
-          className={`rounded-full border px-3 py-1 text-xs transition-colors ${
-            style === "box" ? "border-primary bg-primary/10 text-primary" : "border-border text-muted-foreground"
-          }`}
-        >
-          Dark on box
-        </button>
-      </div>
-
-      <div className="mt-3 flex items-center gap-2">
-        <Button onClick={save} disabled={busy || !text.trim()}>
-          {busy ? "Saving…" : "Save to Media Library"}
-        </Button>
-        <Button variant="secondary" onClick={onClose} disabled={busy}>
-          Cancel
-        </Button>
-      </div>
-      {error && <p className="mt-2 text-xs text-destructive">{error}</p>}
     </div>
   );
 }
@@ -1709,6 +1553,38 @@ function EmailPhotosPanel({
     }
   }
 
+  // The text-overlay editor's entry point for this panel — pencil icon on
+  // each tile, library-sourced photos/videos only (2026-11-06). Drive/
+  // Unsplash-sourced items aren't offered here: compositeTextOnPhoto draws
+  // the image onto a <canvas> client-side, which needs the source to allow
+  // anonymous cross-origin reads, and a Drive hotlink generally doesn't —
+  // same reason the tool was always Library-only even before this move.
+  // Removes the old entry first, then adds the new one, so a panel already
+  // at MAX_PHOTOS doesn't transiently exceed it mid-swap; carries the old
+  // entry's publishing instructions over to the new one.
+  const [editingPhotoId, setEditingPhotoId] = useState<string | null>(null);
+
+  async function replacePhoto(old: EmailPhoto, result: { id: string; url: string }) {
+    setBusy(true);
+    setError(null);
+    try {
+      await removeEmailPhoto({ data: { agentId, postId: post.id, photoId: old.id } });
+      const added = await addEmailPhotoFromLibrary({ data: { agentId, postId: post.id, mediaId: result.id } });
+      const newEntry = added.photos[added.photos.length - 1];
+      if (newEntry && old.publishingInstructions.trim()) {
+        await updateEmailPhotoInstructions({
+          data: { agentId, postId: post.id, photoId: newEntry.id, publishingInstructions: old.publishingInstructions },
+        });
+      }
+      setEditingPhotoId(null);
+      onChanged();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
   async function removeLegacyPhoto() {
     setBusy(true);
     setError(null);
@@ -1799,20 +1675,31 @@ function EmailPhotosPanel({
                   className="mt-2 min-h-[50px] w-full rounded-lg border border-border bg-glass px-2 py-1.5 text-xs outline-none"
                   disabled={busy}
                 />
-                <div className="mt-1 flex items-center justify-between gap-2">
-                  {p.url && (
-                    <button
-                      onClick={() =>
-                        downloadRemoteFile(
-                          displayUrl ?? p.url!,
-                          displayUrl?.startsWith("data:") ? "photo.jpg" : p.url!.split("/").pop() || `${p.id}`,
-                        )
-                      }
-                      className="text-[11px] font-semibold text-muted-foreground hover:text-foreground hover:underline"
-                    >
-                      ⬇ Download
-                    </button>
-                  )}
+                <div className="mt-1 flex flex-wrap items-center justify-between gap-2">
+                  <div className="flex items-center gap-2">
+                    {p.url && (
+                      <button
+                        onClick={() =>
+                          downloadRemoteFile(
+                            displayUrl ?? p.url!,
+                            displayUrl?.startsWith("data:") ? "photo.jpg" : p.url!.split("/").pop() || `${p.id}`,
+                          )
+                        }
+                        className="text-[11px] font-semibold text-muted-foreground hover:text-foreground hover:underline"
+                      >
+                        ⬇ Download
+                      </button>
+                    )}
+                    {p.source === "library" && (
+                      <button
+                        onClick={() => setEditingPhotoId(p.id)}
+                        disabled={busy}
+                        className="text-[11px] font-semibold text-muted-foreground hover:text-foreground hover:underline disabled:opacity-50"
+                      >
+                        ✏️ Edit
+                      </button>
+                    )}
+                  </div>
                   <button
                     onClick={() => removePhoto(p.id)}
                     disabled={busy}
@@ -1821,6 +1708,16 @@ function EmailPhotosPanel({
                     Remove photo
                   </button>
                 </div>
+                {editingPhotoId === p.id && (
+                  <TextOverlayEditor
+                    agentId={agentId}
+                    mediaUrl={p.url}
+                    mediaType={p.mediaType === "video" ? "video" : "photo"}
+                    suggestions={[]}
+                    onClose={() => setEditingPhotoId(null)}
+                    onReplaced={(result) => replacePhoto(p, result)}
+                  />
+                )}
               </div>
             );
           })}
@@ -2230,6 +2127,31 @@ function ReelPhotosPanel({
     }
   }
 
+  // Same text-overlay entry point and library-only gating as
+  // EmailPhotosPanel's equivalent above — see its comment for why.
+  const [editingPhotoId, setEditingPhotoId] = useState<string | null>(null);
+
+  async function replacePhoto(old: ReelPhoto, result: { id: string; url: string }) {
+    setBusy(true);
+    setError(null);
+    try {
+      await removeReelPhoto({ data: { agentId, postId: post.id, photoId: old.id } });
+      const added = await addReelPhotoFromLibrary({ data: { agentId, postId: post.id, mediaId: result.id } });
+      const newEntry = added.photos[added.photos.length - 1];
+      if (newEntry && old.publishingInstructions.trim()) {
+        await updateReelPhotoInstructions({
+          data: { agentId, postId: post.id, photoId: newEntry.id, publishingInstructions: old.publishingInstructions },
+        });
+      }
+      setEditingPhotoId(null);
+      onChanged();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
   async function removeLegacyPhoto() {
     setBusy(true);
     setError(null);
@@ -2309,20 +2231,31 @@ function ReelPhotosPanel({
                   className="mt-2 min-h-[50px] w-full rounded-lg border border-border bg-glass px-2 py-1.5 text-xs outline-none"
                   disabled={busy}
                 />
-                <div className="mt-1 flex items-center justify-between gap-2">
-                  {p.url && (
-                    <button
-                      onClick={() =>
-                        downloadRemoteFile(
-                          displayUrl ?? p.url!,
-                          displayUrl?.startsWith("data:") ? "photo.jpg" : p.url!.split("/").pop() || `${p.id}`,
-                        )
-                      }
-                      className="text-[11px] font-semibold text-muted-foreground hover:text-foreground hover:underline"
-                    >
-                      ⬇ Download
-                    </button>
-                  )}
+                <div className="mt-1 flex flex-wrap items-center justify-between gap-2">
+                  <div className="flex items-center gap-2">
+                    {p.url && (
+                      <button
+                        onClick={() =>
+                          downloadRemoteFile(
+                            displayUrl ?? p.url!,
+                            displayUrl?.startsWith("data:") ? "photo.jpg" : p.url!.split("/").pop() || `${p.id}`,
+                          )
+                        }
+                        className="text-[11px] font-semibold text-muted-foreground hover:text-foreground hover:underline"
+                      >
+                        ⬇ Download
+                      </button>
+                    )}
+                    {p.source === "library" && (
+                      <button
+                        onClick={() => setEditingPhotoId(p.id)}
+                        disabled={busy}
+                        className="text-[11px] font-semibold text-muted-foreground hover:text-foreground hover:underline disabled:opacity-50"
+                      >
+                        ✏️ Edit
+                      </button>
+                    )}
+                  </div>
                   <button
                     onClick={() => removePhoto(p.id)}
                     disabled={busy}
@@ -2331,6 +2264,16 @@ function ReelPhotosPanel({
                     Remove photo
                   </button>
                 </div>
+                {editingPhotoId === p.id && (
+                  <TextOverlayEditor
+                    agentId={agentId}
+                    mediaUrl={p.url}
+                    mediaType={p.mediaType === "video" ? "video" : "photo"}
+                    suggestions={[]}
+                    onClose={() => setEditingPhotoId(null)}
+                    onReplaced={(result) => replacePhoto(p, result)}
+                  />
+                )}
               </div>
             );
           })}
@@ -2619,6 +2562,26 @@ function PostCard({
   // that has a photo attached at all, however that photo got there.
   const [regenerating, setRegenerating] = useState(false);
   const hasRescannablePhoto = !!(post.metadata?.drive_file_id || post.metadata?.media_url);
+  // Text-overlay editor entry point for a plain post's single photo/video —
+  // library/Unsplash-sourced only, same reasoning as EmailPhotosPanel's
+  // equivalent (compositeTextOnPhoto needs anonymous-CORS-friendly source
+  // images, which a Drive hotlink generally isn't). Saving just points this
+  // post at the new derived media via the same setPostMedia the picker
+  // already uses — no new "replace" endpoint needed.
+  const [editingPhotoOpen, setEditingPhotoOpen] = useState(false);
+  async function replaceSinglePhoto(result: { id: string; url: string }) {
+    setBusy(true);
+    setSaveError(null);
+    try {
+      await setPostMedia({ data: { agentId, postId: post.id, mediaId: result.id } });
+      setEditingPhotoOpen(false);
+      onChanged();
+    } catch (e) {
+      setSaveError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
 
   useEffect(() => {
     setDraft(post.content);
@@ -2915,7 +2878,22 @@ function PostCard({
                   {regenerating ? "Rescanning…" : "Rescan this photo"}
                 </Button>
               )}
+              {photoUrl && !driveFileId && (
+                <Button variant="secondary" onClick={() => setEditingPhotoOpen(true)} disabled={busy}>
+                  ✏️ Edit
+                </Button>
+              )}
             </div>
+            {editingPhotoOpen && photoUrl && (
+              <TextOverlayEditor
+                agentId={agentId}
+                mediaUrl={displayPhotoUrl ?? photoUrl}
+                mediaType={post.metadata?.media_type === "video" ? "video" : "photo"}
+                suggestions={post.metadata?.text_overlay_suggestions ?? []}
+                onClose={() => setEditingPhotoOpen(false)}
+                onReplaced={replaceSinglePhoto}
+              />
+            )}
 
             {/* RELOCATED 2026-09-30 per Mike, pointing at a screenshot with
                 an arrow at this exact spot: "the photos, when you click
@@ -3345,13 +3323,18 @@ async function resizeImage(file: File, maxEdge = 2000, quality = 0.85): Promise<
 type TextOverlayStyle = "white" | "box";
 
 // Draws simple, bold text onto a photo, entirely client-side via canvas —
-// same no-library approach as resizeImage above. Per Mike (2026-11-06):
-// "really the only thing we're asking for is to add text... we're not
-// trying to do anything fancy" — so this is deliberately plain: two style
-// presets, one fixed safe placement (clear of Instagram's own header at
-// the top and the caption/audio strip at the bottom — see the scoping
-// doc's placement research), no drag-to-position, no multiple text blocks.
-async function compositeTextOnPhoto(imageUrl: string, text: string, style: TextOverlayStyle): Promise<Blob> {
+// same no-library approach as resizeImage above. Originally (2026-11-06)
+// this used one fixed safe placement; WIDENED the same day per Mike's
+// Canva-style request ("we need to be able to drag and drop the text...
+// wherever we want on the photo") to a free x/y position the editor's drag
+// UI controls, passed in as xPct/yPct (0-100, where 50/50 is dead center).
+async function compositeTextOnPhoto(
+  imageUrl: string,
+  text: string,
+  style: TextOverlayStyle,
+  xPct: number,
+  yPct: number,
+): Promise<Blob> {
   const img = new Image();
   img.crossOrigin = "anonymous";
   await new Promise<void>((resolve, reject) => {
@@ -3395,13 +3378,12 @@ async function compositeTextOnPhoto(imageUrl: string, text: string, style: TextO
   if (line) lines.push(line);
   if (!lines.length) lines.push(text.trim() || " ");
 
-  // Safe band: clear of the Reels header (~top 10%) and the caption/audio
-  // strip + action icons (~bottom 25%) — centered within what's left.
-  const safeTop = height * 0.12;
-  const safeBottom = height * 0.72;
-  const bandCenterY = (safeTop + safeBottom) / 2;
+  // Free placement — wherever the editor's drag handle was dropped, clamped
+  // a little so even a corner drop doesn't push text fully off-canvas.
+  const centerX = width * (Math.min(95, Math.max(5, xPct)) / 100);
+  const centerY = height * (Math.min(95, Math.max(5, yPct)) / 100);
   const totalTextHeight = lines.length * lineHeight;
-  const startY = bandCenterY - totalTextHeight / 2 + lineHeight / 2;
+  const startY = centerY - totalTextHeight / 2 + lineHeight / 2;
 
   if (style === "box") {
     const maxMeasured = Math.max(...lines.map((l) => ctx.measureText(l).width));
@@ -3409,7 +3391,7 @@ async function compositeTextOnPhoto(imageUrl: string, text: string, style: TextO
     const padY = fontSize * 0.35;
     const boxW = maxMeasured + padX * 2;
     const boxH = totalTextHeight + padY * 2;
-    const boxX = width / 2 - boxW / 2;
+    const boxX = centerX - boxW / 2;
     const boxY = startY - lineHeight / 2 - padY;
     ctx.fillStyle = "rgba(255,255,255,0.95)";
     if (typeof ctx.roundRect === "function") {
@@ -3420,7 +3402,7 @@ async function compositeTextOnPhoto(imageUrl: string, text: string, style: TextO
       ctx.fillRect(boxX, boxY, boxW, boxH);
     }
     ctx.fillStyle = "#15171c";
-    lines.forEach((l, i) => ctx.fillText(l, width / 2, startY + i * lineHeight));
+    lines.forEach((l, i) => ctx.fillText(l, centerX, startY + i * lineHeight));
   } else {
     ctx.save();
     ctx.shadowColor = "rgba(0,0,0,0.85)";
@@ -3430,8 +3412,8 @@ async function compositeTextOnPhoto(imageUrl: string, text: string, style: TextO
     ctx.strokeStyle = "rgba(0,0,0,0.55)";
     ctx.fillStyle = "#ffffff";
     lines.forEach((l, i) => {
-      ctx.strokeText(l, width / 2, startY + i * lineHeight);
-      ctx.fillText(l, width / 2, startY + i * lineHeight);
+      ctx.strokeText(l, centerX, startY + i * lineHeight);
+      ctx.fillText(l, centerX, startY + i * lineHeight);
     });
     ctx.restore();
   }
@@ -3439,6 +3421,432 @@ async function compositeTextOnPhoto(imageUrl: string, text: string, style: TextO
   const blob = await new Promise<Blob | null>((resolve) => canvas.toBlob(resolve, "image/jpeg", 0.9));
   if (!blob) throw new Error("Couldn't render this photo with text.");
   return blob;
+}
+
+// Small helper — spreadable pointer handlers that turn a drag anywhere
+// inside `containerRef` into an x/y percentage of that container's box,
+// reported to `onMove`. setPointerCapture means the element keeps getting
+// move events even once the pointer leaves it mid-drag, so no window-level
+// listener bookkeeping/cleanup is needed. Shared by the photo editor's
+// single text handle and the video editor's per-segment handles below.
+function dragHandlers(
+  containerRef: React.RefObject<HTMLDivElement | null>,
+  onMove: (xPct: number, yPct: number) => void,
+) {
+  function toPct(e: React.PointerEvent) {
+    const rect = containerRef.current?.getBoundingClientRect();
+    if (!rect || !rect.width || !rect.height) return null;
+    return {
+      x: Math.min(100, Math.max(0, ((e.clientX - rect.left) / rect.width) * 100)),
+      y: Math.min(100, Math.max(0, ((e.clientY - rect.top) / rect.height) * 100)),
+    };
+  }
+  return {
+    onPointerDown: (e: React.PointerEvent<HTMLDivElement>) => {
+      e.currentTarget.setPointerCapture(e.pointerId);
+      const pct = toPct(e);
+      if (pct) onMove(pct.x, pct.y);
+    },
+    onPointerMove: (e: React.PointerEvent<HTMLDivElement>) => {
+      if (e.buttons !== 1) return;
+      const pct = toPct(e);
+      if (pct) onMove(pct.x, pct.y);
+    },
+  };
+}
+
+type OverlayStyle = "white" | "box";
+
+function overlayTextStyle(style: OverlayStyle): React.CSSProperties {
+  return style === "white"
+    ? { color: "#fff", textShadow: "0 2px 6px rgba(0,0,0,0.85)" }
+    : {
+        color: "#15171c",
+        background: "rgba(255,255,255,0.95)",
+        borderRadius: "6px",
+        padding: "0.25em 0.5em",
+      };
+}
+
+const MAX_VIDEO_TEXT_SEGMENTS_CLIENT = 5;
+
+type VideoTextSegment = { id: string; text: string; startSec: number; endSec: number; xPct: number; yPct: number };
+
+// The text tool itself — a pencil icon away from any photo or video already
+// attached to a post, email, or Reel in the Content Calendar. REBUILT
+// 2026-11-06 per Mike: what started as a plain "pick a line, save" panel on
+// a scan result grew into a Canva-style editor, moved out of the Media tab
+// and Scan My Photos entirely and into the Content Calendar instead — "all
+// we're trying to do is overlay simple text... the UI should almost mimic
+// exactly how you would do it inside of Canva... drag and drop the text
+// wherever we want on the photo and or the video... limit the amount of
+// time it stays up on screen."
+//
+// Photos composite instantly and for free, right here in the browser
+// (compositeTextOnPhoto, plain <canvas>). Video can't work that way — this
+// app's hosting (Cloudflare's edge runtime, via Lovable/Nitro) can't run a
+// video encoder — so a video render is handed off to Shotstack
+// (submitVideoTextRender/checkVideoTextRenderStatus/finalizeVideoTextRender,
+// marketing.ts) and the editor polls for it to finish.
+function TextOverlayEditor({
+  agentId,
+  mediaUrl,
+  mediaType,
+  suggestions,
+  onClose,
+  onReplaced,
+}: {
+  agentId: string;
+  mediaUrl: string;
+  mediaType: "photo" | "video";
+  suggestions: string[];
+  onClose: () => void;
+  // Called once the edited photo/video is saved into the Media Library, so
+  // the caller (PostCard/EmailPhotosPanel/ReelPhotosPanel) can swap whatever
+  // was attached for this new derived file.
+  onReplaced: (result: { id: string; url: string }) => void;
+}) {
+  const [style, setStyle] = useState<OverlayStyle>("white");
+  const [error, setError] = useState<string | null>(null);
+
+  // ---- Photo path --------------------------------------------------------
+  const [photoText, setPhotoText] = useState(suggestions[0] ?? "");
+  const [photoPos, setPhotoPos] = useState({ x: 50, y: 42 });
+  const [photoBusy, setPhotoBusy] = useState(false);
+  const photoBoxRef = useRef<HTMLDivElement>(null);
+
+  async function savePhoto() {
+    const trimmed = photoText.trim();
+    if (!trimmed) return;
+    setPhotoBusy(true);
+    setError(null);
+    try {
+      const blob = await compositeTextOnPhoto(mediaUrl, trimmed, style, photoPos.x, photoPos.y);
+      const file = new File([blob], "text-overlay.jpg", { type: "image/jpeg" });
+      const { path, token } = await createMediaUploadUrl({ data: { agentId, fileName: file.name } });
+      const { error: uploadErr } = await supabase.storage.from("media").uploadToSignedUrl(path, token, file);
+      if (uploadErr) throw uploadErr;
+      const result = await finalizeMediaUpload({
+        data: { agentId, storagePath: path, mediaType: "photo", caption: trimmed },
+      });
+      const { data: pub } = supabase.storage.from("media").getPublicUrl(path);
+      onReplaced({ id: result.id, url: pub.publicUrl });
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setPhotoBusy(false);
+    }
+  }
+
+  // ---- Video path ---------------------------------------------------------
+  const [duration, setDuration] = useState(0);
+  const [segments, setSegments] = useState<VideoTextSegment[]>([]);
+  const [renderState, setRenderState] = useState<"idle" | "submitting" | "rendering" | "error">("idle");
+  const [renderStatusLabel, setRenderStatusLabel] = useState("");
+  const videoBoxRef = useRef<HTMLDivElement>(null);
+  const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  useEffect(() => {
+    return () => {
+      if (pollRef.current) clearInterval(pollRef.current);
+    };
+  }, []);
+
+  function addSegment() {
+    if (segments.length >= MAX_VIDEO_TEXT_SEGMENTS_CLIENT || duration <= 0) return;
+    // Defaults to the next free 3-second window so blocks don't start out
+    // overlapping — "text block 1, 0 through 3 seconds, text block 2, 4
+    // through 6" per Mike's own example.
+    const lastEnd = segments.reduce((max, s) => Math.max(max, s.endSec), 0);
+    const start = Math.min(lastEnd, Math.max(0, duration - 1));
+    const end = Math.min(duration, start + 3);
+    setSegments((cur) => [
+      ...cur,
+      {
+        id: crypto.randomUUID(),
+        text: suggestions[cur.length] ?? "",
+        startSec: start,
+        endSec: end,
+        xPct: 50,
+        yPct: 42,
+      },
+    ]);
+  }
+
+  function updateSegment(id: string, patch: Partial<VideoTextSegment>) {
+    setSegments((cur) => cur.map((s) => (s.id === id ? { ...s, ...patch } : s)));
+  }
+
+  function removeSegment(id: string) {
+    setSegments((cur) => cur.filter((s) => s.id !== id));
+  }
+
+  async function startRender() {
+    setError(null);
+    if (!segments.length) {
+      setError("Add at least one text block first.");
+      return;
+    }
+    setRenderState("submitting");
+    setRenderStatusLabel("Sending to the renderer…");
+    try {
+      const { renderId } = await submitVideoTextRender({
+        data: {
+          agentId,
+          videoUrl: mediaUrl,
+          videoDurationSec: duration,
+          style,
+          segments: segments.map((s) => ({
+            text: s.text.trim(),
+            startSec: s.startSec,
+            endSec: s.endSec,
+            xPct: s.xPct,
+            yPct: s.yPct,
+          })),
+        },
+      });
+      setRenderState("rendering");
+      setRenderStatusLabel("Rendering — this usually takes under a minute…");
+      pollRef.current = setInterval(async () => {
+        try {
+          const status = await checkVideoTextRenderStatus({ data: { agentId, renderId } });
+          if (status.status === "done" && status.url) {
+            if (pollRef.current) clearInterval(pollRef.current);
+            setRenderStatusLabel("Saving to your Media Library…");
+            const caption = segments.map((s) => s.text.trim()).join(" / ");
+            const result = await finalizeVideoTextRender({ data: { agentId, outputUrl: status.url, caption } });
+            setRenderState("idle");
+            onReplaced({ id: result.id, url: result.url });
+          } else if (status.status === "failed") {
+            if (pollRef.current) clearInterval(pollRef.current);
+            setRenderState("error");
+            setError(status.error ?? "The render failed on Shotstack's end.");
+          } else {
+            setRenderStatusLabel(`Rendering (${status.status})…`);
+          }
+        } catch (e) {
+          if (pollRef.current) clearInterval(pollRef.current);
+          setRenderState("error");
+          setError(e instanceof Error ? e.message : String(e));
+        }
+      }, 3000);
+    } catch (e) {
+      setRenderState("error");
+      setError(e instanceof Error ? e.message : String(e));
+    }
+  }
+
+  const rendering = renderState === "submitting" || renderState === "rendering";
+
+  return (
+    <Dialog open onOpenChange={(open) => !open && onClose()}>
+      <DialogContent className="max-h-[90vh] w-[95vw] max-w-3xl overflow-y-auto">
+        <DialogHeader>
+          <DialogTitle>Add text to this {mediaType}</DialogTitle>
+        </DialogHeader>
+
+        <div className="mt-1 flex items-center gap-2">
+          <span className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">Style</span>
+          <button
+            onClick={() => setStyle("white")}
+            className={`rounded-full border px-3 py-1 text-xs transition-colors ${
+              style === "white" ? "border-primary bg-primary/10 text-primary" : "border-border text-muted-foreground"
+            }`}
+          >
+            White text
+          </button>
+          <button
+            onClick={() => setStyle("box")}
+            className={`rounded-full border px-3 py-1 text-xs transition-colors ${
+              style === "box" ? "border-primary bg-primary/10 text-primary" : "border-border text-muted-foreground"
+            }`}
+          >
+            Dark on box
+          </button>
+        </div>
+
+        {mediaType === "photo" ? (
+          <>
+            <div ref={photoBoxRef} className="relative mt-3 touch-none select-none overflow-hidden rounded-lg bg-muted">
+              <img src={mediaUrl} alt="" className="block max-h-[50vh] w-full object-contain" draggable={false} />
+              <div
+                {...dragHandlers(photoBoxRef, (x, y) => setPhotoPos({ x, y }))}
+                className="absolute cursor-grab px-4 text-center active:cursor-grabbing"
+                style={{ left: `${photoPos.x}%`, top: `${photoPos.y}%`, transform: "translate(-50%, -50%)" }}
+              >
+                <span
+                  className="whitespace-pre-wrap text-lg font-extrabold leading-tight"
+                  style={overlayTextStyle(style)}
+                >
+                  {photoText || "Drag me"}
+                </span>
+              </div>
+            </div>
+            <p className="mt-1 text-[11px] text-muted-foreground">Drag the text to position it.</p>
+
+            {suggestions.length > 0 && (
+              <div className="mt-3 flex flex-wrap gap-1.5">
+                {suggestions.map((s, i) => (
+                  <button
+                    key={i}
+                    onClick={() => setPhotoText(s)}
+                    className={`rounded-full border px-3 py-1 text-xs transition-colors ${
+                      photoText === s
+                        ? "border-primary bg-primary/10 text-primary"
+                        : "border-border bg-glass text-muted-foreground hover:text-foreground"
+                    }`}
+                  >
+                    {s}
+                  </button>
+                ))}
+              </div>
+            )}
+
+            <AutoResizeTextarea
+              value={photoText}
+              onChange={setPhotoText}
+              minHeightPx={44}
+              placeholder="Text to overlay on the photo…"
+              className="mt-2 w-full rounded-xl border border-border bg-glass px-3 py-2 text-sm outline-none"
+            />
+
+            <div className="mt-3 flex items-center gap-2">
+              <Button onClick={savePhoto} disabled={photoBusy || !photoText.trim()}>
+                {photoBusy ? "Saving…" : "Save to Media Library"}
+              </Button>
+              <Button variant="secondary" onClick={onClose} disabled={photoBusy}>
+                Cancel
+              </Button>
+            </div>
+          </>
+        ) : (
+          <>
+            <div ref={videoBoxRef} className="relative mt-3 touch-none select-none overflow-hidden rounded-lg bg-muted">
+              <video
+                src={mediaUrl}
+                controls
+                className="block max-h-[50vh] w-full"
+                onLoadedMetadata={(e) => setDuration(e.currentTarget.duration)}
+              />
+              {segments.map((s, i) => (
+                <div
+                  key={s.id}
+                  {...dragHandlers(videoBoxRef, (x, y) => updateSegment(s.id, { xPct: x, yPct: y }))}
+                  className="pointer-events-auto absolute cursor-grab px-3 text-center active:cursor-grabbing"
+                  style={{ left: `${s.xPct}%`, top: `${s.yPct}%`, transform: "translate(-50%, -50%)" }}
+                  title={`Text block ${i + 1}`}
+                >
+                  <span
+                    className="whitespace-pre-wrap text-base font-extrabold leading-tight"
+                    style={overlayTextStyle(style)}
+                  >
+                    {`${i + 1}. ${s.text || "Drag me"}`}
+                  </span>
+                </div>
+              ))}
+            </div>
+            <p className="mt-1 text-[11px] text-muted-foreground">
+              Every block's position is shown at once — drag each one where it should sit. Duration:{" "}
+              {duration ? `${duration.toFixed(1)}s` : "loading…"}
+            </p>
+
+            <div className="mt-3 space-y-2">
+              {segments.map((s, i) => (
+                <div key={s.id} className="rounded-xl border border-border bg-background/40 p-2.5">
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
+                      Text block {i + 1}
+                    </span>
+                    <button
+                      onClick={() => removeSegment(s.id)}
+                      className="text-[11px] font-semibold text-destructive hover:underline"
+                    >
+                      Remove
+                    </button>
+                  </div>
+                  {suggestions.length > 0 && (
+                    <div className="mt-1.5 flex flex-wrap gap-1.5">
+                      {suggestions.map((sug, si) => (
+                        <button
+                          key={si}
+                          onClick={() => updateSegment(s.id, { text: sug })}
+                          className={`rounded-full border px-2.5 py-0.5 text-[11px] transition-colors ${
+                            s.text === sug
+                              ? "border-primary bg-primary/10 text-primary"
+                              : "border-border bg-glass text-muted-foreground hover:text-foreground"
+                          }`}
+                        >
+                          {sug}
+                        </button>
+                      ))}
+                    </div>
+                  )}
+                  <AutoResizeTextarea
+                    value={s.text}
+                    onChange={(v) => updateSegment(s.id, { text: v })}
+                    minHeightPx={36}
+                    placeholder="Text for this block…"
+                    className="mt-1.5 w-full rounded-lg border border-border bg-glass px-2 py-1.5 text-sm outline-none"
+                  />
+                  <div className="mt-1.5 flex items-center gap-2 text-xs">
+                    <label className="flex items-center gap-1 text-muted-foreground">
+                      Start
+                      <input
+                        type="number"
+                        step={0.1}
+                        min={0}
+                        max={duration}
+                        value={s.startSec}
+                        onChange={(e) => updateSegment(s.id, { startSec: Number(e.target.value) })}
+                        className="w-16 rounded-md border border-border bg-glass px-1.5 py-0.5"
+                      />
+                      s
+                    </label>
+                    <label className="flex items-center gap-1 text-muted-foreground">
+                      End
+                      <input
+                        type="number"
+                        step={0.1}
+                        min={0}
+                        max={duration}
+                        value={s.endSec}
+                        onChange={(e) => updateSegment(s.id, { endSec: Number(e.target.value) })}
+                        className="w-16 rounded-md border border-border bg-glass px-1.5 py-0.5"
+                      />
+                      s
+                    </label>
+                  </div>
+                </div>
+              ))}
+            </div>
+
+            <div className="mt-2">
+              <button
+                onClick={addSegment}
+                disabled={!duration || segments.length >= MAX_VIDEO_TEXT_SEGMENTS_CLIENT}
+                className="rounded-full border border-border px-3 py-1.5 text-xs font-semibold transition-colors hover:bg-secondary disabled:opacity-50"
+              >
+                + Add text block ({segments.length}/{MAX_VIDEO_TEXT_SEGMENTS_CLIENT})
+              </button>
+            </div>
+
+            {rendering && <p className="mt-3 text-sm font-semibold text-primary">{renderStatusLabel}</p>}
+
+            <div className="mt-3 flex items-center gap-2">
+              <Button onClick={startRender} disabled={rendering || !segments.length}>
+                {rendering ? "Rendering…" : "Render video"}
+              </Button>
+              <Button variant="secondary" onClick={onClose} disabled={rendering}>
+                Cancel
+              </Button>
+            </div>
+          </>
+        )}
+
+        {error && <p className="mt-2 text-xs text-destructive">{error}</p>}
+      </DialogContent>
+    </Dialog>
+  );
 }
 
 // Short-form video only — reads duration client-side before spending any
@@ -3714,14 +4122,6 @@ function MediaTab({ agentId, isAdmin }: { agentId: string; isAdmin: boolean }) {
   // instead of needing to be deleted and re-uploaded by hand.
   const [fixingId, setFixingId] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
-  // Added 2026-11-06 per Mike: "there is no way to edit pictures yet either.
-  // I tried and clicked and nothing is visible." The text-overlay tool from
-  // earlier today only lived on a freshly-scanned photo's chat bubble — it
-  // was never reachable from the Media tab itself, which is the first place
-  // anyone would naturally go to "edit a picture." Same TextOverlayPanel,
-  // just opened from here too, with no AI suggestions (nothing's been
-  // scanned) — the agent just types their own line.
-  const [textOverlayOpenId, setTextOverlayOpenId] = useState<string | null>(null);
 
   function reload() {
     setMedia(null);
@@ -4000,14 +4400,11 @@ function MediaTab({ agentId, isAdmin }: { agentId: string; isAdmin: boolean }) {
                     Move to active
                   </button>
                 )}
-                {m.url && m.media_type === "photo" && (
-                  <button
-                    onClick={() => setTextOverlayOpenId((cur) => (cur === m.id ? null : m.id))}
-                    className="rounded-full border border-border px-2 py-1 text-[11px] font-semibold transition-colors hover:bg-secondary"
-                  >
-                    {textOverlayOpenId === m.id ? "Close text tool" : "Add text"}
-                  </button>
-                )}
+                {/* The text tool lives in the Content Calendar now, not here
+                    (2026-11-06, per Mike: "take it out of the media
+                    library... it should be done right inside the content
+                    calendar") — attach a photo/video to a post, email, or
+                    Reel first, then use the pencil icon there. */}
                 {m.url && (
                   <button
                     onClick={() => downloadRemoteFile(m.url!, m.url!.split("/").pop() || `${m.id}`)}
@@ -4024,17 +4421,6 @@ function MediaTab({ agentId, isAdmin }: { agentId: string; isAdmin: boolean }) {
                   Delete
                 </button>
               </div>
-              {textOverlayOpenId === m.id && m.url && (
-                <div className="px-2 pb-2">
-                  <TextOverlayPanel
-                    agentId={agentId}
-                    imageUrl={m.url}
-                    suggestions={[]}
-                    onClose={() => setTextOverlayOpenId(null)}
-                    onSaved={reload}
-                  />
-                </div>
-              )}
             </div>
           ))}
         </div>

@@ -1189,11 +1189,16 @@ function TextOverlayPanel({
   imageUrl,
   suggestions,
   onClose,
+  onSaved,
 }: {
   agentId: string;
   imageUrl: string;
   suggestions: string[];
   onClose: () => void;
+  // Optional — lets a caller that keeps its own list of photos (the Media
+  // tab) refresh it once the new texted photo lands, instead of the agent
+  // having to leave and come back to see it.
+  onSaved?: () => void;
 }) {
   const [text, setText] = useState(suggestions[0] ?? "");
   const [style, setStyle] = useState<TextOverlayStyle>("white");
@@ -1214,6 +1219,7 @@ function TextOverlayPanel({
       if (uploadErr) throw uploadErr;
       await finalizeMediaUpload({ data: { agentId, storagePath: path, mediaType: "photo", caption: trimmed } });
       setSavedUrl(path);
+      onSaved?.();
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -1558,17 +1564,24 @@ function EmailPhotosPanel({
 
   // Same fix as PostCard's openPicker (2026-09-29) — always refetch on open
   // instead of once-ever, and don't blank an already-loaded list to []
-  // just because one refresh failed. Also fetches every status now (not
-  // just "available") so used photos can show greyed out below instead of
-  // being hidden — per Mike: "grey out photos that are already be used or
-  // selected."
+  // just because one refresh failed.
+  //
+  // REVERSED 2026-11-06 per Mike: this used to fetch every status so used
+  // photos could show greyed out here instead of being hidden ("grey out
+  // photos that are already be used or selected," 2026-09-29) — but living
+  // with it, that made this picker noisy: "when a photo is used it should
+  // not appear under this photo library at all, only in used... right now
+  // all used photos are appearing making it harder to see which we used in
+  // past." So this now asks for "available" only — a used photo simply
+  // isn't offered here anymore, and the Media tab's own Used filter is the
+  // one place to go look at past-used photos.
   async function openPicker() {
     setPickerOpen(true);
     setPickerTab("library");
     setError(null);
     setMediaError(null);
     try {
-      setMediaOptions(await listMarketingMedia({ data: { agentId } }));
+      setMediaOptions(await listMarketingMedia({ data: { agentId, status: "available" } }));
     } catch (e) {
       setMediaError(e instanceof Error ? e.message : String(e));
     }
@@ -1891,13 +1904,13 @@ function EmailPhotosPanel({
               )}
               {mediaOptions !== null && mediaOptions.length > 0 && (
                 <div className="grid grid-cols-3 gap-2 sm:grid-cols-4">
-                  {/* Greyed out for "used" or "already one of this email's
-                      photos" — per Mike: "grey out photos that are already
-                      be used or selected so everyone knows" (2026-09-29). */}
+                  {/* Only "available" photos are fetched now (see openPicker
+                      above) — a used photo never shows up here at all, per
+                      Mike (2026-11-06). Still flags one already added to
+                      this email, so it's not added twice by accident. */}
                   {mediaOptions.map((m) => {
-                    const isUsed = m.status === "used";
                     const isSelected = photos.some((p) => p.source === "library" && p.url === m.url);
-                    const badge = isSelected ? "Added" : isUsed ? "Used" : null;
+                    const badge = isSelected ? "Added" : null;
                     const failed = failedLibraryThumbs.has(m.id);
                     return (
                       <button
@@ -1905,11 +1918,7 @@ function EmailPhotosPanel({
                         onClick={() => addFromLibrary(m.id)}
                         disabled={busy}
                         className={`relative overflow-hidden rounded-xl border transition-colors disabled:opacity-50 ${
-                          isSelected
-                            ? "border-primary"
-                            : isUsed
-                              ? "border-border opacity-50 hover:opacity-80"
-                              : "border-border hover:border-primary"
+                          isSelected ? "border-primary" : "border-border hover:border-primary"
                         }`}
                       >
                         {m.media_type === "video" ? (
@@ -2130,13 +2139,15 @@ function ReelPhotosPanel({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [agentId, photos.map((p) => p.driveFileId).join(",")]);
 
+  // "available" only (2026-11-06) — see EmailPhotosPanel's openPicker above
+  // for why: a used photo shouldn't be offered in this picker at all anymore.
   async function openPicker() {
     setPickerOpen(true);
     setPickerTab("library");
     setError(null);
     setMediaError(null);
     try {
-      setMediaOptions(await listMarketingMedia({ data: { agentId } }));
+      setMediaOptions(await listMarketingMedia({ data: { agentId, status: "available" } }));
     } catch (e) {
       setMediaError(e instanceof Error ? e.message : String(e));
     }
@@ -2389,10 +2400,12 @@ function ReelPhotosPanel({
               )}
               {mediaOptions !== null && mediaOptions.length > 0 && (
                 <div className="grid grid-cols-3 gap-2 sm:grid-cols-4">
+                  {/* Only "available" photos are fetched now (see openPicker
+                      above) — a used photo never shows up here, per Mike
+                      (2026-11-06). */}
                   {mediaOptions.map((m) => {
-                    const isUsed = m.status === "used";
                     const isSelected = photos.some((p) => p.source === "library" && p.url === m.url);
-                    const badge = isSelected ? "Added" : isUsed ? "Used" : null;
+                    const badge = isSelected ? "Added" : null;
                     const failed = failedLibraryThumbs.has(m.id);
                     return (
                       <button
@@ -2400,11 +2413,7 @@ function ReelPhotosPanel({
                         onClick={() => addFromLibrary(m.id)}
                         disabled={busy}
                         className={`relative overflow-hidden rounded-xl border transition-colors disabled:opacity-50 ${
-                          isSelected
-                            ? "border-primary"
-                            : isUsed
-                              ? "border-border opacity-50 hover:opacity-80"
-                              : "border-border hover:border-primary"
+                          isSelected ? "border-primary" : "border-border hover:border-primary"
                         }`}
                       >
                         {m.media_type === "video" ? (
@@ -2723,15 +2732,19 @@ function PostCard({
   // freshly-added one shows up) and a failure leaves whatever was already
   // loaded on screen instead of blanking it, with a visible Retry.
   // WIDENED 2026-09-29 per Mike: "grey out photos that are already be used
-  // or selected so everyone knows." Fetches every status now (not just
-  // "available") so used photos can be shown greyed out in the grid below
-  // instead of silently disappearing.
+  // or selected so everyone knows" — fetched every status so used photos
+  // could show greyed out instead of disappearing.
+  // REVERSED 2026-11-06 per Mike: that made the picker noisy — "when a
+  // photo is used it should not appear under this photo library at all,
+  // only in used... right now all used photos are appearing making it
+  // harder to see which we used in past." Back to "available" only; the
+  // Media tab's own Used filter is where to go look at past-used photos.
   async function openPicker() {
     setPickerOpen(true);
     setPickerTab("library");
     setMediaError(null);
     try {
-      const list = await listMarketingMedia({ data: { agentId } });
+      const list = await listMarketingMedia({ data: { agentId, status: "available" } });
       setMediaOptions(list);
     } catch (e) {
       setMediaError(e instanceof Error ? e.message : String(e));
@@ -2975,16 +2988,14 @@ function PostCard({
                     )}
                     {mediaOptions !== null && mediaOptions.length > 0 && (
                       <div className="grid grid-cols-3 gap-2 sm:grid-cols-4">
-                        {/* Greyed out for "used" or "already the current photo
-                            on this post" — per Mike: "grey out photos that are
-                            already be used or selected so everyone knows"
-                            (2026-09-29). Still clickable — reusing a photo is a
-                            real thing agents do, this is just a visual heads-up,
-                            not a block. */}
+                        {/* Only "available" photos are fetched now (see
+                            openPicker above) — a used photo never shows up
+                            here at all, per Mike (2026-11-06). Still flags
+                            whichever one is already this post's current
+                            photo. */}
                         {mediaOptions.map((m) => {
-                          const isUsed = m.status === "used";
                           const isSelected = m.id === post.metadata?.media_id;
-                          const badge = isSelected ? "Current" : isUsed ? "Used" : null;
+                          const badge = isSelected ? "Current" : null;
                           // FIXED 2026-09-30 per Mike: "in the photo library,
                           // you see some photos missing... I clicked on one
                           // and it changed out the image" — the record and
@@ -3004,11 +3015,7 @@ function PostCard({
                               onClick={() => pickMedia(m.id)}
                               disabled={mediaBusy}
                               className={`relative overflow-hidden rounded-xl border transition-colors disabled:opacity-50 ${
-                                isSelected
-                                  ? "border-primary"
-                                  : isUsed
-                                    ? "border-border opacity-50 hover:opacity-80"
-                                    : "border-border hover:border-primary"
+                                isSelected ? "border-primary" : "border-border hover:border-primary"
                               }`}
                             >
                               {m.media_type === "video" ? (
@@ -3707,6 +3714,14 @@ function MediaTab({ agentId, isAdmin }: { agentId: string; isAdmin: boolean }) {
   // instead of needing to be deleted and re-uploaded by hand.
   const [fixingId, setFixingId] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  // Added 2026-11-06 per Mike: "there is no way to edit pictures yet either.
+  // I tried and clicked and nothing is visible." The text-overlay tool from
+  // earlier today only lived on a freshly-scanned photo's chat bubble — it
+  // was never reachable from the Media tab itself, which is the first place
+  // anyone would naturally go to "edit a picture." Same TextOverlayPanel,
+  // just opened from here too, with no AI suggestions (nothing's been
+  // scanned) — the agent just types their own line.
+  const [textOverlayOpenId, setTextOverlayOpenId] = useState<string | null>(null);
 
   function reload() {
     setMedia(null);
@@ -3985,6 +4000,14 @@ function MediaTab({ agentId, isAdmin }: { agentId: string; isAdmin: boolean }) {
                     Move to active
                   </button>
                 )}
+                {m.url && m.media_type === "photo" && (
+                  <button
+                    onClick={() => setTextOverlayOpenId((cur) => (cur === m.id ? null : m.id))}
+                    className="rounded-full border border-border px-2 py-1 text-[11px] font-semibold transition-colors hover:bg-secondary"
+                  >
+                    {textOverlayOpenId === m.id ? "Close text tool" : "Add text"}
+                  </button>
+                )}
                 {m.url && (
                   <button
                     onClick={() => downloadRemoteFile(m.url!, m.url!.split("/").pop() || `${m.id}`)}
@@ -4001,6 +4024,17 @@ function MediaTab({ agentId, isAdmin }: { agentId: string; isAdmin: boolean }) {
                   Delete
                 </button>
               </div>
+              {textOverlayOpenId === m.id && m.url && (
+                <div className="px-2 pb-2">
+                  <TextOverlayPanel
+                    agentId={agentId}
+                    imageUrl={m.url}
+                    suggestions={[]}
+                    onClose={() => setTextOverlayOpenId(null)}
+                    onSaved={reload}
+                  />
+                </div>
+              )}
             </div>
           ))}
         </div>
@@ -4838,19 +4872,37 @@ function ContentCalendarTab({
 
   function renderMonthCard(m: CalendarMonth, archived: boolean) {
     const busy = archivingId === m.id;
+    // FIXED 2026-11-06 per Mike: "This button doesn't always click. Sometime
+    // I need to click it 3-5 times before it works." Root cause: only the
+    // "October 2026" text itself was wrapped in a <button> (sized to its own
+    // content, no padding) — the rest of this card looked clickable (the
+    // hover highlight covers the whole thing) but wasn't, so a click
+    // anywhere else on the card silently did nothing. Made the entire card
+    // the click target instead of just that text; the Archive button still
+    // works on its own and stops the click from also opening the month.
     return (
       <div
         key={m.id}
-        className="flex flex-col gap-2 rounded-2xl border border-border bg-glass px-4 py-3 transition-colors hover:bg-secondary"
+        role="button"
+        tabIndex={0}
+        onClick={() => setActiveMonth(m)}
+        onKeyDown={(e) => {
+          if (e.key === "Enter" || e.key === " ") {
+            e.preventDefault();
+            setActiveMonth(m);
+          }
+        }}
+        className="flex cursor-pointer flex-col gap-2 rounded-2xl border border-border bg-glass px-4 py-3 text-left transition-colors hover:bg-secondary"
       >
-        <button onClick={() => setActiveMonth(m)} className="min-w-0 text-left text-sm font-semibold">
-          {m.month}
-        </button>
+        <span className="min-w-0 text-sm font-semibold">{m.month}</span>
         {archived ? (
           <p className="text-[11px] text-muted-foreground">Archived — click the month to create fresh content.</p>
         ) : (
           <button
-            onClick={() => archiveFromList(m)}
+            onClick={(e) => {
+              e.stopPropagation();
+              archiveFromList(m);
+            }}
             disabled={busy}
             className="self-start shrink-0 rounded-full border border-border px-2.5 py-1 text-[11px] font-semibold text-muted-foreground transition-colors hover:bg-background disabled:opacity-50"
             title={`Archive this agent's generated content for ${m.month}`}

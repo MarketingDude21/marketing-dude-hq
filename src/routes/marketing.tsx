@@ -1082,7 +1082,16 @@ function ChatMessageBubble({ msg, agentId, onSaved }: { msg: ChatMessageRow; age
     thumbnailUrl?: string;
     source?: "drive" | "library";
     sourceId?: string;
+    textOverlaySuggestions?: string;
   };
+  let overlaySuggestions: string[] = [];
+  try {
+    const parsed = meta.textOverlaySuggestions ? JSON.parse(meta.textOverlaySuggestions) : [];
+    if (Array.isArray(parsed)) overlaySuggestions = parsed.filter((s): s is string => typeof s === "string");
+  } catch {
+    // Old messages logged before this field existed, or anything malformed
+    // — just show no suggestions rather than breaking the bubble.
+  }
 
   async function saveAsPost() {
     setSaving(true);
@@ -1122,6 +1131,8 @@ function ChatMessageBubble({ msg, agentId, onSaved }: { msg: ChatMessageRow; age
     }
   }
 
+  const [overlayOpen, setOverlayOpen] = useState(false);
+
   return (
     <div className={`flex ${isAssistant ? "justify-start" : "justify-end"}`}>
       <div
@@ -1142,10 +1153,171 @@ function ChatMessageBubble({ msg, agentId, onSaved }: { msg: ChatMessageRow; age
             ) : (
               <span className="text-xs font-semibold text-primary">Saved — review it below</span>
             )}
+            {/* "Add text" tool — photo_scan messages only, since this is
+                specifically wired into the scan flow per Mike (2026-11-06),
+                not a separate standalone entry point. */}
+            {isPhotoScan && meta.thumbnailUrl && (
+              <Button variant="secondary" onClick={() => setOverlayOpen((v) => !v)}>
+                {overlayOpen ? "Close text tool" : "Add text to this photo"}
+              </Button>
+            )}
           </div>
         )}
         {error && <p className="mt-1 text-xs text-destructive">{error}</p>}
+        {overlayOpen && meta.thumbnailUrl && (
+          <TextOverlayPanel
+            agentId={agentId}
+            imageUrl={meta.thumbnailUrl}
+            suggestions={overlaySuggestions}
+            onClose={() => setOverlayOpen(false)}
+          />
+        )}
       </div>
+    </div>
+  );
+}
+
+// The "add text to a photo" tool itself — opened from a photo_scan chat
+// bubble above. Deliberately simple per Mike (2026-11-06): pick or write a
+// line, pick one of two looks, save. No position picker, no multiple text
+// blocks, no cropping/filters — "we're not trying to do anything fancy,"
+// just text on the photo, saved so it's ready to drop straight into a Reel
+// (or any other post) from the Media Library like any other photo, without
+// ever leaving the app.
+function TextOverlayPanel({
+  agentId,
+  imageUrl,
+  suggestions,
+  onClose,
+}: {
+  agentId: string;
+  imageUrl: string;
+  suggestions: string[];
+  onClose: () => void;
+}) {
+  const [text, setText] = useState(suggestions[0] ?? "");
+  const [style, setStyle] = useState<TextOverlayStyle>("white");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [savedUrl, setSavedUrl] = useState<string | null>(null);
+
+  async function save() {
+    const trimmed = text.trim();
+    if (!trimmed) return;
+    setBusy(true);
+    setError(null);
+    try {
+      const blob = await compositeTextOnPhoto(imageUrl, trimmed, style);
+      const file = new File([blob], "text-overlay.jpg", { type: "image/jpeg" });
+      const { path, token } = await createMediaUploadUrl({ data: { agentId, fileName: file.name } });
+      const { error: uploadErr } = await supabase.storage.from("media").uploadToSignedUrl(path, token, file);
+      if (uploadErr) throw uploadErr;
+      await finalizeMediaUpload({ data: { agentId, storagePath: path, mediaType: "photo", caption: trimmed } });
+      setSavedUrl(path);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  if (savedUrl) {
+    return (
+      <div className="mt-3 rounded-xl border border-border bg-background/40 p-3 text-xs">
+        <p className="font-semibold text-primary">Saved to your Media Library.</p>
+        <p className="mt-1 text-muted-foreground">
+          It's ready to pick from the Library next time you're building a Reel or any other post.
+        </p>
+        <div className="mt-2">
+          <Button variant="secondary" onClick={onClose}>
+            Done
+          </Button>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="mt-3 rounded-xl border border-border bg-background/40 p-3">
+      <div className="relative overflow-hidden rounded-lg bg-muted">
+        <img src={imageUrl} alt="" className="block max-h-64 w-full object-contain" />
+        <div
+          className="pointer-events-none absolute inset-x-0 flex items-center justify-center px-4 text-center"
+          style={{ top: "12%", bottom: "28%" }}
+        >
+          <span
+            className="whitespace-pre-wrap text-lg font-extrabold leading-tight"
+            style={
+              style === "white"
+                ? { color: "#fff", textShadow: "0 2px 6px rgba(0,0,0,0.85)" }
+                : {
+                    color: "#15171c",
+                    background: "rgba(255,255,255,0.95)",
+                    borderRadius: "6px",
+                    padding: "0.25em 0.5em",
+                  }
+            }
+          >
+            {text || " "}
+          </span>
+        </div>
+      </div>
+
+      {suggestions.length > 0 && (
+        <div className="mt-3 flex flex-wrap gap-1.5">
+          {suggestions.map((s, i) => (
+            <button
+              key={i}
+              onClick={() => setText(s)}
+              className={`rounded-full border px-3 py-1 text-xs transition-colors ${
+                text === s
+                  ? "border-primary bg-primary/10 text-primary"
+                  : "border-border bg-glass text-muted-foreground hover:text-foreground"
+              }`}
+            >
+              {s}
+            </button>
+          ))}
+        </div>
+      )}
+
+      <AutoResizeTextarea
+        value={text}
+        onChange={setText}
+        minHeightPx={44}
+        placeholder="Text to overlay on the photo…"
+        className="mt-2 w-full rounded-xl border border-border bg-glass px-3 py-2 text-sm outline-none"
+      />
+
+      <div className="mt-2 flex items-center gap-2">
+        <span className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">Style</span>
+        <button
+          onClick={() => setStyle("white")}
+          className={`rounded-full border px-3 py-1 text-xs transition-colors ${
+            style === "white" ? "border-primary bg-primary/10 text-primary" : "border-border text-muted-foreground"
+          }`}
+        >
+          White text
+        </button>
+        <button
+          onClick={() => setStyle("box")}
+          className={`rounded-full border px-3 py-1 text-xs transition-colors ${
+            style === "box" ? "border-primary bg-primary/10 text-primary" : "border-border text-muted-foreground"
+          }`}
+        >
+          Dark on box
+        </button>
+      </div>
+
+      <div className="mt-3 flex items-center gap-2">
+        <Button onClick={save} disabled={busy || !text.trim()}>
+          {busy ? "Saving…" : "Save to Media Library"}
+        </Button>
+        <Button variant="secondary" onClick={onClose} disabled={busy}>
+          Cancel
+        </Button>
+      </div>
+      {error && <p className="mt-2 text-xs text-destructive">{error}</p>}
     </div>
   );
 }
@@ -1221,6 +1393,7 @@ function ChatHub({
               sourceId: s.fileId,
               thumbnailUrl: s.thumbnailUrl,
               fileName: s.fileName,
+              textOverlaySuggestions: s.textOverlaySuggestions,
             },
           });
         }
@@ -3156,6 +3329,109 @@ async function resizeImage(file: File, maxEdge = 2000, quality = 0.85): Promise<
   const blob = await new Promise<Blob | null>((resolve) => canvas.toBlob(resolve, "image/jpeg", quality));
   if (!blob) return file;
   return new File([blob], file.name.replace(/\.\w+$/, ".jpg"), { type: "image/jpeg" });
+}
+
+// Two overlay looks — matching exactly what Mike flagged from @adley's
+// Reels ("some's just white text over screen, some's black text with a
+// white box so it pops") and what the text-overlay scoping research
+// converged on independently.
+type TextOverlayStyle = "white" | "box";
+
+// Draws simple, bold text onto a photo, entirely client-side via canvas —
+// same no-library approach as resizeImage above. Per Mike (2026-11-06):
+// "really the only thing we're asking for is to add text... we're not
+// trying to do anything fancy" — so this is deliberately plain: two style
+// presets, one fixed safe placement (clear of Instagram's own header at
+// the top and the caption/audio strip at the bottom — see the scoping
+// doc's placement research), no drag-to-position, no multiple text blocks.
+async function compositeTextOnPhoto(imageUrl: string, text: string, style: TextOverlayStyle): Promise<Blob> {
+  const img = new Image();
+  img.crossOrigin = "anonymous";
+  await new Promise<void>((resolve, reject) => {
+    img.onload = () => resolve();
+    img.onerror = () => reject(new Error("Couldn't load this photo to add text to it."));
+    img.src = imageUrl;
+  });
+
+  const maxEdge = 1600;
+  const scale = Math.min(1, maxEdge / Math.max(img.naturalWidth, img.naturalHeight));
+  const width = Math.max(1, Math.round(img.naturalWidth * scale));
+  const height = Math.max(1, Math.round(img.naturalHeight * scale));
+  const canvas = document.createElement("canvas");
+  canvas.width = width;
+  canvas.height = height;
+  const ctx = canvas.getContext("2d");
+  if (!ctx) throw new Error("Couldn't prepare this photo for text.");
+  ctx.drawImage(img, 0, 0, width, height);
+
+  const marginX = width * 0.08;
+  const maxLineWidth = width - marginX * 2;
+  const fontSize = Math.max(22, Math.round(width * 0.065));
+  const lineHeight = fontSize * 1.25;
+  ctx.font = `800 ${fontSize}px system-ui, -apple-system, Arial, sans-serif`;
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+
+  // Simple word-wrap to the safe width.
+  const words = text.trim().split(/\s+/).filter(Boolean);
+  const lines: string[] = [];
+  let line = "";
+  for (const word of words) {
+    const test = line ? `${line} ${word}` : word;
+    if (line && ctx.measureText(test).width > maxLineWidth) {
+      lines.push(line);
+      line = word;
+    } else {
+      line = test;
+    }
+  }
+  if (line) lines.push(line);
+  if (!lines.length) lines.push(text.trim() || " ");
+
+  // Safe band: clear of the Reels header (~top 10%) and the caption/audio
+  // strip + action icons (~bottom 25%) — centered within what's left.
+  const safeTop = height * 0.12;
+  const safeBottom = height * 0.72;
+  const bandCenterY = (safeTop + safeBottom) / 2;
+  const totalTextHeight = lines.length * lineHeight;
+  const startY = bandCenterY - totalTextHeight / 2 + lineHeight / 2;
+
+  if (style === "box") {
+    const maxMeasured = Math.max(...lines.map((l) => ctx.measureText(l).width));
+    const padX = fontSize * 0.55;
+    const padY = fontSize * 0.35;
+    const boxW = maxMeasured + padX * 2;
+    const boxH = totalTextHeight + padY * 2;
+    const boxX = width / 2 - boxW / 2;
+    const boxY = startY - lineHeight / 2 - padY;
+    ctx.fillStyle = "rgba(255,255,255,0.95)";
+    if (typeof ctx.roundRect === "function") {
+      ctx.beginPath();
+      ctx.roundRect(boxX, boxY, boxW, boxH, fontSize * 0.2);
+      ctx.fill();
+    } else {
+      ctx.fillRect(boxX, boxY, boxW, boxH);
+    }
+    ctx.fillStyle = "#15171c";
+    lines.forEach((l, i) => ctx.fillText(l, width / 2, startY + i * lineHeight));
+  } else {
+    ctx.save();
+    ctx.shadowColor = "rgba(0,0,0,0.85)";
+    ctx.shadowBlur = fontSize * 0.14;
+    ctx.shadowOffsetY = fontSize * 0.04;
+    ctx.lineWidth = fontSize * 0.1;
+    ctx.strokeStyle = "rgba(0,0,0,0.55)";
+    ctx.fillStyle = "#ffffff";
+    lines.forEach((l, i) => {
+      ctx.strokeText(l, width / 2, startY + i * lineHeight);
+      ctx.fillText(l, width / 2, startY + i * lineHeight);
+    });
+    ctx.restore();
+  }
+
+  const blob = await new Promise<Blob | null>((resolve) => canvas.toBlob(resolve, "image/jpeg", 0.9));
+  if (!blob) throw new Error("Couldn't render this photo with text.");
+  return blob;
 }
 
 // Short-form video only — reads duration client-side before spending any

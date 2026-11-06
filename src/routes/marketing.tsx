@@ -3327,13 +3327,16 @@ type TextOverlayStyle = "white" | "box";
 // this used one fixed safe placement; WIDENED the same day per Mike's
 // Canva-style request ("we need to be able to drag and drop the text...
 // wherever we want on the photo") to a free x/y position the editor's drag
-// UI controls, passed in as xPct/yPct (0-100, where 50/50 is dead center).
+// UI controls, passed in as xPct/yPct (0-100, where 50/50 is dead center),
+// and again the same day to a caller-controlled fontScale (1 = default
+// size) per Mike: "you could insert the font size and make it larger."
 async function compositeTextOnPhoto(
   imageUrl: string,
   text: string,
   style: TextOverlayStyle,
   xPct: number,
   yPct: number,
+  fontScale: number,
 ): Promise<Blob> {
   const img = new Image();
   img.crossOrigin = "anonymous";
@@ -3356,7 +3359,8 @@ async function compositeTextOnPhoto(
 
   const marginX = width * 0.08;
   const maxLineWidth = width - marginX * 2;
-  const fontSize = Math.max(22, Math.round(width * 0.065));
+  const clampedFontScale = Math.min(3, Math.max(0.4, fontScale || 1));
+  const fontSize = Math.max(22, Math.round(width * 0.065 * clampedFontScale));
   const lineHeight = fontSize * 1.25;
   ctx.font = `800 ${fontSize}px system-ui, -apple-system, Arial, sans-serif`;
   ctx.textAlign = "center";
@@ -3457,20 +3461,55 @@ function dragHandlers(
 
 type OverlayStyle = "white" | "box";
 
-function overlayTextStyle(style: OverlayStyle): React.CSSProperties {
+function overlayTextStyle(style: OverlayStyle, fontScale: number): React.CSSProperties {
+  const fontSize = `${Math.round(20 * Math.min(3, Math.max(0.4, fontScale || 1)))}px`;
   return style === "white"
-    ? { color: "#fff", textShadow: "0 2px 6px rgba(0,0,0,0.85)" }
+    ? { color: "#fff", textShadow: "0 2px 6px rgba(0,0,0,0.85)", fontSize }
     : {
         color: "#15171c",
         background: "rgba(255,255,255,0.95)",
         borderRadius: "6px",
         padding: "0.25em 0.5em",
+        fontSize,
       };
 }
 
-const MAX_VIDEO_TEXT_SEGMENTS_CLIENT = 5;
+// A small "–"/"+" font-size control shared by the photo and video editors —
+// added 2026-11-06 per Mike: "the actual text box should be able to...
+// insert the font size and make it larger."
+function FontSizeControl({ value, onChange }: { value: number; onChange: (v: number) => void }) {
+  return (
+    <div className="flex items-center gap-1.5">
+      <span className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">Size</span>
+      <button
+        onClick={() => onChange(Math.max(0.4, Math.round((value - 0.2) * 10) / 10))}
+        className="flex h-6 w-6 items-center justify-center rounded-full border border-border text-xs font-bold transition-colors hover:bg-secondary"
+      >
+        –
+      </button>
+      <span className="w-10 text-center text-[11px] text-muted-foreground">{Math.round(value * 100)}%</span>
+      <button
+        onClick={() => onChange(Math.min(3, Math.round((value + 0.2) * 10) / 10))}
+        className="flex h-6 w-6 items-center justify-center rounded-full border border-border text-xs font-bold transition-colors hover:bg-secondary"
+      >
+        +
+      </button>
+    </div>
+  );
+}
 
-type VideoTextSegment = { id: string; text: string; startSec: number; endSec: number; xPct: number; yPct: number };
+const MAX_VIDEO_TEXT_SEGMENTS_CLIENT = 5;
+const MIN_SEGMENT_SECONDS = 0.3;
+
+type VideoTextSegment = {
+  id: string;
+  text: string;
+  startSec: number;
+  endSec: number;
+  xPct: number;
+  yPct: number;
+  fontScale: number;
+};
 
 // The text tool itself — a pencil icon away from any photo or video already
 // attached to a post, email, or Reel in the Content Calendar. REBUILT
@@ -3512,6 +3551,7 @@ function TextOverlayEditor({
   // ---- Photo path --------------------------------------------------------
   const [photoText, setPhotoText] = useState(suggestions[0] ?? "");
   const [photoPos, setPhotoPos] = useState({ x: 50, y: 42 });
+  const [photoFontScale, setPhotoFontScale] = useState(1);
   const [photoBusy, setPhotoBusy] = useState(false);
   const photoBoxRef = useRef<HTMLDivElement>(null);
 
@@ -3521,7 +3561,7 @@ function TextOverlayEditor({
     setPhotoBusy(true);
     setError(null);
     try {
-      const blob = await compositeTextOnPhoto(mediaUrl, trimmed, style, photoPos.x, photoPos.y);
+      const blob = await compositeTextOnPhoto(mediaUrl, trimmed, style, photoPos.x, photoPos.y, photoFontScale);
       const file = new File([blob], "text-overlay.jpg", { type: "image/jpeg" });
       const { path, token } = await createMediaUploadUrl({ data: { agentId, fileName: file.name } });
       const { error: uploadErr } = await supabase.storage.from("media").uploadToSignedUrl(path, token, file);
@@ -3540,11 +3580,25 @@ function TextOverlayEditor({
 
   // ---- Video path ---------------------------------------------------------
   const [duration, setDuration] = useState(0);
+  const [currentTime, setCurrentTime] = useState(0);
   const [segments, setSegments] = useState<VideoTextSegment[]>([]);
   const [renderState, setRenderState] = useState<"idle" | "submitting" | "rendering" | "error">("idle");
   const [renderStatusLabel, setRenderStatusLabel] = useState("");
+  const videoRef = useRef<HTMLVideoElement>(null);
   const videoBoxRef = useRef<HTMLDivElement>(null);
+  const timelineRef = useRef<HTMLDivElement>(null);
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  // Drag state for the timeline bar below — a ref (not state) so it
+  // survives the re-renders that happen mid-drag (every updateSegment call
+  // re-renders and recreates the pointer handlers' closures; a ref keeps
+  // the drag's original anchor point stable across that).
+  const dragRef = useRef<{
+    id: string;
+    pointerStartX: number;
+    startSec: number;
+    endSec: number;
+    mode: "move" | "start" | "end";
+  } | null>(null);
 
   useEffect(() => {
     return () => {
@@ -3554,12 +3608,12 @@ function TextOverlayEditor({
 
   function addSegment() {
     if (segments.length >= MAX_VIDEO_TEXT_SEGMENTS_CLIENT || duration <= 0) return;
-    // Defaults to the next free 3-second window so blocks don't start out
-    // overlapping — "text block 1, 0 through 3 seconds, text block 2, 4
-    // through 6" per Mike's own example.
-    const lastEnd = segments.reduce((max, s) => Math.max(max, s.endSec), 0);
-    const start = Math.min(lastEnd, Math.max(0, duration - 1));
-    const end = Math.min(duration, start + 3);
+    // Starts wherever the video is right now — "you just want to add a new
+    // text block at that second as the video plays" per Mike — rather than
+    // chaining off the previous block's end time.
+    const playhead = videoRef.current?.currentTime ?? currentTime;
+    const start = Math.min(Math.max(0, playhead), Math.max(0, duration - MIN_SEGMENT_SECONDS));
+    const end = Math.max(start + MIN_SEGMENT_SECONDS, Math.min(duration, start + 3));
     setSegments((cur) => [
       ...cur,
       {
@@ -3569,6 +3623,7 @@ function TextOverlayEditor({
         endSec: end,
         xPct: 50,
         yPct: 42,
+        fontScale: 1,
       },
     ]);
   }
@@ -3579,6 +3634,43 @@ function TextOverlayEditor({
 
   function removeSegment(id: string) {
     setSegments((cur) => cur.filter((s) => s.id !== id));
+  }
+
+  // Shared by the timeline bar's move-the-whole-block drag and its two
+  // resize handles. Reads the drag's anchor from dragRef (set on
+  // pointerdown, immune to re-renders) and computes the new time(s) as an
+  // offset from that anchor, rather than from the segment's live state —
+  // that's what keeps a fast drag from drifting or jittering.
+  function segmentDragHandlers(seg: VideoTextSegment, mode: "move" | "start" | "end") {
+    return {
+      onPointerDown: (e: React.PointerEvent<HTMLDivElement>) => {
+        e.stopPropagation();
+        e.currentTarget.setPointerCapture(e.pointerId);
+        dragRef.current = { id: seg.id, pointerStartX: e.clientX, startSec: seg.startSec, endSec: seg.endSec, mode };
+      },
+      onPointerMove: (e: React.PointerEvent<HTMLDivElement>) => {
+        const drag = dragRef.current;
+        if (!drag || drag.id !== seg.id || e.buttons !== 1) return;
+        const width = timelineRef.current?.getBoundingClientRect().width;
+        if (!width || !duration) return;
+        const deltaSec = ((e.clientX - drag.pointerStartX) / width) * duration;
+        if (drag.mode === "move") {
+          const length = drag.endSec - drag.startSec;
+          const newStart = Math.min(duration - length, Math.max(0, drag.startSec + deltaSec));
+          updateSegment(drag.id, { startSec: newStart, endSec: newStart + length });
+        } else if (drag.mode === "start") {
+          const newStart = Math.min(drag.endSec - MIN_SEGMENT_SECONDS, Math.max(0, drag.startSec + deltaSec));
+          updateSegment(drag.id, { startSec: newStart });
+        } else {
+          const newEnd = Math.max(drag.startSec + MIN_SEGMENT_SECONDS, Math.min(duration, drag.endSec + deltaSec));
+          updateSegment(drag.id, { endSec: newEnd });
+        }
+      },
+      onPointerUp: (e: React.PointerEvent<HTMLDivElement>) => {
+        e.currentTarget.releasePointerCapture(e.pointerId);
+        dragRef.current = null;
+      },
+    };
   }
 
   async function startRender() {
@@ -3602,6 +3694,7 @@ function TextOverlayEditor({
             endSec: s.endSec,
             xPct: s.xPct,
             yPct: s.yPct,
+            fontScale: s.fontScale,
           })),
         },
       });
@@ -3663,6 +3756,11 @@ function TextOverlayEditor({
           >
             Dark on box
           </button>
+          {mediaType === "photo" && (
+            <div className="ml-auto">
+              <FontSizeControl value={photoFontScale} onChange={setPhotoFontScale} />
+            </div>
+          )}
         </div>
 
         {mediaType === "photo" ? (
@@ -3676,7 +3774,7 @@ function TextOverlayEditor({
               >
                 <span
                   className="whitespace-pre-wrap text-lg font-extrabold leading-tight"
-                  style={overlayTextStyle(style)}
+                  style={overlayTextStyle(style, photoFontScale)}
                 >
                   {photoText || "Drag me"}
                 </span>
@@ -3723,46 +3821,103 @@ function TextOverlayEditor({
           <>
             <div ref={videoBoxRef} className="relative mt-3 touch-none select-none overflow-hidden rounded-lg bg-muted">
               <video
+                ref={videoRef}
                 src={mediaUrl}
                 controls
                 className="block max-h-[50vh] w-full"
                 onLoadedMetadata={(e) => setDuration(e.currentTarget.duration)}
+                onTimeUpdate={(e) => setCurrentTime(e.currentTarget.currentTime)}
               />
-              {segments.map((s, i) => (
-                <div
-                  key={s.id}
-                  {...dragHandlers(videoBoxRef, (x, y) => updateSegment(s.id, { xPct: x, yPct: y }))}
-                  className="pointer-events-auto absolute cursor-grab px-3 text-center active:cursor-grabbing"
-                  style={{ left: `${s.xPct}%`, top: `${s.yPct}%`, transform: "translate(-50%, -50%)" }}
-                  title={`Text block ${i + 1}`}
-                >
-                  <span
-                    className="whitespace-pre-wrap text-base font-extrabold leading-tight"
-                    style={overlayTextStyle(style)}
+              {segments.map((s, i) => {
+                // Only the block(s) whose time range covers right now are
+                // shown on the frame — this is the fix for Mike's "the text
+                // doesn't disappear when that end time happens" bug: before,
+                // every block's handle rendered unconditionally regardless
+                // of playback position.
+                if (currentTime < s.startSec || currentTime >= s.endSec) return null;
+                return (
+                  <div
+                    key={s.id}
+                    {...dragHandlers(videoBoxRef, (x, y) => updateSegment(s.id, { xPct: x, yPct: y }))}
+                    className="pointer-events-auto absolute cursor-grab px-3 text-center active:cursor-grabbing"
+                    style={{ left: `${s.xPct}%`, top: `${s.yPct}%`, transform: "translate(-50%, -50%)" }}
+                    title={`Text block ${i + 1}`}
                   >
-                    {`${i + 1}. ${s.text || "Drag me"}`}
-                  </span>
-                </div>
-              ))}
+                    <span
+                      className="whitespace-pre-wrap text-base font-extrabold leading-tight"
+                      style={overlayTextStyle(style, s.fontScale)}
+                    >
+                      {`${i + 1}. ${s.text || "Drag me"}`}
+                    </span>
+                  </div>
+                );
+              })}
             </div>
             <p className="mt-1 text-[11px] text-muted-foreground">
-              Every block's position is shown at once — drag each one where it should sit. Duration:{" "}
+              Play or scrub to a block's time range to see and drag it into position. Duration:{" "}
               {duration ? `${duration.toFixed(1)}s` : "loading…"}
             </p>
+
+            {/* Canva-style visual timeline — drag a block to move it, or its
+                edges to resize it, instead of typing start/end seconds. */}
+            <div className="mt-3">
+              <div ref={timelineRef} className="relative h-1.5 w-full rounded-full bg-border">
+                {duration > 0 && (
+                  <div
+                    className="absolute top-1/2 z-20 h-3 w-[2px] -translate-y-1/2 rounded-full bg-foreground"
+                    style={{ left: `${Math.min(100, (currentTime / duration) * 100)}%` }}
+                  />
+                )}
+              </div>
+              <div className="relative mt-1.5" style={{ height: `${Math.max(1, segments.length) * 30}px` }}>
+                {segments.map((s, i) => {
+                  const leftPct = duration ? (s.startSec / duration) * 100 : 0;
+                  const widthPct = duration ? ((s.endSec - s.startSec) / duration) * 100 : 0;
+                  return (
+                    <div
+                      key={s.id}
+                      className="absolute flex touch-none select-none items-stretch overflow-hidden rounded-md border border-primary/50 bg-primary/15 text-[11px] font-semibold text-primary"
+                      style={{
+                        left: `${leftPct}%`,
+                        width: `${Math.max(3, widthPct)}%`,
+                        top: `${i * 30}px`,
+                        height: "24px",
+                      }}
+                      title={`${s.startSec.toFixed(1)}s – ${s.endSec.toFixed(1)}s`}
+                    >
+                      <div
+                        {...segmentDragHandlers(s, "start")}
+                        className="w-2 shrink-0 cursor-ew-resize bg-primary/50"
+                      />
+                      <div
+                        {...segmentDragHandlers(s, "move")}
+                        className="flex-1 cursor-grab truncate px-1.5 leading-[24px] active:cursor-grabbing"
+                      >
+                        {i + 1}. {s.text || "Drag me"}
+                      </div>
+                      <div {...segmentDragHandlers(s, "end")} className="w-2 shrink-0 cursor-ew-resize bg-primary/50" />
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
 
             <div className="mt-3 space-y-2">
               {segments.map((s, i) => (
                 <div key={s.id} className="rounded-xl border border-border bg-background/40 p-2.5">
                   <div className="flex items-center justify-between gap-2">
                     <span className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
-                      Text block {i + 1}
+                      Text block {i + 1} · {s.startSec.toFixed(1)}s–{s.endSec.toFixed(1)}s
                     </span>
-                    <button
-                      onClick={() => removeSegment(s.id)}
-                      className="text-[11px] font-semibold text-destructive hover:underline"
-                    >
-                      Remove
-                    </button>
+                    <div className="flex items-center gap-2">
+                      <FontSizeControl value={s.fontScale} onChange={(v) => updateSegment(s.id, { fontScale: v })} />
+                      <button
+                        onClick={() => removeSegment(s.id)}
+                        className="text-[11px] font-semibold text-destructive hover:underline"
+                      >
+                        Remove
+                      </button>
+                    </div>
                   </div>
                   {suggestions.length > 0 && (
                     <div className="mt-1.5 flex flex-wrap gap-1.5">
@@ -3788,34 +3943,6 @@ function TextOverlayEditor({
                     placeholder="Text for this block…"
                     className="mt-1.5 w-full rounded-lg border border-border bg-glass px-2 py-1.5 text-sm outline-none"
                   />
-                  <div className="mt-1.5 flex items-center gap-2 text-xs">
-                    <label className="flex items-center gap-1 text-muted-foreground">
-                      Start
-                      <input
-                        type="number"
-                        step={0.1}
-                        min={0}
-                        max={duration}
-                        value={s.startSec}
-                        onChange={(e) => updateSegment(s.id, { startSec: Number(e.target.value) })}
-                        className="w-16 rounded-md border border-border bg-glass px-1.5 py-0.5"
-                      />
-                      s
-                    </label>
-                    <label className="flex items-center gap-1 text-muted-foreground">
-                      End
-                      <input
-                        type="number"
-                        step={0.1}
-                        min={0}
-                        max={duration}
-                        value={s.endSec}
-                        onChange={(e) => updateSegment(s.id, { endSec: Number(e.target.value) })}
-                        className="w-16 rounded-md border border-border bg-glass px-1.5 py-0.5"
-                      />
-                      s
-                    </label>
-                  </div>
                 </div>
               ))}
             </div>
@@ -3826,7 +3953,7 @@ function TextOverlayEditor({
                 disabled={!duration || segments.length >= MAX_VIDEO_TEXT_SEGMENTS_CLIENT}
                 className="rounded-full border border-border px-3 py-1.5 text-xs font-semibold transition-colors hover:bg-secondary disabled:opacity-50"
               >
-                + Add text block ({segments.length}/{MAX_VIDEO_TEXT_SEGMENTS_CLIENT})
+                + Add text block at {currentTime.toFixed(1)}s ({segments.length}/{MAX_VIDEO_TEXT_SEGMENTS_CLIENT})
               </button>
             </div>
 

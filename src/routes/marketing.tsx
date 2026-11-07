@@ -67,7 +67,7 @@ import {
   logPhotoScanToChat,
   getReviewLink,
   regenerateReviewLink,
-  submitVideoTextRender,
+  submitReelRender,
   checkVideoTextRenderStatus,
   finalizeVideoTextRender,
   type MarketingAccess,
@@ -3330,13 +3330,15 @@ type TextOverlayStyle = "white" | "box";
 // UI controls, passed in as xPct/yPct (0-100, where 50/50 is dead center),
 // and again the same day to a caller-controlled fontScale (1 = default
 // size) per Mike: "you could insert the font size and make it larger."
+// WIDENED again 2026-11-07, from a single text string to a LIST of them,
+// per Mike's "combo" Reel builder ask — "you should be able to have 2+
+// text boxes on the screen" applies to photos too now, not just video, so
+// a photo can carry several independently-positioned text entries. Still
+// one flat canvas draw, just looped per entry instead of drawn once.
 async function compositeTextOnPhoto(
   imageUrl: string,
-  text: string,
+  texts: { text: string; xPct: number; yPct: number; fontScale: number }[],
   style: TextOverlayStyle,
-  xPct: number,
-  yPct: number,
-  fontScale: number,
 ): Promise<Blob> {
   const img = new Image();
   img.crossOrigin = "anonymous";
@@ -3359,67 +3361,73 @@ async function compositeTextOnPhoto(
 
   const marginX = width * 0.08;
   const maxLineWidth = width - marginX * 2;
-  const clampedFontScale = Math.min(3, Math.max(0.4, fontScale || 1));
-  const fontSize = Math.max(22, Math.round(width * 0.065 * clampedFontScale));
-  const lineHeight = fontSize * 1.25;
-  ctx.font = `800 ${fontSize}px system-ui, -apple-system, Arial, sans-serif`;
-  ctx.textAlign = "center";
-  ctx.textBaseline = "middle";
 
-  // Simple word-wrap to the safe width.
-  const words = text.trim().split(/\s+/).filter(Boolean);
-  const lines: string[] = [];
-  let line = "";
-  for (const word of words) {
-    const test = line ? `${line} ${word}` : word;
-    if (line && ctx.measureText(test).width > maxLineWidth) {
-      lines.push(line);
-      line = word;
-    } else {
-      line = test;
+  for (const entry of texts) {
+    const trimmed = entry.text.trim();
+    if (!trimmed) continue;
+
+    const clampedFontScale = Math.min(3, Math.max(0.4, entry.fontScale || 1));
+    const fontSize = Math.max(22, Math.round(width * 0.065 * clampedFontScale));
+    const lineHeight = fontSize * 1.25;
+    ctx.font = `800 ${fontSize}px system-ui, -apple-system, Arial, sans-serif`;
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+
+    // Simple word-wrap to the safe width.
+    const words = trimmed.split(/\s+/).filter(Boolean);
+    const lines: string[] = [];
+    let line = "";
+    for (const word of words) {
+      const test = line ? `${line} ${word}` : word;
+      if (line && ctx.measureText(test).width > maxLineWidth) {
+        lines.push(line);
+        line = word;
+      } else {
+        line = test;
+      }
     }
-  }
-  if (line) lines.push(line);
-  if (!lines.length) lines.push(text.trim() || " ");
+    if (line) lines.push(line);
+    if (!lines.length) lines.push(trimmed);
 
-  // Free placement — wherever the editor's drag handle was dropped, clamped
-  // a little so even a corner drop doesn't push text fully off-canvas.
-  const centerX = width * (Math.min(95, Math.max(5, xPct)) / 100);
-  const centerY = height * (Math.min(95, Math.max(5, yPct)) / 100);
-  const totalTextHeight = lines.length * lineHeight;
-  const startY = centerY - totalTextHeight / 2 + lineHeight / 2;
+    // Free placement — wherever the editor's drag handle was dropped, clamped
+    // a little so even a corner drop doesn't push text fully off-canvas.
+    const centerX = width * (Math.min(95, Math.max(5, entry.xPct)) / 100);
+    const centerY = height * (Math.min(95, Math.max(5, entry.yPct)) / 100);
+    const totalTextHeight = lines.length * lineHeight;
+    const startY = centerY - totalTextHeight / 2 + lineHeight / 2;
 
-  if (style === "box") {
-    const maxMeasured = Math.max(...lines.map((l) => ctx.measureText(l).width));
-    const padX = fontSize * 0.55;
-    const padY = fontSize * 0.35;
-    const boxW = maxMeasured + padX * 2;
-    const boxH = totalTextHeight + padY * 2;
-    const boxX = centerX - boxW / 2;
-    const boxY = startY - lineHeight / 2 - padY;
-    ctx.fillStyle = "rgba(255,255,255,0.95)";
-    if (typeof ctx.roundRect === "function") {
-      ctx.beginPath();
-      ctx.roundRect(boxX, boxY, boxW, boxH, fontSize * 0.2);
-      ctx.fill();
+    if (style === "box") {
+      const maxMeasured = Math.max(...lines.map((l) => ctx.measureText(l).width));
+      const padX = fontSize * 0.55;
+      const padY = fontSize * 0.35;
+      const boxW = maxMeasured + padX * 2;
+      const boxH = totalTextHeight + padY * 2;
+      const boxX = centerX - boxW / 2;
+      const boxY = startY - lineHeight / 2 - padY;
+      ctx.fillStyle = "rgba(255,255,255,0.95)";
+      if (typeof ctx.roundRect === "function") {
+        ctx.beginPath();
+        ctx.roundRect(boxX, boxY, boxW, boxH, fontSize * 0.2);
+        ctx.fill();
+      } else {
+        ctx.fillRect(boxX, boxY, boxW, boxH);
+      }
+      ctx.fillStyle = "#15171c";
+      lines.forEach((l, i) => ctx.fillText(l, centerX, startY + i * lineHeight));
     } else {
-      ctx.fillRect(boxX, boxY, boxW, boxH);
+      ctx.save();
+      ctx.shadowColor = "rgba(0,0,0,0.85)";
+      ctx.shadowBlur = fontSize * 0.14;
+      ctx.shadowOffsetY = fontSize * 0.04;
+      ctx.lineWidth = fontSize * 0.1;
+      ctx.strokeStyle = "rgba(0,0,0,0.55)";
+      ctx.fillStyle = "#ffffff";
+      lines.forEach((l, i) => {
+        ctx.strokeText(l, centerX, startY + i * lineHeight);
+        ctx.fillText(l, centerX, startY + i * lineHeight);
+      });
+      ctx.restore();
     }
-    ctx.fillStyle = "#15171c";
-    lines.forEach((l, i) => ctx.fillText(l, centerX, startY + i * lineHeight));
-  } else {
-    ctx.save();
-    ctx.shadowColor = "rgba(0,0,0,0.85)";
-    ctx.shadowBlur = fontSize * 0.14;
-    ctx.shadowOffsetY = fontSize * 0.04;
-    ctx.lineWidth = fontSize * 0.1;
-    ctx.strokeStyle = "rgba(0,0,0,0.55)";
-    ctx.fillStyle = "#ffffff";
-    lines.forEach((l, i) => {
-      ctx.strokeText(l, centerX, startY + i * lineHeight);
-      ctx.fillText(l, centerX, startY + i * lineHeight);
-    });
-    ctx.restore();
   }
 
   const blob = await new Promise<Blob | null>((resolve) => canvas.toBlob(resolve, "image/jpeg", 0.9));
@@ -3498,12 +3506,44 @@ function FontSizeControl({ value, onChange }: { value: number; onChange: (v: num
   );
 }
 
-const MAX_VIDEO_TEXT_SEGMENTS_CLIENT = 5;
+const MAX_TEXTS_PER_CLIP = 5;
 const MIN_SEGMENT_SECONDS = 0.3;
+const MAX_REEL_CLIPS = 8;
+const DEFAULT_PHOTO_DURATION_SEC = 3;
+const MIN_PHOTO_DURATION_SEC = 1;
+const MAX_PHOTO_DURATION_SEC = 15;
+const MIN_CLIP_TRIM_SECONDS = 1;
+
+// A new text block's starting spot cycles through these instead of always
+// landing dead center — per Mike: "each text block created needs to...
+// not overlap in the original. This means you should be able to have 2+
+// text boxes on the screen." Every new block used to default to the exact
+// same xPct/yPct, so two blocks visible at the same moment rendered
+// stacked on top of each other and looked like one box instead of two.
+// Still fully draggable afterward — this just keeps a fresh block from
+// being born invisible under an existing one.
+const DEFAULT_TEXT_POSITIONS = [
+  { x: 50, y: 28 },
+  { x: 50, y: 72 },
+  { x: 28, y: 50 },
+  { x: 72, y: 50 },
+  { x: 50, y: 50 },
+];
+
+type PhotoTextEntry = {
+  id: string;
+  text: string;
+  xPct: number;
+  yPct: number;
+  fontScale: number;
+};
 
 type VideoTextSegment = {
   id: string;
   text: string;
+  // LOCAL to this clip's own trimmed window — 0 means right at trimStartSec,
+  // not the combined Reel's absolute timeline (submitReelRender in
+  // marketing.ts does that math once it knows where each clip lands).
   startSec: number;
   endSec: number;
   xPct: number;
@@ -3511,22 +3551,76 @@ type VideoTextSegment = {
   fontScale: number;
 };
 
+// One item in the Reel's sequence — REBUILT 2026-11-07 per Mike's "combo"
+// ask: "we need a way to trim video too... add another video for a
+// reel... start with one video and then have the option to upload a
+// picture or video... this allows us to tell the story." A discriminated
+// union rather than one shape with a pile of optional fields, since a
+// photo clip and a video clip genuinely carry different data (a display
+// duration vs. a source length to trim into) and this keeps the two from
+// ever being mixed up at the type level.
+type ReelClip =
+  | {
+      id: string;
+      kind: "photo";
+      url: string;
+      photoDurationSec: number;
+      texts: PhotoTextEntry[];
+    }
+  | {
+      id: string;
+      kind: "video";
+      url: string;
+      // 0 until probeVideoFromUrl (below) resolves — doubles as the
+      // "still probing" flag, since a real video is never 0 seconds long.
+      sourceDurationSec: number;
+      sourceWidthPx: number;
+      sourceHeightPx: number;
+      trimStartSec: number;
+      trimEndSec: number;
+      texts: VideoTextSegment[];
+    };
+
+// Reads a video's real duration and pixel dimensions from its URL alone.
+// Used to probe every video clip added to the Reel — not just whichever
+// one is currently active/visible — so trim bounds and output size are
+// ready before a render needs them.
+function probeVideoFromUrl(url: string): Promise<{ durationSec: number; widthPx: number; heightPx: number }> {
+  return new Promise((resolve) => {
+    const video = document.createElement("video");
+    video.preload = "metadata";
+    video.muted = true;
+    video.onloadedmetadata = () => {
+      resolve({
+        durationSec: video.duration || 0.5,
+        widthPx: video.videoWidth || 0,
+        heightPx: video.videoHeight || 0,
+      });
+    };
+    video.onerror = () => resolve({ durationSec: 0.5, widthPx: 0, heightPx: 0 });
+    video.src = url;
+  });
+}
+
 // The text tool itself — a pencil icon away from any photo or video already
 // attached to a post, email, or Reel in the Content Calendar. REBUILT
-// 2026-11-06 per Mike: what started as a plain "pick a line, save" panel on
-// a scan result grew into a Canva-style editor, moved out of the Media tab
-// and Scan My Photos entirely and into the Content Calendar instead — "all
-// we're trying to do is overlay simple text... the UI should almost mimic
-// exactly how you would do it inside of Canva... drag and drop the text
-// wherever we want on the photo and or the video... limit the amount of
-// time it stays up on screen."
+// 2026-11-06 per Mike into a Canva-style drag-and-drop editor, then REBUILT
+// AGAIN 2026-11-07 into a full Reel builder — "we need a way to trim video
+// too. But add another video for a reel. You would start with one video
+// and then have the option to upload a picture of video. Same with all
+// this tool works with combo or photo only or video. This allows us to
+// tell the story." So this edits a SEQUENCE of 1+ clips (any mix of photos
+// and videos), each trimmable (video) or timed (photo), each with its own
+// draggable, independently-timed text — not just whichever single photo or
+// video was clicked on to open it.
 //
-// Photos composite instantly and for free, right here in the browser
-// (compositeTextOnPhoto, plain <canvas>). Video can't work that way — this
-// app's hosting (Cloudflare's edge runtime, via Lovable/Nitro) can't run a
-// video encoder — so a video render is handed off to Shotstack
-// (submitVideoTextRender/checkVideoTextRenderStatus/finalizeVideoTextRender,
-// marketing.ts) and the editor polls for it to finish.
+// A single photo with nothing else added still composites instantly and
+// for free, right here in the browser (compositeTextOnPhoto, plain
+// <canvas>) — the one case that doesn't need Shotstack. Everything else
+// (any video, or 2+ clips of any kind) goes through Shotstack
+// (submitReelRender/checkVideoTextRenderStatus/finalizeVideoTextRender,
+// marketing.ts), since this app's hosting (Cloudflare's edge runtime, via
+// Lovable/Nitro) can't run a video encoder itself.
 function TextOverlayEditor({
   agentId,
   mediaUrl,
@@ -3548,132 +3642,298 @@ function TextOverlayEditor({
   const [style, setStyle] = useState<OverlayStyle>("white");
   const [error, setError] = useState<string | null>(null);
 
-  // ---- Photo path --------------------------------------------------------
-  const [photoText, setPhotoText] = useState(suggestions[0] ?? "");
-  const [photoPos, setPhotoPos] = useState({ x: 50, y: 42 });
-  const [photoFontScale, setPhotoFontScale] = useState(1);
-  const [photoBusy, setPhotoBusy] = useState(false);
-  const photoBoxRef = useRef<HTMLDivElement>(null);
+  // ---- The clip sequence --------------------------------------------------
+  // Seeded with whatever the pencil icon was clicked on; "+ Add clip" below
+  // appends more.
+  const [clips, setClips] = useState<ReelClip[]>(() => [
+    mediaType === "photo"
+      ? {
+          id: crypto.randomUUID(),
+          kind: "photo",
+          url: mediaUrl,
+          photoDurationSec: DEFAULT_PHOTO_DURATION_SEC,
+          texts: [],
+        }
+      : {
+          id: crypto.randomUUID(),
+          kind: "video",
+          url: mediaUrl,
+          sourceDurationSec: 0,
+          sourceWidthPx: 0,
+          sourceHeightPx: 0,
+          trimStartSec: 0,
+          trimEndSec: 0,
+          texts: [],
+        },
+  ]);
+  const [activeClipId, setActiveClipId] = useState<string>(clips[0]!.id);
+  const activeClip = clips.find((c) => c.id === activeClipId) ?? clips[0]!;
+  // Narrowed, stable aliases for the JSX below — sidesteps relying on
+  // TypeScript's narrowing of `activeClip` carrying through every nested
+  // closure (onLoadedMetadata, the .map callbacks, etc.) by just giving
+  // each branch its own already-narrowed constant instead.
+  const photoClip = activeClip.kind === "photo" ? activeClip : null;
+  const videoClip = activeClip.kind === "video" ? activeClip : null;
 
-  async function savePhoto() {
-    const trimmed = photoText.trim();
-    if (!trimmed) return;
-    setPhotoBusy(true);
-    setError(null);
-    try {
-      const blob = await compositeTextOnPhoto(mediaUrl, trimmed, style, photoPos.x, photoPos.y, photoFontScale);
-      const file = new File([blob], "text-overlay.jpg", { type: "image/jpeg" });
-      const { path, token } = await createMediaUploadUrl({ data: { agentId, fileName: file.name } });
-      const { error: uploadErr } = await supabase.storage.from("media").uploadToSignedUrl(path, token, file);
-      if (uploadErr) throw uploadErr;
-      const result = await finalizeMediaUpload({
-        data: { agentId, storagePath: path, mediaType: "photo", caption: trimmed },
+  // Probes every video clip's real duration/dimensions as soon as it's
+  // added, not just the active one, so a clip further down the filmstrip
+  // still has a correct trim window and output size by the time "Render
+  // Reel" needs it. Converges safely: once a clip's sourceDurationSec is
+  // set it no longer matches the "unprobed" filter, so nothing re-probes
+  // the same clip twice.
+  useEffect(() => {
+    const unprobed = clips.filter(
+      (c): c is Extract<ReelClip, { kind: "video" }> => c.kind === "video" && c.sourceDurationSec === 0,
+    );
+    if (!unprobed.length) return;
+    unprobed.forEach((c) => {
+      probeVideoFromUrl(c.url).then(({ durationSec, widthPx, heightPx }) => {
+        setClips((cur) =>
+          cur.map((x) =>
+            x.id === c.id && x.kind === "video" && x.sourceDurationSec === 0
+              ? {
+                  ...x,
+                  sourceDurationSec: durationSec,
+                  sourceWidthPx: widthPx,
+                  sourceHeightPx: heightPx,
+                  trimEndSec: durationSec,
+                }
+              : x,
+          ),
+        );
       });
-      const { data: pub } = supabase.storage.from("media").getPublicUrl(path);
-      onReplaced({ id: result.id, url: pub.publicUrl });
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [clips]);
+
+  function removeClip(id: string) {
+    setClips((cur) => {
+      if (cur.length <= 1) return cur; // always keep at least one clip
+      const next = cur.filter((c) => c.id !== id);
+      if (id === activeClipId) setActiveClipId(next[0]!.id);
+      return next;
+    });
+  }
+
+  // ---- "+ Add clip" library picker ---------------------------------------
+  const [pickerOpen, setPickerOpen] = useState(false);
+  const [pickerOptions, setPickerOptions] = useState<MediaRow[] | null>(null);
+  const [pickerError, setPickerError] = useState<string | null>(null);
+
+  async function openPicker() {
+    setPickerOpen(true);
+    setPickerError(null);
+    try {
+      setPickerOptions(await listMarketingMedia({ data: { agentId, status: "available" } }));
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
-    } finally {
-      setPhotoBusy(false);
+      setPickerError(e instanceof Error ? e.message : String(e));
     }
   }
 
-  // ---- Video path ---------------------------------------------------------
-  const [duration, setDuration] = useState(0);
-  const [currentTime, setCurrentTime] = useState(0);
-  // Shotstack's render-time validator rejects a bare {format:"mp4"} output
-  // with "Validation failed for output: Found 1 validation error" — every
-  // example in its own docs sets resolution or size, so it needs an
-  // explicit frame size. Captured here (native pixels, from the same
-  // onLoadedMetadata event duration comes from) so submitVideoTextRender
-  // can pass the SOURCE video's own dimensions through as output.size —
-  // not a preset like "sd"/"hd", which would reflow a vertical phone
-  // recording into a landscape frame and throw off every block's x/y%.
-  const [videoWidthPx, setVideoWidthPx] = useState(0);
-  const [videoHeightPx, setVideoHeightPx] = useState(0);
-  const [segments, setSegments] = useState<VideoTextSegment[]>([]);
-  const [renderState, setRenderState] = useState<"idle" | "submitting" | "rendering" | "error">("idle");
-  const [renderStatusLabel, setRenderStatusLabel] = useState("");
+  function addClipFromLibrary(m: MediaRow) {
+    if (!m.url || clips.length >= MAX_REEL_CLIPS) return;
+    const newClip: ReelClip =
+      m.media_type === "photo"
+        ? {
+            id: crypto.randomUUID(),
+            kind: "photo",
+            url: m.url,
+            photoDurationSec: DEFAULT_PHOTO_DURATION_SEC,
+            texts: [],
+          }
+        : {
+            id: crypto.randomUUID(),
+            kind: "video",
+            url: m.url,
+            sourceDurationSec: 0,
+            sourceWidthPx: 0,
+            sourceHeightPx: 0,
+            trimStartSec: 0,
+            trimEndSec: 0,
+            texts: [],
+          };
+    setClips((cur) => [...cur, newClip]);
+    setActiveClipId(newClip.id);
+    setPickerOpen(false);
+  }
+
+  // ---- Photo text entries (drag position only — no time range needed, a
+  // photo clip just shows for its whole photoDurationSec) ------------------
+  const photoBoxRef = useRef<HTMLDivElement>(null);
+
+  function addPhotoText() {
+    if (activeClip.kind !== "photo" || activeClip.texts.length >= MAX_TEXTS_PER_CLIP) return;
+    const pos = DEFAULT_TEXT_POSITIONS[activeClip.texts.length % DEFAULT_TEXT_POSITIONS.length] ?? { x: 50, y: 42 };
+    const clipId = activeClip.id;
+    const nextIdx = activeClip.texts.length;
+    setClips((cur) =>
+      cur.map((c) =>
+        c.id === clipId && c.kind === "photo"
+          ? {
+              ...c,
+              texts: [
+                ...c.texts,
+                { id: crypto.randomUUID(), text: suggestions[nextIdx] ?? "", xPct: pos.x, yPct: pos.y, fontScale: 1 },
+              ],
+            }
+          : c,
+      ),
+    );
+  }
+
+  function updatePhotoText(clipId: string, textId: string, patch: Partial<PhotoTextEntry>) {
+    setClips((cur) =>
+      cur.map((c) =>
+        c.id === clipId && c.kind === "photo"
+          ? { ...c, texts: c.texts.map((t) => (t.id === textId ? { ...t, ...patch } : t)) }
+          : c,
+      ),
+    );
+  }
+
+  function removePhotoText(clipId: string, textId: string) {
+    setClips((cur) =>
+      cur.map((c) =>
+        c.id === clipId && c.kind === "photo" ? { ...c, texts: c.texts.filter((t) => t.id !== textId) } : c,
+      ),
+    );
+  }
+
+  // ---- Video text segments + trim -----------------------------------------
   const videoRef = useRef<HTMLVideoElement>(null);
   const videoBoxRef = useRef<HTMLDivElement>(null);
   const timelineRef = useRef<HTMLDivElement>(null);
-  const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
-  // Drag state for the timeline bar below — a ref (not state) so it
-  // survives the re-renders that happen mid-drag (every updateSegment call
-  // re-renders and recreates the pointer handlers' closures; a ref keeps
-  // the drag's original anchor point stable across that).
+  const trimRef = useRef<HTMLDivElement>(null);
+  const [currentTime, setCurrentTime] = useState(0);
+  // Drag state for the text timeline and the trim bar below — refs, not
+  // state, so they survive the re-renders every drag update triggers
+  // (each updateVideoSegment/applyTrim call re-renders and recreates the
+  // pointer handlers' closures; a ref keeps the drag's original anchor
+  // point stable across that, which is what keeps a fast drag from
+  // drifting or jittering).
   const dragRef = useRef<{
+    clipId: string;
     id: string;
     pointerStartX: number;
     startSec: number;
     endSec: number;
     mode: "move" | "start" | "end";
   } | null>(null);
+  const trimDragRef = useRef<{
+    clipId: string;
+    pointerStartX: number;
+    trimStartSec: number;
+    trimEndSec: number;
+    mode: "start" | "end";
+  } | null>(null);
 
+  // Jump the visible <video> to wherever the newly-active clip's trim
+  // window starts, so switching clips in the filmstrip always previews
+  // from the right spot instead of wherever the last clip happened to
+  // leave off.
   useEffect(() => {
-    return () => {
-      if (pollRef.current) clearInterval(pollRef.current);
-    };
-  }, []);
+    if (activeClip.kind === "video" && videoRef.current) {
+      videoRef.current.currentTime = activeClip.trimStartSec;
+      setCurrentTime(activeClip.trimStartSec);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeClipId]);
 
-  function addSegment() {
-    if (segments.length >= MAX_VIDEO_TEXT_SEGMENTS_CLIENT || duration <= 0) return;
-    // Starts wherever the video is right now — "you just want to add a new
-    // text block at that second as the video plays" per Mike — rather than
-    // chaining off the previous block's end time.
-    const playhead = videoRef.current?.currentTime ?? currentTime;
-    const start = Math.min(Math.max(0, playhead), Math.max(0, duration - MIN_SEGMENT_SECONDS));
-    const end = Math.max(start + MIN_SEGMENT_SECONDS, Math.min(duration, start + 3));
-    setSegments((cur) => [
-      ...cur,
-      {
-        id: crypto.randomUUID(),
-        text: suggestions[cur.length] ?? "",
-        startSec: start,
-        endSec: end,
-        xPct: 50,
-        yPct: 42,
-        fontScale: 1,
-      },
-    ]);
+  function addVideoSegment() {
+    if (activeClip.kind !== "video" || activeClip.texts.length >= MAX_TEXTS_PER_CLIP) return;
+    const clip = activeClip;
+    const trimmedDuration = Math.max(MIN_SEGMENT_SECONDS, clip.trimEndSec - clip.trimStartSec);
+    if (trimmedDuration <= 0) return;
+    // Starts wherever the video is right now, relative to this clip's own
+    // trim window — "you just want to add a new text block at that second
+    // as the video plays" per Mike.
+    const playheadAbs = videoRef.current?.currentTime ?? currentTime;
+    const playheadLocal = Math.max(0, playheadAbs - clip.trimStartSec);
+    const start = Math.min(playheadLocal, Math.max(0, trimmedDuration - MIN_SEGMENT_SECONDS));
+    const end = Math.max(start + MIN_SEGMENT_SECONDS, Math.min(trimmedDuration, start + 3));
+    const pos = DEFAULT_TEXT_POSITIONS[clip.texts.length % DEFAULT_TEXT_POSITIONS.length] ?? { x: 50, y: 42 };
+    const nextIdx = clip.texts.length;
+    setClips((cur) =>
+      cur.map((c) =>
+        c.id === clip.id && c.kind === "video"
+          ? {
+              ...c,
+              texts: [
+                ...c.texts,
+                {
+                  id: crypto.randomUUID(),
+                  text: suggestions[nextIdx] ?? "",
+                  startSec: start,
+                  endSec: end,
+                  xPct: pos.x,
+                  yPct: pos.y,
+                  fontScale: 1,
+                },
+              ],
+            }
+          : c,
+      ),
+    );
   }
 
-  function updateSegment(id: string, patch: Partial<VideoTextSegment>) {
-    setSegments((cur) => cur.map((s) => (s.id === id ? { ...s, ...patch } : s)));
+  function updateVideoSegment(clipId: string, segId: string, patch: Partial<VideoTextSegment>) {
+    setClips((cur) =>
+      cur.map((c) =>
+        c.id === clipId && c.kind === "video"
+          ? { ...c, texts: c.texts.map((t) => (t.id === segId ? { ...t, ...patch } : t)) }
+          : c,
+      ),
+    );
   }
 
-  function removeSegment(id: string) {
-    setSegments((cur) => cur.filter((s) => s.id !== id));
+  function removeVideoSegment(clipId: string, segId: string) {
+    setClips((cur) =>
+      cur.map((c) =>
+        c.id === clipId && c.kind === "video" ? { ...c, texts: c.texts.filter((t) => t.id !== segId) } : c,
+      ),
+    );
   }
 
   // Shared by the timeline bar's move-the-whole-block drag and its two
-  // resize handles. Reads the drag's anchor from dragRef (set on
-  // pointerdown, immune to re-renders) and computes the new time(s) as an
-  // offset from that anchor, rather than from the segment's live state —
-  // that's what keeps a fast drag from drifting or jittering.
-  function segmentDragHandlers(seg: VideoTextSegment, mode: "move" | "start" | "end") {
+  // resize handles, bounded to this clip's own TRIMMED duration.
+  function segmentDragHandlers(
+    clip: Extract<ReelClip, { kind: "video" }>,
+    seg: VideoTextSegment,
+    mode: "move" | "start" | "end",
+  ) {
+    const trimmedDuration = Math.max(MIN_SEGMENT_SECONDS, clip.trimEndSec - clip.trimStartSec);
     return {
       onPointerDown: (e: React.PointerEvent<HTMLDivElement>) => {
         e.stopPropagation();
         e.currentTarget.setPointerCapture(e.pointerId);
-        dragRef.current = { id: seg.id, pointerStartX: e.clientX, startSec: seg.startSec, endSec: seg.endSec, mode };
+        dragRef.current = {
+          clipId: clip.id,
+          id: seg.id,
+          pointerStartX: e.clientX,
+          startSec: seg.startSec,
+          endSec: seg.endSec,
+          mode,
+        };
       },
       onPointerMove: (e: React.PointerEvent<HTMLDivElement>) => {
         const drag = dragRef.current;
         if (!drag || drag.id !== seg.id || e.buttons !== 1) return;
         const width = timelineRef.current?.getBoundingClientRect().width;
-        if (!width || !duration) return;
-        const deltaSec = ((e.clientX - drag.pointerStartX) / width) * duration;
+        if (!width) return;
+        const deltaSec = ((e.clientX - drag.pointerStartX) / width) * trimmedDuration;
         if (drag.mode === "move") {
           const length = drag.endSec - drag.startSec;
-          const newStart = Math.min(duration - length, Math.max(0, drag.startSec + deltaSec));
-          updateSegment(drag.id, { startSec: newStart, endSec: newStart + length });
+          const newStart = Math.min(trimmedDuration - length, Math.max(0, drag.startSec + deltaSec));
+          updateVideoSegment(drag.clipId, drag.id, { startSec: newStart, endSec: newStart + length });
         } else if (drag.mode === "start") {
           const newStart = Math.min(drag.endSec - MIN_SEGMENT_SECONDS, Math.max(0, drag.startSec + deltaSec));
-          updateSegment(drag.id, { startSec: newStart });
+          updateVideoSegment(drag.clipId, drag.id, { startSec: newStart });
         } else {
-          const newEnd = Math.max(drag.startSec + MIN_SEGMENT_SECONDS, Math.min(duration, drag.endSec + deltaSec));
-          updateSegment(drag.id, { endSec: newEnd });
+          const newEnd = Math.max(
+            drag.startSec + MIN_SEGMENT_SECONDS,
+            Math.min(trimmedDuration, drag.endSec + deltaSec),
+          );
+          updateVideoSegment(drag.clipId, drag.id, { endSec: newEnd });
         }
       },
       onPointerUp: (e: React.PointerEvent<HTMLDivElement>) => {
@@ -3683,31 +3943,163 @@ function TextOverlayEditor({
     };
   }
 
+  function applyTrim(clipId: string, trimStartSec: number, trimEndSec: number) {
+    const newLength = Math.max(MIN_SEGMENT_SECONDS, trimEndSec - trimStartSec);
+    setClips((cur) =>
+      cur.map((c) => {
+        if (c.id !== clipId || c.kind !== "video") return c;
+        // Clamp every text block to the new, possibly-shorter window — same
+        // offsets-from-trim-start meaning as before, just capped so a block
+        // can't end up pointing past where the clip now ends.
+        const texts = c.texts.map((t) => {
+          const endSec = Math.min(t.endSec, newLength);
+          const startSec = Math.min(t.startSec, Math.max(0, endSec - MIN_SEGMENT_SECONDS));
+          return { ...t, startSec, endSec };
+        });
+        return { ...c, trimStartSec, trimEndSec, texts };
+      }),
+    );
+  }
+
+  // The trim bar's two edge handles — same ref-anchored drag pattern as
+  // segmentDragHandlers, but bounded by the clip's FULL source duration
+  // rather than its already-trimmed window, since this is what SETS that
+  // window.
+  function trimDragHandlers(clip: Extract<ReelClip, { kind: "video" }>, mode: "start" | "end") {
+    return {
+      onPointerDown: (e: React.PointerEvent<HTMLDivElement>) => {
+        e.stopPropagation();
+        e.currentTarget.setPointerCapture(e.pointerId);
+        trimDragRef.current = {
+          clipId: clip.id,
+          pointerStartX: e.clientX,
+          trimStartSec: clip.trimStartSec,
+          trimEndSec: clip.trimEndSec,
+          mode,
+        };
+      },
+      onPointerMove: (e: React.PointerEvent<HTMLDivElement>) => {
+        const drag = trimDragRef.current;
+        if (!drag || drag.clipId !== clip.id || e.buttons !== 1) return;
+        const width = trimRef.current?.getBoundingClientRect().width;
+        if (!width || !clip.sourceDurationSec) return;
+        const deltaSec = ((e.clientX - drag.pointerStartX) / width) * clip.sourceDurationSec;
+        if (drag.mode === "start") {
+          const newStart = Math.min(drag.trimEndSec - MIN_CLIP_TRIM_SECONDS, Math.max(0, drag.trimStartSec + deltaSec));
+          applyTrim(clip.id, newStart, clip.trimEndSec);
+        } else {
+          const newEnd = Math.max(
+            drag.trimStartSec + MIN_CLIP_TRIM_SECONDS,
+            Math.min(clip.sourceDurationSec, drag.trimEndSec + deltaSec),
+          );
+          applyTrim(clip.id, clip.trimStartSec, newEnd);
+        }
+      },
+      onPointerUp: (e: React.PointerEvent<HTMLDivElement>) => {
+        e.currentTarget.releasePointerCapture(e.pointerId);
+        trimDragRef.current = null;
+      },
+    };
+  }
+
+  // ---- Save (free, instant, client-side) or Render (Shotstack) -----------
+  const [busy, setBusy] = useState(false);
+  const [renderState, setRenderState] = useState<"idle" | "submitting" | "rendering" | "error">("idle");
+  const [renderStatusLabel, setRenderStatusLabel] = useState("");
+  const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  useEffect(() => {
+    return () => {
+      if (pollRef.current) clearInterval(pollRef.current);
+    };
+  }, []);
+
+  // The ONE case that still skips Shotstack entirely — exactly one clip,
+  // and it's a photo. Everything else (any video, or 2+ clips) needs a
+  // real render.
+  const isSinglePhotoOnly = clips.length === 1 && clips[0]!.kind === "photo";
+
+  async function saveSinglePhoto() {
+    const clip = clips[0];
+    if (!clip || clip.kind !== "photo") return;
+    setBusy(true);
+    setError(null);
+    try {
+      const blob = await compositeTextOnPhoto(clip.url, clip.texts, style);
+      const file = new File([blob], "text-overlay.jpg", { type: "image/jpeg" });
+      const { path, token } = await createMediaUploadUrl({ data: { agentId, fileName: file.name } });
+      const { error: uploadErr } = await supabase.storage.from("media").uploadToSignedUrl(path, token, file);
+      if (uploadErr) throw uploadErr;
+      const caption = clip.texts
+        .map((t) => t.text.trim())
+        .filter(Boolean)
+        .join(" / ");
+      const result = await finalizeMediaUpload({
+        data: { agentId, storagePath: path, mediaType: "photo", caption },
+      });
+      const { data: pub } = supabase.storage.from("media").getPublicUrl(path);
+      onReplaced({ id: result.id, url: pub.publicUrl });
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
   async function startRender() {
     setError(null);
-    if (!segments.length) {
+    if (clips.some((c) => c.kind === "video" && c.sourceDurationSec === 0)) {
+      setError("Still reading one of the videos — give it a second and try again.");
+      return;
+    }
+    if (!clips.some((c) => c.texts.length > 0)) {
       setError("Add at least one text block first.");
       return;
     }
     setRenderState("submitting");
     setRenderStatusLabel("Sending to the renderer…");
     try {
-      const { renderId } = await submitVideoTextRender({
+      // The combined output frame follows the first VIDEO clip's own
+      // native dimensions (same reasoning as the single-video build this
+      // grew out of — an explicit size is required, see
+      // shotstackOutputSize in marketing.ts); a photo-only Reel has no
+      // video to measure, so it falls back to that function's own default.
+      const firstVideoClip = clips.find((c): c is Extract<ReelClip, { kind: "video" }> => c.kind === "video");
+
+      const { renderId } = await submitReelRender({
         data: {
           agentId,
-          videoUrl: mediaUrl,
-          videoDurationSec: duration,
-          videoWidthPx,
-          videoHeightPx,
           style,
-          segments: segments.map((s) => ({
-            text: s.text.trim(),
-            startSec: s.startSec,
-            endSec: s.endSec,
-            xPct: s.xPct,
-            yPct: s.yPct,
-            fontScale: s.fontScale,
-          })),
+          outputWidthPx: firstVideoClip?.sourceWidthPx ?? 0,
+          outputHeightPx: firstVideoClip?.sourceHeightPx ?? 0,
+          clips: clips.map((c) =>
+            c.kind === "photo"
+              ? {
+                  kind: "photo" as const,
+                  url: c.url,
+                  lengthSec: c.photoDurationSec,
+                  texts: c.texts.map((t) => ({
+                    text: t.text.trim(),
+                    xPct: t.xPct,
+                    yPct: t.yPct,
+                    fontScale: t.fontScale,
+                  })),
+                }
+              : {
+                  kind: "video" as const,
+                  url: c.url,
+                  trimStartSec: c.trimStartSec,
+                  trimEndSec: c.trimEndSec,
+                  texts: c.texts.map((t) => ({
+                    text: t.text.trim(),
+                    startSec: t.startSec,
+                    endSec: t.endSec,
+                    xPct: t.xPct,
+                    yPct: t.yPct,
+                    fontScale: t.fontScale,
+                  })),
+                },
+          ),
         },
       });
       setRenderState("rendering");
@@ -3718,7 +4110,10 @@ function TextOverlayEditor({
           if (status.status === "done" && status.url) {
             if (pollRef.current) clearInterval(pollRef.current);
             setRenderStatusLabel("Saving to your Media Library…");
-            const caption = segments.map((s) => s.text.trim()).join(" / ");
+            const caption = clips
+              .flatMap((c) => c.texts.map((t) => t.text.trim()))
+              .filter(Boolean)
+              .join(" / ");
             const result = await finalizeVideoTextRender({ data: { agentId, outputUrl: status.url, caption } });
             setRenderState("idle");
             onReplaced({ id: result.id, url: result.url });
@@ -3747,10 +4142,96 @@ function TextOverlayEditor({
     <Dialog open onOpenChange={(open) => !open && onClose()}>
       <DialogContent className="max-h-[90vh] w-[95vw] max-w-3xl overflow-y-auto">
         <DialogHeader>
-          <DialogTitle>Add text to this {mediaType}</DialogTitle>
+          <DialogTitle>{clips.length > 1 ? "Build this Reel" : `Add text to this ${mediaType}`}</DialogTitle>
         </DialogHeader>
 
-        <div className="mt-1 flex items-center gap-2">
+        {/* Filmstrip — one clip at a time is edited below; click a
+            thumbnail to switch. Start with one photo or video, then add
+            more of either to tell a longer story in one Reel. */}
+        <div className="mt-1 flex items-center gap-2 overflow-x-auto pb-1">
+          {clips.map((c, i) => (
+            <button
+              key={c.id}
+              onClick={() => setActiveClipId(c.id)}
+              className={`group relative h-14 w-14 shrink-0 overflow-hidden rounded-lg border-2 transition-colors ${
+                c.id === activeClipId ? "border-primary" : "border-border hover:border-primary/50"
+              }`}
+              title={`Clip ${i + 1}`}
+            >
+              {c.kind === "photo" ? (
+                <img src={c.url} alt="" className="h-full w-full object-cover" />
+              ) : (
+                <video src={c.url} className="h-full w-full object-cover" muted />
+              )}
+              <span className="absolute bottom-0.5 left-0.5 rounded bg-background/80 px-1 text-[9px] font-semibold">
+                {i + 1}
+              </span>
+              {clips.length > 1 && (
+                <span
+                  role="button"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    removeClip(c.id);
+                  }}
+                  className="absolute right-0.5 top-0.5 flex h-4 w-4 items-center justify-center rounded-full bg-background/90 text-[10px] font-bold text-destructive opacity-0 transition-opacity group-hover:opacity-100"
+                >
+                  ×
+                </span>
+              )}
+            </button>
+          ))}
+          {clips.length < MAX_REEL_CLIPS && (
+            <button
+              onClick={openPicker}
+              className="flex h-14 w-14 shrink-0 flex-col items-center justify-center gap-0.5 rounded-lg border border-dashed border-border text-[10px] font-semibold text-muted-foreground transition-colors hover:border-primary hover:text-primary"
+            >
+              <span className="text-base leading-none">+</span>
+              Add clip
+            </button>
+          )}
+        </div>
+
+        {pickerOpen && (
+          <div className="mt-2 rounded-xl border border-border bg-background/60 p-3">
+            <div className="mb-2 flex items-center justify-between">
+              <span className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
+                Add a photo or video from your Media Library
+              </span>
+              <button
+                onClick={() => setPickerOpen(false)}
+                className="text-[11px] text-muted-foreground hover:underline"
+              >
+                Close
+              </button>
+            </div>
+            {pickerOptions === null && !pickerError && <p className="text-xs text-muted-foreground">Loading…</p>}
+            {pickerError && <p className="text-xs text-destructive">{pickerError}</p>}
+            {pickerOptions !== null && pickerOptions.length === 0 && (
+              <p className="text-xs text-muted-foreground">No available media in your Library yet.</p>
+            )}
+            {pickerOptions !== null && pickerOptions.length > 0 && (
+              <div className="grid grid-cols-4 gap-2 sm:grid-cols-6">
+                {pickerOptions.map((m) =>
+                  m.url ? (
+                    <button
+                      key={m.id}
+                      onClick={() => addClipFromLibrary(m)}
+                      className="overflow-hidden rounded-lg border border-border transition-colors hover:border-primary"
+                    >
+                      {m.media_type === "video" ? (
+                        <video src={m.url} className="aspect-square w-full object-cover" muted />
+                      ) : (
+                        <img src={m.url} alt="" className="aspect-square w-full object-cover" />
+                      )}
+                    </button>
+                  ) : null,
+                )}
+              </div>
+            )}
+          </div>
+        )}
+
+        <div className="mt-3 flex items-center gap-2">
           <span className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">Style</span>
           <button
             onClick={() => setStyle("white")}
@@ -3768,167 +4249,74 @@ function TextOverlayEditor({
           >
             Dark on box
           </button>
-          {mediaType === "photo" && (
-            <div className="ml-auto">
-              <FontSizeControl value={photoFontScale} onChange={setPhotoFontScale} />
-            </div>
-          )}
         </div>
 
-        {mediaType === "photo" ? (
+        {photoClip ? (
           <>
             <div ref={photoBoxRef} className="relative mt-3 touch-none select-none overflow-hidden rounded-lg bg-muted">
-              <img src={mediaUrl} alt="" className="block max-h-[50vh] w-full object-contain" draggable={false} />
-              <div
-                {...dragHandlers(photoBoxRef, (x, y) => setPhotoPos({ x, y }))}
-                className="absolute cursor-grab px-4 text-center active:cursor-grabbing"
-                style={{ left: `${photoPos.x}%`, top: `${photoPos.y}%`, transform: "translate(-50%, -50%)" }}
-              >
-                <span
-                  className="whitespace-pre-wrap text-lg font-extrabold leading-tight"
-                  style={overlayTextStyle(style, photoFontScale)}
+              <img src={photoClip.url} alt="" className="block max-h-[50vh] w-full object-contain" draggable={false} />
+              {photoClip.texts.map((t) => (
+                <div
+                  key={t.id}
+                  {...dragHandlers(photoBoxRef, (x, y) => updatePhotoText(photoClip.id, t.id, { xPct: x, yPct: y }))}
+                  className="absolute cursor-grab px-4 text-center active:cursor-grabbing"
+                  style={{ left: `${t.xPct}%`, top: `${t.yPct}%`, transform: "translate(-50%, -50%)" }}
                 >
-                  {photoText || "Drag me"}
-                </span>
-              </div>
-            </div>
-            <p className="mt-1 text-[11px] text-muted-foreground">Drag the text to position it.</p>
-
-            {suggestions.length > 0 && (
-              <div className="mt-3 flex flex-wrap gap-1.5">
-                {suggestions.map((s, i) => (
-                  <button
-                    key={i}
-                    onClick={() => setPhotoText(s)}
-                    className={`rounded-full border px-3 py-1 text-xs transition-colors ${
-                      photoText === s
-                        ? "border-primary bg-primary/10 text-primary"
-                        : "border-border bg-glass text-muted-foreground hover:text-foreground"
-                    }`}
+                  <span
+                    className="whitespace-pre-wrap text-lg font-extrabold leading-tight"
+                    style={overlayTextStyle(style, t.fontScale)}
                   >
-                    {s}
-                  </button>
-                ))}
+                    {t.text || "Drag me"}
+                  </span>
+                </div>
+              ))}
+            </div>
+            <p className="mt-1 text-[11px] text-muted-foreground">Drag each text box to position it.</p>
+
+            {clips.length > 1 && (
+              <div className="mt-2 flex items-center gap-2 text-xs text-muted-foreground">
+                <span>Show this photo for</span>
+                <input
+                  type="number"
+                  min={MIN_PHOTO_DURATION_SEC}
+                  max={MAX_PHOTO_DURATION_SEC}
+                  step={0.5}
+                  value={photoClip.photoDurationSec}
+                  onChange={(e) =>
+                    setClips((cur) =>
+                      cur.map((c) =>
+                        c.id === photoClip.id && c.kind === "photo"
+                          ? {
+                              ...c,
+                              photoDurationSec: Math.min(
+                                MAX_PHOTO_DURATION_SEC,
+                                Math.max(MIN_PHOTO_DURATION_SEC, Number(e.target.value) || DEFAULT_PHOTO_DURATION_SEC),
+                              ),
+                            }
+                          : c,
+                      ),
+                    )
+                  }
+                  className="w-16 rounded-md border border-border bg-glass px-1.5 py-0.5"
+                />
+                <span>seconds</span>
               </div>
             )}
 
-            <AutoResizeTextarea
-              value={photoText}
-              onChange={setPhotoText}
-              minHeightPx={44}
-              placeholder="Text to overlay on the photo…"
-              className="mt-2 w-full rounded-xl border border-border bg-glass px-3 py-2 text-sm outline-none"
-            />
-
-            <div className="mt-3 flex items-center gap-2">
-              <Button onClick={savePhoto} disabled={photoBusy || !photoText.trim()}>
-                {photoBusy ? "Saving…" : "Save to Media Library"}
-              </Button>
-              <Button variant="secondary" onClick={onClose} disabled={photoBusy}>
-                Cancel
-              </Button>
-            </div>
-          </>
-        ) : (
-          <>
-            <div ref={videoBoxRef} className="relative mt-3 touch-none select-none overflow-hidden rounded-lg bg-muted">
-              <video
-                ref={videoRef}
-                src={mediaUrl}
-                controls
-                className="block max-h-[50vh] w-full"
-                onLoadedMetadata={(e) => {
-                  setDuration(e.currentTarget.duration);
-                  setVideoWidthPx(e.currentTarget.videoWidth);
-                  setVideoHeightPx(e.currentTarget.videoHeight);
-                }}
-                onTimeUpdate={(e) => setCurrentTime(e.currentTarget.currentTime)}
-              />
-              {segments.map((s, i) => {
-                // Only the block(s) whose time range covers right now are
-                // shown on the frame — this is the fix for Mike's "the text
-                // doesn't disappear when that end time happens" bug: before,
-                // every block's handle rendered unconditionally regardless
-                // of playback position.
-                if (currentTime < s.startSec || currentTime >= s.endSec) return null;
-                return (
-                  <div
-                    key={s.id}
-                    {...dragHandlers(videoBoxRef, (x, y) => updateSegment(s.id, { xPct: x, yPct: y }))}
-                    className="pointer-events-auto absolute cursor-grab px-3 text-center active:cursor-grabbing"
-                    style={{ left: `${s.xPct}%`, top: `${s.yPct}%`, transform: "translate(-50%, -50%)" }}
-                    title={`Text block ${i + 1}`}
-                  >
-                    <span
-                      className="whitespace-pre-wrap text-base font-extrabold leading-tight"
-                      style={overlayTextStyle(style, s.fontScale)}
-                    >
-                      {`${i + 1}. ${s.text || "Drag me"}`}
-                    </span>
-                  </div>
-                );
-              })}
-            </div>
-            <p className="mt-1 text-[11px] text-muted-foreground">
-              Play or scrub to a block's time range to see and drag it into position. Duration:{" "}
-              {duration ? `${duration.toFixed(1)}s` : "loading…"}
-            </p>
-
-            {/* Canva-style visual timeline — drag a block to move it, or its
-                edges to resize it, instead of typing start/end seconds. */}
-            <div className="mt-3">
-              <div ref={timelineRef} className="relative h-1.5 w-full rounded-full bg-border">
-                {duration > 0 && (
-                  <div
-                    className="absolute top-1/2 z-20 h-3 w-[2px] -translate-y-1/2 rounded-full bg-foreground"
-                    style={{ left: `${Math.min(100, (currentTime / duration) * 100)}%` }}
-                  />
-                )}
-              </div>
-              <div className="relative mt-1.5" style={{ height: `${Math.max(1, segments.length) * 30}px` }}>
-                {segments.map((s, i) => {
-                  const leftPct = duration ? (s.startSec / duration) * 100 : 0;
-                  const widthPct = duration ? ((s.endSec - s.startSec) / duration) * 100 : 0;
-                  return (
-                    <div
-                      key={s.id}
-                      className="absolute flex touch-none select-none items-stretch overflow-hidden rounded-md border border-primary/50 bg-primary/15 text-[11px] font-semibold text-primary"
-                      style={{
-                        left: `${leftPct}%`,
-                        width: `${Math.max(3, widthPct)}%`,
-                        top: `${i * 30}px`,
-                        height: "24px",
-                      }}
-                      title={`${s.startSec.toFixed(1)}s – ${s.endSec.toFixed(1)}s`}
-                    >
-                      <div
-                        {...segmentDragHandlers(s, "start")}
-                        className="w-2 shrink-0 cursor-ew-resize bg-primary/50"
-                      />
-                      <div
-                        {...segmentDragHandlers(s, "move")}
-                        className="flex-1 cursor-grab truncate px-1.5 leading-[24px] active:cursor-grabbing"
-                      >
-                        {i + 1}. {s.text || "Drag me"}
-                      </div>
-                      <div {...segmentDragHandlers(s, "end")} className="w-2 shrink-0 cursor-ew-resize bg-primary/50" />
-                    </div>
-                  );
-                })}
-              </div>
-            </div>
-
             <div className="mt-3 space-y-2">
-              {segments.map((s, i) => (
-                <div key={s.id} className="rounded-xl border border-border bg-background/40 p-2.5">
+              {photoClip.texts.map((t, i) => (
+                <div key={t.id} className="rounded-xl border border-border bg-background/40 p-2.5">
                   <div className="flex items-center justify-between gap-2">
                     <span className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
-                      Text block {i + 1} · {s.startSec.toFixed(1)}s–{s.endSec.toFixed(1)}s
+                      Text {i + 1}
                     </span>
                     <div className="flex items-center gap-2">
-                      <FontSizeControl value={s.fontScale} onChange={(v) => updateSegment(s.id, { fontScale: v })} />
+                      <FontSizeControl
+                        value={t.fontScale}
+                        onChange={(v) => updatePhotoText(photoClip.id, t.id, { fontScale: v })}
+                      />
                       <button
-                        onClick={() => removeSegment(s.id)}
+                        onClick={() => removePhotoText(photoClip.id, t.id)}
                         className="text-[11px] font-semibold text-destructive hover:underline"
                       >
                         Remove
@@ -3940,9 +4328,9 @@ function TextOverlayEditor({
                       {suggestions.map((sug, si) => (
                         <button
                           key={si}
-                          onClick={() => updateSegment(s.id, { text: sug })}
+                          onClick={() => updatePhotoText(photoClip.id, t.id, { text: sug })}
                           className={`rounded-full border px-2.5 py-0.5 text-[11px] transition-colors ${
-                            s.text === sug
+                            t.text === sug
                               ? "border-primary bg-primary/10 text-primary"
                               : "border-border bg-glass text-muted-foreground hover:text-foreground"
                           }`}
@@ -3953,10 +4341,10 @@ function TextOverlayEditor({
                     </div>
                   )}
                   <AutoResizeTextarea
-                    value={s.text}
-                    onChange={(v) => updateSegment(s.id, { text: v })}
+                    value={t.text}
+                    onChange={(v) => updatePhotoText(photoClip.id, t.id, { text: v })}
                     minHeightPx={36}
-                    placeholder="Text for this block…"
+                    placeholder="Text for this photo…"
                     className="mt-1.5 w-full rounded-lg border border-border bg-glass px-2 py-1.5 text-sm outline-none"
                   />
                 </div>
@@ -3965,26 +4353,250 @@ function TextOverlayEditor({
 
             <div className="mt-2">
               <button
-                onClick={addSegment}
-                disabled={!duration || segments.length >= MAX_VIDEO_TEXT_SEGMENTS_CLIENT}
+                onClick={addPhotoText}
+                disabled={photoClip.texts.length >= MAX_TEXTS_PER_CLIP}
                 className="rounded-full border border-border px-3 py-1.5 text-xs font-semibold transition-colors hover:bg-secondary disabled:opacity-50"
               >
-                + Add text block at {currentTime.toFixed(1)}s ({segments.length}/{MAX_VIDEO_TEXT_SEGMENTS_CLIENT})
+                + Add text ({photoClip.texts.length}/{MAX_TEXTS_PER_CLIP})
               </button>
             </div>
 
             {rendering && <p className="mt-3 text-sm font-semibold text-primary">{renderStatusLabel}</p>}
 
             <div className="mt-3 flex items-center gap-2">
-              <Button onClick={startRender} disabled={rendering || !segments.length}>
-                {rendering ? "Rendering…" : "Render video"}
+              {isSinglePhotoOnly ? (
+                <Button onClick={saveSinglePhoto} disabled={busy || !clips[0]?.texts.length}>
+                  {busy ? "Saving…" : "Save to Media Library"}
+                </Button>
+              ) : (
+                <Button onClick={startRender} disabled={rendering}>
+                  {rendering ? "Rendering…" : "Render Reel"}
+                </Button>
+              )}
+              <Button variant="secondary" onClick={onClose} disabled={busy || rendering}>
+                Cancel
+              </Button>
+            </div>
+          </>
+        ) : videoClip ? (
+          <>
+            <div ref={videoBoxRef} className="relative mt-3 touch-none select-none overflow-hidden rounded-lg bg-muted">
+              <video
+                key={videoClip.id}
+                ref={videoRef}
+                src={videoClip.url}
+                controls
+                className="block max-h-[50vh] w-full"
+                onLoadedMetadata={(e) => {
+                  e.currentTarget.currentTime = videoClip.trimStartSec;
+                }}
+                onTimeUpdate={(e) => {
+                  const t = e.currentTarget.currentTime;
+                  // Loop within the trim window during preview playback,
+                  // rather than playing on into the part that won't
+                  // actually be in the rendered Reel.
+                  if (videoClip.trimEndSec > 0 && t >= videoClip.trimEndSec) {
+                    e.currentTarget.currentTime = videoClip.trimStartSec;
+                    e.currentTarget.pause();
+                  }
+                  setCurrentTime(t);
+                }}
+              />
+              {videoClip.texts.map((s, i) => {
+                // Only the block(s) whose time range covers right now are
+                // shown on the frame — this is the fix for Mike's "the text
+                // doesn't disappear when that end time happens" bug: before,
+                // every block's handle rendered unconditionally regardless
+                // of playback position.
+                const localTime = currentTime - videoClip.trimStartSec;
+                if (localTime < s.startSec || localTime >= s.endSec) return null;
+                return (
+                  <div
+                    key={s.id}
+                    {...dragHandlers(videoBoxRef, (x, y) =>
+                      updateVideoSegment(videoClip.id, s.id, { xPct: x, yPct: y }),
+                    )}
+                    className="pointer-events-auto absolute cursor-grab px-3 text-center active:cursor-grabbing"
+                    style={{ left: `${s.xPct}%`, top: `${s.yPct}%`, transform: "translate(-50%, -50%)" }}
+                    title={`Text block ${i + 1}`}
+                  >
+                    <span
+                      className="whitespace-pre-wrap text-base font-extrabold leading-tight"
+                      style={overlayTextStyle(style, s.fontScale)}
+                    >
+                      {s.text || "Drag me"}
+                    </span>
+                  </div>
+                );
+              })}
+            </div>
+
+            {videoClip.sourceDurationSec === 0 ? (
+              <p className="mt-1 text-[11px] text-muted-foreground">Reading this video…</p>
+            ) : (
+              <>
+                {/* Trim bar — spans the FULL source video; drag either edge
+                    to cut the clip down to just the part that's used. */}
+                <p className="mt-2 text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
+                  Trim this clip ({(videoClip.trimEndSec - videoClip.trimStartSec).toFixed(1)}s of{" "}
+                  {videoClip.sourceDurationSec.toFixed(1)}s)
+                </p>
+                <div ref={trimRef} className="relative mt-1 h-6 w-full touch-none select-none rounded-md bg-border/60">
+                  <div
+                    className="absolute top-0 h-full rounded-md bg-primary/30"
+                    style={{
+                      left: `${(videoClip.trimStartSec / videoClip.sourceDurationSec) * 100}%`,
+                      width: `${((videoClip.trimEndSec - videoClip.trimStartSec) / videoClip.sourceDurationSec) * 100}%`,
+                    }}
+                  />
+                  <div
+                    {...trimDragHandlers(videoClip, "start")}
+                    className="absolute top-0 h-full w-3 cursor-ew-resize rounded-l-md bg-primary"
+                    style={{ left: `${(videoClip.trimStartSec / videoClip.sourceDurationSec) * 100}%` }}
+                  />
+                  <div
+                    {...trimDragHandlers(videoClip, "end")}
+                    className="absolute top-0 h-full w-3 cursor-ew-resize rounded-r-md bg-primary"
+                    style={{ left: `calc(${(videoClip.trimEndSec / videoClip.sourceDurationSec) * 100}% - 12px)` }}
+                  />
+                </div>
+
+                <p className="mt-2 text-[11px] text-muted-foreground">
+                  Play or scrub to a block's time range to see and drag it into position.
+                </p>
+
+                {/* Canva-style visual timeline for THIS clip's trimmed
+                    length — drag a block to move it, or its edges to
+                    resize it, instead of typing start/end seconds. */}
+                <div className="mt-2">
+                  <div ref={timelineRef} className="relative h-1.5 w-full rounded-full bg-border">
+                    <div
+                      className="absolute top-1/2 z-20 h-3 w-[2px] -translate-y-1/2 rounded-full bg-foreground"
+                      style={{
+                        left: `${Math.min(
+                          100,
+                          Math.max(
+                            0,
+                            ((currentTime - videoClip.trimStartSec) /
+                              Math.max(MIN_SEGMENT_SECONDS, videoClip.trimEndSec - videoClip.trimStartSec)) *
+                              100,
+                          ),
+                        )}%`,
+                      }}
+                    />
+                  </div>
+                  <div className="relative mt-1.5" style={{ height: `${Math.max(1, videoClip.texts.length) * 30}px` }}>
+                    {videoClip.texts.map((s, i) => {
+                      const trimmedDuration = Math.max(
+                        MIN_SEGMENT_SECONDS,
+                        videoClip.trimEndSec - videoClip.trimStartSec,
+                      );
+                      const leftPct = (s.startSec / trimmedDuration) * 100;
+                      const widthPct = ((s.endSec - s.startSec) / trimmedDuration) * 100;
+                      return (
+                        <div
+                          key={s.id}
+                          className="absolute flex touch-none select-none items-stretch overflow-hidden rounded-md border border-primary/50 bg-primary/15 text-[11px] font-semibold text-primary"
+                          style={{
+                            left: `${leftPct}%`,
+                            width: `${Math.max(3, widthPct)}%`,
+                            top: `${i * 30}px`,
+                            height: "24px",
+                          }}
+                          title={`${s.startSec.toFixed(1)}s – ${s.endSec.toFixed(1)}s`}
+                        >
+                          <div
+                            {...segmentDragHandlers(videoClip, s, "start")}
+                            className="w-2 shrink-0 cursor-ew-resize bg-primary/50"
+                          />
+                          <div
+                            {...segmentDragHandlers(videoClip, s, "move")}
+                            className="flex-1 cursor-grab truncate px-1.5 leading-[24px] active:cursor-grabbing"
+                          >
+                            {s.text || "Drag me"}
+                          </div>
+                          <div
+                            {...segmentDragHandlers(videoClip, s, "end")}
+                            className="w-2 shrink-0 cursor-ew-resize bg-primary/50"
+                          />
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+
+                <div className="mt-3 space-y-2">
+                  {videoClip.texts.map((s, i) => (
+                    <div key={s.id} className="rounded-xl border border-border bg-background/40 p-2.5">
+                      <div className="flex items-center justify-between gap-2">
+                        <span className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
+                          Text block {i + 1} · {s.startSec.toFixed(1)}s–{s.endSec.toFixed(1)}s
+                        </span>
+                        <div className="flex items-center gap-2">
+                          <FontSizeControl
+                            value={s.fontScale}
+                            onChange={(v) => updateVideoSegment(videoClip.id, s.id, { fontScale: v })}
+                          />
+                          <button
+                            onClick={() => removeVideoSegment(videoClip.id, s.id)}
+                            className="text-[11px] font-semibold text-destructive hover:underline"
+                          >
+                            Remove
+                          </button>
+                        </div>
+                      </div>
+                      {suggestions.length > 0 && (
+                        <div className="mt-1.5 flex flex-wrap gap-1.5">
+                          {suggestions.map((sug, si) => (
+                            <button
+                              key={si}
+                              onClick={() => updateVideoSegment(videoClip.id, s.id, { text: sug })}
+                              className={`rounded-full border px-2.5 py-0.5 text-[11px] transition-colors ${
+                                s.text === sug
+                                  ? "border-primary bg-primary/10 text-primary"
+                                  : "border-border bg-glass text-muted-foreground hover:text-foreground"
+                              }`}
+                            >
+                              {sug}
+                            </button>
+                          ))}
+                        </div>
+                      )}
+                      <AutoResizeTextarea
+                        value={s.text}
+                        onChange={(v) => updateVideoSegment(videoClip.id, s.id, { text: v })}
+                        minHeightPx={36}
+                        placeholder="Text for this block…"
+                        className="mt-1.5 w-full rounded-lg border border-border bg-glass px-2 py-1.5 text-sm outline-none"
+                      />
+                    </div>
+                  ))}
+                </div>
+
+                <div className="mt-2">
+                  <button
+                    onClick={addVideoSegment}
+                    disabled={videoClip.texts.length >= MAX_TEXTS_PER_CLIP}
+                    className="rounded-full border border-border px-3 py-1.5 text-xs font-semibold transition-colors hover:bg-secondary disabled:opacity-50"
+                  >
+                    + Add text block ({videoClip.texts.length}/{MAX_TEXTS_PER_CLIP})
+                  </button>
+                </div>
+              </>
+            )}
+
+            {rendering && <p className="mt-3 text-sm font-semibold text-primary">{renderStatusLabel}</p>}
+
+            <div className="mt-3 flex items-center gap-2">
+              <Button onClick={startRender} disabled={rendering}>
+                {rendering ? "Rendering…" : "Render Reel"}
               </Button>
               <Button variant="secondary" onClick={onClose} disabled={rendering}>
                 Cancel
               </Button>
             </div>
           </>
-        )}
+        ) : null}
 
         {error && <p className="mt-2 text-xs text-destructive">{error}</p>}
       </DialogContent>

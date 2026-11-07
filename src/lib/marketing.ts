@@ -5890,35 +5890,48 @@ export const sendContentToAgent = createServerFn({ method: "POST" })
   });
 
 // ---------------------------------------------------------------------------
-// Video text-overlay rendering (Shotstack) — added 2026-11-06 alongside the
-// photo text tool's upgrade to drag-and-drop placement and its move into the
-// Content Calendar. Burning text into a PHOTO is free and instant (plain
-// <canvas>, see compositeTextOnPhoto in marketing.tsx) because a still image
-// is just pixels this app can draw on directly in the browser. A VIDEO is
-// not — actually encoding text into video frames needs a real video encoder,
-// and this app deploys through Lovable onto Cloudflare's edge runtime (see
-// vite.config.ts — nitro's "cloudflare" target), which can't run ffmpeg or
-// spawn any process at all. So this calls out to Shotstack (shotstack.io), a
-// hosted video-rendering API built for exactly this: send it a background
-// video plus a timeline of text clips, get back a finished, text-baked-in
-// mp4. Needs SHOTSTACK_API_KEY in Lovable Cloud → Secrets (free sandbox
-// signup at shotstack.io) and, once ready for real client-facing
-// (unwatermarked) output, SHOTSTACK_ENV=v1 on a paid plan — it defaults to
-// "stage," their free sandbox, which WATERMARKS every render.
+// Video/Reel text-overlay rendering (Shotstack) — added 2026-11-06 alongside
+// the photo text tool's upgrade to drag-and-drop placement and its move into
+// the Content Calendar; WIDENED 2026-11-07 from a single video to a whole
+// sequence of clips, per Mike's "combo" ask — "we need a way to trim video
+// too... add another video for a reel... start with one video and then have
+// the option to upload a picture or video... this allows us to tell the
+// story." Burning text into a PHOTO-only Reel (exactly one photo, nothing
+// else) is still free and instant (plain <canvas>, see compositeTextOnPhoto
+// in marketing.tsx) because a still image is just pixels this app can draw
+// on directly in the browser. Anything with a VIDEO in it, or more than one
+// clip, is not — actually encoding text into video frames (or splicing
+// multiple clips together) needs a real video encoder, and this app deploys
+// through Lovable onto Cloudflare's edge runtime (see vite.config.ts —
+// nitro's "cloudflare" target), which can't run ffmpeg or spawn any process
+// at all. So this calls out to Shotstack (shotstack.io), a hosted
+// video-rendering API built for exactly this: send it a sequence of
+// photo/video clips plus a timeline of text clips, get back one finished,
+// text-baked-in mp4. Needs SHOTSTACK_API_KEY in Lovable Cloud → Secrets
+// (free sandbox signup at shotstack.io) and, once ready for real
+// client-facing (unwatermarked) output, SHOTSTACK_ENV=v1 on a paid plan —
+// it defaults to "stage," their free sandbox, which WATERMARKS every render.
 //
 // This is the one piece of this build that couldn't be fully tested
 // end-to-end here, since it needs a real Shotstack account/API key this
 // session never had access to (and never will — creating accounts on
 // someone else's behalf isn't something this assistant does). The request
 // shape below matches Shotstack's own documented Edit API (timeline/tracks/
-// clips, html-asset text overlays, the position+offset positioning model),
-// but the very first real render should be treated as a test: check the
+// clips, html-asset text overlays, the position+offset positioning model,
+// trim for cutting into a video clip's source, fit:"crop" so clips of
+// different native sizes all fill the same output frame), but the very
+// first real multi-clip render should be treated as a test: check the
 // output's timing, text position, and quality against what the editor
 // previewed before trusting it for client-facing content.
 const MAX_VIDEO_TEXT_SEGMENTS = 5;
+const MAX_REEL_CLIPS = 8;
 
 type VideoTextSegmentInput = {
   text: string;
+  // LOCAL to whichever clip this text block belongs to — 0 means "right at
+  // this clip's own start" (its trim start, for a video), not the combined
+  // Reel's absolute timeline. submitReelRender below does the absolute-time
+  // math once it knows where each clip lands in the sequence.
   startSec: number;
   endSec: number;
   // 0-100, percentage position within the frame — matches the drag-and-drop
@@ -5932,6 +5945,21 @@ type VideoTextSegmentInput = {
   // whole render over a stray value.
   fontScale: number;
 };
+
+type ReelClipInput =
+  | {
+      kind: "photo";
+      url: string;
+      lengthSec: number;
+      texts: { text: string; xPct: number; yPct: number; fontScale: number }[];
+    }
+  | {
+      kind: "video";
+      url: string;
+      trimStartSec: number;
+      trimEndSec: number;
+      texts: VideoTextSegmentInput[];
+    };
 
 function shotstackBase(): string {
   const env = (process.env["SHOTSTACK_ENV"] ?? "stage").trim() || "stage";
@@ -6010,67 +6038,110 @@ function shotstackTextAsset(text: string, style: "white" | "box", scale: number)
 // short and simple is the safer bet, especially for a first-time
 // integration with a service this session couldn't test rendering against
 // directly. The client polls checkVideoTextRenderStatus below instead.
-export const submitVideoTextRender = createServerFn({ method: "POST" })
+//
+// REBUILT 2026-11-07 from the single-video-only submitVideoTextRender into
+// a general Reel sequencer: walks the clip list once, laying each one back
+// to back on one background track (cursor tracks where the next clip
+// starts) while flattening every clip's own LOCAL text-block times into
+// ABSOLUTE ones (cursor + local) on their own text tracks.
+export const submitReelRender = createServerFn({ method: "POST" })
   .middleware([requireSupabaseAuth])
   .inputValidator(
     (data: {
       agentId: string;
-      videoUrl: string;
-      videoDurationSec: number;
-      videoWidthPx: number;
-      videoHeightPx: number;
       style: "white" | "box";
-      segments: VideoTextSegmentInput[];
+      outputWidthPx: number;
+      outputHeightPx: number;
+      clips: ReelClipInput[];
     }) => data,
   )
   .handler(async ({ data, context }): Promise<{ renderId: string }> => {
     const email = (context.claims as { email?: string } | undefined)?.email;
     await requireAgentAccess(context.userId, email, data.agentId);
 
-    if (!data.segments.length) throw new Error("Add at least one text block before rendering.");
-    if (data.segments.length > MAX_VIDEO_TEXT_SEGMENTS) {
-      throw new Error(`Up to ${MAX_VIDEO_TEXT_SEGMENTS} text blocks at a time, for now.`);
-    }
-    const duration = Math.max(0.5, data.videoDurationSec);
-    for (const seg of data.segments) {
-      if (!seg.text.trim()) throw new Error("Every text block needs some text.");
-      if (seg.startSec < 0 || seg.endSec > duration + 0.25 || seg.endSec <= seg.startSec) {
-        throw new Error("A text block's timing doesn't fit within this video.");
-      }
+    if (!data.clips.length) throw new Error("Add at least one photo or video first.");
+    if (data.clips.length > MAX_REEL_CLIPS) {
+      throw new Error(`Up to ${MAX_REEL_CLIPS} clips in one Reel, for now.`);
     }
 
     const key = shotstackKey();
     const base = shotstackBase();
 
-    const textTracks = data.segments.map((seg) => {
-      const { position, offset } = toShotstackPosition(seg.xPct, seg.yPct);
-      return {
-        clips: [
-          {
-            asset: shotstackTextAsset(seg.text.trim(), data.style, seg.fontScale),
-            start: Math.round(seg.startSec * 100) / 100,
-            length: Math.round((seg.endSec - seg.startSec) * 100) / 100,
-            position,
-            offset,
-          },
-        ],
-      };
-    });
+    const backgroundClips: Record<string, unknown>[] = [];
+    const textTracks: Record<string, unknown>[] = [];
+    let cursor = 0;
+    let totalTexts = 0;
+
+    for (const clip of data.clips) {
+      if (clip.texts.length > MAX_VIDEO_TEXT_SEGMENTS) {
+        throw new Error(`Up to ${MAX_VIDEO_TEXT_SEGMENTS} text blocks per clip, for now.`);
+      }
+      totalTexts += clip.texts.length;
+
+      if (clip.kind === "video") {
+        const length = clip.trimEndSec - clip.trimStartSec;
+        if (length <= 0) throw new Error("A video clip's trim doesn't leave anything to render.");
+        backgroundClips.push({
+          asset: { type: "video", src: clip.url, trim: Math.round(clip.trimStartSec * 100) / 100 },
+          start: Math.round(cursor * 100) / 100,
+          length: Math.round(length * 100) / 100,
+          // Clips can mix different native sizes (a photo plus a phone
+          // video, say) — crop-to-fill keeps every clip filling the SAME
+          // output frame (see output.size below) instead of each dictating
+          // its own shape.
+          fit: "crop",
+        });
+        for (const seg of clip.texts) {
+          if (!seg.text.trim()) throw new Error("Every text block needs some text.");
+          if (seg.startSec < 0 || seg.endSec > length + 0.25 || seg.endSec <= seg.startSec) {
+            throw new Error("A text block's timing doesn't fit within its own clip.");
+          }
+          const { position, offset } = toShotstackPosition(seg.xPct, seg.yPct);
+          textTracks.push({
+            clips: [
+              {
+                asset: shotstackTextAsset(seg.text.trim(), data.style, seg.fontScale),
+                start: Math.round((cursor + seg.startSec) * 100) / 100,
+                length: Math.round((seg.endSec - seg.startSec) * 100) / 100,
+                position,
+                offset,
+              },
+            ],
+          });
+        }
+        cursor += length;
+      } else {
+        const length = Math.max(0.5, clip.lengthSec);
+        backgroundClips.push({
+          asset: { type: "image", src: clip.url },
+          start: Math.round(cursor * 100) / 100,
+          length: Math.round(length * 100) / 100,
+          fit: "crop",
+        });
+        for (const t of clip.texts) {
+          if (!t.text.trim()) throw new Error("Every text box needs some text.");
+          const { position, offset } = toShotstackPosition(t.xPct, t.yPct);
+          textTracks.push({
+            clips: [
+              {
+                asset: shotstackTextAsset(t.text.trim(), data.style, t.fontScale),
+                start: Math.round(cursor * 100) / 100,
+                length: Math.round(length * 100) / 100,
+                position,
+                offset,
+              },
+            ],
+          });
+        }
+        cursor += length;
+      }
+    }
+
+    if (!totalTexts) throw new Error("Add at least one text block before rendering.");
 
     const body = {
       timeline: {
-        tracks: [
-          ...textTracks,
-          {
-            clips: [
-              {
-                asset: { type: "video", src: data.videoUrl },
-                start: 0,
-                length: Math.round(duration * 100) / 100,
-              },
-            ],
-          },
-        ],
+        tracks: [...textTracks, { clips: backgroundClips }],
       },
       // An explicit size, not a resolution/aspectRatio preset — Shotstack's
       // render-time validator rejects a bare {format:"mp4"} output
@@ -6078,15 +6149,16 @@ export const submitVideoTextRender = createServerFn({ method: "POST" })
       // 2026-11-06 off Mike's first real test render), and every example in
       // Shotstack's own docs sets resolution or size, so it needs an
       // explicit frame. A preset like "sd"/"hd" would reflow a vertical
-      // phone recording into a landscape frame; passing the SOURCE video's
-      // own native pixel dimensions instead keeps the editor's drag
-      // positions (captured as xPct/yPct against that same native frame,
-      // see TextOverlayEditor in marketing.tsx) meaning the same thing on
-      // both sides. H.264 needs even width/height, hence the rounding; a
-      // missing/zero dimension (an old browser that didn't report
-      // videoWidth/videoHeight) falls back to a safe 1280x720 rather than
-      // sending 0.
-      output: { format: "mp4", size: shotstackOutputSize(data.videoWidthPx, data.videoHeightPx) },
+      // phone recording into a landscape frame; passing one clip's own
+      // native pixel dimensions instead (picked client-side — see
+      // TextOverlayEditor's startRender in marketing.tsx) keeps the
+      // editor's drag positions (captured as xPct/yPct against that same
+      // native frame) meaning the same thing on both sides, for at least
+      // that clip. H.264 needs even width/height, hence the rounding in
+      // shotstackOutputSize; a missing/zero dimension (an old browser that
+      // didn't report videoWidth/videoHeight, or a photo-only Reel) falls
+      // back to a safe 1280x720 rather than sending 0.
+      output: { format: "mp4", size: shotstackOutputSize(data.outputWidthPx, data.outputHeightPx) },
     };
 
     const res = await fetch(`${base}/render`, {

@@ -3581,6 +3581,16 @@ function TextOverlayEditor({
   // ---- Video path ---------------------------------------------------------
   const [duration, setDuration] = useState(0);
   const [currentTime, setCurrentTime] = useState(0);
+  // Shotstack's render-time validator rejects a bare {format:"mp4"} output
+  // with "Validation failed for output: Found 1 validation error" — every
+  // example in its own docs sets resolution or size, so it needs an
+  // explicit frame size. Captured here (native pixels, from the same
+  // onLoadedMetadata event duration comes from) so submitVideoTextRender
+  // can pass the SOURCE video's own dimensions through as output.size —
+  // not a preset like "sd"/"hd", which would reflow a vertical phone
+  // recording into a landscape frame and throw off every block's x/y%.
+  const [videoWidthPx, setVideoWidthPx] = useState(0);
+  const [videoHeightPx, setVideoHeightPx] = useState(0);
   const [segments, setSegments] = useState<VideoTextSegment[]>([]);
   const [renderState, setRenderState] = useState<"idle" | "submitting" | "rendering" | "error">("idle");
   const [renderStatusLabel, setRenderStatusLabel] = useState("");
@@ -3687,6 +3697,8 @@ function TextOverlayEditor({
           agentId,
           videoUrl: mediaUrl,
           videoDurationSec: duration,
+          videoWidthPx,
+          videoHeightPx,
           style,
           segments: segments.map((s) => ({
             text: s.text.trim(),
@@ -3825,7 +3837,11 @@ function TextOverlayEditor({
                 src={mediaUrl}
                 controls
                 className="block max-h-[50vh] w-full"
-                onLoadedMetadata={(e) => setDuration(e.currentTarget.duration)}
+                onLoadedMetadata={(e) => {
+                  setDuration(e.currentTarget.duration);
+                  setVideoWidthPx(e.currentTarget.videoWidth);
+                  setVideoHeightPx(e.currentTarget.videoHeight);
+                }}
                 onTimeUpdate={(e) => setCurrentTime(e.currentTarget.currentTime)}
               />
               {segments.map((s, i) => {

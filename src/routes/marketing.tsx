@@ -94,15 +94,15 @@ import type { Paragraph, TextRun, ExternalHyperlink } from "docx";
 export const Route = createFileRoute("/marketing")({
   head: () => ({
     meta: [
-      { title: "Monthly Marketing — Your Marketing Dude" },
+      { title: "Create My Monthly Content — Your Marketing Dude" },
       {
         name: "description",
-        content: "Monthly social posts, emails, and video scripts generated in your voice.",
+        content: "Generate your monthly content calendar and pull photos/video in from Google Drive.",
       },
-      { property: "og:title", content: "Monthly Marketing — Your Marketing Dude" },
+      { property: "og:title", content: "Create My Monthly Content — Your Marketing Dude" },
       {
         property: "og:description",
-        content: "Monthly social posts, emails, and video scripts generated in your voice.",
+        content: "Generate your monthly content calendar and pull photos/video in from Google Drive.",
       },
       { property: "og:type", content: "website" },
       { name: "twitter:card", content: "summary_large_image" },
@@ -591,7 +591,7 @@ function MarketingPage() {
         <PageHeader />
         <Card className="mt-5">
           <p className="text-sm text-muted-foreground">
-            Your account isn't set up in Monthly Marketing yet. Ask your team to add you as an agent.
+            Your account isn't set up yet. Ask your team to add you as an agent.
           </p>
         </Card>
       </AppShell>
@@ -727,20 +727,234 @@ function MarketingPage() {
   );
 }
 
+// Added 2026-11-13 per Mike: "Create Individual Posts" and "Media" needed
+// to be their own top-level sections (their own tile on both desktop and
+// mobile), not buried one tab deep inside Monthly Marketing's "What Do You
+// Want To Do?" row — see the new /posts and /media routes, which render
+// this with PostsTab/MediaTab as their content. This deliberately does NOT
+// reuse MarketingPage above directly: MarketingPage also carries the
+// "Manage Content Calendar" admin screen (ManageCalendarScreen), which is
+// specific to the content-calendar feature and has no business showing up
+// on the agent-picker step for the Posts or Media pages. Rather than thread
+// a bunch of calendar-specific conditionals through one shared component,
+// this is its own copy of just the access-check + "choose an agent" flow
+// (identical logic to MarketingPage's own, minus the calendar-admin
+// branch) — a little duplication, but it keeps each page's access flow
+// simple and means nothing about how Monthly Marketing's admin tools work
+// had to be touched to add these two new pages.
+export function AgentScopedPage({
+  title,
+  tagline,
+  children,
+}: {
+  title: string;
+  tagline: string;
+  children: (ctx: {
+    agentId: string;
+    agentEmail: string | null;
+    isAdmin: boolean;
+    agentName: string;
+  }) => React.ReactNode;
+}) {
+  const [access, setAccess] = useState<MarketingAccess | null>(null);
+  const [accessError, setAccessError] = useState<string | null>(null);
+  const [agents, setAgents] = useState<AgentOption[]>([]);
+  const [selected, setSelected] = useState<AgentOption | null>(null);
+  const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
+  const [deletingId, setDeletingId] = useState<string | null>(null);
+  const [deleteError, setDeleteError] = useState<string | null>(null);
+
+  useEffect(() => {
+    getMarketingAccess()
+      .then(async (a) => {
+        setAccess(a);
+        if (a.role === "admin") {
+          const list = await listMarketingAgents();
+          setAgents(
+            list.map((ag) => ({
+              id: ag.id,
+              name: ag.full_name ?? ag.email ?? "Unnamed agent",
+              email: ag.email ?? null,
+              hasVoiceDna: !!ag.voice_summary,
+            })),
+          );
+        } else if (a.role === "agent") {
+          setSelected({ id: a.agentId, name: a.agentName, email: null });
+        }
+      })
+      .catch((e) => setAccessError(e instanceof Error ? e.message : String(e)));
+  }, []);
+
+  async function handleDeleteAgent(id: string) {
+    setDeletingId(id);
+    setDeleteError(null);
+    try {
+      await deleteAgent({ data: { agentId: id } });
+      setAgents((prev) => prev.filter((a) => a.id !== id));
+      setConfirmDeleteId(null);
+    } catch (e) {
+      setDeleteError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setDeletingId(null);
+    }
+  }
+
+  if (accessError) {
+    return (
+      <AppShell>
+        <PageHeader title={title} tagline={tagline} />
+        <Card className="mt-5">
+          <p className="text-sm text-destructive">{accessError}</p>
+        </Card>
+      </AppShell>
+    );
+  }
+
+  if (!access) {
+    return (
+      <AppShell>
+        <PageHeader title={title} tagline={tagline} />
+        <Card className="mt-5">
+          <p className="text-sm text-muted-foreground">Loading…</p>
+        </Card>
+      </AppShell>
+    );
+  }
+
+  if (access.role === "none") {
+    return (
+      <AppShell>
+        <PageHeader title={title} tagline={tagline} />
+        <Card className="mt-5">
+          <p className="text-sm text-muted-foreground">
+            Your account isn't set up yet. Ask your team to add you as an agent.
+          </p>
+        </Card>
+      </AppShell>
+    );
+  }
+
+  if (access.role === "admin" && !selected) {
+    return (
+      <AppShell>
+        <PageHeader title={title} tagline={tagline} />
+        <Card className="mt-5">
+          <h2 className="font-display text-lg font-semibold">Choose an agent</h2>
+          <p className="mt-1 text-sm text-muted-foreground">
+            Pick who you're working on behalf of. Every action you take here is logged against their account, not yours.
+          </p>
+          {deleteError && <p className="mt-2 text-xs text-destructive">{deleteError}</p>}
+          <div className="mt-4 grid gap-2 sm:grid-cols-2 lg:grid-cols-3">
+            {agents.map((a) => {
+              const isDuplicateName = agents.filter((o) => o.name === a.name).length > 1;
+              const isConfirming = confirmDeleteId === a.id;
+              const isDeleting = deletingId === a.id;
+              return (
+                <div
+                  key={a.id}
+                  className="relative rounded-2xl border border-border bg-glass px-4 py-3 text-sm font-medium transition-colors hover:bg-secondary"
+                >
+                  <button type="button" onClick={() => setSelected(a)} className="block w-full pr-14 text-left">
+                    <span className="flex items-center gap-1.5">
+                      {a.name}
+                      {isDuplicateName && (
+                        <span
+                          title="Another agent also has this exact name — double check the email below before connecting anything to this one."
+                          className="rounded-full bg-amber-500/20 px-1.5 py-0.5 text-[10px] font-semibold text-amber-600 dark:text-amber-400"
+                        >
+                          ⚠ duplicate name
+                        </span>
+                      )}
+                    </span>
+                    {a.email && (
+                      <span className="mt-0.5 block text-xs font-normal text-muted-foreground">{a.email}</span>
+                    )}
+                    <span className="mt-1 block text-[10px] font-normal text-muted-foreground">
+                      {a.hasVoiceDna ? "✓ Voice DNA complete" : "— Voice DNA not started"}
+                    </span>
+                  </button>
+                  <div className="absolute right-2 top-2">
+                    {isConfirming ? (
+                      <div className="flex w-40 flex-col items-end gap-1.5 rounded-xl border border-destructive/40 bg-background p-2 shadow-lg">
+                        <p className="text-right text-[10px] leading-snug text-destructive">
+                          Permanently delete {a.name}? Their posts, photos, and Voice DNA go too — this can't be undone.
+                        </p>
+                        <div className="flex gap-1">
+                          <Button variant="danger" disabled={isDeleting} onClick={() => handleDeleteAgent(a.id)}>
+                            {isDeleting ? "Deleting…" : "Yes, delete"}
+                          </Button>
+                          <button
+                            type="button"
+                            disabled={isDeleting}
+                            onClick={() => setConfirmDeleteId(null)}
+                            className="rounded-full border border-border px-3 py-1 text-xs disabled:opacity-50"
+                          >
+                            Cancel
+                          </button>
+                        </div>
+                      </div>
+                    ) : (
+                      <button
+                        type="button"
+                        title="Delete this agent"
+                        onClick={() => setConfirmDeleteId(a.id)}
+                        className="rounded-full px-2 py-1 text-xs text-muted-foreground hover:text-destructive"
+                      >
+                        Delete
+                      </button>
+                    )}
+                  </div>
+                </div>
+              );
+            })}
+            {agents.length === 0 && <p className="text-sm text-muted-foreground">No agents yet.</p>}
+          </div>
+        </Card>
+      </AppShell>
+    );
+  }
+
+  if (!selected) return null;
+
+  return (
+    <AppShell>
+      <PageHeader
+        title={title}
+        tagline={tagline}
+        agentName={selected.name}
+        onChangeAgent={access.role === "admin" ? () => setSelected(null) : undefined}
+      />
+      {children({
+        agentId: selected.id,
+        agentEmail: selected.email,
+        isAdmin: access.role === "admin",
+        agentName: selected.name,
+      })}
+    </AppShell>
+  );
+}
+
+// title/tagline added 2026-11-13 so this same header works for the new
+// standalone "My Marketing Dude" and "Media" pages too (see
+// AgentScopedPage below) — each page passes its own, this route's own
+// calls below just rely on the defaults so nothing here had to change at
+// each call site.
 function PageHeader({
+  title = "Create My Monthly Content",
+  tagline = "Posts, emails, and video scripts in your voice — every month.",
   agentName,
   onChangeAgent,
 }: {
+  title?: string;
+  tagline?: string;
   agentName?: string | undefined;
   onChangeAgent?: (() => void) | undefined;
 }) {
   return (
     <div className="flex flex-wrap items-end justify-between gap-3 pt-2">
       <div>
-        <h1 className="font-display text-2xl font-bold tracking-tight">Monthly Marketing</h1>
-        <p className="mt-1 text-sm text-muted-foreground">
-          {agentName ? `Viewing as: ${agentName}` : "Posts, emails, and video scripts in your voice — every month."}
-        </p>
+        <h1 className="font-display text-2xl font-bold tracking-tight">{title}</h1>
+        <p className="mt-1 text-sm text-muted-foreground">{agentName ? `Viewing as: ${agentName}` : tagline}</p>
       </div>
       {onChangeAgent && (
         <Button variant="secondary" onClick={onChangeAgent}>
@@ -752,7 +966,14 @@ function PageHeader({
 }
 
 function Workspace({ agentId, agentEmail, isAdmin }: { agentId: string; agentEmail: string | null; isAdmin: boolean }) {
-  const [tab, setTab] = useState<"posts" | "calendar" | "media" | "drive">("posts");
+  // "posts" and "media" dropped from this tab set 2026-11-13 — per Mike,
+  // Create Individual Posts and Media each needed their own top-level
+  // section/tile (see the new /posts and /media routes, both built on
+  // PostsTab/MediaTab exported from this same file) rather than living one
+  // tab deep in here. Google Drive stays here, by Mike's own choice, since
+  // it's used alongside the content calendar generator (pulling Drive
+  // photos into posts) rather than as its own standalone destination.
+  const [tab, setTab] = useState<"calendar" | "drive">("calendar");
   // Which month's workspace is open on the calendar tab — LIFTED UP here
   // from ContentCalendarTab (2026-09-29) per Mike: "anytime you click off or
   // you move to another screen and you come back to the generate my monthly
@@ -779,17 +1000,15 @@ function Workspace({ agentId, agentEmail, isAdmin }: { agentId: string; agentEma
   }, [agentId]);
   return (
     <div className="mt-5">
-      {/* Heading + mobile-centered nav, added 2026-09-23 per Mike: "it needs
-          to say above the first set of buttons What Do You Want To Do? on
-          both desktop and mobile. Then on mobile center the buttons." The
-          pill row itself is unchanged (still `w-fit` so it hugs its own
-          content) — it's wrapped in a flex container that centers it on
-          small screens and reverts to left-aligned from `sm:` up, matching
-          the desktop layout Mike didn't ask to change. */}
-      <h2 className="text-center text-sm font-semibold text-foreground sm:text-left">What Do You Want To Do?</h2>
-      <div className="mt-2 flex justify-center sm:justify-start">
+      {/* The old "What Do You Want To Do?" heading + 4-way pill row is gone
+          (2026-11-13, per Mike — Create Individual Posts and Media are now
+          their own top-level sections, not tabs in here). Just Content
+          Calendar and Google Drive are left, so this is a small, unlabeled
+          toggle rather than the bigger "pick one of four things" selector
+          it used to be. */}
+      <div className="flex justify-center sm:justify-start">
         <div className="flex flex-wrap justify-center gap-1 rounded-full border border-border bg-glass p-1 backdrop-blur-xl w-fit">
-          {(["posts", "calendar", "media", "drive"] as const).map((t) => (
+          {(["calendar", "drive"] as const).map((t) => (
             <button
               key={t}
               onClick={() => setTab(t)}
@@ -797,19 +1016,12 @@ function Workspace({ agentId, agentEmail, isAdmin }: { agentId: string; agentEma
                 tab === t ? "bg-secondary text-foreground" : "text-muted-foreground hover:text-foreground"
               }`}
             >
-              {t === "posts"
-                ? "Create Individual Posts"
-                : t === "calendar"
-                  ? "Generate My Monthly Content Calendar"
-                  : t === "media"
-                    ? "Media"
-                    : "Google Drive"}
+              {t === "calendar" ? "Content Calendar" : "Google Drive"}
             </button>
           ))}
         </div>
       </div>
       <div className="mt-5">
-        {tab === "posts" && <PostsTab agentId={agentId} isAdmin={isAdmin} />}
         {tab === "calendar" && (
           <ContentCalendarTab
             agentId={agentId}
@@ -818,7 +1030,6 @@ function Workspace({ agentId, agentEmail, isAdmin }: { agentId: string; agentEma
             setActiveMonth={setActiveMonth}
           />
         )}
-        {tab === "media" && <MediaTab agentId={agentId} isAdmin={isAdmin} />}
         {tab === "drive" && <DriveTab agentId={agentId} agentEmail={agentEmail} isAdmin={isAdmin} />}
       </div>
     </div>
@@ -847,7 +1058,7 @@ function Workspace({ agentId, agentEmail, isAdmin }: { agentId: string; agentEma
 // that would only ever show on the calendar tab anyway — having two
 // separate scan buttons that both feed the same one destination was exactly
 // the kind of duplication Mike flagged, just one level deeper.
-function PostsTab({ agentId, isAdmin }: { agentId: string; isAdmin: boolean }) {
+export function PostsTab({ agentId, isAdmin }: { agentId: string; isAdmin: boolean }) {
   const [months, setMonths] = useState<string[]>([]);
   const [month, setMonth] = useState<string>("");
   const [posts, setPosts] = useState<Post[] | null>(null);
@@ -4901,7 +5112,7 @@ function PublicReviewLinkCard({ agentId }: { agentId: string }) {
   );
 }
 
-function MediaTab({ agentId, isAdmin }: { agentId: string; isAdmin: boolean }) {
+export function MediaTab({ agentId, isAdmin }: { agentId: string; isAdmin: boolean }) {
   const [status, setStatus] = useState<"available" | "used">("available");
   const [media, setMedia] = useState<MediaRow[] | null>(null);
   const [error, setError] = useState<string | null>(null);

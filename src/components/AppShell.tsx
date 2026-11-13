@@ -1,6 +1,7 @@
 import { Link, Outlet, useNavigate } from "@tanstack/react-router";
 import type { ReactNode } from "react";
 import { useAuth } from "@/hooks/useAuth";
+import { Database, Sparkles, Calendar, MessagesSquare, Image, UserCircle } from "lucide-react";
 // Real logo asset (2026-09-23) — restores Mike's actual white "Your
 // Marketing Dude" clapperboard logo after an earlier pass accidentally
 // reverted the header to a placeholder "YM" box (see the note on BrandMark
@@ -14,11 +15,26 @@ import logoWhite from "@/assets/logo-white.png";
 // the marketing landing page at "/" still exists and the header logo still
 // links there, this just drops it from the nav itself so a signed-in user
 // isn't routed back to the public marketing page from the app's own menu.
+//
+// RESTRUCTURED 2026-11-13 per Mike: "Create Individual Posts" and "Media"
+// used to be tabs one level deep inside Monthly Marketing's "What Do You
+// Want To Do?" row (see Workspace in marketing.tsx) — confusing enough that
+// Mike flagged it directly off a screenshot of someone getting lost in
+// there. They're now their own top-level entries (own routes: /posts and
+// /media — see those files), same as everything else in this list. Three
+// renames came with it, all per Mike: "Monthly Marketing" → "Create My
+// Monthly Content" (now that it's just the content-calendar generator, not
+// a 4-way picker), the old "Create Individual Posts" tab → "My Marketing
+// Dude" at its new /posts route, and "Build My Brand" → "My Brand". Icons
+// added alongside the rename since this list now also drives the mobile
+// tile grid below, which needs something more visual than just a label.
 const NAV = [
-  { to: "/database", label: "Build My Database", exact: false },
-  { to: "/voice", label: "Build My Brand", exact: false },
-  { to: "/marketing", label: "Monthly Marketing", exact: false },
-  { to: "/account", label: "Account", exact: false },
+  { to: "/database", label: "Build My Database", exact: false, Icon: Database },
+  { to: "/voice", label: "My Brand", exact: false, Icon: Sparkles },
+  { to: "/marketing", label: "Create My Monthly Content", exact: false, Icon: Calendar },
+  { to: "/posts", label: "My Marketing Dude", exact: false, Icon: MessagesSquare },
+  { to: "/media", label: "Media", exact: false, Icon: Image },
+  { to: "/account", label: "Account", exact: false, Icon: UserCircle },
 ] as const;
 
 // FIXED (2026-09-23) — this used to render a generic "YM" placeholder box.
@@ -93,6 +109,33 @@ export function AppShell({ children }: { children?: ReactNode }) {
           )}
         </div>
       </header>
+      {/* Added 2026-11-13 per Mike: nothing stood in for the desktop pill-nav
+          above on mobile before this — that `nav` is `hidden` below the `md`
+          breakpoint with no equivalent, so none of these sections had any
+          way to be reached from a phone at all. A home-screen-style grid of
+          tiles (one per NAV entry, icon + label) is what he specifically
+          asked for when he said each section needed "its own tile to click
+          into" on mobile, not a cut-down version of the desktop pill row. */}
+      <nav className="relative z-10 mx-auto grid max-w-7xl grid-cols-3 gap-2 px-6 pb-3 sm:grid-cols-4 md:hidden">
+        {NAV.map((item) => (
+          <Link
+            key={item.to}
+            to={item.to}
+            activeOptions={{ exact: item.exact }}
+            activeProps={{
+              className:
+                "flex flex-col items-center gap-1.5 rounded-2xl border border-primary/50 bg-secondary px-2 py-3 text-center text-foreground",
+            }}
+            inactiveProps={{
+              className:
+                "flex flex-col items-center gap-1.5 rounded-2xl border border-border bg-glass px-2 py-3 text-center text-muted-foreground transition-colors hover:text-foreground",
+            }}
+          >
+            <item.Icon className="size-5" />
+            <span className="text-[11px] font-medium leading-tight">{item.label}</span>
+          </Link>
+        ))}
+      </nav>
       <main className="relative z-10 mx-auto max-w-7xl px-6 pb-20">{children ?? <Outlet />}</main>
     </div>
   );

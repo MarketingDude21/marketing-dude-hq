@@ -3559,24 +3559,64 @@ export const setAgentDriveFolder = createServerFn({ method: "POST" })
 // underneath the Voice DNA text - so a post written for this agent is shaped
 // by both the interview AND whatever extra brand/content strategy guidance
 // Mike uploaded for them, not just the interview alone.
-function contentBrandingStrategyText(voiceAnswers: unknown): string | null {
+// Broadened 2026-11-13 per Mike: "no matter what, the system is always
+// pulling from the brand DNA, their content strategy, their persona,
+// basically anything that's within their brand profile." Before this, this
+// only ever folded the Content Branding Strategy upload into the Voice DNA
+// summary — the agent's specific service-area detail (separate from the
+// one-line market_area city every prompt already gets) and whatever their
+// own scanned website says about their business (title/description, see
+// scanAgentWebsite in voice-dna.ts) existed in voice_answers but never
+// actually reached a single content-generation prompt. Both call sites
+// below keep their exact signatures, so every existing caller — every
+// generateMonthlyBatch content type, the My Marketing Dude chat hub, both
+// AI-rewrite flows, and all 3 photo-captioning functions via the Optional
+// variant — picks this up automatically with no call-site changes.
+function brandContextAddendum(voiceAnswers: unknown): string | null {
   if (!voiceAnswers || typeof voiceAnswers !== "object") return null;
-  const text = (voiceAnswers as { contentBrandingStrategy?: unknown }).contentBrandingStrategy;
-  return typeof text === "string" && text.trim() ? text.trim() : null;
+  const va = voiceAnswers as {
+    contentBrandingStrategy?: unknown;
+    serviceAreas?: unknown;
+    websiteScan?: { title?: unknown; description?: unknown } | null;
+  };
+  const parts: string[] = [];
+
+  const serviceAreas = typeof va.serviceAreas === "string" ? va.serviceAreas.trim() : "";
+  if (serviceAreas) {
+    parts.push(
+      `SPECIFIC SERVICE AREA (more precise than just the city — use this when local detail actually matters):\n${serviceAreas}`,
+    );
+  }
+
+  const strategy = typeof va.contentBrandingStrategy === "string" ? va.contentBrandingStrategy.trim() : "";
+  if (strategy) {
+    parts.push(
+      `CONTENT BRANDING STRATEGY (additional guidance from the agent - weave this in alongside the voice DNA above):\n${strategy}`,
+    );
+  }
+
+  const scanTitle = typeof va.websiteScan?.title === "string" ? va.websiteScan.title.trim() : "";
+  const scanDescription = typeof va.websiteScan?.description === "string" ? va.websiteScan.description.trim() : "";
+  if (scanTitle || scanDescription) {
+    parts.push(
+      "FROM THEIR OWN WEBSITE (pulled automatically — real context about their business, reference only, never quote it verbatim):\n" +
+        [scanTitle, scanDescription].filter(Boolean).join(" — "),
+    );
+  }
+
+  return parts.length ? parts.join("\n\n") : null;
 }
 
 function withContentBrandingStrategy(voiceDna: string, voiceAnswers: unknown): string {
-  const strategy = contentBrandingStrategyText(voiceAnswers);
-  if (!strategy) return voiceDna;
-  return `${voiceDna}\n\nCONTENT BRANDING STRATEGY (additional guidance from the agent - weave this in alongside the voice DNA above):\n${strategy}`;
+  const addendum = brandContextAddendum(voiceAnswers);
+  if (!addendum) return voiceDna;
+  return `${voiceDna}\n\n${addendum}`;
 }
 
 function withContentBrandingStrategyOptional(voiceDna: string | undefined, voiceAnswers: unknown): string | undefined {
-  const strategy = contentBrandingStrategyText(voiceAnswers);
-  if (!strategy) return voiceDna;
-  return voiceDna
-    ? `${voiceDna}\n\nCONTENT BRANDING STRATEGY (additional guidance from the agent - weave this in alongside the voice DNA above):\n${strategy}`
-    : `CONTENT BRANDING STRATEGY (additional guidance from the agent):\n${strategy}`;
+  const addendum = brandContextAddendum(voiceAnswers);
+  if (!addendum) return voiceDna;
+  return voiceDna ? `${voiceDna}\n\n${addendum}` : addendum;
 }
 
 // ============================================================================
@@ -3782,18 +3822,62 @@ export const generateMarketingContent = createServerFn({ method: "POST" })
 // Per Mike's voice note: the old "+ New content" form-and-list should become
 // a real, persistent, per-agent chat thread — "your own personal marketing
 // dude," embedded in the agent's whole workflow, not a set of separate
-// tools. One continuous conversation per agent (backed by
-// agent_chat_messages, see monthly-marketing-chat-hub-migration.sql) with a
-// content-type switcher (post/email, video script, photo scan — carousel to
-// follow once Mike sends a template/brand direction) that changes how the
-// NEXT reply gets generated, not a separate siloed thread per mode — a
-// correction made while drafting an email should still be visible context
-// if the agent switches to video-script mode a minute later.
+// tools.
+//
+// REVERSED 2026-11-13, per Mike directly: "every time you click a social
+// post, email, video script, or any of those tabs, it should open up into a
+// new window. There should not be a continuous thread of everything you've
+// ever done there... if I'm going to be on social posts, that should only
+// be my social post thread." This used to be deliberately ONE continuous
+// conversation across every mode (see the superseded reasoning this
+// replaced, below) — now each mode (post/email/video_script/photo_scan) is
+// its own separate thread, both for what's SHOWN (listAgentChatMessages)
+// and for what Claude sees as conversational context when writing the next
+// reply (sendAgentChatMessage) — a correction made in email mode no longer
+// bleeds into video-script mode.
+//
+// Mike also asked for a per-thread "Clear thread" control, with one
+// explicit constraint: "even though they might clear it, it still
+// remembers everything they have." So clearing never deletes a row from
+// agent_chat_messages — it inserts a lightweight marker message
+// (role "system", metadata.type === CHAT_THREAD_CLEAR_MARKER) into that
+// mode's thread, and both listAgentChatMessages and sendAgentChatMessage's
+// history fetch only look at messages AFTER the most recent marker for
+// that mode. Older messages stay in the database forever (so nothing about
+// "remembering everything" is lost — that's what fetchLearnedFeedback and
+// the brand-profile context above already draw from, independent of raw
+// chat history), they just stop being shown or fed back in as the live
+// conversation once a clear marker exists.
+//
+// Superseded reasoning (kept for the record, no longer how this works):
+// "a content-type switcher that changes how the NEXT reply gets generated,
+// not a separate siloed thread per mode — a correction made while drafting
+// an email should still be visible context if the agent switches to
+// video-script mode a minute later."
 //
 // Full scoping: individual-posts-hub-scoping.md.
 // ============================================================================
 
 export type ChatMode = "post" | "email" | "video_script" | "photo_scan";
+
+// Bookkeeping-only marker inserted by clearAgentChatThread below — never a
+// real message, never shown to the agent, never sent to Claude as
+// conversational context. See the big comment block above for why this
+// exists instead of actually deleting rows.
+const CHAT_THREAD_CLEAR_MARKER = "thread_clear";
+
+// Shared by listAgentChatMessages and sendAgentChatMessage: given a mode's
+// full message history in chronological (ascending) order, returns only
+// what came after the most recent clear-thread marker — or everything, if
+// that mode's thread has never been cleared. The marker row itself is
+// naturally excluded since the slice starts right after it.
+function messagesSinceLastClear<T extends { metadata: unknown }>(rows: T[]): T[] {
+  let lastClearIndex = -1;
+  rows.forEach((r, i) => {
+    if ((r.metadata as { type?: string } | null)?.type === CHAT_THREAD_CLEAR_MARKER) lastClearIndex = i;
+  });
+  return lastClearIndex === -1 ? rows : rows.slice(lastClearIndex + 1);
+}
 
 export type ChatMessageRow = {
   id: string;
@@ -3867,7 +3951,10 @@ function buildChatSystemPrompt(
 
 export const listAgentChatMessages = createServerFn({ method: "GET" })
   .middleware([requireSupabaseAuth])
-  .inputValidator((data: { agentId: string }) => data)
+  // `mode` added 2026-11-13 — see the big comment block above. Each mode
+  // now reads back only its own thread, not every message the agent has
+  // ever sent across every mode.
+  .inputValidator((data: { agentId: string; mode: ChatMode }) => data)
   .handler(async ({ data, context }): Promise<ChatMessageRow[]> => {
     const email = (context.claims as { email?: string } | undefined)?.email;
     await requireAgentAccess(context.userId, email, data.agentId);
@@ -3876,10 +3963,11 @@ export const listAgentChatMessages = createServerFn({ method: "GET" })
       .from("agent_chat_messages")
       .select("id, role, content, mode, metadata, created_at")
       .eq("agent_id", data.agentId)
+      .eq("mode", data.mode)
       .order("created_at", { ascending: true })
       .limit(200);
     if (error) throw error;
-    return (rows ?? []) as unknown as ChatMessageRow[];
+    return messagesSinceLastClear((rows ?? []) as unknown as ChatMessageRow[]);
   });
 
 export const sendAgentChatMessage = createServerFn({ method: "POST" })
@@ -3922,18 +4010,33 @@ export const sendAgentChatMessage = createServerFn({ method: "POST" })
     });
     if (userInsertErr) throw userInsertErr;
 
-    // Recent thread as conversational context — capped so a long-running
-    // relationship doesn't grow the prompt without bound.
+    // Recent thread as conversational context — scoped to THIS mode's own
+    // thread only (2026-11-13, see the big comment block above), and to
+    // messages since the last "Clear thread" for this mode, if any. Fetched
+    // in chronological order up to the mode's full 200-row display cap,
+    // then trimmed to the most recent 20 for the actual API call so a
+    // long-running thread doesn't grow the prompt without bound.
     const { data: history } = await supabaseAdmin
       .from("agent_chat_messages")
-      .select("role, content")
+      .select("role, content, metadata")
       .eq("agent_id", data.agentId)
-      .order("created_at", { ascending: false })
-      .limit(20);
-    const claudeMessages = (history ?? [])
-      .slice()
-      .reverse()
-      .map((m) => ({ role: m.role === "assistant" ? "assistant" : "user", content: m.content }));
+      .eq("mode", data.mode)
+      .order("created_at", { ascending: true })
+      .limit(200);
+    const recentHistory = messagesSinceLastClear(
+      (history ?? []) as { role: string; content: string; metadata: unknown }[],
+    ).slice(-20);
+    // Anthropic's Messages API requires the conversation to open on a user
+    // turn. That's true of every real thread here, but photo_scan mode can
+    // log an assistant-authored suggestion with no prior user message (see
+    // logPhotoScanToChat below) — if a clear marker (or the thread's start)
+    // happens to land right before one of those, drop any leading
+    // assistant rows rather than sending a request the API would reject.
+    while (recentHistory.length && recentHistory[0]?.role !== "user") recentHistory.shift();
+    const claudeMessages = recentHistory.map((m) => ({
+      role: m.role === "assistant" ? "assistant" : "user",
+      content: m.content,
+    }));
 
     const res = await fetch("https://api.anthropic.com/v1/messages", {
       method: "POST",
@@ -3973,6 +4076,28 @@ export const sendAgentChatMessage = createServerFn({ method: "POST" })
     if (assistantInsertErr) throw assistantInsertErr;
 
     return { ok: true, reply: assistantRow as unknown as ChatMessageRow };
+  });
+
+// "Clear thread" (2026-11-13) — resets one mode's thread for display and
+// for the next message's conversational context, WITHOUT deleting
+// anything: see the big comment block above ChatMode for why. Just an
+// insert, so this can't fail partway in a way that loses data.
+export const clearAgentChatThread = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator((data: { agentId: string; mode: ChatMode }) => data)
+  .handler(async ({ data, context }): Promise<{ ok: true }> => {
+    const email = (context.claims as { email?: string } | undefined)?.email;
+    await requireAgentAccess(context.userId, email, data.agentId);
+    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+    const { error } = await supabaseAdmin.from("agent_chat_messages").insert({
+      agent_id: data.agentId,
+      role: "system",
+      mode: data.mode,
+      content: "",
+      metadata: { type: CHAT_THREAD_CLEAR_MARKER, clearedAt: new Date().toISOString() },
+    });
+    if (error) throw error;
+    return { ok: true };
   });
 
 // Turns one of Claude's chat replies into a real post that goes through the
@@ -4940,7 +5065,15 @@ export const generateMonthlyBatch = createServerFn({ method: "POST" })
         }
 
         try {
-          const eraw = await callClaude(anthropicKey, emailPrompt, 2000);
+          // Added webSearch here 2026-11-13 per Mike, who noticed emails
+          // specifically weren't pulling in anything local/current — this
+          // was the one content type in generateMonthlyBatch that got
+          // skipped when web search was first wired in (posts and videos
+          // got it, email didn't), even though the "Local Letter" format
+          // above is explicitly about local observations and is exactly
+          // the kind of email that benefits from a real current detail
+          // instead of a generic one.
+          const eraw = await callClaude(anthropicKey, emailPrompt, 2400, { webSearch: true });
           const sm = eraw.match(/SUBJECT OPTIONS:([\s\S]*?)EMAIL BODY:/);
           const bm = eraw.match(/EMAIL BODY:([\s\S]*)/);
           const body = cleanCopy(
@@ -5279,6 +5412,14 @@ async function captionPhotoInVoice(
   agentName: string | undefined,
   agentCity: string | undefined,
   voiceDna: string | undefined,
+  // Added 2026-11-13 per Mike: "getting smarter and knowing each individual
+  // user as they give it more feedback." Every other content-generation
+  // call in this file already folds fetchLearnedFeedback's digest in —
+  // Scan My Photos was the one real gap, writing captions with no memory
+  // of what reviewers have corrected for this agent before. Optional (not
+  // required) so this stays easy to call without fetching feedback first
+  // in a context that doesn't have it handy.
+  learnedFeedback?: string,
 ): Promise<{ description: string; suggestedPost: string; textOverlaySuggestions: string[] } | null> {
   const base64 = Buffer.from(imageBytes).toString("base64");
   // FIXED (2026-09-30) — per Mike: "when I rescan image it gives error,"
@@ -5338,7 +5479,8 @@ async function captionPhotoInVoice(
     "Separately, this photo may end up as a Reel with short text overlaid on screen — write 3 short text-overlay options for it (not captions, just the on-screen text itself), each using a different one of these frameworks, whichever actually fit what you see in THIS photo:\n\n" +
     `${TEXT_ON_SCREEN_FRAMEWORKS}\n\n` +
     "These are suggestions only — the agent will pick, edit, or ignore them, so give real variety across the 3 rather than three versions of the same line.\n\n" +
-    "Output format:\nDESCRIPTION: [one sentence of what you see]\nPOST: [the social media caption]\nTEXT OVERLAYS:\n1. [short overlay line]\n2. [short overlay line]\n3. [short overlay line]";
+    (learnedFeedback ?? "") +
+    "\n\nOutput format:\nDESCRIPTION: [one sentence of what you see]\nPOST: [the social media caption]\nTEXT OVERLAYS:\n1. [short overlay line]\n2. [short overlay line]\n3. [short overlay line]";
 
   const res = await fetch("https://api.anthropic.com/v1/messages", {
     method: "POST",
@@ -5414,6 +5556,7 @@ export const scanAgentDrivePhotos = createServerFn({ method: "POST" })
       const agentName = agent?.full_name ?? undefined;
       const agentCity = agent?.market_area ?? undefined;
       const voiceDna = withContentBrandingStrategyOptional(agent?.voice_summary ?? undefined, agent?.voice_answers);
+      const learnedFeedback = await fetchLearnedFeedback(data.agentId);
 
       // Searches the whole folder tree under this agent's Drive folder, not
       // just its direct contents — see listDriveFolderIds above for why
@@ -5482,6 +5625,7 @@ export const scanAgentDrivePhotos = createServerFn({ method: "POST" })
               agentName,
               agentCity,
               voiceDna,
+              learnedFeedback,
             );
             if (!caption) return null;
             const { description, suggestedPost, textOverlaySuggestions } = caption;
@@ -5546,6 +5690,7 @@ export const scanAgentLibraryPhotos = createServerFn({ method: "POST" })
     const agentName = agent?.full_name ?? undefined;
     const agentCity = agent?.market_area ?? undefined;
     const voiceDna = withContentBrandingStrategyOptional(agent?.voice_summary ?? undefined, agent?.voice_answers);
+    const learnedFeedback = await fetchLearnedFeedback(data.agentId);
 
     const { data: photos, error } = await supabaseAdmin
       .from("agent_photos")
@@ -5577,6 +5722,7 @@ export const scanAgentLibraryPhotos = createServerFn({ method: "POST" })
             agentName,
             agentCity,
             voiceDna,
+            learnedFeedback,
           );
           if (!caption) return null;
           return {
@@ -5707,6 +5853,7 @@ export const regeneratePhotoScanCaption = createServerFn({ method: "POST" })
     const agentName = agent?.full_name ?? undefined;
     const agentCity = agent?.market_area ?? undefined;
     const voiceDna = withContentBrandingStrategyOptional(agent?.voice_summary ?? undefined, agent?.voice_answers);
+    const learnedFeedback = await fetchLearnedFeedback(data.agentId);
 
     let arrayBuffer: ArrayBuffer;
     let mediaType = "image/jpeg";
@@ -5758,7 +5905,15 @@ export const regeneratePhotoScanCaption = createServerFn({ method: "POST" })
       }
     }
 
-    const caption = await captionPhotoInVoice(arrayBuffer, mediaType, anthropicKey, agentName, agentCity, voiceDna);
+    const caption = await captionPhotoInVoice(
+      arrayBuffer,
+      mediaType,
+      anthropicKey,
+      agentName,
+      agentCity,
+      voiceDna,
+      learnedFeedback,
+    );
     if (!caption) throw new Error("Claude didn't return a usable caption for this photo — try again.");
 
     const { error: updateErr } = await supabaseAdmin

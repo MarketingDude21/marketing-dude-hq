@@ -22,12 +22,14 @@ import {
   saveContentBrandingStrategy,
   saveAgentSocialHandles,
   generateBrandBios,
+  scanAgentWebsite,
   type VoiceDnaAnswer,
   type VoiceDnaAnswers,
   type AgentBusinessInfo,
   type AgentSocialHandles,
   type BrandBioResult,
   type BrandBioTone,
+  type WebsiteScan,
 } from "@/lib/voice-dna";
 // Reused from Monthly Marketing (2026-09-28) — same admin_allowlist +
 // agents identity model, so "who am I working on behalf of" is resolved the
@@ -145,6 +147,92 @@ function drawCircularImage(
   ctx.restore();
 }
 
+// Brand color extraction (2026-11-13) — this was explicitly flagged as NOT
+// built back when brand assets first shipped (see the old comment this
+// replaced in voice-dna.ts). Off Mike's own reference examples of
+// real-looking agent banners (teal, navy/green brand strips, not a generic
+// dark/light default), the logo is sampled for a dominant color that then
+// drives the footer band + background tint below, so each agent's graphics
+// actually look like THEIR brand instead of one of 2 fixed color schemes.
+// Downsamples to a tiny canvas first — fast, and anti-aliasing from the
+// resize naturally acts like a blur so one stray pixel can't skew it.
+// Wrapped by the caller in try/catch: getImageData throws on a tainted
+// canvas (a cross-origin image with no CORS headers), and that's an
+// acceptable, silent fallback here, not an error worth surfacing.
+function extractAccentColor(img: HTMLImageElement, fallback: { r: number; g: number; b: number }) {
+  const size = 32;
+  const canvas = document.createElement("canvas");
+  canvas.width = size;
+  canvas.height = size;
+  const ctx = canvas.getContext("2d", { willReadFrequently: true });
+  if (!ctx) return fallback;
+  ctx.drawImage(img, 0, 0, size, size);
+  const { data } = ctx.getImageData(0, 0, size, size);
+  let r = 0;
+  let g = 0;
+  let b = 0;
+  let n = 0;
+  for (let i = 0; i < data.length; i += 4) {
+    const alpha = data[i + 3]!;
+    if (alpha < 80) continue; // skip transparent/near-transparent pixels
+    const rr = data[i]!;
+    const gg = data[i + 1]!;
+    const bb = data[i + 2]!;
+    // Skip near-white and near-black pixels — logos are mostly background/
+    // outline, and including those would just pull every result toward
+    // grey instead of the actual brand color.
+    const max = Math.max(rr, gg, bb);
+    const min = Math.min(rr, gg, bb);
+    if (max > 240 && min > 225) continue;
+    if (max < 25) continue;
+    r += rr;
+    g += gg;
+    b += bb;
+    n++;
+  }
+  if (n < size) return fallback; // not enough real color signal — stick with the fallback
+  return { r: Math.round(r / n), g: Math.round(g / n), b: Math.round(b / n) };
+}
+
+function shade(rgb: { r: number; g: number; b: number }, amount: number): string {
+  // amount: -1 (black) to +1 (white), 0 = unchanged.
+  const mix = (c: number) => (amount >= 0 ? c + (255 - c) * amount : c * (1 + amount));
+  const r = Math.round(Math.min(255, Math.max(0, mix(rgb.r))));
+  const g = Math.round(Math.min(255, Math.max(0, mix(rgb.g))));
+  const b = Math.round(Math.min(255, Math.max(0, mix(rgb.b))));
+  return `rgb(${r}, ${g}, ${b})`;
+}
+function rgba(rgb: { r: number; g: number; b: number }, alpha: number): string {
+  return `rgba(${rgb.r}, ${rgb.g}, ${rgb.b}, ${alpha})`;
+}
+
+// A gentle wave along the top edge of a filled region — the same curved
+// footer motif Mike's reference banners use instead of a flat cut line.
+function drawWaveBand(ctx: CanvasRenderingContext2D, x: number, y: number, w: number, h: number, waveHeight: number) {
+  ctx.beginPath();
+  ctx.moveTo(x, y + waveHeight);
+  ctx.quadraticCurveTo(x + w * 0.25, y - waveHeight * 0.6, x + w * 0.5, y + waveHeight * 0.3);
+  ctx.quadraticCurveTo(x + w * 0.75, y + waveHeight * 1.2, x + w, y);
+  ctx.lineTo(x + w, y + h);
+  ctx.lineTo(x, y + h);
+  ctx.closePath();
+  ctx.fill();
+}
+
+type BrandGraphicContact = { phone: string; website: string; email: string; licenseNumber: string };
+
+function hexToRgb(hex: string): { r: number; g: number; b: number } | null {
+  const m = /^#?([0-9a-f]{3}|[0-9a-f]{6})$/i.exec(hex.trim());
+  if (!m) return null;
+  let h = m[1]!;
+  if (h.length === 3)
+    h = h
+      .split("")
+      .map((c) => c + c)
+      .join("");
+  return { r: parseInt(h.slice(0, 2), 16), g: parseInt(h.slice(2, 4), 16), b: parseInt(h.slice(4, 6), 16) };
+}
+
 async function renderBrandGraphic(
   format: BrandGraphicFormat,
   template: BrandGraphicTemplate,
@@ -152,6 +240,19 @@ async function renderBrandGraphic(
   logoUrl: string | null,
   name: string,
   tagline: string,
+  contact: BrandGraphicContact,
+  // Scan My Website (2026-11-13) — optional, re-hosted (see WebsiteScan in
+  // voice-dna.ts) photo to use as a backdrop instead of a flat gradient.
+  // Still fully optional per Mike: "the only thing you should need is
+  // headshot and logo" — every template below falls back to its plain
+  // gradient look when this is null or fails to load.
+  backgroundImageUrl?: string | null,
+  // Added same day per Mike: "when you scan their website that should give
+  // you colors." A hex color straight from the site's own theme-color meta
+  // tag (see WebsiteScan.brandColor) — preferred over sampling the logo
+  // when present, since it's the agent's own stated brand color rather
+  // than our best guess at one.
+  brandColorHex?: string | null,
 ): Promise<Blob> {
   const { width, height } = BRAND_GRAPHIC_SIZES[format];
   const canvas = document.createElement("canvas");
@@ -160,33 +261,81 @@ async function renderBrandGraphic(
   const ctx = canvas.getContext("2d");
   if (!ctx) throw new Error("Couldn't prepare this graphic.");
 
-  const [headshot, logo] = await Promise.all([
+  const [headshot, logo, backgroundPhoto] = await Promise.all([
     loadImage(headshotUrl),
-    logoUrl ? loadImage(logoUrl) : Promise.resolve(null),
+    logoUrl ? loadImage(logoUrl).catch(() => null) : Promise.resolve(null),
+    backgroundImageUrl ? loadImage(backgroundImageUrl).catch(() => null) : Promise.resolve(null),
   ]);
+
+  const isDark = template === "bold-split";
+  const fallbackAccent = isDark ? { r: 39, g: 42, b: 51 } : { r: 93, g: 102, b: 92 };
+  let accent = fallbackAccent;
+  const brandColorRgb = brandColorHex ? hexToRgb(brandColorHex) : null;
+  if (brandColorRgb) {
+    accent = brandColorRgb;
+  } else {
+    try {
+      if (logo) accent = extractAccentColor(logo, fallbackAccent);
+    } catch {
+      accent = fallbackAccent;
+    }
+  }
 
   // YouTube's "safe area" is the centered region that survives every
   // device's crop of the full banner; Facebook's cover has no such concept,
   // so for that format the safe area is just the full canvas.
-  const safeArea =
+  const fullSafeArea =
     format === "youtube"
       ? { width: 1546, height: 423, x: (width - 1546) / 2, y: (height - 423) / 2 }
       : { width, height, x: 0, y: 0 };
 
-  if (template === "bold-split") {
+  // Contact footer band — reserve the bottom slice of the safe area for it
+  // whenever there's actually something to put there, so the headshot/name
+  // above never collides with it.
+  const contactParts = [contact.phone, contact.website, contact.email].map((s) => s.trim()).filter(Boolean);
+  const hasFooter = contactParts.length > 0 || contact.licenseNumber.trim();
+  const footerHeight = hasFooter ? Math.round(fullSafeArea.height * 0.22) : 0;
+  const safeArea = {
+    ...fullSafeArea,
+    height: fullSafeArea.height - footerHeight,
+  };
+
+  // Background: a real photo (scanned from the agent's own website) when
+  // one was picked and actually loaded, tinted with the accent color for
+  // text legibility; otherwise the original flat gradient look.
+  if (backgroundPhoto) {
+    drawImageCover(ctx, backgroundPhoto, 0, 0, width, height);
+    const tint = ctx.createLinearGradient(0, 0, width, 0);
+    tint.addColorStop(0, rgba(accent, isDark ? 0.92 : 0.88));
+    tint.addColorStop(0.65, rgba(accent, isDark ? 0.55 : 0.5));
+    tint.addColorStop(1, rgba(accent, isDark ? 0.3 : 0.25));
+    ctx.fillStyle = tint;
+    ctx.fillRect(0, 0, width, height);
+  } else if (isDark) {
     const gradient = ctx.createLinearGradient(0, 0, width, height);
-    gradient.addColorStop(0, "#15171c");
-    gradient.addColorStop(1, "#2a2d36");
+    gradient.addColorStop(0, shade(accent, -0.45));
+    gradient.addColorStop(1, shade(accent, -0.15));
     ctx.fillStyle = gradient;
     ctx.fillRect(0, 0, width, height);
+  } else {
+    const gradient = ctx.createLinearGradient(0, 0, 0, height);
+    gradient.addColorStop(0, shade(accent, 0.85));
+    gradient.addColorStop(1, shade(accent, 0.7));
+    ctx.fillStyle = gradient;
+    ctx.fillRect(0, 0, width, height);
+  }
 
+  const textColor = isDark || backgroundPhoto ? "#ffffff" : "#1b1d22";
+  const subTextColor = isDark || backgroundPhoto ? "rgba(255,255,255,0.78)" : "rgba(27,29,34,0.7)";
+
+  if (template === "bold-split") {
     const radius = safeArea.height * 0.42;
     const cx = safeArea.x + radius + safeArea.width * 0.04;
     const cy = safeArea.y + safeArea.height / 2;
     ctx.save();
     ctx.beginPath();
     ctx.arc(cx, cy, radius + radius * 0.06, 0, Math.PI * 2);
-    ctx.fillStyle = "rgba(255,255,255,0.9)";
+    ctx.fillStyle = "rgba(255,255,255,0.92)";
     ctx.fill();
     ctx.restore();
     drawCircularImage(ctx, headshot, cx, cy, radius);
@@ -197,7 +346,7 @@ async function renderBrandGraphic(
     const taglineSize = Math.round(safeArea.height * 0.08);
     ctx.textAlign = "left";
     ctx.textBaseline = "alphabetic";
-    ctx.fillStyle = "#ffffff";
+    ctx.fillStyle = textColor;
     ctx.font = `800 ${nameSize}px system-ui, -apple-system, Arial, sans-serif`;
     let nameText = name;
     while (ctx.measureText(nameText).width > maxTextWidth && nameText.length > 3) {
@@ -205,7 +354,7 @@ async function renderBrandGraphic(
     }
     ctx.fillText(nameText, textX, cy - taglineSize * 0.4);
     ctx.font = `500 ${taglineSize}px system-ui, -apple-system, Arial, sans-serif`;
-    ctx.fillStyle = "rgba(255,255,255,0.75)";
+    ctx.fillStyle = subTextColor;
     let taglineText = tagline;
     while (ctx.measureText(taglineText).width > maxTextWidth && taglineText.length > 3) {
       taglineText = taglineText.slice(0, -1);
@@ -217,20 +366,14 @@ async function renderBrandGraphic(
       const pad = logoSize * 0.5;
       ctx.save();
       ctx.globalAlpha = 0.92;
-      drawImageCover(ctx, logo, width - logoSize - pad, height - logoSize - pad, logoSize, logoSize);
+      drawImageCover(ctx, logo, width - logoSize - pad, pad, logoSize, logoSize);
       ctx.restore();
     }
   } else {
     // centered-minimal
-    const gradient = ctx.createLinearGradient(0, 0, 0, height);
-    gradient.addColorStop(0, "#f4f1ec");
-    gradient.addColorStop(1, "#e3ddd2");
-    ctx.fillStyle = gradient;
-    ctx.fillRect(0, 0, width, height);
-
     const radius = safeArea.height * 0.3;
     const cx = safeArea.x + safeArea.width / 2;
-    const cy = safeArea.y + safeArea.height * 0.4;
+    const cy = safeArea.y + safeArea.height * 0.38;
     ctx.save();
     ctx.beginPath();
     ctx.arc(cx, cy, radius + radius * 0.06, 0, Math.PI * 2);
@@ -243,16 +386,47 @@ async function renderBrandGraphic(
     const taglineSize = Math.round(safeArea.height * 0.075);
     ctx.textAlign = "center";
     ctx.textBaseline = "alphabetic";
-    ctx.fillStyle = "#15171c";
+    ctx.fillStyle = textColor;
     ctx.font = `800 ${nameSize}px system-ui, -apple-system, Arial, sans-serif`;
     ctx.fillText(name, cx, cy + radius + nameSize * 1.1);
     ctx.font = `500 ${taglineSize}px system-ui, -apple-system, Arial, sans-serif`;
-    ctx.fillStyle = "rgba(21,23,28,0.7)";
+    ctx.fillStyle = subTextColor;
     ctx.fillText(tagline, cx, cy + radius + nameSize * 1.1 + taglineSize * 1.4);
 
     if (logo) {
-      const logoSize = Math.min(width, height) * 0.16;
-      drawImageCover(ctx, logo, cx - logoSize / 2, height - logoSize * 1.2, logoSize, logoSize * 0.7);
+      const logoSize = Math.min(width, height) * 0.09;
+      drawImageCover(ctx, logo, cx - logoSize / 2, safeArea.y + logoSize * 0.2, logoSize, logoSize);
+    }
+  }
+
+  // Contact footer — phone / website / email, plus a license number when
+  // given, on a solid band in the accent color with a soft wave dividing
+  // it from the main banner above (the same motif in Mike's reference
+  // examples). Drawn last so it always sits on top of the headshot/photo.
+  if (hasFooter) {
+    const footerY = height - footerHeight;
+    const footerColor = backgroundPhoto ? shade(accent, isDark ? -0.3 : 0.1) : shade(accent, isDark ? -0.35 : -0.05);
+    ctx.fillStyle = footerColor;
+    drawWaveBand(ctx, 0, footerY, width, footerHeight, footerHeight * 0.3);
+
+    const footerTextColor = isDark || backgroundPhoto ? "#ffffff" : "#ffffff";
+    const infoSize = Math.round(footerHeight * 0.34);
+    ctx.font = `600 ${infoSize}px system-ui, -apple-system, Arial, sans-serif`;
+    ctx.fillStyle = footerTextColor;
+    ctx.textBaseline = "middle";
+
+    const infoLine = contactParts.join("     •     ");
+    const footerCenterY = footerY + footerHeight * 0.62;
+    if (infoLine) {
+      ctx.textAlign = "center";
+      ctx.fillText(infoLine, width / 2, footerCenterY, width * 0.9);
+    }
+    if (contact.licenseNumber.trim()) {
+      const licenseSize = Math.round(infoSize * 0.72);
+      ctx.font = `500 ${licenseSize}px system-ui, -apple-system, Arial, sans-serif`;
+      ctx.fillStyle = "rgba(255,255,255,0.8)";
+      ctx.textAlign = "center";
+      ctx.fillText(`License #${contact.licenseNumber.trim()}`, width / 2, footerY + footerHeight * 0.88, width * 0.9);
     }
   }
 
@@ -495,6 +669,16 @@ function VoiceWorkspace({
   const [socialHandlesSaving, setSocialHandlesSaving] = useState(false);
   const [socialHandlesStatus, setSocialHandlesStatus] = useState<string | null>(null);
 
+  // Scan My Website (2026-11-13) — per Mike, right after the above shipped:
+  // "you should be able to scan their website and create content too, to
+  // grab other images etc if need be, but the only thing you should need
+  // is headshot and logo." Purely additive: nothing below requires this —
+  // bios still generate and graphics still render from just headshot+logo
+  // if this is never run. See scanAgentWebsite in voice-dna.ts.
+  const [websiteScan, setWebsiteScan] = useState<WebsiteScan | null>(null);
+  const [scanningWebsite, setScanningWebsite] = useState(false);
+  const [scanError, setScanError] = useState<string | null>(null);
+
   // Brand Bio Writer (2026-11-13) — per Mike: "we need to create a
   // done-for-you bio section... rate it by professional, personable,
   // funny, relatable." See generateBrandBios in voice-dna.ts for what
@@ -519,6 +703,14 @@ function VoiceWorkspace({
   const [graphicGenerating, setGraphicGenerating] = useState(false);
   const [graphicError, setGraphicError] = useState<string | null>(null);
   const [graphicPreviews, setGraphicPreviews] = useState<Partial<Record<BrandGraphicFormat, string>>>({});
+  // "None" (pure gradient, headshot + logo only — Mike's "only thing you
+  // should need") is the default; a scanned website photo is opt-in.
+  const [selectedBackgroundImage, setSelectedBackgroundImage] = useState<string | null>(null);
+
+  // Generate My Branding Kit (2026-11-13) — one-click orchestrator over the
+  // 3 pieces above; see handleGenerateBrandKit.
+  const [kitGenerating, setKitGenerating] = useState(false);
+  const [kitStatus, setKitStatus] = useState<string | null>(null);
 
   // Load whatever profile already exists for the agent we're working on —
   // via the access-checked server function (see voice-dna.ts), not a direct
@@ -545,6 +737,7 @@ function VoiceWorkspace({
           setBusinessInfo(stored?.businessInfo ?? EMPTY_BUSINESS_INFO);
           setContentStrategy(stored?.contentBrandingStrategy ?? "");
           setSocialHandles(stored?.socialHandles ?? EMPTY_SOCIAL_HANDLES);
+          setWebsiteScan(stored?.websiteScan ?? null);
           setGraphicTagline(data.market_area ? `Real Estate Agent — ${data.market_area}` : "Real Estate Agent");
           if (stored?.answers?.length) {
             const restored = emptyAnswers();
@@ -635,6 +828,38 @@ function VoiceWorkspace({
     }
   }
 
+  // Returns the fresh scan (or null on failure) rather than just updating
+  // state — handleGenerateBrandKit below chains this straight into
+  // handleGenerateGraphics within the same function call, and React state
+  // set here wouldn't actually be visible yet to code running later in
+  // that same synchronous call (a setState doesn't re-render mid-function).
+  async function handleScanWebsite(): Promise<WebsiteScan | null> {
+    if (!businessInfo.website.trim()) {
+      setScanError("Add a website in Business Info above and save it first.");
+      return null;
+    }
+    setScanningWebsite(true);
+    setScanError(null);
+    try {
+      const result = await scanAgentWebsite({ data: { agentId } });
+      if (!result.ok) {
+        setScanError(result.error);
+        return null;
+      }
+      const { ok: _ok, ...scan } = result;
+      setWebsiteScan(scan);
+      // Default to the first found photo as the graphics background —
+      // agent can still pick "None" below to go back to headshot+logo only.
+      if (scan.images[0]) setSelectedBackgroundImage(scan.images[0]);
+      return scan;
+    } catch (e) {
+      setScanError(e instanceof Error ? e.message : "Something went wrong scanning that site.");
+      return null;
+    } finally {
+      setScanningWebsite(false);
+    }
+  }
+
   async function handleGenerateBios() {
     setBioGenerating(true);
     setBioError(null);
@@ -662,7 +887,11 @@ function VoiceWorkspace({
     }
   }
 
-  async function handleGenerateGraphics() {
+  // overrideBackground/overrideBrandColor let handleGenerateBrandKit below
+  // pass a just-scanned result straight through, bypassing the same
+  // stale-closure gap described above handleScanWebsite — normal clicks of
+  // the "Generate graphics" button pass neither and just use current state.
+  async function handleGenerateGraphics(overrideBackground?: string | null, overrideBrandColor?: string | null) {
     if (!headshotUrl) {
       setGraphicError("Upload a headshot above first — these are built from it.");
       return;
@@ -672,10 +901,28 @@ function VoiceWorkspace({
     try {
       const name = basics.fullName.trim() || "Your Name";
       const tagline = (graphicTagline ?? "Real Estate Agent").trim() || "Real Estate Agent";
+      const contact = {
+        phone: basics.phone.trim(),
+        website: businessInfo.website.trim(),
+        email: businessInfo.email.trim(),
+        licenseNumber: businessInfo.licenseNumber.trim(),
+      };
+      const backgroundImage = overrideBackground !== undefined ? overrideBackground : selectedBackgroundImage;
+      const brandColorHex = overrideBrandColor !== undefined ? overrideBrandColor : (websiteScan?.brandColor ?? null);
       const formats: BrandGraphicFormat[] = ["youtube", "facebook"];
       const entries = await Promise.all(
         formats.map(async (format) => {
-          const blob = await renderBrandGraphic(format, graphicTemplate, headshotUrl, logoUrl, name, tagline);
+          const blob = await renderBrandGraphic(
+            format,
+            graphicTemplate,
+            headshotUrl,
+            logoUrl,
+            name,
+            tagline,
+            contact,
+            backgroundImage,
+            brandColorHex,
+          );
           return [format, URL.createObjectURL(blob)] as const;
         }),
       );
@@ -690,6 +937,41 @@ function VoiceWorkspace({
       setGraphicError(e instanceof Error ? e.message : "Something went wrong generating these graphics.");
     } finally {
       setGraphicGenerating(false);
+    }
+  }
+
+  // Generate My Branding Kit (2026-11-13) — per Mike: "we want to turn this
+  // app into here's who I am and what I look like, now give me a whole
+  // branding kit with the click of a button." One button that chains the 3
+  // pieces already built above: scan the website (only if one's on file —
+  // this step is skipped, not failed, when there isn't one), write the 5
+  // bios, then build both graphics — using the freshly scanned background
+  // photo/brand color right away rather than waiting on a second click,
+  // since relying on React state here would mean using last session's scan
+  // (or none) instead of the one this same click just produced.
+  async function handleGenerateBrandKit() {
+    if (!headshotUrl) {
+      setKitStatus(null);
+      setGraphicError("Upload a headshot above first — your whole kit is built from it.");
+      return;
+    }
+    setKitGenerating(true);
+    try {
+      let freshScan: WebsiteScan | null = null;
+      if (businessInfo.website.trim()) {
+        setKitStatus("Scanning your website…");
+        freshScan = await handleScanWebsite();
+      }
+      setKitStatus("Writing your bios…");
+      await handleGenerateBios();
+      setKitStatus("Building your graphics…");
+      await handleGenerateGraphics(
+        freshScan ? (freshScan.images[0] ?? null) : undefined,
+        freshScan ? freshScan.brandColor : undefined,
+      );
+    } finally {
+      setKitGenerating(false);
+      setKitStatus(null);
     }
   }
 
@@ -1188,6 +1470,33 @@ function VoiceWorkspace({
           {brandAssetError && <p className="mt-3 text-xs text-destructive">{brandAssetError}</p>}
         </div>
 
+        {/* Generate My Branding Kit (2026-11-13) — per Mike: "we want to
+            turn this app into here's who I am and what I look like, now
+            give me a whole branding kit with the click of a button." Runs
+            Scan My Website (if a website's on file), the Brand Bio Writer,
+            and Branding Graphics in one go — see handleGenerateBrandKit.
+            Placed right under Headshot & Logo since that's literally "who
+            I am and what I look like," everything else below still works
+            on its own for re-runs/tweaks (a different tone, a different
+            template, re-picking the background photo). */}
+        <div className="mb-5 rounded-3xl border border-primary/40 bg-glass p-6 backdrop-blur-2xl">
+          <h2 className="font-display text-lg font-semibold">Generate My Branding Kit</h2>
+          <p className="mt-1 text-sm text-muted-foreground">
+            One click: scans your website if you've added one, writes all 5 bios below, and builds your YouTube banner
+            and Facebook cover — all from your headshot, logo, and Voice DNA.
+          </p>
+          <div className="mt-4 flex items-center gap-3">
+            <button
+              onClick={handleGenerateBrandKit}
+              disabled={kitGenerating || !headshotUrl}
+              className="rounded-xl bg-primary px-5 py-2.5 text-sm font-semibold text-primary-foreground shadow-lg shadow-primary/30 transition-transform hover:-translate-y-0.5 disabled:opacity-60"
+            >
+              {kitGenerating ? (kitStatus ?? "Building your kit…") : "Generate my branding kit"}
+            </button>
+            {!headshotUrl && <p className="text-xs text-muted-foreground">Upload a headshot above first.</p>}
+          </div>
+        </div>
+
         {/* Business Info (2026-10-22) — per Mike: "beneath the headshot logo
             section, we should put in the rest of their information, where
             they could put their phone number, their website, their license
@@ -1253,6 +1562,49 @@ function VoiceWorkspace({
               {businessInfoSaving ? "Saving…" : "Save business info"}
             </button>
             {businessInfoStatus && <p className="text-xs text-muted-foreground">{businessInfoStatus}</p>}
+          </div>
+
+          {/* Scan My Website (2026-11-13) — per Mike: "you should be able to
+              scan their website and create content too, to grab other
+              images etc if need be, but the only thing you should need is
+              headshot and logo." Pulls the page's title/description (woven
+              into the bios below as extra context) and a few photos
+              (re-hosted, selectable as an optional Branding Graphics
+              background further down) — see scanAgentWebsite in
+              voice-dna.ts. Entirely optional; nothing downstream requires
+              it. */}
+          <div className="mt-4 border-t border-border pt-4">
+            <div className="flex flex-wrap items-center gap-3">
+              <button
+                onClick={handleScanWebsite}
+                disabled={scanningWebsite || !businessInfo.website.trim()}
+                className="rounded-xl border border-border bg-glass px-4 py-2 text-xs font-semibold transition-colors hover:bg-secondary disabled:opacity-60"
+              >
+                {scanningWebsite ? "Scanning…" : websiteScan ? "Re-scan website" : "Scan my website"}
+              </button>
+              <p className="text-xs text-muted-foreground">
+                Optional — pulls a bit of copy and a few photos from your own site to help write your bios and build
+                your graphics.
+              </p>
+            </div>
+            {scanError && <p className="mt-2 text-xs text-destructive">{scanError}</p>}
+            {websiteScan && !scanError && (
+              <div className="mt-3 rounded-xl border border-border bg-background/40 p-3">
+                <p className="text-xs text-muted-foreground">
+                  {websiteScan.title ? <span className="font-medium text-foreground">{websiteScan.title}</span> : null}
+                  {websiteScan.description ? ` — ${websiteScan.description}` : ""}
+                  {!websiteScan.title && !websiteScan.description
+                    ? "Scanned — no page title or description found."
+                    : ""}
+                </p>
+                {websiteScan.images.length > 0 && (
+                  <p className="mt-1.5 text-[11px] text-muted-foreground">
+                    Found {websiteScan.images.length} photo{websiteScan.images.length === 1 ? "" : "s"} — pick one as a
+                    background in Branding Graphics below.
+                  </p>
+                )}
+              </div>
+            )}
           </div>
         </div>
 
@@ -1498,9 +1850,42 @@ function VoiceWorkspace({
               className="mt-1 w-full rounded-xl border border-border bg-background/60 px-3 py-2 text-sm outline-none ring-ring transition focus:ring-2"
             />
           </label>
+          {/* Background photo (2026-11-13) — optional, only shows up once
+              Scan My Website (above, in Business Info) has actually found
+              photos. Picking "None" (the default when nothing's been
+              scanned) keeps the plain gradient look built from just
+              headshot + logo, per Mike's "only thing you should need." */}
+          {websiteScan && websiteScan.images.length > 0 && (
+            <div className="mt-4">
+              <span className="text-xs font-medium text-muted-foreground">Background photo (from your website)</span>
+              <div className="mt-1.5 flex flex-wrap gap-2">
+                <button
+                  onClick={() => setSelectedBackgroundImage(null)}
+                  className={`grid h-14 w-20 shrink-0 place-items-center rounded-lg border text-[10px] font-medium transition-colors ${
+                    selectedBackgroundImage === null
+                      ? "border-primary bg-secondary text-foreground"
+                      : "border-border bg-background/40 text-muted-foreground hover:bg-secondary"
+                  }`}
+                >
+                  None
+                </button>
+                {websiteScan.images.map((url) => (
+                  <button
+                    key={url}
+                    onClick={() => setSelectedBackgroundImage(url)}
+                    className={`h-14 w-20 shrink-0 overflow-hidden rounded-lg border-2 transition-colors ${
+                      selectedBackgroundImage === url ? "border-primary" : "border-transparent hover:border-border"
+                    }`}
+                  >
+                    <img src={url} alt="" className="size-full object-cover" />
+                  </button>
+                ))}
+              </div>
+            </div>
+          )}
           <div className="mt-4 flex items-center gap-3">
             <button
-              onClick={handleGenerateGraphics}
+              onClick={() => handleGenerateGraphics()}
               disabled={graphicGenerating || !headshotUrl}
               className="rounded-xl bg-primary px-4 py-2 text-xs font-semibold text-primary-foreground shadow-lg shadow-primary/30 transition-transform hover:-translate-y-0.5 disabled:opacity-60"
             >

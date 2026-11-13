@@ -121,8 +121,25 @@ export type AgentBusinessInfo = {
   officeAddress: string;
 };
 
-// Shape stored in the agents.voice_answers jsonb column. businessInfo and
-// contentBrandingStrategy (both added 2026-10-22) are set independently of
+// Added 2026-11-13 per Mike: "we should also plug in their social media
+// handles... Instagram, Facebook, LinkedIn, YouTube, Zillow, Trulia" —
+// specifically as reference text the bio writer below can work from, not
+// as something this app fetches live (see the comment on generateBrandBios
+// for why). TikTok added alongside the ones Mike actually listed since this
+// whole app already leans on Reels/video content and most agents using it
+// will have one; easy to drop if it turns out nobody fills it in.
+export type AgentSocialHandles = {
+  instagram: string;
+  facebook: string;
+  linkedin: string;
+  youtube: string;
+  tiktok: string;
+  zillow: string;
+  trulia: string;
+};
+
+// Shape stored in the agents.voice_answers jsonb column. businessInfo,
+// contentBrandingStrategy, and socialHandles are all set independently of
 // the interview's own answers/serviceAreas, via their own save calls below -
 // see saveAgentVoiceProfile's merge-not-overwrite comment for why that
 // matters.
@@ -131,6 +148,7 @@ export type VoiceDnaAnswers = {
   serviceAreas: string;
   businessInfo?: AgentBusinessInfo;
   contentBrandingStrategy?: string;
+  socialHandles?: AgentSocialHandles;
 };
 
 function buildVoiceDnaPrompt(name: string, city: string, answers: VoiceDnaAnswer[]): string {
@@ -509,15 +527,243 @@ export const saveContentBrandingStrategy = createServerFn({ method: "POST" })
     return { ok: true };
   });
 
+// Social Media Handles (2026-11-13) — see AgentSocialHandles above. Same
+// read-modify-write-into-voice_answers pattern as saveAgentBusinessInfo and
+// saveContentBrandingStrategy; this is purely storage, generateBrandBios
+// below is what actually does anything with these.
+export const saveAgentSocialHandles = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .validator(
+    (data: {
+      agentId: string;
+      instagram: string;
+      facebook: string;
+      linkedin: string;
+      youtube: string;
+      tiktok: string;
+      zillow: string;
+      trulia: string;
+    }) => data,
+  )
+  .handler(async ({ data, context }): Promise<{ ok: true } | { ok: false; error: string }> => {
+    const email = (context.claims as { email?: string } | undefined)?.email;
+    await requireAgentAccess(context.userId, email, data.agentId);
+    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+
+    const { data: existingRow, error: readErr } = await supabaseAdmin
+      .from("agents")
+      .select("voice_answers")
+      .eq("id", data.agentId)
+      .maybeSingle();
+    if (readErr) return { ok: false, error: readErr.message };
+
+    const existing = (existingRow?.voice_answers as VoiceDnaAnswers | null) ?? { answers: [], serviceAreas: "" };
+    const nextVoiceAnswers: VoiceDnaAnswers = {
+      ...existing,
+      socialHandles: {
+        instagram: data.instagram.trim(),
+        facebook: data.facebook.trim(),
+        linkedin: data.linkedin.trim(),
+        youtube: data.youtube.trim(),
+        tiktok: data.tiktok.trim(),
+        zillow: data.zillow.trim(),
+        trulia: data.trulia.trim(),
+      },
+    };
+
+    const { error } = await supabaseAdmin
+      .from("agents")
+      .update({ voice_answers: nextVoiceAnswers, updated_at: new Date().toISOString() })
+      .eq("id", data.agentId);
+    if (error) return { ok: false, error: error.message };
+    return { ok: true };
+  });
+
+// Brand Bio Writer (2026-11-13) — per Mike: "we need to create a done-for-
+// you bio section that can be created just based on what they've already
+// created in that section... Instagram header with the link and emojis...
+// the introduction for your Facebook profile settings... the about page
+// for your website, your LinkedIn profile, your Zillow profile... rate it
+// by how do you want to be, professional, personable, funny, relatable."
+//
+// Deliberately does NOT attempt to fetch/scrape the agent's actual
+// Instagram/Facebook/LinkedIn/Zillow/Trulia pages live — asked Mike about
+// this directly, since none of those platforms offer a public API for this
+// and scraping them is both fragile (breaks on any markup change) and
+// against most of their terms of service. His call: "you know what my
+// goals are, put a marketing dude in their pocket" — so this uses
+// everything already captured about the agent (Voice DNA, business info,
+// the social handles/links themselves as reference text, any content
+// branding strategy) as the raw material instead, same as every other
+// content-generation call in this app already does.
+export type BrandBioResult = {
+  instagram: string;
+  facebook: string;
+  linkedin: string;
+  realtorProfile: string;
+  websiteAbout: string;
+};
+
+export type BrandBioTone = "professional" | "personable" | "funny" | "relatable";
+
+const BRAND_BIO_TONE_DESCRIPTIONS: Record<BrandBioTone, string> = {
+  professional: "Polished and credible, minimal flourishes, still warm — never stiff or corporate.",
+  personable: "Warm, approachable, first-person and conversational — like introducing yourself to a new neighbor.",
+  funny: "Playful, a little witty or self-deprecating, personality-forward — still trustworthy, never a joke account.",
+  relatable:
+    "Down-to-earth and real, like a text from a friend who happens to sell real estate — nothing that sounds rehearsed.",
+};
+
+function buildBrandBioPrompt(opts: {
+  name: string;
+  city: string;
+  phone: string;
+  businessInfo: AgentBusinessInfo | undefined;
+  socialHandles: AgentSocialHandles | undefined;
+  voiceSummary: string | null;
+  contentBrandingStrategy: string | undefined;
+  tone: BrandBioTone;
+  extraNotes: string;
+}): string {
+  const bi = opts.businessInfo;
+  const sh = opts.socialHandles;
+  const contact =
+    `Phone: ${opts.phone || "(not given)"}\n` +
+    `Website: ${bi?.website || "(not given)"}\n` +
+    `Email: ${bi?.email || "(not given)"}\n` +
+    `License: ${bi?.licenseNumber || "(not given)"}`;
+  const handles =
+    `Instagram: ${sh?.instagram || "(not given)"}\n` +
+    `Facebook: ${sh?.facebook || "(not given)"}\n` +
+    `LinkedIn: ${sh?.linkedin || "(not given)"}\n` +
+    `YouTube: ${sh?.youtube || "(not given)"}\n` +
+    `TikTok: ${sh?.tiktok || "(not given)"}\n` +
+    `Zillow: ${sh?.zillow || "(not given)"}\n` +
+    `Trulia: ${sh?.trulia || "(not given)"}`;
+
+  return `You are writing branding bio copy for a real estate agent — their own "about me" text, reused wherever they need to introduce themselves. This is NOT a social media post or caption.
+
+Agent: ${opts.name}, serving ${opts.city || "their local market"}.
+
+CONTACT:
+${contact}
+
+SOCIAL HANDLES/LINKS (reference only — weave the relevant ones in naturally where a platform calls for it, don't just list them):
+${handles}
+
+VOICE DNA:
+${opts.voiceSummary ?? "Warm, authentic, conversational. Sounds like a real person, not a real estate agent."}
+
+${opts.contentBrandingStrategy ? `BRAND/CONTENT STRATEGY NOTES:\n${opts.contentBrandingStrategy}\n\n` : ""}TONE REQUESTED: ${BRAND_BIO_TONE_DESCRIPTIONS[opts.tone]}
+
+${opts.extraNotes.trim() ? `ADDITIONAL NOTES FROM THE AGENT:\n${opts.extraNotes.trim()}\n\n` : ""}Write 5 distinct bios below, each written for exactly where it will be used — don't write one generic bio and repeat it. Pull from the Voice DNA so every version still sounds like THIS specific person. NEVER use real-estate-agent clichés: no "passionate about," "navigating the market," "your trusted advisor," "dedicated to excellence," or similar. No hyphens used as dashes. First person throughout.
+
+Output ONLY in this exact format, nothing before or after:
+
+INSTAGRAM:
+[Under 150 characters total — Instagram enforces this as a hard limit. Punchy, can use relevant emojis, line breaks are fine, end pointing at their link or a DM. Not full sentences — bio-style fragments are fine.]
+
+FACEBOOK:
+[2-3 sentences for Facebook's "Intro" field on their profile. Warm, personable, first person.]
+
+LINKEDIN:
+[A professional "About" summary, 4-6 sentences, first person. More polished than the others but still unmistakably this specific person, never corporate boilerplate.]
+
+REALTOR PROFILE:
+[For Zillow/Trulia/Realtor.com-style public agent profiles. Consumer-facing and trust-building, 3-5 sentences, first person, mentions their market area and what makes working with them worth it.]
+
+WEBSITE ABOUT:
+[The longest one — 2-3 short paragraphs for their website's About page or a YouTube channel description. Tells a real story, not just a credentials list, first person.]`;
+}
+
+export const generateBrandBios = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .validator((data: { agentId: string; tone: BrandBioTone; extraNotes: string }) => data)
+  .handler(async ({ data, context }): Promise<BrandBioResult> => {
+    const email = (context.claims as { email?: string } | undefined)?.email;
+    await requireAgentAccess(context.userId, email, data.agentId);
+    const apiKey = process.env["ANTHROPIC_API_KEY"];
+    if (!apiKey) {
+      throw new Error("Bio generation isn't configured yet — add ANTHROPIC_API_KEY in Lovable Cloud → Secrets.");
+    }
+
+    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+    const { data: row, error } = await supabaseAdmin
+      .from("agents")
+      .select("full_name, market_area, phone, voice_answers, voice_summary")
+      .eq("id", data.agentId)
+      .maybeSingle();
+    if (error) throw error;
+    if (!row) throw new Error("Couldn't find this agent.");
+
+    const voiceAnswers = (row.voice_answers as VoiceDnaAnswers | null) ?? null;
+    const prompt = buildBrandBioPrompt({
+      name: row.full_name ?? "this agent",
+      city: row.market_area ?? "",
+      phone: row.phone ?? "",
+      businessInfo: voiceAnswers?.businessInfo,
+      socialHandles: voiceAnswers?.socialHandles,
+      voiceSummary: row.voice_summary,
+      contentBrandingStrategy: voiceAnswers?.contentBrandingStrategy,
+      tone: data.tone,
+      extraNotes: data.extraNotes,
+    });
+
+    const res = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "x-api-key": apiKey, "anthropic-version": "2023-06-01" },
+      body: JSON.stringify({
+        model: "claude-haiku-4-5-20251001",
+        max_tokens: 2000,
+        messages: [{ role: "user", content: prompt }],
+      }),
+    });
+    const json = (await res.json()) as AnthropicResponse;
+    if (!res.ok) {
+      throw new Error(json.error?.message ?? `Claude API error (${res.status})`);
+    }
+    const raw = (json.content ?? [])
+      .map((block) => block.text ?? "")
+      .join("")
+      .trim();
+    if (!raw) throw new Error("Empty response from Claude — try again.");
+
+    // Pulls each labeled section out in order, each one running until the
+    // next known label (or end of string) — same idea as the DESCRIPTION/
+    // POST/TEXT OVERLAYS parsing marketing.ts already uses for photo scans,
+    // just with 5 labels instead of 3.
+    function section(label: string, nextLabels: string[]): string {
+      const stopPattern = nextLabels.length ? `(?:\\n(?:${nextLabels.join("|")}):|$)` : "$";
+      const re = new RegExp(`${label}:\\s*\\n([\\s\\S]*?)${stopPattern}`, "i");
+      const match = raw.match(re);
+      return (match?.[1] ?? "").trim();
+    }
+
+    const result: BrandBioResult = {
+      instagram: section("INSTAGRAM", ["FACEBOOK", "LINKEDIN", "REALTOR PROFILE", "WEBSITE ABOUT"]),
+      facebook: section("FACEBOOK", ["LINKEDIN", "REALTOR PROFILE", "WEBSITE ABOUT"]),
+      linkedin: section("LINKEDIN", ["REALTOR PROFILE", "WEBSITE ABOUT"]),
+      realtorProfile: section("REALTOR PROFILE", ["WEBSITE ABOUT"]),
+      websiteAbout: section("WEBSITE ABOUT", []),
+    };
+    if (!result.instagram && !result.facebook && !result.linkedin && !result.realtorProfile && !result.websiteAbout) {
+      throw new Error("Could not parse the generated bios — try again.");
+    }
+    return result;
+  });
+
 // Brand assets — headshot + logo (2026-09-28). Mike: "they should also be
 // able to upload their headshots and logos to this section... their
 // headshot and logos would give us like their brand colors and everything
 // else we need for anything marketing going forward." Built now: upload +
-// storage + display. NOT built yet (no spec/assets from Mike to build
-// against): automatic brand-color extraction from the uploaded images, a
-// bio builder, and Facebook/YouTube header generation — Mike flagged these
-// as "eventually" additions to this same section, tracked as roadmap items
-// in build-status.md, not part of this pass.
+// storage + display.
+//
+// The bio builder and the YouTube/Facebook graphics generator Mike flagged
+// as "eventually" additions here are now built too — see generateBrandBios
+// above (bios) and renderBrandGraphic in voice.tsx (the client-side canvas
+// compositor behind the banner/cover generator, built the same way
+// marketing.tsx's photo text-overlay tool composites text onto a photo —
+// no new server function needed for that half at all).
 //
 // Same two-step signed-upload-URL pattern Monthly Marketing's Media tab
 // already uses (createMediaUploadUrl/finalizeMediaUpload in marketing.ts) —

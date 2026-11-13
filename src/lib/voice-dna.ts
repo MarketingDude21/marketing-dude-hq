@@ -964,6 +964,169 @@ export const generateBrandBios = createServerFn({ method: "POST" })
     return result;
   });
 
+// Branding Graphics v2 — real AI image generation (2026-11-13). The first
+// version of this (see renderBrandGraphic, formerly in voice.tsx) drew
+// shapes on a <canvas> by hand: a circle, a gradient, some text. Mike's
+// reaction, after sending 3 examples of real polished agent banners: "worst
+// cover photo ever I literally gave you examples... This is why you need
+// to scan the website and come up with some cool shit... use all your
+// resources... pretend you are [a graphic designer] and make marketing
+// dude look awesome." He's right that hand-drawn shapes were never going
+// to compete with an actually-designed banner — so this replaces that
+// approach entirely with a real text-to-image model (OpenAI's gpt-image-1,
+// the same model behind image generation in ChatGPT, which he explicitly
+// pointed at) doing actual design work from a detailed art-directed prompt,
+// given the agent's real headshot, logo, scanned website photo, and brand
+// color as reference images. Needs an OPENAI_API_KEY secret in Lovable
+// Cloud — same setup as the existing ANTHROPIC_API_KEY, just a different
+// provider since Claude's own API is text-only and has no image model.
+//
+// One generation call returns one landscape "master" image; voice.tsx then
+// crops that same image into the exact YouTube banner and Facebook cover
+// pixel dimensions client-side (cheap, free, no second API call) — see
+// cropMasterGraphic there. That's also why the prompt below explicitly asks
+// the model to keep the headshot and all text inside the vertical-center
+// band of the frame: a Facebook cover is a much shorter/wider strip than
+// the model can generate directly, so the top and bottom have to be safe
+// to crop away.
+export type BrandGraphicTemplate = "bold-split" | "photo-backdrop" | "centered-minimal";
+
+const BRAND_GRAPHIC_TEMPLATE_BRIEFS: Record<BrandGraphicTemplate, string> = {
+  "bold-split":
+    "STYLE: Bold modern editorial. Deep, rich dark background in the brand color (moody gradient, subtle diagonal light streak or soft geometric shapes for depth — never flat/empty). The headshot sits in a clean circular frame with a thin glowing ring in a light accent color, positioned left-of-center. Large, confident, bold condensed sans-serif typography for the name, in white, immediately to the right of the headshot. A thinner, lighter-weight tagline line beneath the name. This should feel like a premium real estate brand's YouTube channel art — polished, a little dramatic, unmistakably professional.",
+  "photo-backdrop":
+    "STYLE: Lifestyle photo backdrop. Use the provided website photo as a full-bleed background, subtly darkened/color-graded toward the brand color with a soft gradient overlay so text stays perfectly legible — never leave it bright/uncolored, and never leave text low-contrast. The headshot sits in a clean white-bordered circular badge, with the name and tagline in a semi-opaque rounded card/panel so they read clearly over the photo. This should feel like a real, published real estate team's cover photo — warm, inviting, true to their actual business, not a stock-photo collage.",
+  "centered-minimal":
+    "STYLE: Clean minimal centered. Soft, airy, light background in a gentle tint of the brand color (think warm cream, soft sage, or pale sand depending on the brand color given — never stark white, never a hard gradient). Headshot centered in a clean circular frame with a soft drop shadow. Name centered beneath it in confident, elegant typography (a refined serif or a clean bold sans — designer's choice), tagline centered below that in a lighter weight. Tasteful, generous whitespace. This should feel like a boutique brokerage's polished About page hero image.",
+};
+
+function buildBrandGraphicPrompt(opts: {
+  name: string;
+  tagline: string;
+  phone: string;
+  website: string;
+  email: string;
+  licenseNumber: string;
+  brandColorHex: string | null;
+  template: BrandGraphicTemplate;
+  hasLogo: boolean;
+  hasBackgroundPhoto: boolean;
+}): string {
+  const contactParts = [opts.phone, opts.website, opts.email].map((s) => s.trim()).filter(Boolean);
+  const contactLine = contactParts.join("   •   ");
+
+  return `You are a senior graphic designer creating a professional real estate marketing banner (usable as both a YouTube channel banner and a Facebook cover photo) for a real estate agent. Output a single polished, high-end, realistic marketing graphic — not a mockup, not a collage, not a template with placeholder-looking text. This needs to look like it came out of a real design agency.
+
+${BRAND_GRAPHIC_TEMPLATE_BRIEFS[opts.template]}
+
+${opts.brandColorHex ? `BRAND COLOR: Build the entire palette around ${opts.brandColorHex} — this is this agent's real brand color, pulled from their own website. Use it with confidence, not as a token accent.` : "BRAND COLOR: No brand color was given — choose a sophisticated, trustworthy palette (deep navy, warm charcoal, or an editorial green/teal all work well for real estate) and commit to it fully."}
+
+IMAGES PROVIDED: The first image is this agent's real headshot — use their actual likeness, cropped into the circular frame described above, do not alter their face or replace it with a generic person.${opts.hasLogo ? " The second image is their company/team logo — place it tastefully and small in a corner (top or bottom), preserving its exact design, never redrawn or altered." : ""}${
+    opts.hasBackgroundPhoto
+      ? ` The ${opts.hasLogo ? "third" : "second"} image is a real photo from this agent's own website. ${
+          opts.template === "photo-backdrop"
+            ? "Use it exactly as instructed in the style brief above (as the full background)."
+            : "Do not place it literally in the design — use only its colors, lighting, and mood as inspiration for the background palette."
+        }`
+      : ""
+  }
+
+TEXT TO RENDER (exact spelling, bold and perfectly legible, real typography — not garbled or approximated):
+Name: "${opts.name}"
+Tagline: "${opts.tagline}"
+${contactLine ? `Contact line (small, in a clean row, can include simple minimal icons): "${contactLine}"` : ""}
+${opts.licenseNumber.trim() ? `License line (small, subtle): "License #${opts.licenseNumber.trim()}"` : ""}
+
+CRITICAL COMPOSITION CONSTRAINT: This image will be cropped to several different wide aspect ratios afterward (some much shorter/wider than this canvas). Keep the headshot and ALL text — name, tagline, contact line, license — vertically centered within the middle 50% of the frame, with generous, visually intentional (not empty-looking) background extending to the very top and bottom edges. Nothing essential can be near the top or bottom edge.
+
+Landscape orientation. No watermarks, no stock-photo text, no placeholder text of any kind.`;
+}
+
+async function fetchAsBlob(url: string): Promise<Blob> {
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`Couldn't load one of your brand images (${res.status}).`);
+  return res.blob();
+}
+
+export const generateBrandGraphicAI = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .validator(
+    (data: { agentId: string; template: BrandGraphicTemplate; tagline: string; backgroundImageUrl: string | null }) =>
+      data,
+  )
+  .handler(async ({ data, context }): Promise<{ imageUrl: string }> => {
+    const email = (context.claims as { email?: string } | undefined)?.email;
+    await requireAgentAccess(context.userId, email, data.agentId);
+    const apiKey = process.env["OPENAI_API_KEY"];
+    if (!apiKey) {
+      throw new Error(
+        "Branding Graphics needs an OPENAI_API_KEY secret — add it in Lovable Cloud → Secrets, then try again.",
+      );
+    }
+
+    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+    const { data: row, error } = await supabaseAdmin
+      .from("agents")
+      .select("full_name, phone, headshot_url, logo_url, voice_answers")
+      .eq("id", data.agentId)
+      .maybeSingle();
+    if (error) throw error;
+    if (!row) throw new Error("Couldn't find this agent.");
+    if (!row.headshot_url) throw new Error("Upload a headshot above first — these are built from it.");
+
+    const voiceAnswers = (row.voice_answers as VoiceDnaAnswers | null) ?? null;
+    const bi = voiceAnswers?.businessInfo;
+
+    const prompt = buildBrandGraphicPrompt({
+      name: row.full_name ?? "Your Name",
+      tagline: data.tagline.trim() || "Real Estate Agent",
+      phone: row.phone ?? "",
+      website: bi?.website ?? "",
+      email: bi?.email ?? "",
+      licenseNumber: bi?.licenseNumber ?? "",
+      brandColorHex: voiceAnswers?.websiteScan?.brandColor ?? null,
+      template: data.template,
+      hasLogo: Boolean(row.logo_url),
+      hasBackgroundPhoto: Boolean(data.backgroundImageUrl),
+    });
+
+    const formData = new FormData();
+    formData.append("model", "gpt-image-1");
+    formData.append("prompt", prompt);
+    formData.append("size", "1536x1024");
+    // "high" over the cheaper/faster options — this is specifically about
+    // rendering a name, tagline, and contact info accurately and legibly,
+    // and lower quality settings on this model noticeably hurt text
+    // fidelity. Worth the extra cost/latency for something an agent will
+    // actually publish.
+    formData.append("quality", "high");
+    formData.append("image[]", await fetchAsBlob(row.headshot_url), "headshot.png");
+    if (row.logo_url) formData.append("image[]", await fetchAsBlob(row.logo_url), "logo.png");
+    if (data.backgroundImageUrl)
+      formData.append("image[]", await fetchAsBlob(data.backgroundImageUrl), "background.png");
+
+    const res = await fetch("https://api.openai.com/v1/images/edits", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${apiKey}` },
+      body: formData,
+    });
+    const json = (await res.json()) as { data?: { b64_json?: string }[]; error?: { message?: string } };
+    if (!res.ok) {
+      throw new Error(json.error?.message ?? `Image generation failed (${res.status}).`);
+    }
+    const b64 = json.data?.[0]?.b64_json;
+    if (!b64) throw new Error("Image generation returned nothing usable — try again.");
+
+    const buf = Buffer.from(b64, "base64");
+    const path = `${data.agentId}/brand/ai-graphics/${crypto.randomUUID()}.png`;
+    const { error: uploadErr } = await supabaseAdmin.storage
+      .from("media")
+      .upload(path, buf, { contentType: "image/png", upsert: true });
+    if (uploadErr) throw uploadErr;
+    const { data: pub } = supabaseAdmin.storage.from("media").getPublicUrl(path);
+    return { imageUrl: pub.publicUrl };
+  });
+
 // Brand assets — headshot + logo (2026-09-28). Mike: "they should also be
 // able to upload their headshots and logos to this section... their
 // headshot and logos would give us like their brand colors and everything

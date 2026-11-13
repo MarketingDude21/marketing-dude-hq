@@ -138,17 +138,47 @@ export type AgentSocialHandles = {
   trulia: string;
 };
 
+// Website Scan (2026-11-13) — per Mike, right after the bio writer/graphics
+// generator shipped: "you should be able to scan their website and create
+// content too... to grab other images etc, if need be, but the only thing
+// you should need is headshot and logo." So this is purely additive — an
+// agent who's only ever uploaded a headshot and logo still gets full bios
+// and graphics (see generateBrandBios and renderBrandGraphic in voice.tsx),
+// this just optionally enriches both further when the agent's own website
+// is already on file (see Business Info above). Images found on the page
+// are re-hosted into our own "media" Storage bucket (see scanAgentWebsite
+// below) rather than linked directly — most real-world sites don't send
+// CORS headers, which would silently block the browser's <canvas> from
+// ever using them as a graphic background.
+export type WebsiteScan = {
+  scannedAt: string;
+  title: string;
+  description: string;
+  images: string[];
+  // Added same day per Mike: "when you scan their website that should give
+  // you colors... give me a whole branding kit with the click of a
+  // button." Pulled from the page's own <meta name="theme-color"> tag when
+  // it sets one — that tag exists specifically so a browser/OS can tint its
+  // own UI to match a site's brand, so it's a direct, reliable signal
+  // rather than a guess (see scanAgentWebsite). Not every site sets one;
+  // when it's missing, renderBrandGraphic in voice.tsx falls back to
+  // sampling the agent's logo instead (extractAccentColor), same as before
+  // this existed.
+  brandColor: string | null;
+};
+
 // Shape stored in the agents.voice_answers jsonb column. businessInfo,
-// contentBrandingStrategy, and socialHandles are all set independently of
-// the interview's own answers/serviceAreas, via their own save calls below -
-// see saveAgentVoiceProfile's merge-not-overwrite comment for why that
-// matters.
+// contentBrandingStrategy, socialHandles, and websiteScan are all set
+// independently of the interview's own answers/serviceAreas, via their own
+// save calls below - see saveAgentVoiceProfile's merge-not-overwrite
+// comment for why that matters.
 export type VoiceDnaAnswers = {
   answers: VoiceDnaAnswer[];
   serviceAreas: string;
   businessInfo?: AgentBusinessInfo;
   contentBrandingStrategy?: string;
   socialHandles?: AgentSocialHandles;
+  websiteScan?: WebsiteScan;
 };
 
 function buildVoiceDnaPrompt(name: string, city: string, answers: VoiceDnaAnswer[]): string {
@@ -579,6 +609,182 @@ export const saveAgentSocialHandles = createServerFn({ method: "POST" })
     return { ok: true };
   });
 
+// Scan My Website (2026-11-13) — see WebsiteScan above for why this exists.
+// Server-side only (never fetched from the browser): the site being scanned
+// is a third party from the browser's point of view, so a client-side fetch
+// would just hit CORS and fail for most sites anyway, and a server function
+// is also where API keys/secrets stay out of the client bundle, same reason
+// every Claude call in this file already runs server-side.
+//
+// Deliberately simple — no HTML-parsing library pulled in (nothing in this
+// repo already does that), just a handful of targeted regexes against the
+// raw HTML for <title>, the meta description, and image URLs (og:image
+// first, then a handful of <img src> tags). This is this agent's OWN site,
+// scanned at their own request for their own content — a materially
+// different call than the "should we scrape Instagram/Facebook/etc." one
+// flagged on generateBrandBios above, where the platform's own ToS is what
+// rules scraping out.
+//
+// Found images are downloaded here (server-side, so no CORS concern on the
+// read) and re-uploaded into the same "media" Storage bucket brand assets
+// already use, under this agent's own `${agentId}/brand/website-scan/`
+// prefix — never linked to directly. Most real business sites don't send
+// Access-Control-Allow-Origin headers, and the <canvas> compositor in
+// voice.tsx (renderBrandGraphic) needs crossOrigin="anonymous" to export
+// anything it draws; without re-hosting, a background photo picked here
+// would just silently fail to load there. One bad image (fails to
+// download, isn't actually an image, etc.) is skipped rather than failing
+// the whole scan — this is a best-effort enrichment, not a hard dependency.
+export const scanAgentWebsite = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .validator((data: { agentId: string }) => data)
+  .handler(async ({ data, context }): Promise<({ ok: true } & WebsiteScan) | { ok: false; error: string }> => {
+    const email = (context.claims as { email?: string } | undefined)?.email;
+    await requireAgentAccess(context.userId, email, data.agentId);
+    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+
+    const { data: existingRow, error: readErr } = await supabaseAdmin
+      .from("agents")
+      .select("voice_answers")
+      .eq("id", data.agentId)
+      .maybeSingle();
+    if (readErr) return { ok: false, error: readErr.message };
+
+    const existing = (existingRow?.voice_answers as VoiceDnaAnswers | null) ?? { answers: [], serviceAreas: "" };
+    const rawWebsite = existing.businessInfo?.website?.trim();
+    if (!rawWebsite) {
+      return { ok: false, error: "Add a website in Business Info above and save it first." };
+    }
+    const baseUrl = /^https?:\/\//i.test(rawWebsite) ? rawWebsite : `https://${rawWebsite}`;
+
+    async function fetchWithTimeout(url: string, timeoutMs: number, extraHeaders?: Record<string, string>) {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), timeoutMs);
+      try {
+        return await fetch(url, {
+          signal: controller.signal,
+          redirect: "follow",
+          headers: {
+            "User-Agent": "Mozilla/5.0 (compatible; YourMarketingDudeBot/1.0; +https://yourmarketingdude.com)",
+            ...extraHeaders,
+          },
+        });
+      } finally {
+        clearTimeout(timer);
+      }
+    }
+
+    let html: string;
+    let finalUrl: string;
+    try {
+      const res = await fetchWithTimeout(baseUrl, 8000);
+      if (!res.ok) return { ok: false, error: `Couldn't reach that site (${res.status}).` };
+      const contentType = res.headers.get("content-type") ?? "";
+      if (!contentType.includes("html")) return { ok: false, error: "That website didn't return a normal web page." };
+      finalUrl = res.url || baseUrl;
+      const fullText = await res.text();
+      html = fullText.slice(0, 600_000); // cap — plenty for head/meta tags and the first screenful of images
+    } catch {
+      return { ok: false, error: "Couldn't reach that site — double check the URL in Business Info." };
+    }
+
+    function decodeEntities(s: string): string {
+      return s
+        .replace(/&amp;/g, "&")
+        .replace(/&quot;/g, '"')
+        .replace(/&#0?39;/g, "'")
+        .replace(/&lt;/g, "<")
+        .replace(/&gt;/g, ">")
+        .replace(/&nbsp;/g, " ")
+        .trim();
+    }
+
+    const titleMatch = html.match(/<title[^>]*>([^<]*)<\/title>/i);
+    const ogTitleMatch = html.match(/<meta[^>]+property=["']og:title["'][^>]+content=["']([^"']*)["']/i);
+    const title = decodeEntities(ogTitleMatch?.[1] || titleMatch?.[1] || "");
+
+    const descMatch =
+      html.match(/<meta[^>]+name=["']description["'][^>]+content=["']([^"']*)["']/i) ||
+      html.match(/<meta[^>]+property=["']og:description["'][^>]+content=["']([^"']*)["']/i);
+    const description = decodeEntities(descMatch?.[1] || "").slice(0, 600);
+
+    const ogImageMatch = html.match(/<meta[^>]+property=["']og:image["'][^>]+content=["']([^"']*)["']/i);
+
+    // theme-color's content/name attributes can appear in either order in
+    // real-world markup, so two passes rather than assuming name comes first.
+    const themeColorMatch =
+      html.match(/<meta[^>]+name=["']theme-color["'][^>]+content=["']([^"']*)["']/i) ||
+      html.match(/<meta[^>]+content=["']([^"']*)["'][^>]+name=["']theme-color["']/i);
+    const rawThemeColor = themeColorMatch?.[1]?.trim() ?? "";
+    const brandColor = /^#([0-9a-f]{3}|[0-9a-f]{6})$/i.test(rawThemeColor) ? rawThemeColor.toLowerCase() : null;
+
+    const SKIP_PATTERN = /logo|icon|sprite|pixel|favicon|spacer|blank|placeholder|avatar/i;
+    const candidateUrls: string[] = [];
+    if (ogImageMatch?.[1]) candidateUrls.push(ogImageMatch[1]);
+    const imgTagRe = /<img[^>]+src=["']([^"']+)["']/gi;
+    let m: RegExpExecArray | null;
+    while ((m = imgTagRe.exec(html)) && candidateUrls.length < 14) {
+      const src = m[1]!;
+      if (src.startsWith("data:")) continue;
+      if (SKIP_PATTERN.test(src)) continue;
+      if (!/\.(jpe?g|png|webp)(\?|$)/i.test(src) && !src.includes("?")) continue;
+      candidateUrls.push(src);
+    }
+
+    // Resolve to absolute URLs and dedupe, keeping first-seen order (og:image
+    // stays first since it was pushed in before the <img> scan).
+    const seen = new Set<string>();
+    const absoluteUrls: string[] = [];
+    for (const u of candidateUrls) {
+      try {
+        const abs = new URL(u, finalUrl).toString();
+        if (!seen.has(abs)) {
+          seen.add(abs);
+          absoluteUrls.push(abs);
+        }
+      } catch {
+        // not a parseable URL — skip it
+      }
+    }
+
+    // Download + re-upload up to 6 candidates server-side, so the browser
+    // <canvas> never has to load a cross-origin image directly (see the
+    // comment above this function for why). Best-effort: a failure on any
+    // one candidate just means it's skipped, not that the scan fails.
+    const images: string[] = [];
+    for (const url of absoluteUrls) {
+      if (images.length >= 6) break;
+      try {
+        const imgRes = await fetchWithTimeout(url, 6000);
+        if (!imgRes.ok) continue;
+        const contentType = imgRes.headers.get("content-type") ?? "";
+        if (!contentType.startsWith("image/")) continue;
+        const buf = Buffer.from(await imgRes.arrayBuffer());
+        if (buf.byteLength < 4000 || buf.byteLength > 8_000_000) continue; // too small = icon/tracking pixel, too big = skip
+        const ext = contentType.includes("png") ? "png" : contentType.includes("webp") ? "webp" : "jpg";
+        const path = `${data.agentId}/brand/website-scan/${crypto.randomUUID()}.${ext}`;
+        const { error: uploadErr } = await supabaseAdmin.storage
+          .from("media")
+          .upload(path, buf, { contentType, upsert: true });
+        if (uploadErr) continue;
+        const { data: pub } = supabaseAdmin.storage.from("media").getPublicUrl(path);
+        images.push(pub.publicUrl);
+      } catch {
+        continue;
+      }
+    }
+
+    const scan: WebsiteScan = { scannedAt: new Date().toISOString(), title, description, images, brandColor };
+    const nextVoiceAnswers: VoiceDnaAnswers = { ...existing, websiteScan: scan };
+    const { error: writeErr } = await supabaseAdmin
+      .from("agents")
+      .update({ voice_answers: nextVoiceAnswers, updated_at: new Date().toISOString() })
+      .eq("id", data.agentId);
+    if (writeErr) return { ok: false, error: writeErr.message };
+
+    return { ok: true, ...scan };
+  });
+
 // Brand Bio Writer (2026-11-13) — per Mike: "we need to create a done-for-
 // you bio section that can be created just based on what they've already
 // created in that section... Instagram header with the link and emojis...
@@ -622,6 +828,7 @@ function buildBrandBioPrompt(opts: {
   socialHandles: AgentSocialHandles | undefined;
   voiceSummary: string | null;
   contentBrandingStrategy: string | undefined;
+  websiteScan: WebsiteScan | undefined;
   tone: BrandBioTone;
   extraNotes: string;
 }): string {
@@ -654,7 +861,11 @@ ${handles}
 VOICE DNA:
 ${opts.voiceSummary ?? "Warm, authentic, conversational. Sounds like a real person, not a real estate agent."}
 
-${opts.contentBrandingStrategy ? `BRAND/CONTENT STRATEGY NOTES:\n${opts.contentBrandingStrategy}\n\n` : ""}TONE REQUESTED: ${BRAND_BIO_TONE_DESCRIPTIONS[opts.tone]}
+${opts.contentBrandingStrategy ? `BRAND/CONTENT STRATEGY NOTES:\n${opts.contentBrandingStrategy}\n\n` : ""}${
+    opts.websiteScan?.title || opts.websiteScan?.description
+      ? `FROM THEIR OWN WEBSITE (scanned automatically, reference only — real specifics to draw from, not something to quote verbatim):\nTitle: ${opts.websiteScan.title || "(none)"}\nDescription: ${opts.websiteScan.description || "(none)"}\n\n`
+      : ""
+  }TONE REQUESTED: ${BRAND_BIO_TONE_DESCRIPTIONS[opts.tone]}
 
 ${opts.extraNotes.trim() ? `ADDITIONAL NOTES FROM THE AGENT:\n${opts.extraNotes.trim()}\n\n` : ""}Write 5 distinct bios below, each written for exactly where it will be used — don't write one generic bio and repeat it. Pull from the Voice DNA so every version still sounds like THIS specific person. NEVER use real-estate-agent clichés: no "passionate about," "navigating the market," "your trusted advisor," "dedicated to excellence," or similar. No hyphens used as dashes. First person throughout.
 
@@ -705,6 +916,7 @@ export const generateBrandBios = createServerFn({ method: "POST" })
       socialHandles: voiceAnswers?.socialHandles,
       voiceSummary: row.voice_summary,
       contentBrandingStrategy: voiceAnswers?.contentBrandingStrategy,
+      websiteScan: voiceAnswers?.websiteScan,
       tone: data.tone,
       extraNotes: data.extraNotes,
     });

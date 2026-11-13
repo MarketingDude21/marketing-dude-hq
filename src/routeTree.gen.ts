@@ -14,6 +14,8 @@ import { Route as AccountRouteImport } from './routes/account'
 import { Route as DatabaseRouteImport } from './routes/database'
 import { Route as LoginRouteImport } from './routes/login'
 import { Route as MarketingRouteImport } from './routes/marketing'
+import { Route as MediaRouteImport } from './routes/media'
+import { Route as PostsRouteImport } from './routes/posts'
 import { Route as ResetPasswordRouteImport } from './routes/reset-password'
 import { Route as SweetAssistRouteImport } from './routes/sweet-assist'
 import { Route as VoiceRouteImport } from './routes/voice'
@@ -44,6 +46,16 @@ const LoginRoute = LoginRouteImport.update({
 const MarketingRoute = MarketingRouteImport.update({
   id: '/marketing',
   path: '/marketing',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const MediaRoute = MediaRouteImport.update({
+  id: '/media',
+  path: '/media',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const PostsRoute = PostsRouteImport.update({
+  id: '/posts',
+  path: '/posts',
   getParentRoute: () => rootRouteImport,
 } as any)
 const ResetPasswordRoute = ResetPasswordRouteImport.update({
@@ -83,6 +95,8 @@ export interface FileRoutesByFullPath {
   '/database': typeof DatabaseRoute
   '/login': typeof LoginRoute
   '/marketing': typeof MarketingRoute
+  '/media': typeof MediaRoute
+  '/posts': typeof PostsRoute
   '/reset-password': typeof ResetPasswordRoute
   '/sweet-assist': typeof SweetAssistRoute
   '/voice': typeof VoiceRoute
@@ -96,6 +110,8 @@ export interface FileRoutesByTo {
   '/database': typeof DatabaseRoute
   '/login': typeof LoginRoute
   '/marketing': typeof MarketingRoute
+  '/media': typeof MediaRoute
+  '/posts': typeof PostsRoute
   '/reset-password': typeof ResetPasswordRoute
   '/sweet-assist': typeof SweetAssistRoute
   '/voice': typeof VoiceRoute
@@ -110,6 +126,8 @@ export interface FileRoutesById {
   '/database': typeof DatabaseRoute
   '/login': typeof LoginRoute
   '/marketing': typeof MarketingRoute
+  '/media': typeof MediaRoute
+  '/posts': typeof PostsRoute
   '/reset-password': typeof ResetPasswordRoute
   '/sweet-assist': typeof SweetAssistRoute
   '/voice': typeof VoiceRoute
@@ -125,6 +143,8 @@ export interface FileRouteTypes {
     | '/database'
     | '/login'
     | '/marketing'
+    | '/media'
+    | '/posts'
     | '/reset-password'
     | '/sweet-assist'
     | '/voice'
@@ -138,6 +158,8 @@ export interface FileRouteTypes {
     | '/database'
     | '/login'
     | '/marketing'
+    | '/media'
+    | '/posts'
     | '/reset-password'
     | '/sweet-assist'
     | '/voice'
@@ -151,6 +173,8 @@ export interface FileRouteTypes {
     | '/database'
     | '/login'
     | '/marketing'
+    | '/media'
+    | '/posts'
     | '/reset-password'
     | '/sweet-assist'
     | '/voice'
@@ -165,6 +189,8 @@ export interface RootRouteChildren {
   DatabaseRoute: typeof DatabaseRoute
   LoginRoute: typeof LoginRoute
   MarketingRoute: typeof MarketingRoute
+  MediaRoute: typeof MediaRoute
+  PostsRoute: typeof PostsRoute
   ResetPasswordRoute: typeof ResetPasswordRoute
   SweetAssistRoute: typeof SweetAssistRoute
   VoiceRoute: typeof VoiceRoute
@@ -208,6 +234,20 @@ declare module '@tanstack/react-router' {
       path: '/marketing'
       fullPath: '/marketing'
       preLoaderRoute: typeof MarketingRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/media': {
+      id: '/media'
+      path: '/media'
+      fullPath: '/media'
+      preLoaderRoute: typeof MediaRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/posts': {
+      id: '/posts'
+      path: '/posts'
+      fullPath: '/posts'
+      preLoaderRoute: typeof PostsRouteImport
       parentRoute: typeof rootRouteImport
     }
     '/reset-password': {
@@ -261,6 +301,8 @@ const rootRouteChildren: RootRouteChildren = {
   DatabaseRoute: DatabaseRoute,
   LoginRoute: LoginRoute,
   MarketingRoute: MarketingRoute,
+  MediaRoute: MediaRoute,
+  PostsRoute: PostsRoute,
   ResetPasswordRoute: ResetPasswordRoute,
   SweetAssistRoute: SweetAssistRoute,
   VoiceRoute: VoiceRoute,

@@ -3836,7 +3836,9 @@ function buildChatSystemPrompt(
     `You are ${agentName}'s own personal marketing assistant — their "Marketing Dude," embedded in their day-to-day workflow. You know their voice and you're having an ongoing conversation with them, not filling out a form. Keep replies focused on the content they're working on; don't pad with generic assistant chatter.\n\n` +
     `You are writing for ${agentName} in ${agentCity}.\n\n` +
     `VOICE DNA:\n${voiceDna}${learnedFeedback}\n\n` +
-    'House rules that apply no matter what you\'re writing: no hyphens used as dashes, no "As a real estate professional" or any version of that, no "Navigating the market," no corporate language, no buzzwords, no filler, standard capitalization always, never write in a way a real person wouldn\'t actually say out loud.\n\n';
+    'House rules that apply no matter what you\'re writing: no hyphens used as dashes, no "As a real estate professional" or any version of that, no "Navigating the market," no corporate language, no buzzwords, no filler, standard capitalization always, never write in a way a real person wouldn\'t actually say out loud.\n\n' +
+    WEB_SEARCH_INSTRUCTION +
+    "\n\n";
 
   if (mode === "email") {
     return (
@@ -3942,9 +3944,14 @@ export const sendAgentChatMessage = createServerFn({ method: "POST" })
       },
       body: JSON.stringify({
         model: "claude-haiku-4-5-20251001",
-        max_tokens: 1200,
+        // Bumped 1200 -> 1800 alongside adding web search below — a real
+        // search-then-write turn needs more response budget than pure text
+        // generation, same reasoning as the video-script bump in
+        // generateMonthlyBatch above.
+        max_tokens: 1800,
         system: systemPrompt,
         messages: claudeMessages,
+        tools: [WEB_SEARCH_TOOL],
       }),
     });
     const json = (await res.json()) as {
@@ -4602,11 +4609,49 @@ async function fetchWithTimeout(url: string, options: RequestInit, timeoutMs: nu
   }
 }
 
+// Anthropic's server-side web search tool (added 2026-11-13, see the
+// WEB_SEARCH_INSTRUCTION comment below for why). Claude decides for itself
+// whether a given prompt actually needs it — just having this in `tools`
+// doesn't force a search on every call, so handing it to a prompt that
+// never needs current facts costs nothing extra. max_uses caps it at 3
+// searches per call as a cost backstop ($10/1,000 searches on Anthropic's
+// side, so 3 is a fraction of a cent even in the worst case) — plenty for
+// "look up today's rate" or "look up this zip's inventory," not enough to
+// spiral on a confused query. Needs web search turned ON for the org in
+// the Claude Console (console.anthropic.com) — separate from the
+// ANTHROPIC_API_KEY secret already in Lovable — or every call that
+// includes this tool fails outright with a 400.
+const WEB_SEARCH_TOOL = { type: "web_search_20250305", name: "web_search", max_uses: 3 };
+
+// Appended to any prompt that's allowed to use web search, so Claude knows
+// the tool is there FOR something specific rather than just sitting
+// unused in the tool list. Added 2026-11-13 per Mike, after he flagged
+// that a "Step 1" needing current stats (local housing numbers, rates,
+// etc — see the hyper-local Reel prompt templates in 2026-09-posts.md)
+// would otherwise silently guess at them with no way to tell the
+// difference from a real number.
+const WEB_SEARCH_INSTRUCTION =
+  "\n\nIf writing this well depends on a real, current fact, number, or rate (today's mortgage rate, this area's current housing inventory, a local statistic, something that happened recently) — use the web search tool to look it up before you write. Never invent or estimate a specific number, date, or statistic. If you search and still can't find a solid current number, write around it in general terms instead of guessing one.";
+
 // Exported (was module-private) 2026-11-05 so soi-builder.ts's new contact
 // cleanup step can reuse the exact same Claude call this file already makes
 // for content generation, instead of duplicating the fetch/timeout/error
-// handling boilerplate a second time.
-export async function callClaude(apiKey: string, prompt: string, maxTokens: number): Promise<string> {
+// handling boilerplate a second time. soi-builder.ts's calls never pass
+// `webSearch` (it has nothing to do with content), so they're unaffected
+// by the tool added below — it's additive and off by default.
+export async function callClaude(
+  apiKey: string,
+  prompt: string,
+  maxTokens: number,
+  opts?: { webSearch?: boolean },
+): Promise<string> {
+  const body: Record<string, unknown> = {
+    model: "claude-haiku-4-5-20251001",
+    max_tokens: maxTokens,
+    messages: [{ role: "user", content: opts?.webSearch ? `${prompt}${WEB_SEARCH_INSTRUCTION}` : prompt }],
+  };
+  if (opts?.webSearch) body["tools"] = [WEB_SEARCH_TOOL];
+
   const res = await fetchWithTimeout(
     "https://api.anthropic.com/v1/messages",
     {
@@ -4616,20 +4661,35 @@ export async function callClaude(apiKey: string, prompt: string, maxTokens: numb
         "x-api-key": apiKey,
         "anthropic-version": "2023-06-01",
       },
-      body: JSON.stringify({
-        model: "claude-haiku-4-5-20251001",
-        max_tokens: maxTokens,
-        messages: [{ role: "user", content: prompt }],
-      }),
+      body: JSON.stringify(body),
     },
-    60_000,
+    // Bumped from a flat 60s when webSearch is on: a real search round trip
+    // (query out, results back, THEN the model writes) can genuinely take
+    // longer than a pure-text generation call, and timing it out mid-search
+    // would waste the search without producing anything.
+    opts?.webSearch ? 90_000 : 60_000,
   );
-  const json = (await res.json()) as { content?: { text?: string }[]; error?: { message?: string } };
+  const json = (await res.json()) as {
+    content?: { type?: string; text?: string }[];
+    stop_reason?: string;
+    error?: { message?: string };
+  };
   if (!res.ok) throw new Error(json.error?.message ?? `Claude API error (${res.status})`);
-  return (json.content ?? [])
+  // Non-text blocks Claude can emit mid-search (server_tool_use,
+  // web_search_tool_result) have no `.text`, so they fall out of this join
+  // on their own — no special-casing needed to skip them.
+  const text = (json.content ?? [])
     .map((b) => b.text ?? "")
     .join("")
     .trim();
+  // Known, deliberately-not-handled edge case: a long chain of searches can
+  // come back with stop_reason "pause_turn" instead of finishing — meant to
+  // be resumed with another request carrying the same content back. Not
+  // worth the added complexity for a single-shot content-generation call
+  // capped at 3 searches; in the rare case this is hit, `text` below is
+  // just whatever was written before the pause, which the caller's normal
+  // "empty response" handling already guards against being totally blank.
+  return text;
 }
 
 function cleanCopy(text: string): string {
@@ -4759,7 +4819,7 @@ export const generateMonthlyBatch = createServerFn({ method: "POST" })
         "Posts to write:\n" +
         postDocs.map((p, i) => `POST ${i + 1}: ${p.title}\nCONCEPT: ${p.goal}\nORIGINAL: ${p.copy}`).join("\n\n");
 
-      const raw = await callClaude(anthropicKey, postPrompt, 4000);
+      const raw = await callClaude(anthropicKey, postPrompt, 4000, { webSearch: true });
       const blocks = raw.split("---").filter((b) => b.trim());
       const media = await assignSuggestedMedia(
         data.agentId,
@@ -4939,7 +4999,13 @@ export const generateMonthlyBatch = createServerFn({ method: "POST" })
           learnedFeedback;
 
         try {
-          const vraw = cleanCopy(await callClaude(anthropicKey, videoPrompt, 600));
+          // 600 -> 1200 tokens when this prompt is one of the hyper-local
+          // templates that asks Claude to actually go look something up
+          // first (see VIDEO_SCRIPT_REFERENCE_TEMPLATE-style briefs in
+          // 2026-09-posts.md) — the search step itself eats into the same
+          // response budget as the script text, and 600 was sized for a
+          // 150-word script with no search involved.
+          const vraw = cleanCopy(await callClaude(anthropicKey, videoPrompt, 1200, { webSearch: true }));
           return {
             agent_id: data.agentId,
             content: vraw,

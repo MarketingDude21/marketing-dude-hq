@@ -20,9 +20,14 @@ import {
   finalizeBrandAssetUpload,
   saveAgentBusinessInfo,
   saveContentBrandingStrategy,
+  saveAgentSocialHandles,
+  generateBrandBios,
   type VoiceDnaAnswer,
   type VoiceDnaAnswers,
   type AgentBusinessInfo,
+  type AgentSocialHandles,
+  type BrandBioResult,
+  type BrandBioTone,
 } from "@/lib/voice-dna";
 // Reused from Monthly Marketing (2026-09-28) — same admin_allowlist +
 // agents identity model, so "who am I working on behalf of" is resolved the
@@ -56,9 +61,204 @@ type Stage = "loading" | "intro" | "basics" | "interview" | "areas" | "generatin
 type Basics = { fullName: string; marketArea: string; phone: string };
 const EMPTY_BASICS: Basics = { fullName: "", marketArea: "", phone: "" };
 const EMPTY_BUSINESS_INFO: AgentBusinessInfo = { website: "", licenseNumber: "", email: "", officeAddress: "" };
+const EMPTY_SOCIAL_HANDLES: AgentSocialHandles = {
+  instagram: "",
+  facebook: "",
+  linkedin: "",
+  youtube: "",
+  tiktok: "",
+  zillow: "",
+  trulia: "",
+};
 
 function emptyAnswers(): string[] {
   return new Array(VOICE_DNA_QUESTIONS.length).fill("");
+}
+
+// Branding Graphics (2026-11-13) — per Mike: "we should be able to take the
+// headshot they uploaded and the logo and be able to create really
+// nice-looking YouTube headers, Facebook covers, all of the above. We
+// should have a couple different versions of that." Built the same way
+// compositeTextOnPhoto in marketing.tsx already composites text onto a
+// photo — plain client-side <canvas>, no new image-generation vendor —
+// just a different layout (circular headshot crop + logo + name/tagline
+// instead of free-floating draggable text).
+type BrandGraphicFormat = "youtube" | "facebook";
+type BrandGraphicTemplate = "bold-split" | "centered-minimal";
+
+const BRAND_GRAPHIC_SIZES: Record<BrandGraphicFormat, { width: number; height: number; fileSuffix: string }> = {
+  // Full YouTube banner is 2560x1440, but only the centered 1546x423 "safe
+  // area" is guaranteed visible on every device/crop — see safeArea below.
+  youtube: { width: 2560, height: 1440, fileSuffix: "YouTube-Banner" },
+  facebook: { width: 820, height: 312, fileSuffix: "Facebook-Cover" },
+};
+
+function loadImage(url: string): Promise<HTMLImageElement> {
+  const img = new Image();
+  img.crossOrigin = "anonymous";
+  return new Promise((resolve, reject) => {
+    img.onload = () => resolve(img);
+    img.onerror = () => reject(new Error("Couldn't load one of your brand images."));
+    img.src = url;
+  });
+}
+
+// Draws `img` into the x/y/w/h box, cropping (never stretching) to fill it —
+// the canvas equivalent of CSS `object-fit: cover`.
+function drawImageCover(
+  ctx: CanvasRenderingContext2D,
+  img: HTMLImageElement,
+  x: number,
+  y: number,
+  w: number,
+  h: number,
+) {
+  const imgRatio = img.naturalWidth / img.naturalHeight;
+  const boxRatio = w / h;
+  let sx = 0;
+  let sy = 0;
+  let sw = img.naturalWidth;
+  let sh = img.naturalHeight;
+  if (imgRatio > boxRatio) {
+    sw = img.naturalHeight * boxRatio;
+    sx = (img.naturalWidth - sw) / 2;
+  } else {
+    sh = img.naturalWidth / boxRatio;
+    sy = (img.naturalHeight - sh) / 2;
+  }
+  ctx.drawImage(img, sx, sy, sw, sh, x, y, w, h);
+}
+
+function drawCircularImage(
+  ctx: CanvasRenderingContext2D,
+  img: HTMLImageElement,
+  cx: number,
+  cy: number,
+  radius: number,
+) {
+  ctx.save();
+  ctx.beginPath();
+  ctx.arc(cx, cy, radius, 0, Math.PI * 2);
+  ctx.closePath();
+  ctx.clip();
+  drawImageCover(ctx, img, cx - radius, cy - radius, radius * 2, radius * 2);
+  ctx.restore();
+}
+
+async function renderBrandGraphic(
+  format: BrandGraphicFormat,
+  template: BrandGraphicTemplate,
+  headshotUrl: string,
+  logoUrl: string | null,
+  name: string,
+  tagline: string,
+): Promise<Blob> {
+  const { width, height } = BRAND_GRAPHIC_SIZES[format];
+  const canvas = document.createElement("canvas");
+  canvas.width = width;
+  canvas.height = height;
+  const ctx = canvas.getContext("2d");
+  if (!ctx) throw new Error("Couldn't prepare this graphic.");
+
+  const [headshot, logo] = await Promise.all([
+    loadImage(headshotUrl),
+    logoUrl ? loadImage(logoUrl) : Promise.resolve(null),
+  ]);
+
+  // YouTube's "safe area" is the centered region that survives every
+  // device's crop of the full banner; Facebook's cover has no such concept,
+  // so for that format the safe area is just the full canvas.
+  const safeArea =
+    format === "youtube"
+      ? { width: 1546, height: 423, x: (width - 1546) / 2, y: (height - 423) / 2 }
+      : { width, height, x: 0, y: 0 };
+
+  if (template === "bold-split") {
+    const gradient = ctx.createLinearGradient(0, 0, width, height);
+    gradient.addColorStop(0, "#15171c");
+    gradient.addColorStop(1, "#2a2d36");
+    ctx.fillStyle = gradient;
+    ctx.fillRect(0, 0, width, height);
+
+    const radius = safeArea.height * 0.42;
+    const cx = safeArea.x + radius + safeArea.width * 0.04;
+    const cy = safeArea.y + safeArea.height / 2;
+    ctx.save();
+    ctx.beginPath();
+    ctx.arc(cx, cy, radius + radius * 0.06, 0, Math.PI * 2);
+    ctx.fillStyle = "rgba(255,255,255,0.9)";
+    ctx.fill();
+    ctx.restore();
+    drawCircularImage(ctx, headshot, cx, cy, radius);
+
+    const textX = cx + radius + safeArea.width * 0.06;
+    const maxTextWidth = safeArea.x + safeArea.width - textX;
+    const nameSize = Math.round(safeArea.height * 0.16);
+    const taglineSize = Math.round(safeArea.height * 0.08);
+    ctx.textAlign = "left";
+    ctx.textBaseline = "alphabetic";
+    ctx.fillStyle = "#ffffff";
+    ctx.font = `800 ${nameSize}px system-ui, -apple-system, Arial, sans-serif`;
+    let nameText = name;
+    while (ctx.measureText(nameText).width > maxTextWidth && nameText.length > 3) {
+      nameText = nameText.slice(0, -1);
+    }
+    ctx.fillText(nameText, textX, cy - taglineSize * 0.4);
+    ctx.font = `500 ${taglineSize}px system-ui, -apple-system, Arial, sans-serif`;
+    ctx.fillStyle = "rgba(255,255,255,0.75)";
+    let taglineText = tagline;
+    while (ctx.measureText(taglineText).width > maxTextWidth && taglineText.length > 3) {
+      taglineText = taglineText.slice(0, -1);
+    }
+    ctx.fillText(taglineText, textX, cy + taglineSize * 1.15);
+
+    if (logo) {
+      const logoSize = Math.min(width, height) * 0.1;
+      const pad = logoSize * 0.5;
+      ctx.save();
+      ctx.globalAlpha = 0.92;
+      drawImageCover(ctx, logo, width - logoSize - pad, height - logoSize - pad, logoSize, logoSize);
+      ctx.restore();
+    }
+  } else {
+    // centered-minimal
+    const gradient = ctx.createLinearGradient(0, 0, 0, height);
+    gradient.addColorStop(0, "#f4f1ec");
+    gradient.addColorStop(1, "#e3ddd2");
+    ctx.fillStyle = gradient;
+    ctx.fillRect(0, 0, width, height);
+
+    const radius = safeArea.height * 0.3;
+    const cx = safeArea.x + safeArea.width / 2;
+    const cy = safeArea.y + safeArea.height * 0.4;
+    ctx.save();
+    ctx.beginPath();
+    ctx.arc(cx, cy, radius + radius * 0.06, 0, Math.PI * 2);
+    ctx.fillStyle = "#ffffff";
+    ctx.fill();
+    ctx.restore();
+    drawCircularImage(ctx, headshot, cx, cy, radius);
+
+    const nameSize = Math.round(safeArea.height * 0.14);
+    const taglineSize = Math.round(safeArea.height * 0.075);
+    ctx.textAlign = "center";
+    ctx.textBaseline = "alphabetic";
+    ctx.fillStyle = "#15171c";
+    ctx.font = `800 ${nameSize}px system-ui, -apple-system, Arial, sans-serif`;
+    ctx.fillText(name, cx, cy + radius + nameSize * 1.1);
+    ctx.font = `500 ${taglineSize}px system-ui, -apple-system, Arial, sans-serif`;
+    ctx.fillStyle = "rgba(21,23,28,0.7)";
+    ctx.fillText(tagline, cx, cy + radius + nameSize * 1.1 + taglineSize * 1.4);
+
+    if (logo) {
+      const logoSize = Math.min(width, height) * 0.16;
+      drawImageCover(ctx, logo, cx - logoSize / 2, height - logoSize * 1.2, logoSize, logoSize * 0.7);
+    }
+  }
+
+  const blob = await new Promise<Blob | null>((resolve) => canvas.toBlob(resolve, "image/png"));
+  if (!blob) throw new Error("Couldn't render this graphic.");
+  return blob;
 }
 
 const GENERATING_MESSAGES = [
@@ -287,6 +487,39 @@ function VoiceWorkspace({
   const [contentStrategySaving, setContentStrategySaving] = useState(false);
   const [contentStrategyStatus, setContentStrategyStatus] = useState<string | null>(null);
 
+  // Social Media Handles (2026-11-13) — per Mike: "we should also plug in
+  // their social media handles." Same live-independent-of-interview-stage
+  // pattern as Business Info above; the only thing that actually reads
+  // these is the Brand Bio Writer below.
+  const [socialHandles, setSocialHandles] = useState<AgentSocialHandles>(EMPTY_SOCIAL_HANDLES);
+  const [socialHandlesSaving, setSocialHandlesSaving] = useState(false);
+  const [socialHandlesStatus, setSocialHandlesStatus] = useState<string | null>(null);
+
+  // Brand Bio Writer (2026-11-13) — per Mike: "we need to create a
+  // done-for-you bio section... rate it by professional, personable,
+  // funny, relatable." See generateBrandBios in voice-dna.ts for what
+  // actually gets sent and why this doesn't try to scrape the agent's
+  // actual social profiles.
+  const [bioTone, setBioTone] = useState<BrandBioTone>("personable");
+  const [bioExtraNotes, setBioExtraNotes] = useState("");
+  const [bioGenerating, setBioGenerating] = useState(false);
+  const [bioError, setBioError] = useState<string | null>(null);
+  const [bioResult, setBioResult] = useState<BrandBioResult | null>(null);
+  const [bioCopiedKey, setBioCopiedKey] = useState<string | null>(null);
+
+  // Branding Graphics (2026-11-13) — per Mike: "take the headshot they
+  // uploaded and the logo and be able to create really nice-looking
+  // YouTube headers, Facebook covers... a couple different versions."
+  // Entirely client-side (see renderBrandGraphic below) — no server
+  // function, no new storage, same canvas-compositing idea marketing.tsx's
+  // photo text-overlay tool already uses, just drawing a banner layout
+  // instead of overlaid text.
+  const [graphicTemplate, setGraphicTemplate] = useState<BrandGraphicTemplate>("bold-split");
+  const [graphicTagline, setGraphicTagline] = useState<string | null>(null);
+  const [graphicGenerating, setGraphicGenerating] = useState(false);
+  const [graphicError, setGraphicError] = useState<string | null>(null);
+  const [graphicPreviews, setGraphicPreviews] = useState<Partial<Record<BrandGraphicFormat, string>>>({});
+
   // Load whatever profile already exists for the agent we're working on —
   // via the access-checked server function (see voice-dna.ts), not a direct
   // browser Supabase read, since that read used to be RLS-scoped to
@@ -311,6 +544,8 @@ function VoiceWorkspace({
           const stored = data.voice_answers;
           setBusinessInfo(stored?.businessInfo ?? EMPTY_BUSINESS_INFO);
           setContentStrategy(stored?.contentBrandingStrategy ?? "");
+          setSocialHandles(stored?.socialHandles ?? EMPTY_SOCIAL_HANDLES);
+          setGraphicTagline(data.market_area ? `Real Estate Agent — ${data.market_area}` : "Real Estate Agent");
           if (stored?.answers?.length) {
             const restored = emptyAnswers();
             stored.answers.forEach((a, i) => {
@@ -385,6 +620,90 @@ function VoiceWorkspace({
     } finally {
       setContentStrategySaving(false);
     }
+  }
+
+  async function handleSaveSocialHandles() {
+    setSocialHandlesSaving(true);
+    setSocialHandlesStatus(null);
+    try {
+      const result = await saveAgentSocialHandles({ data: { agentId, ...socialHandles } });
+      setSocialHandlesStatus(result.ok ? "Saved." : `Could not save: ${result.error}`);
+    } catch (e) {
+      setSocialHandlesStatus(e instanceof Error ? e.message : "Could not save.");
+    } finally {
+      setSocialHandlesSaving(false);
+    }
+  }
+
+  async function handleGenerateBios() {
+    setBioGenerating(true);
+    setBioError(null);
+    try {
+      const result = await generateBrandBios({ data: { agentId, tone: bioTone, extraNotes: bioExtraNotes } });
+      setBioResult(result);
+    } catch (e) {
+      setBioError(e instanceof Error ? e.message : "Something went wrong generating these bios.");
+    } finally {
+      setBioGenerating(false);
+    }
+  }
+
+  function copyBioText(key: string, text: string) {
+    if (!text) return;
+    const done = () => {
+      setBioCopiedKey(key);
+      setTimeout(() => setBioCopiedKey((cur) => (cur === key ? null : cur)), 2500);
+    };
+    if (navigator.clipboard?.writeText) {
+      navigator.clipboard
+        .writeText(text)
+        .then(done)
+        .catch(() => {});
+    }
+  }
+
+  async function handleGenerateGraphics() {
+    if (!headshotUrl) {
+      setGraphicError("Upload a headshot above first — these are built from it.");
+      return;
+    }
+    setGraphicGenerating(true);
+    setGraphicError(null);
+    try {
+      const name = basics.fullName.trim() || "Your Name";
+      const tagline = (graphicTagline ?? "Real Estate Agent").trim() || "Real Estate Agent";
+      const formats: BrandGraphicFormat[] = ["youtube", "facebook"];
+      const entries = await Promise.all(
+        formats.map(async (format) => {
+          const blob = await renderBrandGraphic(format, graphicTemplate, headshotUrl, logoUrl, name, tagline);
+          return [format, URL.createObjectURL(blob)] as const;
+        }),
+      );
+      setGraphicPreviews((prev) => {
+        // Revoke the previous round's object URLs before replacing them —
+        // these aren't tiny, and nothing else holds a reference once a new
+        // preview replaces the old <img src>.
+        Object.values(prev).forEach((url) => url && URL.revokeObjectURL(url));
+        return Object.fromEntries(entries);
+      });
+    } catch (e) {
+      setGraphicError(e instanceof Error ? e.message : "Something went wrong generating these graphics.");
+    } finally {
+      setGraphicGenerating(false);
+    }
+  }
+
+  function downloadGraphic(format: BrandGraphicFormat) {
+    const url = graphicPreviews[format];
+    if (!url) return;
+    const name = (basics.fullName.trim() || "Agent").replace(/\s+/g, "-");
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `${name}-${BRAND_GRAPHIC_SIZES[format].fileSuffix}.png`;
+    a.style.display = "none";
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
   }
 
   // Reads a plain-text file straight into the textarea, client side —
@@ -996,6 +1315,226 @@ function VoiceWorkspace({
             </button>
             {contentStrategyStatus && <p className="text-xs text-muted-foreground">{contentStrategyStatus}</p>}
           </div>
+        </div>
+
+        {/* Social Media Handles (2026-11-13) — per Mike: "we should also
+            plug in their social media handles, anywhere else where you
+            could pull public information on them, so that you can write a
+            bio." We asked Mike whether to actually scrape these live;
+            getting no clear answer, we went with the safer default he
+            pointed us toward ("you know what my goals are") — these are
+            reference text only, fed into the bio prompt below, never
+            fetched or scraped. Scraping Instagram/Facebook/LinkedIn/
+            Zillow/Trulia is fragile and likely against each platform's
+            ToS, and none of them offer a public API for this. */}
+        <div className="mb-5 rounded-3xl border border-border bg-glass p-6 backdrop-blur-2xl">
+          <h2 className="font-display text-lg font-semibold">Social Media Handles</h2>
+          <p className="mt-1 text-sm text-muted-foreground">
+            Optional — your usernames/profile links. We use these as reference when writing your bios below (never
+            scraped or fetched automatically), and weave the relevant ones in naturally.
+          </p>
+          <div className="mt-4 grid grid-cols-1 gap-3 sm:grid-cols-2">
+            {(
+              [
+                { key: "instagram" as const, label: "Instagram", placeholder: "@yourname" },
+                { key: "facebook" as const, label: "Facebook", placeholder: "facebook.com/yourname" },
+                { key: "linkedin" as const, label: "LinkedIn", placeholder: "linkedin.com/in/yourname" },
+                { key: "youtube" as const, label: "YouTube", placeholder: "youtube.com/@yourname" },
+                { key: "tiktok" as const, label: "TikTok", placeholder: "@yourname" },
+                { key: "zillow" as const, label: "Zillow profile", placeholder: "zillow.com/profile/yourname" },
+                { key: "trulia" as const, label: "Trulia profile", placeholder: "trulia.com/profile/yourname" },
+              ] satisfies { key: keyof AgentSocialHandles; label: string; placeholder: string }[]
+            ).map((field) => (
+              <label key={field.key} className="block">
+                <span className="text-xs font-medium text-muted-foreground">{field.label}</span>
+                <input
+                  value={socialHandles[field.key]}
+                  onChange={(e) => setSocialHandles((s) => ({ ...s, [field.key]: e.target.value }))}
+                  placeholder={field.placeholder}
+                  className="mt-1 w-full rounded-xl border border-border bg-background/60 px-3 py-2 text-sm outline-none ring-ring transition focus:ring-2"
+                />
+              </label>
+            ))}
+          </div>
+          <div className="mt-4 flex items-center gap-3">
+            <button
+              onClick={handleSaveSocialHandles}
+              disabled={socialHandlesSaving}
+              className="rounded-xl bg-primary px-4 py-2 text-xs font-semibold text-primary-foreground shadow-lg shadow-primary/30 transition-transform hover:-translate-y-0.5 disabled:opacity-60"
+            >
+              {socialHandlesSaving ? "Saving…" : "Save handles"}
+            </button>
+            {socialHandlesStatus && <p className="text-xs text-muted-foreground">{socialHandlesStatus}</p>}
+          </div>
+        </div>
+
+        {/* Brand Bio Writer (2026-11-13) — per Mike: "we need to create a
+            done-for-you bio section that can be created just based on what
+            they've already created in that section... this should be no
+            different than I'm just typing in Claude. I need you to write a
+            bio based upon who I am... maybe we can rate it by, like, how do
+            you want to be — professional, personable, funny, relatable."
+            Pulls Voice DNA + Business Info + Content Branding Strategy +
+            the handles above into one prompt (see buildBrandBioPrompt in
+            voice-dna.ts) and returns 5 platform-specific variants in one
+            call. */}
+        <div className="mb-5 rounded-3xl border border-border bg-glass p-6 backdrop-blur-2xl">
+          <h2 className="font-display text-lg font-semibold">Brand Bio Writer</h2>
+          <p className="mt-1 text-sm text-muted-foreground">
+            Done-for-you bios for everywhere you need one — Instagram, Facebook, LinkedIn, your Zillow/Trulia profile,
+            and your website or YouTube About section — written from your Voice DNA, business info, and handles above.
+          </p>
+          <div className="mt-4">
+            <span className="text-xs font-medium text-muted-foreground">Tone</span>
+            <div className="mt-1.5 flex flex-wrap gap-1 rounded-full border border-border bg-glass p-1 backdrop-blur-xl w-fit">
+              {(["professional", "personable", "funny", "relatable"] as const satisfies BrandBioTone[]).map((t) => (
+                <button
+                  key={t}
+                  onClick={() => setBioTone(t)}
+                  className={`rounded-full px-4 py-1.5 text-sm font-medium capitalize transition-colors ${
+                    bioTone === t ? "bg-secondary text-foreground" : "text-muted-foreground hover:text-foreground"
+                  }`}
+                >
+                  {t}
+                </button>
+              ))}
+            </div>
+          </div>
+          <label className="mt-4 block">
+            <span className="text-xs font-medium text-muted-foreground">Anything else we should know? (optional)</span>
+            <textarea
+              value={bioExtraNotes}
+              onChange={(e) => setBioExtraNotes(e.target.value)}
+              placeholder="Hobbies, background, family, what makes you different — anything you want woven in."
+              rows={3}
+              className="mt-1 w-full resize-y rounded-2xl border border-border bg-background/60 px-4 py-3 text-sm outline-none ring-ring transition focus:ring-2"
+            />
+          </label>
+          <div className="mt-4 flex items-center gap-3">
+            <button
+              onClick={handleGenerateBios}
+              disabled={bioGenerating}
+              className="rounded-xl bg-primary px-4 py-2 text-xs font-semibold text-primary-foreground shadow-lg shadow-primary/30 transition-transform hover:-translate-y-0.5 disabled:opacity-60"
+            >
+              {bioGenerating ? "Writing your bios…" : bioResult ? "Regenerate bios" : "Write my bios"}
+            </button>
+            {bioError && <p className="text-xs text-destructive">{bioError}</p>}
+          </div>
+          {bioResult && (
+            <div className="mt-5 space-y-4">
+              {(
+                [
+                  { key: "instagram" as const, label: "Instagram bio", counter: true },
+                  { key: "facebook" as const, label: "Facebook intro" },
+                  { key: "linkedin" as const, label: "LinkedIn about" },
+                  { key: "realtorProfile" as const, label: "Realtor profile (Zillow / Trulia)" },
+                  { key: "websiteAbout" as const, label: "Website / YouTube about" },
+                ] satisfies { key: keyof BrandBioResult; label: string; counter?: boolean }[]
+              ).map((variant) => {
+                const text = bioResult[variant.key];
+                return (
+                  <div key={variant.key} className="rounded-2xl border border-border bg-background/40 p-4">
+                    <div className="flex items-center justify-between gap-3">
+                      <p className="text-sm font-semibold">{variant.label}</p>
+                      <button
+                        onClick={() => copyBioText(variant.key, text)}
+                        className="shrink-0 rounded-full border border-border bg-glass px-3 py-1 text-xs font-semibold transition-colors hover:bg-secondary"
+                      >
+                        {bioCopiedKey === variant.key ? "Copied!" : "Copy"}
+                      </button>
+                    </div>
+                    <p className="mt-2 whitespace-pre-wrap text-sm text-muted-foreground">{text}</p>
+                    {variant.counter && (
+                      <p className="mt-1.5 text-[11px] text-muted-foreground">{text.length} / 150 characters</p>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </div>
+
+        {/* Branding Graphics (2026-11-13) — per Mike: "we should be able to
+            take the headshot they uploaded and the logo and be able to
+            create really nice-looking YouTube headers, Facebook covers...
+            we should have a couple different versions of that." Rendered
+            entirely client-side with <canvas> (see renderBrandGraphic
+            above) — same technique as the existing photo text-overlay tool
+            in Create Individual Posts, just a different layout, so no new
+            image-generation vendor was needed. */}
+        <div className="mb-5 rounded-3xl border border-border bg-glass p-6 backdrop-blur-2xl">
+          <h2 className="font-display text-lg font-semibold">Branding Graphics</h2>
+          <p className="mt-1 text-sm text-muted-foreground">
+            A YouTube channel banner and a Facebook cover, built from your headshot and logo above. Pick a style, adjust
+            your tagline, and generate — download either one as a PNG.
+          </p>
+          {!headshotUrl && (
+            <p className="mt-3 text-xs text-destructive">Upload a headshot in the section above first.</p>
+          )}
+          <div className="mt-4">
+            <span className="text-xs font-medium text-muted-foreground">Style</span>
+            <div className="mt-1.5 flex flex-wrap gap-1 rounded-full border border-border bg-glass p-1 backdrop-blur-xl w-fit">
+              {(["bold-split", "centered-minimal"] as const satisfies BrandGraphicTemplate[]).map((t) => (
+                <button
+                  key={t}
+                  onClick={() => setGraphicTemplate(t)}
+                  className={`rounded-full px-4 py-1.5 text-sm font-medium transition-colors ${
+                    graphicTemplate === t
+                      ? "bg-secondary text-foreground"
+                      : "text-muted-foreground hover:text-foreground"
+                  }`}
+                >
+                  {t === "bold-split" ? "Bold split" : "Centered minimal"}
+                </button>
+              ))}
+            </div>
+          </div>
+          <label className="mt-4 block">
+            <span className="text-xs font-medium text-muted-foreground">Tagline</span>
+            <input
+              value={graphicTagline ?? ""}
+              onChange={(e) => setGraphicTagline(e.target.value)}
+              placeholder="Real Estate Agent — Austin, TX"
+              className="mt-1 w-full rounded-xl border border-border bg-background/60 px-3 py-2 text-sm outline-none ring-ring transition focus:ring-2"
+            />
+          </label>
+          <div className="mt-4 flex items-center gap-3">
+            <button
+              onClick={handleGenerateGraphics}
+              disabled={graphicGenerating || !headshotUrl}
+              className="rounded-xl bg-primary px-4 py-2 text-xs font-semibold text-primary-foreground shadow-lg shadow-primary/30 transition-transform hover:-translate-y-0.5 disabled:opacity-60"
+            >
+              {graphicGenerating ? "Building your graphics…" : "Generate graphics"}
+            </button>
+            {graphicError && <p className="text-xs text-destructive">{graphicError}</p>}
+          </div>
+          {(graphicPreviews.youtube || graphicPreviews.facebook) && (
+            <div className="mt-5 grid grid-cols-1 gap-4 sm:grid-cols-2">
+              {(
+                [
+                  { key: "youtube" as const, label: "YouTube banner" },
+                  { key: "facebook" as const, label: "Facebook cover" },
+                ] satisfies { key: BrandGraphicFormat; label: string }[]
+              ).map((item) => {
+                const url = graphicPreviews[item.key];
+                if (!url) return null;
+                return (
+                  <div key={item.key} className="rounded-2xl border border-border bg-background/40 p-4">
+                    <p className="text-sm font-semibold">{item.label}</p>
+                    <div className="mt-2 overflow-hidden rounded-xl border border-border bg-muted">
+                      <img src={url} alt={item.label} className="w-full object-cover" />
+                    </div>
+                    <button
+                      onClick={() => downloadGraphic(item.key)}
+                      className="mt-3 rounded-full border border-border bg-glass px-3 py-1.5 text-xs font-semibold transition-colors hover:bg-secondary"
+                    >
+                      Download
+                    </button>
+                  </div>
+                );
+              })}
+            </div>
+          )}
         </div>
 
         {stage === "intro" && (

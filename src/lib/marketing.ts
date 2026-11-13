@@ -6021,14 +6021,32 @@ function toShotstackPosition(xPct: number, yPct: number): { position: string; of
 // background only wraps its own <p> content (display: inline-block), not
 // the full html-asset frame, so extra frame padding around a smaller line
 // of text stays invisible rather than showing as a stray rectangle.
-function shotstackTextAsset(text: string, style: "white" | "box", scale: number) {
+//
+// FIXED 2026-11-07 per Mike's first real Reel render off a small 640x480
+// source clip: the text ran off both edges of the frame. Root cause — this
+// asset's own html-frame box was a FIXED 1100x350px no matter what the
+// actual output frame size was, so on a 640px-wide output the text box
+// itself was already wider than the entire video before any text in it
+// even wrapped. Now sized as a fraction of the real output frame
+// (outputWidthPx/outputHeightPx, same values passed to shotstackOutputSize
+// for this render) so the box can never be wider or taller than the video
+// it's being burned into, at any resolution.
+function shotstackTextAsset(
+  text: string,
+  style: "white" | "box",
+  scale: number,
+  outputWidthPx: number,
+  outputHeightPx: number,
+) {
   const escaped = text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
   const fontSize = Math.round(54 * Math.min(3, Math.max(0.4, scale || 1)));
   const css =
     style === "box"
       ? `p { font-family: Arial, sans-serif; font-weight: 800; font-size: ${fontSize}px; color: #15171c; background: rgba(255,255,255,0.95); border-radius: 10px; padding: 0.3em 0.6em; display: inline-block; text-align: center; }`
       : `p { font-family: Arial, sans-serif; font-weight: 800; font-size: ${fontSize}px; color: #ffffff; text-shadow: 0 2px 10px rgba(0,0,0,0.85); text-align: center; }`;
-  return { type: "html" as const, html: `<p>${escaped}</p>`, css, width: 1100, height: 350 };
+  const frameWidth = Math.max(100, Math.round((outputWidthPx || 1280) * 0.9));
+  const frameHeight = Math.max(80, Math.round((outputHeightPx || 720) * 0.6));
+  return { type: "html" as const, html: `<p>${escaped}</p>`, css, width: frameWidth, height: frameHeight };
 }
 
 // Step 1: submits the render job and returns immediately with Shotstack's
@@ -6063,6 +6081,11 @@ export const submitReelRender = createServerFn({ method: "POST" })
     if (data.clips.length > MAX_REEL_CLIPS) {
       throw new Error(`Up to ${MAX_REEL_CLIPS} clips in one Reel, for now.`);
     }
+
+    // Resolved once up front so every text block's own html-asset frame
+    // (see shotstackTextAsset) is sized against the SAME output frame the
+    // render actually uses below, not recomputed per text block.
+    const outputSize = shotstackOutputSize(data.outputWidthPx, data.outputHeightPx);
 
     const key = shotstackKey();
     const base = shotstackBase();
@@ -6100,7 +6123,13 @@ export const submitReelRender = createServerFn({ method: "POST" })
           textTracks.push({
             clips: [
               {
-                asset: shotstackTextAsset(seg.text.trim(), data.style, seg.fontScale),
+                asset: shotstackTextAsset(
+                  seg.text.trim(),
+                  data.style,
+                  seg.fontScale,
+                  outputSize.width,
+                  outputSize.height,
+                ),
                 start: Math.round((cursor + seg.startSec) * 100) / 100,
                 length: Math.round((seg.endSec - seg.startSec) * 100) / 100,
                 position,
@@ -6124,7 +6153,7 @@ export const submitReelRender = createServerFn({ method: "POST" })
           textTracks.push({
             clips: [
               {
-                asset: shotstackTextAsset(t.text.trim(), data.style, t.fontScale),
+                asset: shotstackTextAsset(t.text.trim(), data.style, t.fontScale, outputSize.width, outputSize.height),
                 start: Math.round(cursor * 100) / 100,
                 length: Math.round(length * 100) / 100,
                 position,
@@ -6158,7 +6187,7 @@ export const submitReelRender = createServerFn({ method: "POST" })
       // shotstackOutputSize; a missing/zero dimension (an old browser that
       // didn't report videoWidth/videoHeight, or a photo-only Reel) falls
       // back to a safe 1280x720 rather than sending 0.
-      output: { format: "mp4", size: shotstackOutputSize(data.outputWidthPx, data.outputHeightPx) },
+      output: { format: "mp4", size: outputSize },
     };
 
     const res = await fetch(`${base}/render`, {

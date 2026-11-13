@@ -1629,7 +1629,7 @@ function EmailPhotosPanel({
 
       {photos.length > 0 && (
         <div className="mb-3 grid gap-3 sm:grid-cols-3">
-          {photos.map((p) => {
+          {photos.map((p, photoIndex) => {
             const displayUrl = p.driveFileId ? (driveThumbs[p.driveFileId] ?? p.url) : p.url;
             const thisPhotoFailed = !!p.driveFileId && failedDriveThumbs.has(p.driveFileId);
             return (
@@ -1682,7 +1682,13 @@ function EmailPhotosPanel({
                         onClick={() =>
                           downloadRemoteFile(
                             displayUrl ?? p.url!,
-                            displayUrl?.startsWith("data:") ? "photo.jpg" : p.url!.split("/").pop() || `${p.id}`,
+                            displayUrl?.startsWith("data:")
+                              ? "photo.jpg"
+                              : filenameFromTitle(
+                                  post.title,
+                                  p.url!,
+                                  photos.length > 1 ? `${photoIndex + 1}` : undefined,
+                                ),
                           )
                         }
                         className="text-[11px] font-semibold text-muted-foreground hover:text-foreground hover:underline"
@@ -2191,7 +2197,7 @@ function ReelPhotosPanel({
 
       {photos.length > 0 && (
         <div className="mb-3 grid gap-3 sm:grid-cols-3">
-          {photos.map((p) => {
+          {photos.map((p, photoIndex) => {
             const displayUrl = p.driveFileId ? (driveThumbs[p.driveFileId] ?? p.url) : p.url;
             const thisPhotoFailed = !!p.driveFileId && failedDriveThumbs.has(p.driveFileId);
             const libraryFailed = p.source === "library" && failedLibraryThumbs.has(p.id);
@@ -2238,7 +2244,13 @@ function ReelPhotosPanel({
                         onClick={() =>
                           downloadRemoteFile(
                             displayUrl ?? p.url!,
-                            displayUrl?.startsWith("data:") ? "photo.jpg" : p.url!.split("/").pop() || `${p.id}`,
+                            displayUrl?.startsWith("data:")
+                              ? "photo.jpg"
+                              : filenameFromTitle(
+                                  post.title,
+                                  p.url!,
+                                  photos.length > 1 ? `${photoIndex + 1}` : undefined,
+                                ),
                           )
                         }
                         className="text-[11px] font-semibold text-muted-foreground hover:text-foreground hover:underline"
@@ -2846,7 +2858,7 @@ function PostCard({
                   onClick={() =>
                     downloadRemoteFile(
                       displayPhotoUrl ?? photoUrl,
-                      displayPhotoUrl?.startsWith("data:") ? "photo.jpg" : photoUrl.split("/").pop() || "photo",
+                      displayPhotoUrl?.startsWith("data:") ? "photo.jpg" : filenameFromTitle(post.title, photoUrl),
                     )
                   }
                   className="w-full border-t border-border bg-glass py-1 text-[11px] font-semibold text-muted-foreground transition-colors hover:bg-secondary hover:text-foreground"
@@ -3987,12 +3999,21 @@ function TextOverlayEditor({
         if (drag.mode === "start") {
           const newStart = Math.min(drag.trimEndSec - MIN_CLIP_TRIM_SECONDS, Math.max(0, drag.trimStartSec + deltaSec));
           applyTrim(clip.id, newStart, clip.trimEndSec);
+          // Added 2026-11-07 per Mike: the preview used to just sit wherever
+          // it already was while dragging a trim handle, so the actual cut
+          // point — and where any text block would land inside it — only
+          // showed up after rendering. Seeking the player live to whichever
+          // edge is being dragged means what's on screen while dragging IS
+          // the new in/out point, the same way the player already seeks on
+          // the Canva-style text timeline below.
+          if (videoRef.current) videoRef.current.currentTime = newStart;
         } else {
           const newEnd = Math.max(
             drag.trimStartSec + MIN_CLIP_TRIM_SECONDS,
             Math.min(clip.sourceDurationSec, drag.trimEndSec + deltaSec),
           );
           applyTrim(clip.id, clip.trimStartSec, newEnd);
+          if (videoRef.current) videoRef.current.currentTime = Math.max(0, newEnd - 0.05);
         }
       },
       onPointerUp: (e: React.PointerEvent<HTMLDivElement>) => {
@@ -4632,6 +4653,26 @@ const MAX_VIDEO_SECONDS = 120;
 // endpoint, for one, doesn't allow that kind of fetch from a browser, but it
 // already forces a real download on a plain click, so the fallback covers
 // it correctly either way).
+// Added 2026-11-07 per Mike, after a rendered Reel downloaded as a raw
+// storage UUID ("a6494f30-...-text-overlay.mp4"): the filename offered to
+// the browser should read like the post it came from, not the random
+// storage path. Keeps the real extension off the url (so a rendered .mp4
+// still downloads as .mp4, not .jpg), slugifies the post's title, and
+// takes an optional suffix for posts with more than one photo so they
+// don't all collide on the exact same filename.
+function filenameFromTitle(title: string | null | undefined, url: string, suffix?: string): string {
+  const extMatch = url.match(/\.([a-zA-Z0-9]{2,5})(?:[?#]|$)/);
+  const ext = (extMatch?.[1] ?? "jpg").toLowerCase();
+  const slug = (title ?? "")
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 60);
+  const base = slug || "download";
+  return suffix ? `${base}-${suffix}.${ext}` : `${base}.${ext}`;
+}
+
 async function downloadRemoteFile(url: string, filename: string) {
   try {
     const res = await fetch(url);

@@ -1090,8 +1090,24 @@ export const generateBrandGraphicAI = createServerFn({ method: "POST" })
       hasBackgroundPhoto: Boolean(data.backgroundImageUrl),
     });
 
+    // Model pinned here, not hardcoded as a bare literal: OpenAI shut down
+    // the original gpt-image-1 entirely on 2026-10-23 (confirmed on their
+    // own API reference — calling it now returns "The model 'gpt-image-1'
+    // does not exist", which is exactly the error Mike hit testing this).
+    // Their image lineup has churned fast (1 → 1.5 → 2 → 2.5 → 2.6 inside
+    // about a year, with full shutdowns of older ones along the way), so an
+    // optional OPENAI_IMAGE_MODEL secret lets this be repointed at whatever
+    // OpenAI calls their current model later WITHOUT a code change/re-paste
+    // — just a secret update in Lovable Cloud. Default is
+    // "gpt-image-2.5-sunburst", OpenAI's own stated default for this exact
+    // endpoint and the one they currently describe as "most capable" for
+    // editing — the right fit here since the prompt below is explicitly
+    // about precision editing (keep the agent's real face, keep the logo
+    // exactly as given), not freeform generation.
+    const imageModel = process.env["OPENAI_IMAGE_MODEL"] || "gpt-image-2.5-sunburst";
+
     const formData = new FormData();
-    formData.append("model", "gpt-image-1");
+    formData.append("model", imageModel);
     formData.append("prompt", prompt);
     formData.append("size", "1536x1024");
     // "high" over the cheaper/faster options — this is specifically about

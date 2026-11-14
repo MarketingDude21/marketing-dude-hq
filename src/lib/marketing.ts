@@ -235,6 +235,19 @@ export type PostMetadata = {
   // (e.g. the post's photo didn't come from a scan) — the editor still works
   // fine with a blank line to type into.
   text_overlay_suggestions?: string[] | undefined;
+  // Meta scheduling via Upload-Post (2026-11-15) — see scheduleAgentPostToSocial
+  // below and claude/upload-post-scheduling-scoping.md for the full plan.
+  // upload_post_job_id is Upload-Post's own id for a SCHEDULED post (absent
+  // when a post publishes immediately instead, which this app never asks
+  // for — everything goes through scheduled_date); upload_post_status is
+  // refreshed from their /status endpoint, not assumed to stay accurate
+  // forever on its own.
+  upload_post_job_id?: string | null | undefined;
+  upload_post_platforms?: string[] | undefined;
+  upload_post_scheduled_for?: string | null | undefined;
+  upload_post_timezone?: string | null | undefined;
+  upload_post_status?: string | null | undefined;
+  upload_post_facebook_page_id?: string | null | undefined;
   [key: string]: string | number | boolean | null | undefined | EmailPhoto[] | ReelPhoto[] | string[];
 };
 
@@ -5287,6 +5300,206 @@ export const deleteGeneratedPost = createServerFn({ method: "POST" })
     const { error: delErr } = await supabaseAdmin.from("generated_posts").delete().eq("id", data.postId);
     if (delErr) throw delErr;
     return { ok: true };
+  });
+
+// Scheduling to Meta via Upload-Post — Phase 2 (2026-11-15), per Mike:
+// "beneath each social post there should be a box that says schedule
+// here." Phase 1 (src/lib/voice-dna.ts: getAgentSocialConnectStatus /
+// generateAgentSocialConnectLink, the "Connect Facebook & Instagram" card
+// on My Brand) connects an agent's account; this is what actually sends a
+// specific post to it. Full plan in claude/upload-post-scheduling-scoping.md.
+//
+// These two small helpers are deliberately duplicated from voice-dna.ts
+// rather than imported — voice-dna.ts already imports requireAgentAccess
+// FROM this file, so importing back the other way would be a circular
+// import for the sake of 4 lines.
+const UPLOAD_POST_API_BASE = "https://api.upload-post.com/api";
+
+function uploadPostUsernameForAgent(agentId: string): string {
+  return `agent-${agentId}`;
+}
+
+function requireUploadPostApiKey(): string {
+  const key = process.env["UPLOAD_POST_API_KEY"];
+  if (!key) {
+    throw new Error("Scheduling isn't configured yet — add an UPLOAD_POST_API_KEY secret in Lovable Cloud → Secrets.");
+  }
+  return key;
+}
+
+export type UploadPostPlatform = "instagram" | "facebook";
+
+export const scheduleAgentPostToSocial = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator(
+    (data: {
+      agentId: string;
+      postId: string;
+      platforms: UploadPostPlatform[];
+      scheduledDate: string; // ISO-8601, in the future
+      timezone?: string;
+      facebookPageId?: string;
+    }) => data,
+  )
+  .handler(async ({ data, context }): Promise<{ ok: true; jobId: string | null }> => {
+    const email = (context.claims as { email?: string } | undefined)?.email;
+    await requireAgentAccess(context.userId, email, data.agentId);
+    if (!data.platforms.length) throw new Error("Pick at least one platform to schedule to.");
+    const apiKey = requireUploadPostApiKey();
+    const username = uploadPostUsernameForAgent(data.agentId);
+
+    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+    const { data: post, error: postErr } = await supabaseAdmin
+      .from("generated_posts")
+      .select("id, content, title, metadata, agent_id")
+      .eq("id", data.postId)
+      .maybeSingle();
+    if (postErr) throw postErr;
+    if (!post || post.agent_id !== data.agentId) throw new Error("Post not found for this agent.");
+
+    const meta = (post.metadata ?? {}) as PostMetadata;
+    const photoUrl = meta.media_url || meta.drive_download_url || meta.drive_thumbnail_url;
+    if (!photoUrl) {
+      throw new Error(
+        "This post has no photo attached yet — Upload-Post needs an image to post to Instagram/Facebook.",
+      );
+    }
+
+    const form = new FormData();
+    form.append("user", username);
+    for (const p of data.platforms) form.append("platform[]", p);
+    form.append("photos[]", photoUrl);
+    form.append("title", post.content || post.title || "");
+    form.append("scheduled_date", data.scheduledDate);
+    if (data.timezone) form.append("timezone", data.timezone);
+    if (data.facebookPageId) form.append("facebook_page_id", data.facebookPageId);
+    form.append("external_id", post.id);
+
+    const res = await fetch(`${UPLOAD_POST_API_BASE}/upload_photos`, {
+      method: "POST",
+      headers: { Authorization: `Apikey ${apiKey}` },
+      body: form,
+    });
+    const json = (await res.json().catch(() => ({}))) as {
+      success?: boolean;
+      job_id?: string;
+      error?: string;
+      results?: Record<string, { success?: boolean; error?: string }>;
+    };
+    if (!res.ok || json.success === false) {
+      // Surface a specific platform-level failure when one's there (e.g.
+      // Instagram connected but Facebook isn't) rather than just "it failed".
+      const firstPlatformError = json.results ? Object.values(json.results).find((r) => r.error)?.error : undefined;
+      throw new Error(firstPlatformError ?? json.error ?? `Upload-Post error (${res.status}) scheduling this post.`);
+    }
+
+    const jobId = json.job_id ?? null;
+    const { error: updateErr } = await supabaseAdmin
+      .from("generated_posts")
+      .update({
+        metadata: {
+          ...meta,
+          upload_post_job_id: jobId,
+          upload_post_platforms: data.platforms,
+          upload_post_scheduled_for: data.scheduledDate,
+          upload_post_timezone: data.timezone ?? null,
+          upload_post_facebook_page_id: data.facebookPageId ?? null,
+          upload_post_status: jobId ? "scheduled" : "posted",
+        },
+      })
+      .eq("id", data.postId);
+    if (updateErr) throw updateErr;
+
+    return { ok: true, jobId };
+  });
+
+// Cancels a previously scheduled (not yet published) post — Upload-Post's
+// own DELETE on the scheduled job, falling back to just clearing our local
+// "scheduled" status if that call isn't available/succeeds anyway, since
+// the worse failure mode here is a stuck "Scheduled" badge forever, not an
+// extra best-effort cancel attempt.
+export const cancelAgentPostSchedule = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator((data: { agentId: string; postId: string }) => data)
+  .handler(async ({ data, context }): Promise<{ ok: true }> => {
+    const email = (context.claims as { email?: string } | undefined)?.email;
+    await requireAgentAccess(context.userId, email, data.agentId);
+    const apiKey = requireUploadPostApiKey();
+
+    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+    const { data: post, error: postErr } = await supabaseAdmin
+      .from("generated_posts")
+      .select("id, metadata, agent_id")
+      .eq("id", data.postId)
+      .maybeSingle();
+    if (postErr) throw postErr;
+    if (!post || post.agent_id !== data.agentId) throw new Error("Post not found for this agent.");
+
+    const meta = (post.metadata ?? {}) as PostMetadata;
+    if (meta.upload_post_job_id) {
+      try {
+        await fetch(`${UPLOAD_POST_API_BASE}/uploadposts/jobs/${encodeURIComponent(meta.upload_post_job_id)}`, {
+          method: "DELETE",
+          headers: { Authorization: `Apikey ${apiKey}` },
+        });
+      } catch {
+        // Best-effort — still clear our own status below either way.
+      }
+    }
+
+    const { error: updateErr } = await supabaseAdmin
+      .from("generated_posts")
+      .update({
+        metadata: {
+          ...meta,
+          upload_post_job_id: null,
+          upload_post_status: "cancelled",
+        },
+      })
+      .eq("id", data.postId);
+    if (updateErr) throw updateErr;
+    return { ok: true };
+  });
+
+// Refreshes a post's own upload_post_status from Upload-Post's /status
+// endpoint — their public docs don't show that response's exact field
+// names, so this reads defensively (a couple of likely field names) and
+// simply leaves the locally-stored status alone if nothing recognizable
+// comes back, rather than overwriting a known status with "unknown".
+export const refreshAgentPostScheduleStatus = createServerFn({ method: "GET" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator((data: { agentId: string; postId: string }) => data)
+  .handler(async ({ data, context }): Promise<{ status: string | null }> => {
+    const email = (context.claims as { email?: string } | undefined)?.email;
+    await requireAgentAccess(context.userId, email, data.agentId);
+    const apiKey = requireUploadPostApiKey();
+
+    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+    const { data: post, error: postErr } = await supabaseAdmin
+      .from("generated_posts")
+      .select("id, metadata, agent_id")
+      .eq("id", data.postId)
+      .maybeSingle();
+    if (postErr) throw postErr;
+    if (!post || post.agent_id !== data.agentId) throw new Error("Post not found for this agent.");
+
+    const meta = (post.metadata ?? {}) as PostMetadata;
+    if (!meta.upload_post_job_id) return { status: meta.upload_post_status ?? null };
+
+    const res = await fetch(
+      `${UPLOAD_POST_API_BASE}/uploadposts/status?job_id=${encodeURIComponent(meta.upload_post_job_id)}`,
+      { headers: { Authorization: `Apikey ${apiKey}` } },
+    );
+    if (!res.ok) return { status: meta.upload_post_status ?? null };
+    const json = (await res.json().catch(() => null)) as { status?: string; job_status?: string } | null;
+    const liveStatus = json?.status ?? json?.job_status ?? null;
+    if (!liveStatus || liveStatus === meta.upload_post_status) return { status: meta.upload_post_status ?? null };
+
+    await supabaseAdmin
+      .from("generated_posts")
+      .update({ metadata: { ...meta, upload_post_status: liveStatus } })
+      .eq("id", data.postId);
+    return { status: liveStatus };
   });
 
 // Archives a month's generated content for one agent — added 2026-09-20 per

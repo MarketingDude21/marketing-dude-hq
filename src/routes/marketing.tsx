@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { createFileRoute } from "@tanstack/react-router";
+import { createFileRoute, Link } from "@tanstack/react-router";
 import { AppShell } from "@/components/AppShell";
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { supabase } from "@/integrations/supabase/client";
@@ -71,6 +71,10 @@ import {
   submitReelRender,
   checkVideoTextRenderStatus,
   finalizeVideoTextRender,
+  scheduleAgentPostToSocial,
+  cancelAgentPostSchedule,
+  refreshAgentPostScheduleStatus,
+  type UploadPostPlatform,
   type MarketingAccess,
   type MediaRow,
   type DriveFile,
@@ -85,6 +89,12 @@ import {
   type ChatMode,
   type ChatMessageRow,
 } from "@/lib/marketing";
+// Connect status lives in voice-dna.ts (the "Connect Facebook & Instagram"
+// card on My Brand writes it) — read-only here, just to know whether the
+// schedule box below should show platform options or a "connect first"
+// prompt. No cycle: voice-dna.ts imports FROM marketing.ts, not the other
+// way, and this file is a third module importing from both.
+import { getAgentSocialConnectStatus, type AgentSocialConnectStatus } from "@/lib/voice-dna";
 // Type-only import (erased at build) — the runtime docx library is loaded
 // lazily inside buildContentDocxBlob() below instead of imported at the top
 // of the file, so its ~170KB gzipped bundle only ever downloads for someone
@@ -3504,6 +3514,11 @@ function PostCard({
           )}
         </div>
 
+        {/* Added 2026-11-15 per Mike's screenshot: "beneath each social post
+            there should be a box that says schedule here." Posts only — an
+            email or video script has nothing for Upload-Post to post. */}
+        {post.content_type === "post" && <ScheduleToSocialBox agentId={agentId} post={post} onChanged={onChanged} />}
+
         {editorOpen && (
           <div className="mt-4 space-y-4 rounded-2xl border border-border bg-background/40 p-4">
             {/* Direct edit — on top, per Mike: "Place the edit feature just
@@ -3571,6 +3586,256 @@ function PostCard({
         )}
       </div>
     </Card>
+  );
+}
+
+// "Schedule to Facebook / Instagram" box — added 2026-11-15 per Mike's
+// screenshot of the Content Calendar: "beneath each social post there
+// should be a box that says schedule here. We need a place where they
+// actually connect their social media accounts to post." Connecting an
+// account itself happens on the My Brand page (the "Connect Facebook &
+// Instagram" card in voice.tsx, backed by getAgentSocialConnectStatus /
+// generateAgentSocialConnectLink in voice-dna.ts) — this box only reads
+// that connected state, and once it's connected, actually schedules THIS
+// one post via scheduleAgentPostToSocial (src/lib/marketing.ts), which
+// posts/schedules through Upload-Post. Full plan:
+// claude/upload-post-scheduling-scoping.md.
+function ScheduleToSocialBox({ agentId, post, onChanged }: { agentId: string; post: Post; onChanged: () => void }) {
+  const meta = post.metadata;
+  const existingStatus = meta?.upload_post_status ?? null;
+
+  const [connectStatus, setConnectStatus] = useState<AgentSocialConnectStatus | null>(null);
+  const [connectError, setConnectError] = useState<string | null>(null);
+  const [open, setOpen] = useState(false);
+  const [platforms, setPlatforms] = useState<UploadPostPlatform[]>([]);
+  const [date, setDate] = useState(() => (post.scheduled_for ? post.scheduled_for.slice(0, 10) : ""));
+  const [time, setTime] = useState("09:00");
+  const [facebookPageId, setFacebookPageId] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [refreshing, setRefreshing] = useState(false);
+
+  // Only loads once the box is opened — no point checking connection status
+  // for every post card on a month with 20+ posts in it before the admin
+  // has even looked at scheduling.
+  useEffect(() => {
+    if (!open || connectStatus || connectError) return;
+    getAgentSocialConnectStatus({ data: { agentId } })
+      .then((r) => {
+        setConnectStatus(r);
+        setPlatforms((prev) =>
+          prev.length
+            ? prev
+            : (r.platforms.filter((p) => p === "instagram" || p === "facebook") as UploadPostPlatform[]),
+        );
+        if (r.facebookPages.length === 1) setFacebookPageId(r.facebookPages[0]!.id);
+      })
+      .catch((e) => setConnectError(e instanceof Error ? e.message : String(e)));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open, agentId]);
+
+  function togglePlatform(p: UploadPostPlatform) {
+    setPlatforms((prev) => (prev.includes(p) ? prev.filter((x) => x !== p) : [...prev, p]));
+  }
+
+  async function submitSchedule() {
+    if (!platforms.length) {
+      setError("Pick at least one platform.");
+      return;
+    }
+    if (!date) {
+      setError("Pick a date to post.");
+      return;
+    }
+    setBusy(true);
+    setError(null);
+    try {
+      const timezone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+      const scheduledDate = new Date(`${date}T${time || "09:00"}:00`).toISOString();
+      await scheduleAgentPostToSocial({
+        data: {
+          agentId,
+          postId: post.id,
+          platforms,
+          scheduledDate,
+          timezone,
+          ...(facebookPageId ? { facebookPageId } : {}),
+        },
+      });
+      setOpen(false);
+      onChanged();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function cancelSchedule() {
+    setBusy(true);
+    setError(null);
+    try {
+      await cancelAgentPostSchedule({ data: { agentId, postId: post.id } });
+      onChanged();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function refreshStatus() {
+    setRefreshing(true);
+    setError(null);
+    try {
+      await refreshAgentPostScheduleStatus({ data: { agentId, postId: post.id } });
+      onChanged();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setRefreshing(false);
+    }
+  }
+
+  // Already scheduled or posted — show status instead of the schedule form.
+  if (existingStatus === "scheduled" || existingStatus === "posted") {
+    return (
+      <div className="mt-3 rounded-2xl border border-border bg-background/40 p-4">
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <div>
+            <p className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
+              {existingStatus === "posted" ? "Posted" : "Scheduled"} to{" "}
+              {(meta?.upload_post_platforms ?? []).join(" & ") || "social"}
+            </p>
+            {meta?.upload_post_scheduled_for && (
+              <p className="mt-1 text-sm">
+                {new Date(meta.upload_post_scheduled_for).toLocaleString(undefined, {
+                  dateStyle: "medium",
+                  timeStyle: "short",
+                })}
+              </p>
+            )}
+          </div>
+          <div className="flex shrink-0 gap-2">
+            <Button variant="secondary" onClick={refreshStatus} disabled={refreshing || busy}>
+              {refreshing ? "Checking…" : "Refresh status"}
+            </Button>
+            {existingStatus === "scheduled" && (
+              <Button variant="danger" onClick={cancelSchedule} disabled={busy}>
+                {busy ? "Cancelling…" : "Cancel"}
+              </Button>
+            )}
+          </div>
+        </div>
+        {error && <p className="mt-2 text-xs text-destructive">{error}</p>}
+      </div>
+    );
+  }
+
+  if (!open) {
+    return (
+      <div className="mt-3">
+        <Button variant="secondary" onClick={() => setOpen(true)}>
+          Schedule to Facebook / Instagram
+        </Button>
+      </div>
+    );
+  }
+
+  return (
+    <div className="mt-3 space-y-3 rounded-2xl border border-border bg-background/40 p-4">
+      <div className="flex items-center justify-between">
+        <p className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
+          Schedule to Facebook / Instagram
+        </p>
+        <button
+          onClick={() => setOpen(false)}
+          className="text-xs font-semibold text-muted-foreground hover:text-foreground hover:underline"
+        >
+          Close
+        </button>
+      </div>
+
+      {connectError && <p className="text-xs text-destructive">Couldn't check connection status: {connectError}</p>}
+
+      {!connectStatus && !connectError && <p className="text-sm text-muted-foreground">Checking connection…</p>}
+
+      {connectStatus && !connectStatus.connected && (
+        <p className="text-sm text-muted-foreground">
+          This agent hasn't connected Facebook or Instagram yet.{" "}
+          <Link to="/voice" className="font-semibold text-primary underline">
+            Connect on their My Brand page
+          </Link>{" "}
+          first, then come back here to schedule this post.
+        </p>
+      )}
+
+      {connectStatus && connectStatus.connected && (
+        <>
+          <div className="flex flex-wrap gap-4">
+            {(["instagram", "facebook"] as const).map((p) => (
+              <label key={p} className="flex items-center gap-2 text-sm">
+                <input
+                  type="checkbox"
+                  checked={platforms.includes(p)}
+                  disabled={!connectStatus.platforms.includes(p)}
+                  onChange={() => togglePlatform(p)}
+                />
+                {p === "instagram" ? "Instagram" : "Facebook"}
+                {!connectStatus.platforms.includes(p) && (
+                  <span className="text-xs text-muted-foreground">(not connected)</span>
+                )}
+              </label>
+            ))}
+          </div>
+
+          {platforms.includes("facebook") && connectStatus.facebookPages.length > 1 && (
+            <label className="block text-xs text-muted-foreground">
+              Facebook Page
+              <select
+                value={facebookPageId}
+                onChange={(e) => setFacebookPageId(e.target.value)}
+                className="mt-1 block w-full rounded-xl border border-border bg-glass px-3 py-2 text-sm outline-none"
+              >
+                <option value="">Choose a Page…</option>
+                {connectStatus.facebookPages.map((pg) => (
+                  <option key={pg.id} value={pg.id}>
+                    {pg.name}
+                  </option>
+                ))}
+              </select>
+            </label>
+          )}
+
+          <div className="flex flex-wrap gap-3">
+            <label className="text-xs text-muted-foreground">
+              Date
+              <input
+                type="date"
+                value={date}
+                onChange={(e) => setDate(e.target.value)}
+                className="mt-1 block rounded-xl border border-border bg-glass px-3 py-1.5 text-sm outline-none"
+              />
+            </label>
+            <label className="text-xs text-muted-foreground">
+              Time
+              <input
+                type="time"
+                value={time}
+                onChange={(e) => setTime(e.target.value)}
+                className="mt-1 block rounded-xl border border-border bg-glass px-3 py-1.5 text-sm outline-none"
+              />
+            </label>
+          </div>
+
+          {error && <p className="text-xs text-destructive">{error}</p>}
+
+          <Button onClick={submitSchedule} disabled={busy}>
+            {busy ? "Scheduling…" : "Schedule it"}
+          </Button>
+        </>
+      )}
+    </div>
   );
 }
 
@@ -5998,6 +6263,17 @@ function CalendarMonthItemsScreen({ month, onBack }: { month: CalendarMonth; onB
   const [addBusy, setAddBusy] = useState(false);
   const [addError, setAddError] = useState<string | null>(null);
   const [busyItemId, setBusyItemId] = useState<string | null>(null);
+  // Fix for "Edit button is broken" (2026-11-14 screenshot) — the Add/Edit
+  // form lives once at the top of this card, above the item list. Clicking
+  // Edit on an item further down DID open it and fill it in, but the form
+  // appeared off-screen above whatever the user was scrolled to, so nothing
+  // looked like it happened. Scroll the form into view whenever it opens.
+  const formRef = useRef<HTMLDivElement>(null);
+  function scrollToForm() {
+    requestAnimationFrame(() => {
+      formRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
+    });
+  }
 
   function reload() {
     setItems(null);
@@ -6030,6 +6306,7 @@ function CalendarMonthItemsScreen({ month, onBack }: { month: CalendarMonth; onB
     setTargetDate(it.targetDate ?? "");
     setAddError(null);
     setAddOpen(true);
+    scrollToForm();
   }
 
   async function saveItem() {
@@ -6102,11 +6379,23 @@ function CalendarMonthItemsScreen({ month, onBack }: { month: CalendarMonth; onB
       <Card>
         <div className="flex items-center justify-between">
           <h4 className="font-display text-sm font-semibold">This month's content</h4>
-          {!addOpen && <Button onClick={() => setAddOpen(true)}>+ Add piece</Button>}
+          {!addOpen && (
+            <Button
+              onClick={() => {
+                setAddOpen(true);
+                scrollToForm();
+              }}
+            >
+              + Add piece
+            </Button>
+          )}
         </div>
 
         {addOpen && (
-          <div className="mt-3 space-y-2 rounded-2xl border border-border bg-background/40 p-4">
+          <div ref={formRef} className="mt-3 space-y-2 rounded-2xl border border-border bg-background/40 p-4">
+            {editingId && (
+              <p className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">Editing</p>
+            )}
             <div className="flex flex-wrap gap-1 rounded-full border border-border bg-glass p-1 w-fit">
               {(["post", "email", "video"] as const).map((t) => (
                 <button
@@ -6176,7 +6465,9 @@ function CalendarMonthItemsScreen({ month, onBack }: { month: CalendarMonth; onB
             {items.map((it) => (
               <div
                 key={it.id}
-                className="flex items-center justify-between gap-2 rounded-2xl border border-border bg-glass px-4 py-3"
+                className={`flex items-center justify-between gap-2 rounded-2xl border px-4 py-3 ${
+                  editingId === it.id ? "border-primary bg-primary/10" : "border-border bg-glass"
+                }`}
               >
                 <div>
                   <span className="rounded-full bg-muted px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">

@@ -24,6 +24,8 @@ import {
   generateBrandBios,
   scanAgentWebsite,
   generateBrandGraphicAI,
+  getAgentSocialConnectStatus,
+  generateAgentSocialConnectLink,
   type VoiceDnaAnswer,
   type VoiceDnaAnswers,
   type AgentBusinessInfo,
@@ -32,6 +34,7 @@ import {
   type BrandBioTone,
   type WebsiteScan,
   type BrandGraphicTemplate,
+  type AgentSocialConnectStatus,
 } from "@/lib/voice-dna";
 // Reused from Monthly Marketing (2026-09-28) — same admin_allowlist +
 // agents identity model, so "who am I working on behalf of" is resolved the
@@ -386,6 +389,18 @@ function VoiceWorkspace({
   const [socialHandlesSaving, setSocialHandlesSaving] = useState(false);
   const [socialHandlesStatus, setSocialHandlesStatus] = useState<string | null>(null);
 
+  // Connect Facebook & Instagram (2026-11-15) — Phase 1 of scheduling to
+  // Meta via Upload-Post, per Mike: "All we want to do is be able to
+  // schedule our content with the photos directly into Meta, Instagram,
+  // and Facebook." This is a separate, independent connection from Social
+  // Media Handles above — those are just reference text for bios, this is
+  // a real OAuth link to the agent's actual Facebook Page / Instagram
+  // Business account, held by Upload-Post, not by this app. See
+  // claude/upload-post-scheduling-scoping.md for the full plan.
+  const [connectStatus, setConnectStatus] = useState<AgentSocialConnectStatus | null>(null);
+  const [connectStatusError, setConnectStatusError] = useState<string | null>(null);
+  const [connecting, setConnecting] = useState(false);
+
   // Scan My Website (2026-11-13) — per Mike, right after the above shipped:
   // "you should be able to scan their website and create content too, to
   // grab other images etc if need be, but the only thing you should need
@@ -479,6 +494,34 @@ function VoiceWorkspace({
       cancelled = true;
     };
   }, [agentId]);
+
+  // Loaded independently of the big voice-profile fetch above — a stale or
+  // not-yet-configured UPLOAD_POST_API_KEY shouldn't block anything else on
+  // this page from loading, it should just leave this one card showing its
+  // own error.
+  function loadConnectStatus() {
+    if (!agentId) return;
+    getAgentSocialConnectStatus({ data: { agentId } })
+      .then((s) => {
+        setConnectStatus(s);
+        setConnectStatusError(null);
+      })
+      .catch((e) => setConnectStatusError(e instanceof Error ? e.message : String(e)));
+  }
+  useEffect(loadConnectStatus, [agentId]);
+
+  async function handleConnectSocial() {
+    setConnecting(true);
+    setConnectStatusError(null);
+    try {
+      const { accessUrl } = await generateAgentSocialConnectLink({ data: { agentId } });
+      window.open(accessUrl, "_blank", "noopener,noreferrer");
+    } catch (e) {
+      setConnectStatusError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setConnecting(false);
+    }
+  }
 
   async function uploadBrandAsset(file: File, kind: "headshot" | "logo") {
     setBrandAssetError(null);
@@ -1423,6 +1466,85 @@ function VoiceWorkspace({
               {socialHandlesSaving ? "Saving…" : "Save handles"}
             </button>
             {socialHandlesStatus && <p className="text-xs text-muted-foreground">{socialHandlesStatus}</p>}
+          </div>
+        </div>
+
+        {/* Connect Facebook & Instagram (2026-11-15) — Phase 1 of scheduling
+            content directly to Meta, per Mike: "All we want to do is be
+            able to schedule our content with the photos directly into
+            Meta, Instagram, and Facebook... I don't want to deal with a
+            lot of the dev right now." Goes through Upload-Post rather than
+            a Meta app of our own — see claude/upload-post-scheduling-
+            scoping.md for why. This card only connects the account; actual
+            scheduling of a post happens from the Content Calendar once an
+            agent is connected here. */}
+        <div className="mb-5 rounded-3xl border border-border bg-glass p-6 backdrop-blur-2xl">
+          <h2 className="font-display text-lg font-semibold">Connect Facebook &amp; Instagram</h2>
+          <p className="mt-1 text-sm text-muted-foreground">
+            Connect your real Facebook Page and Instagram Business/Creator account once, so posts from the Content
+            Calendar can be scheduled straight to them. This opens a secure page hosted by our scheduling provider —
+            your login never passes through this app.
+          </p>
+
+          {connectStatusError && (
+            <p className="mt-3 text-xs text-destructive">
+              {connectStatusError}
+              {connectStatusError.includes("UPLOAD_POST_API_KEY") ? null : (
+                <>
+                  {" "}
+                  <button onClick={loadConnectStatus} className="underline hover:text-foreground">
+                    Try again
+                  </button>
+                </>
+              )}
+            </p>
+          )}
+
+          {!connectStatusError && (
+            <div className="mt-3 flex flex-wrap items-center gap-2">
+              {(["facebook", "instagram"] as const).map((platform) => {
+                const isConnected = Boolean(connectStatus?.platforms.includes(platform));
+                return (
+                  <span
+                    key={platform}
+                    className={`rounded-full px-3 py-1 text-xs font-semibold ${
+                      isConnected ? "bg-primary/15 text-primary" : "bg-muted text-muted-foreground"
+                    }`}
+                  >
+                    {platform === "facebook" ? "Facebook" : "Instagram"} — {isConnected ? "Connected" : "Not connected"}
+                  </span>
+                );
+              })}
+              {connectStatus && connectStatus.platforms.includes("facebook") && (
+                <span className="text-xs text-muted-foreground">
+                  {connectStatus.facebookPages.length > 1
+                    ? `${connectStatus.facebookPages.length} Pages available — pick one when scheduling`
+                    : connectStatus.facebookPages.length === 1
+                      ? `Page: ${connectStatus.facebookPages[0]?.name}`
+                      : null}
+                </span>
+              )}
+            </div>
+          )}
+
+          <div className="mt-4 flex items-center gap-3">
+            <button
+              onClick={handleConnectSocial}
+              disabled={connecting}
+              className="rounded-xl bg-primary px-4 py-2 text-xs font-semibold text-primary-foreground shadow-lg shadow-primary/30 transition-transform hover:-translate-y-0.5 disabled:opacity-60"
+            >
+              {connecting
+                ? "Opening…"
+                : connectStatus?.connected
+                  ? "Reconnect / manage accounts"
+                  : "Connect Facebook & Instagram"}
+            </button>
+            <button
+              onClick={loadConnectStatus}
+              className="text-xs font-medium text-muted-foreground underline hover:text-foreground"
+            >
+              Refresh status
+            </button>
           </div>
         </div>
 

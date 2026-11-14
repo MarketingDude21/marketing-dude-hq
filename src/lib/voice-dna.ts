@@ -609,6 +609,155 @@ export const saveAgentSocialHandles = createServerFn({ method: "POST" })
     return { ok: true };
   });
 
+// Meta (Facebook + Instagram) scheduling — connect flow, Phase 1 (2026-11-15).
+//
+// Per Mike: "I don't want to deal with a lot of the dev right now on my
+// own. I'd rather have a plug into an app that we could tap into... All we
+// want to do is be able to schedule our content with the photos directly
+// into Meta, Instagram, and Facebook." Researched this directly against
+// the earlier Meta-direct scoping (individual-posts-hub-scoping.md's
+// sibling doc, meta-scheduling-scoping.md) and against Upload-Post's own
+// current docs (docs.upload-post.com) before building anything — going
+// through a third-party provider like this is the whole point: their own
+// Meta app already has App Review and Business Verification, so an agent
+// connects their Facebook Page / Instagram Business account through
+// Upload-Post's own hosted OAuth page, never through an app of ours that
+// would need its own review. Full plan + open questions in
+// claude/upload-post-scheduling-scoping.md.
+//
+// One Upload-Post "profile" per agent, keyed by a deterministic username
+// derived from the agent's own id — no new column/migration needed to
+// remember it, it's just recomputed the same way every time.
+function uploadPostUsernameForAgent(agentId: string): string {
+  return `agent-${agentId}`;
+}
+
+const UPLOAD_POST_API_BASE = "https://api.upload-post.com/api";
+
+function requireUploadPostApiKey(): string {
+  const key = process.env["UPLOAD_POST_API_KEY"];
+  if (!key) {
+    throw new Error("Scheduling isn't configured yet — add an UPLOAD_POST_API_KEY secret in Lovable Cloud → Secrets.");
+  }
+  return key;
+}
+
+// Upload-Post's public docs don't pin down the exact shape of a profile's
+// `social_accounts` field (seen described both as an array of entries with
+// their own `platform` field, and as an object keyed by platform name) —
+// parsed defensively here so either shape still surfaces which platforms
+// are actually connected, rather than guessing one shape and silently
+// showing "not connected" when it's really the other.
+function extractConnectedPlatforms(socialAccounts: unknown): string[] {
+  if (!socialAccounts) return [];
+  if (Array.isArray(socialAccounts)) {
+    return socialAccounts
+      .map((entry) => (entry && typeof entry === "object" ? (entry as { platform?: unknown }).platform : entry))
+      .filter((p): p is string => typeof p === "string");
+  }
+  if (typeof socialAccounts === "object") {
+    return Object.entries(socialAccounts as Record<string, unknown>)
+      .filter(([, v]) => Boolean(v))
+      .map(([k]) => k);
+  }
+  return [];
+}
+
+async function fetchFacebookPagesForProfile(apiKey: string, username: string): Promise<{ id: string; name: string }[]> {
+  const res = await fetch(
+    `${UPLOAD_POST_API_BASE}/uploadposts/facebook/pages?profile=${encodeURIComponent(username)}`,
+    { headers: { Authorization: `Apikey ${apiKey}` } },
+  );
+  if (!res.ok) return [];
+  const json = (await res.json().catch(() => null)) as { pages?: Record<string, unknown>[] } | null;
+  return (json?.pages ?? [])
+    .map((p) => ({
+      id: String(p["id"] ?? p["page_id"] ?? ""),
+      name: String(p["name"] ?? p["page_name"] ?? "Facebook Page"),
+    }))
+    .filter((p) => p.id);
+}
+
+export type AgentSocialConnectStatus = {
+  connected: boolean;
+  platforms: string[];
+  facebookPages: { id: string; name: string }[];
+};
+
+export const getAgentSocialConnectStatus = createServerFn({ method: "GET" })
+  .middleware([requireSupabaseAuth])
+  .validator((data: { agentId: string }) => data)
+  .handler(async ({ data, context }): Promise<AgentSocialConnectStatus> => {
+    const email = (context.claims as { email?: string } | undefined)?.email;
+    await requireAgentAccess(context.userId, email, data.agentId);
+    const apiKey = requireUploadPostApiKey();
+    const username = uploadPostUsernameForAgent(data.agentId);
+
+    const res = await fetch(`${UPLOAD_POST_API_BASE}/uploadposts/users`, {
+      headers: { Authorization: `Apikey ${apiKey}` },
+    });
+    if (!res.ok) throw new Error(`Upload-Post error (${res.status}) checking connection status.`);
+    const json = (await res.json().catch(() => ({}))) as {
+      profiles?: { username?: string; social_accounts?: unknown }[];
+    };
+
+    const profile = (json.profiles ?? []).find((p) => p.username === username);
+    if (!profile) return { connected: false, platforms: [], facebookPages: [] };
+
+    const platforms = extractConnectedPlatforms(profile.social_accounts);
+    let facebookPages: { id: string; name: string }[] = [];
+    if (platforms.includes("facebook")) {
+      // Non-fatal if this particular call fails — the schedule step falls
+      // back to "exactly one Page connected" behavior when the list is empty.
+      facebookPages = await fetchFacebookPagesForProfile(apiKey, username).catch(() => []);
+    }
+
+    return { connected: platforms.length > 0, platforms, facebookPages };
+  });
+
+// Generates a hosted Upload-Post connect link for this agent to open and
+// link their own Facebook Page + Instagram Business/Creator account —
+// "Upload-Post handles all authentication and token storage securely," per
+// their own docs, so this app never sees or stores the agent's Meta
+// credentials, only the fact that Upload-Post's profile for them is
+// connected. The access_url it returns is valid for 48 hours.
+export const generateAgentSocialConnectLink = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .validator((data: { agentId: string }) => data)
+  .handler(async ({ data, context }): Promise<{ accessUrl: string }> => {
+    const email = (context.claims as { email?: string } | undefined)?.email;
+    await requireAgentAccess(context.userId, email, data.agentId);
+    const apiKey = requireUploadPostApiKey();
+    const username = uploadPostUsernameForAgent(data.agentId);
+
+    // Create the profile if it doesn't exist yet. If it already does,
+    // Upload-Post's own error for that is swallowed here on purpose — the
+    // profile existing is exactly the state we want before generating a
+    // link for it, not a real failure.
+    try {
+      await fetch(`${UPLOAD_POST_API_BASE}/uploadposts/users`, {
+        method: "POST",
+        headers: { Authorization: `Apikey ${apiKey}`, "Content-Type": "application/json" },
+        body: JSON.stringify({ username }),
+      });
+    } catch {
+      // A network hiccup creating the profile isn't fatal by itself — the
+      // generate-jwt call right below fails with a clear error if the
+      // profile genuinely isn't there.
+    }
+
+    const jwtRes = await fetch(`${UPLOAD_POST_API_BASE}/uploadposts/users/generate-jwt`, {
+      method: "POST",
+      headers: { Authorization: `Apikey ${apiKey}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ username }),
+    });
+    const jwtJson = (await jwtRes.json().catch(() => ({}))) as { access_url?: string; error?: string };
+    if (!jwtRes.ok || !jwtJson.access_url) {
+      throw new Error(jwtJson.error ?? `Upload-Post error (${jwtRes.status}) generating the connect link.`);
+    }
+    return { accessUrl: jwtJson.access_url };
+  });
+
 // Scan My Website (2026-11-13) — see WebsiteScan above for why this exists.
 // Server-side only (never fetched from the browser): the site being scanned
 // is a third party from the browser's point of view, so a client-side fetch

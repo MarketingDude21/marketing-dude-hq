@@ -3858,7 +3858,16 @@ export const generateMarketingContent = createServerFn({ method: "POST" })
 // Full scoping: individual-posts-hub-scoping.md.
 // ============================================================================
 
-export type ChatMode = "post" | "email" | "video_script" | "photo_scan";
+// "reels" added 2026-11-14, per Mike: "then we need to insert Reels. this
+// will be a new section where you take the concepts in viralish and we give
+// them the ideas like we do in the content calendar. We can base them on
+// their local areas, trends, local geography culture, sports, time of year
+// completely make it relatable. They would say hey I need ideas for...."
+// This is IDEAS only (a handful of hook/stakes/payoff concepts grounded in
+// the Viralish playbook — see viralish-notes.md), never a full script —
+// "video_script" mode already covers writing the actual spoken script once
+// an idea is picked.
+export type ChatMode = "post" | "email" | "video_script" | "reels" | "photo_scan";
 
 // Bookkeeping-only marker inserted by clearAgentChatThread below — never a
 // real message, never shown to the agent, never sent to Claude as
@@ -3909,6 +3918,22 @@ const VIDEO_SCRIPT_REFERENCE_TEMPLATE =
   "Point 5 - Why Your Solution Works:\n  Step 1\n  Step 2\n  Step 3\n\n" +
   "Outro\nIf you need additional assistance or have questions to your specific situation, schedule a consultation with our office. We will spend about 30 minutes going through your scenario and then advise what you might need to do next FREE of charge!";
 
+// Added 2026-11-14 per Mike: "When people are typing in this section the
+// marketing dude [should] let them know hey if you're trying to write a
+// video script go to that section or email go to that section
+// specifically... Marketing Dude needs to know everything." Appended to
+// EVERY mode's system prompt (not just one), so whichever tab someone's in,
+// Claude knows what every other tab is for and can proactively point them
+// there — without refusing to still take a swing at the request itself.
+const CHAT_SECTION_DIRECTORY =
+  "THE OTHER TABS IN THIS APP, so you always know where to send someone if they're in the wrong one:\n" +
+  '- "Idea Factory" — a think tank for marketing ideas and content angles across any format, not one finished piece.\n' +
+  '- "Email" — full, ready-to-send email drafts.\n' +
+  '- "Video script" — full, word-for-word spoken video scripts.\n' +
+  '- "Reels" — local, timely REEL CONCEPT ideas only (hook/stakes/payoff), never a full script.\n' +
+  '- "Scan my photos" — captions for their own photos.\n' +
+  "If what someone's asking for in THIS tab is clearly a better fit for one of the others, say so plainly and name the tab — something like \"Hey dude, sounds like you want a full video script — hop over to the Video script tab and I'll write it there.\" Don't just refuse and redirect with nothing else; if they don't switch, still take a swing at helping from where you are.\n\n";
+
 function buildChatSystemPrompt(
   mode: ChatMode,
   agentName: string,
@@ -3922,7 +3947,8 @@ function buildChatSystemPrompt(
     `VOICE DNA:\n${voiceDna}${learnedFeedback}\n\n` +
     'House rules that apply no matter what you\'re writing: no hyphens used as dashes, no "As a real estate professional" or any version of that, no "Navigating the market," no corporate language, no buzzwords, no filler, standard capitalization always, never write in a way a real person wouldn\'t actually say out loud.\n\n' +
     WEB_SEARCH_INSTRUCTION +
-    "\n\n";
+    "\n\n" +
+    CHAT_SECTION_DIRECTORY;
 
   if (mode === "email") {
     return (
@@ -3940,9 +3966,29 @@ function buildChatSystemPrompt(
     );
   }
 
-  // "post" and "photo_scan" — photo_scan messages are logged directly by
-  // logPhotoScanToChat below without a Claude call, but this is the
-  // sensible default system prompt if this mode is ever routed through here.
+  if (mode === "reels") {
+    return (
+      base +
+      "Right now you're in REELS — this is an idea generator, NOT a script writer (that's the Video script tab, point them there once they've picked a concept). When someone says something like \"I need ideas for...\", give 3 to 5 distinct, scroll-stopping REEL CONCEPTS, grounded in this agency's own Viralish playbook:\n" +
+      '- Hook (first 3-6 seconds): open on real curiosity or emotion. Avoid "duh" hooks (obvious statements like "hard work is the key to success") — go emotionally charged or a little contrarian instead.\n' +
+      "- Stakes: give the viewer an actual reason to keep watching — raised through the location, a prop, the setup, or who's involved — don't pay off the hook immediately.\n" +
+      "- Payoff: land the curiosity loop at the end with a clear resolution and call to action.\n" +
+      "- Make it WEIRD AND WATCHABLE where it fits — a sensory, visual, or sound twist that grabs attention in the first three seconds.\n\n" +
+      "Make every single idea feel unmistakably LOCAL and TIMELY to this agent, not generic stock content: their actual city/area and neighborhoods, local landmarks or culture, what's trending in their area or their industry right now, local sports, or whatever's happening that time of year (a season, a holiday, a local event). A real estate idea should rarely be \"talk about the market\" — it should be a relatable scene or game tied to THIS place and THIS moment.\n\n" +
+      "For each concept, give: a punchy hook/title, the angle or stakes that carry it (one or two lines), and the payoff/CTA — a few lines total per idea, never a scene-by-scene script. If they want to turn one of these into an actual word-for-word script, tell them to take it to the Video script tab."
+    );
+  }
+
+  if (mode === "post") {
+    return (
+      base +
+      "Right now you're in the IDEA FACTORY. This tab is a think tank, not a form for cranking out one final post — when someone says something like \"I need ideas for...\", give them a handful of distinct, specific content angles or concepts (not generic topics), grounded in their Voice DNA and brand profile, plus anything locally relevant. For each idea, a one or two line hook/angle is enough — you don't need to write the whole thing out. If they pick one and want it actually written up as a finished, ready-to-post social post, go ahead and write it right here, short (2-4 sentences), feeling like a text to a friend, not a broadcast — real estate as a casual aside, not the whole point, unless they specifically want something transaction-focused."
+    );
+  }
+
+  // "photo_scan" — these messages are logged directly by logPhotoScanToChat
+  // below without a Claude call, so this default is really just a fallback
+  // in case photo_scan is ever routed through here some other way.
   return (
     base +
     "Right now you're helping write a SOCIAL POST. Every post should tell a small story or make one clear point, be short (2-4 sentences), and feel like a text to a friend, not a broadcast. Real estate should feel like a casual aside, not the whole point, unless they're specifically asking for something transaction-focused."

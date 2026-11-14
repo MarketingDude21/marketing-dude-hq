@@ -491,19 +491,28 @@ function MicButton({ value, onChange }: { value: string; onChange: (v: string) =
 
   if (!supported) return null;
 
+  // Made deliberately loud (2026-11-14), per Mike: "need to make the mic
+  // icon much more obvious it's hard to see... Talking into it should be
+  // our preferred method so we get the users voice and personality dialed
+  // in." A quiet 28px outline icon undersold the one input this whole app
+  // is built around, so this is now a full labeled pill with a filled
+  // primary background and a glow while listening, not a bare icon.
   return (
     <span className="inline-flex items-center gap-2">
       <button
         type="button"
         onClick={toggle}
-        title={listening ? "Tap to stop dictating" : "Tap to dictate"}
-        className={`inline-flex h-7 w-7 items-center justify-center rounded-full border text-xs transition-colors ${
+        title={
+          listening ? "Tap to stop dictating" : "Tap to talk — this is the fastest way to feed your Marketing Dude"
+        }
+        className={`inline-flex h-11 items-center gap-2 rounded-full border-2 px-4 text-sm font-bold shadow-sm transition-all ${
           listening
-            ? "border-primary bg-primary text-primary-foreground animate-pulse"
-            : "border-border text-muted-foreground hover:border-primary/50"
+            ? "scale-105 animate-pulse border-primary bg-primary text-primary-foreground shadow-lg shadow-primary/40"
+            : "border-primary bg-primary text-primary-foreground hover:scale-105 hover:shadow-md hover:shadow-primary/30"
         }`}
       >
-        🎤
+        <span className="text-lg leading-none">🎤</span>
+        <span>{listening ? "Listening…" : "Tap to talk"}</span>
       </button>
       {label && <span className="text-[11px] text-muted-foreground">{label}</span>}
     </span>
@@ -1290,10 +1299,17 @@ export function PostsTab({ agentId }: { agentId: string; isAdmin: boolean }) {
 // direction, see individual-posts-hub-scoping.md.
 // ============================================================================
 
+// "post" relabeled "Idea Factory" 2026-11-14 per Mike: "this section should
+// be to get marketing ideas... a think tank of ideas where they can tap
+// into our brains and get something to create... rename this section not
+// social posts, but Idea Factory." "reels" added the same day as a brand
+// new tab — see buildChatSystemPrompt in marketing.ts for what each mode
+// actually does.
 const CHAT_MODE_LABELS: Record<ChatMode, string> = {
-  post: "Social post",
+  post: "Idea Factory",
   email: "Email",
   video_script: "Video script",
+  reels: "Reels",
   photo_scan: "Scan my photos",
 };
 
@@ -1350,7 +1366,8 @@ function ChatMessageBubble({ msg, agentId, onSaved }: { msg: ChatMessageRow; age
           data: {
             agentId,
             messageId: msg.id,
-            contentType: msg.mode === "email" ? "email" : msg.mode === "video_script" ? "video" : "post",
+            contentType:
+              msg.mode === "email" ? "email" : msg.mode === "video_script" || msg.mode === "reels" ? "video" : "post",
           },
         });
       }
@@ -1371,7 +1388,9 @@ function ChatMessageBubble({ msg, agentId, onSaved }: { msg: ChatMessageRow; age
         }`}
       >
         {meta.thumbnailUrl && (
-          <img src={meta.thumbnailUrl} alt="" className="mb-2 h-32 w-full rounded-xl object-cover" />
+          <div className="mb-2 overflow-hidden rounded-xl bg-muted">
+            <img src={meta.thumbnailUrl} alt="" className="max-h-64 w-full object-contain" />
+          </div>
         )}
         <p className="whitespace-pre-wrap">{msg.content}</p>
         {isAssistant && (
@@ -1427,6 +1446,11 @@ function ChatHub({
   useEffect(() => {
     setMessages(null);
     setConfirmingClear(false);
+    // Whatever was half-typed for the old tab shouldn't bleed into the new
+    // one (2026-11-14) — each mode is its own thread, so its draft box
+    // starts blank too.
+    setDraft("");
+    setError(null);
     loadMessages();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [agentId, mode]);
@@ -1506,13 +1530,14 @@ function ChatHub({
           say What Kind Of Content Do You Want To Create?" */}
       <h3 className="font-display text-sm font-semibold">What Kind Of Content Do You Want To Create?</h3>
       <p className="mt-1 text-xs text-muted-foreground">
-        Each tab below is its own thread, grounded in your Voice DNA — ask for a post, a video script, or scan your
-        photos for ideas. Everything here is a draft until you save it as a post.
+        Each tab below is its own thread, grounded in your Voice DNA — brainstorm in Idea Factory, ask for an email or a
+        video script, get local Reel ideas, or scan your photos. Everything here is a draft until you save it as a post.
+        Tap the mic and just talk — that's the fastest way to feed your Marketing Dude.
       </p>
 
       <div className="mt-4 flex flex-wrap items-center justify-between gap-2">
         <div className="flex flex-wrap gap-1 rounded-full border border-border bg-glass p-1 w-fit">
-          {(["post", "email", "video_script", "photo_scan"] as ChatMode[]).map((m) => (
+          {(["post", "email", "video_script", "reels", "photo_scan"] as ChatMode[]).map((m) => (
             <button
               key={m}
               onClick={() => setMode(m)}
@@ -1587,7 +1612,9 @@ function ChatHub({
                 ? "What's the email about"
                 : mode === "video_script"
                   ? "What's the video about"
-                  : "What's on your mind"}
+                  : mode === "reels"
+                    ? "I need reel ideas for…"
+                    : "What's on your mind"}
             </span>
             <MicButton value={draft} onChange={setDraft} />
           </div>

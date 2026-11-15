@@ -11,12 +11,12 @@ import { AgentScopedPage, PostsTab } from "@/routes/marketing";
 export const Route = createFileRoute("/posts")({
   head: () => ({
     meta: [
-      { title: "My Marketing Dude — Your Marketing Dude" },
+      { title: "Individual Content — Your Marketing Dude" },
       {
         name: "description",
         content: "Draft and save one social post, email, video script, or photo scan at a time, in your voice.",
       },
-      { property: "og:title", content: "My Marketing Dude — Your Marketing Dude" },
+      { property: "og:title", content: "Individual Content — Your Marketing Dude" },
       {
         property: "og:description",
         content: "Draft and save one social post, email, video script, or photo scan at a time, in your voice.",
@@ -28,9 +28,17 @@ export const Route = createFileRoute("/posts")({
   component: PostsPage,
 });
 
+// Renamed 2026-11-15 per Mike: "Make My Marketing Dude to 'Individual
+// Content'." The nav label (AppShell.tsx) and this page's own title move
+// together — "My Marketing Dude" still shows up inside the page as the
+// chat hub's voice/brand name (ChatHub's "Talk to your Marketing Dude…"),
+// that's unchanged, just not the page's own heading anymore.
 function PostsPage() {
   return (
-    <AgentScopedPage title="My Marketing Dude" tagline="Draft and save one post, email, or script at a time, in your voice.">
+    <AgentScopedPage
+      title="Individual Content"
+      tagline="Draft and save one post, email, or script at a time, in your voice."
+    >
       {({ agentId, isAdmin }) => (
         <div className="mt-5">
           <PostsTab agentId={agentId} isAdmin={isAdmin} />

@@ -66,6 +66,9 @@ import {
   clearAgentChatThread,
   saveChatMessageAsPost,
   logPhotoScanToChat,
+  listAgentScannableVideos,
+  captionVideoFrames,
+  applyRegeneratedVideoCaption,
   getReviewLink,
   regenerateReviewLink,
   submitReelRender,
@@ -162,7 +165,15 @@ const CATEGORY_ORDER: ContentCategory[] = ["post", "canva", "email", "video"];
 // of the same posts twice — see the comment on PostsTab (2026-09-18, per
 // Mike: "this post section is repetitive to the generate my monthly
 // content... we do need to remove everything that displays in it").
-const BATCH_SOURCES = new Set(["content_calendar", "drive_photo_scan", "library_photo_scan"]);
+const BATCH_SOURCES = new Set([
+  "content_calendar",
+  "drive_photo_scan",
+  "library_photo_scan",
+  // Added 2026-11-14 for the new "Scan my videos" (Reels tab) — same
+  // categorization as library_photo_scan, since it's the same kind of
+  // scanned-content batch, just video instead of a still photo.
+  "library_video_scan",
+]);
 
 const CATEGORY_META: Record<ContentCategory, { label: string; icon: string; accent: string }> = {
   post: {
@@ -1328,13 +1339,24 @@ function ChatMessageBubble({ msg, agentId, onSaved }: { msg: ChatMessageRow; age
   const [saved, setSaved] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const isAssistant = msg.role === "assistant";
-  const isPhotoScan = msg.mode === "photo_scan";
   const meta = (msg.metadata ?? {}) as {
     thumbnailUrl?: string;
     source?: "drive" | "library";
     sourceId?: string;
     textOverlaySuggestions?: string;
+    // Added 2026-11-14 for "Scan my videos" (Reels tab) — see
+    // logPhotoScanToChat in marketing.ts.
+    mediaType?: "photo" | "video";
+    mediaUrl?: string;
   };
+  // Was `msg.mode === "photo_scan"` — widened 2026-11-14 so a video scanned
+  // from the REELS tab (mode "reels", so it logs into that tab's own
+  // thread, not photo_scan's) still takes this same "attach the real
+  // scanned media" save path instead of falling into the plain
+  // saveChatMessageAsPost branch below, which has no idea this message
+  // came with a photo/video attached and would save a bare, medialess
+  // post. Detecting by metadata instead of mode covers both cases.
+  const isMediaScan = !!(meta.source && meta.sourceId);
   // Parsed back out here only to hand to addPhotoPostsToBatch below so the
   // suggestions survive onto the post itself (PostMetadata.text_overlay_
   // suggestions) — the actual "Add text" tool no longer lives on this bubble
@@ -1354,7 +1376,7 @@ function ChatMessageBubble({ msg, agentId, onSaved }: { msg: ChatMessageRow; age
     setSaving(true);
     setError(null);
     try {
-      if (isPhotoScan && meta.source && meta.sourceId) {
+      if (isMediaScan && meta.source && meta.sourceId) {
         await addPhotoPostsToBatch({
           data: {
             agentId,
@@ -1367,6 +1389,8 @@ function ChatMessageBubble({ msg, agentId, onSaved }: { msg: ChatMessageRow; age
                 sourceId: meta.sourceId,
                 thumbnailUrl: meta.thumbnailUrl ?? "",
                 textOverlaySuggestions: overlaySuggestions,
+                mediaType: meta.mediaType,
+                mediaUrl: meta.mediaUrl,
               },
             ],
           },
@@ -1422,6 +1446,73 @@ function ChatMessageBubble({ msg, agentId, onSaved }: { msg: ChatMessageRow; age
   );
 }
 
+// Samples a handful of frames from a video URL entirely client-side — no
+// library, same no-dependency approach as resizeImage/compositeTextOnPhoto
+// above. Added 2026-11-14 for "Scan my videos": Claude's vision API reads
+// images, not video directly (confirmed against Anthropic's own docs —
+// "Claude doesn't natively process video as a single object yet... sample
+// frames yourself and send them as a sequence of static images"), and this
+// Cloudflare-hosted server has no video decoder of its own to do that
+// sampling server-side (same reason Reel renders go through Shotstack
+// instead of being encoded here) — so the browser, which can already decode
+// and seek video for playback, does it instead. Skips the very start/end of
+// the clip (some encoders give a black or not-yet-decoded frame right at
+// 0:00) by sampling evenly between 8% and 92% of the duration. crossOrigin
+// = "anonymous" matches compositeTextOnPhoto's existing pattern for the
+// same Supabase Storage bucket, so canvas doesn't treat this as tainted.
+async function extractVideoFrames(url: string, frameCount = 5): Promise<string[]> {
+  const video = document.createElement("video");
+  video.crossOrigin = "anonymous";
+  video.muted = true;
+  video.preload = "auto";
+  await new Promise<void>((resolve, reject) => {
+    video.onloadedmetadata = () => resolve();
+    video.onerror = () => reject(new Error("Couldn't load this video to look at it — the file may be unreadable."));
+    video.src = url;
+  });
+  const duration = video.duration || 0;
+  if (!duration || !Number.isFinite(duration)) {
+    throw new Error("Couldn't read this video's length — it may still be processing or the file is corrupt.");
+  }
+
+  const maxEdge = 960; // plenty for a vision caption, keeps the payload small across several frames
+  const scale = Math.min(1, maxEdge / Math.max(video.videoWidth || maxEdge, video.videoHeight || maxEdge));
+  const width = Math.max(1, Math.round((video.videoWidth || maxEdge) * scale));
+  const height = Math.max(1, Math.round((video.videoHeight || maxEdge) * scale));
+  const canvas = document.createElement("canvas");
+  canvas.width = width;
+  canvas.height = height;
+  const ctx = canvas.getContext("2d");
+  if (!ctx) throw new Error("Couldn't prepare this video's frames to look at.");
+
+  const frames: string[] = [];
+  for (let i = 0; i < frameCount; i++) {
+    const pct = frameCount === 1 ? 0.5 : 0.08 + (i / (frameCount - 1)) * 0.84;
+    const t = Math.min(duration - 0.05, Math.max(0, duration * pct));
+    await new Promise<void>((resolve) => {
+      const onSeeked = () => {
+        video.removeEventListener("seeked", onSeeked);
+        resolve();
+      };
+      video.addEventListener("seeked", onSeeked);
+      video.currentTime = t;
+    });
+    ctx.drawImage(video, 0, 0, width, height);
+    // toDataURL throws SecurityError on a tainted canvas (crossOrigin
+    // mismatch/missing CORS headers on the source) — surface that plainly
+    // rather than a generic failure, since the fix is on the storage side,
+    // not anything the person scanning can do.
+    let dataUrl: string;
+    try {
+      dataUrl = canvas.toDataURL("image/jpeg", 0.8);
+    } catch {
+      throw new Error("Couldn't read this video's frames (a browser security restriction) — try re-uploading it.");
+    }
+    frames.push(dataUrl.replace(/^data:image\/jpeg;base64,/, ""));
+  }
+  return frames;
+}
+
 function ChatHub({
   agentId,
   driveFolderId,
@@ -1436,6 +1527,11 @@ function ChatHub({
   const [draft, setDraft] = useState("");
   const [sending, setSending] = useState(false);
   const [scanning, setScanning] = useState(false);
+  // "Scan my videos" on the Reels tab (2026-11-14) — separate from
+  // `scanning` above since the two buttons can't both be visible at once
+  // today, but keeping them distinct avoids one spinner label lying about
+  // which thing is actually running if that ever changes.
+  const [scanningVideos, setScanningVideos] = useState(false);
   const [error, setError] = useState<string | null>(null);
   // Two-step inline confirm for "Clear thread" rather than a browser
   // confirm() popup, matching this app's own style elsewhere — not gated
@@ -1534,6 +1630,58 @@ function ChatHub({
     }
   }
 
+  // "Scan my videos" on the Reels tab (2026-11-14) — per Mike, twice over:
+  // he hit "Claude can't read" a video through the Rescan button (fixed
+  // separately in PostCard below), then asked directly for Reels to get
+  // the same scan-and-write-content treatment Scan My Photos already has,
+  // for short-form video instead of a still photo. Library only for now
+  // (see listAgentScannableVideos in marketing.ts for why not Drive yet).
+  // Unlike scanPhotos above, this can't be one server round trip — frame
+  // extraction has to happen here in the browser (extractVideoFrames),
+  // since Claude's vision API reads images, not video, and this server has
+  // no video decoder to sample frames itself. One video failing to extract
+  // or caption doesn't stop the rest — each is independent.
+  async function scanVideos() {
+    setScanningVideos(true);
+    setError(null);
+    try {
+      const res = await listAgentScannableVideos({ data: { agentId, maxVideos: 3 } });
+      if (!res.videos.length) {
+        setError("No new unused short-form videos found in the Media Library right now.");
+        return;
+      }
+      let loggedAny = false;
+      for (const v of res.videos) {
+        try {
+          const frames = await extractVideoFrames(v.url, 5);
+          const caption = await captionVideoFrames({ data: { agentId, frames } });
+          await logPhotoScanToChat({
+            data: {
+              agentId,
+              mode: "reels",
+              suggestedPost: caption.suggestedPost,
+              source: "library",
+              sourceId: v.id,
+              thumbnailUrl: `data:image/jpeg;base64,${frames[0]}`,
+              fileName: v.fileName,
+              textOverlaySuggestions: caption.textOverlaySuggestions,
+              mediaType: "video",
+              mediaUrl: v.url,
+            },
+          });
+          loggedAny = true;
+        } catch (e) {
+          setError(e instanceof Error ? e.message : String(e));
+        }
+      }
+      if (loggedAny) loadMessages();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setScanningVideos(false);
+    }
+  }
+
   return (
     <Card>
       {/* Renamed 2026-09-23 per Mike: "instead of Your Marketing Dude should
@@ -1616,6 +1764,24 @@ function ChatHub({
         </div>
       ) : (
         <div className="mt-3 space-y-2">
+          {/* Added 2026-11-14 per Mike: "the reels section has to have the
+              ability to scan videos and create the text from it based on
+              what they are doing in video... just like scan your photos
+              works now." Sits above the normal chat input rather than
+              replacing it — brainstorming reel ideas by chatting and
+              scanning an actual filmed video are two different ways into
+              this same tab, not alternatives to each other. */}
+          {mode === "reels" && (
+            <div className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-dashed border-border bg-background/40 px-3 py-2">
+              <p className="text-xs text-muted-foreground">
+                Or let your Marketing Dude watch a short-form video you haven't used yet and write the idea straight
+                from what's actually happening in it.
+              </p>
+              <Button variant="secondary" onClick={scanVideos} disabled={scanningVideos}>
+                {scanningVideos ? "Watching…" : "Scan my videos"}
+              </Button>
+            </div>
+          )}
           <div className="flex items-center justify-between">
             <span className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
               {mode === "email"
@@ -2927,11 +3093,31 @@ function PostCard({
       });
   }, [post.metadata?.drive_file_id, agentId]);
 
+  // Branches on media type (2026-11-14) — per Mike's report, "Rescan this
+  // photo" on a video post used to hit regeneratePhotoScanCaption, which
+  // fetches the attached media server-side and hands it straight to
+  // Claude's vision API, so it errored with "Claude can't read [this]
+  // directly" (that function's real message, confusingly phrased around
+  // HEIC/HEIF, which is what prompted his report). A video has to go
+  // through the browser first (extractVideoFrames — no video decoder on
+  // this server), so a video post takes a 3-step client path instead:
+  // extract frames, caption them (captionVideoFrames), write the result
+  // onto the post (applyRegeneratedVideoCaption). A photo post is
+  // unchanged — still the original 1-call path.
   async function regenerateCaption() {
     setRegenerating(true);
     setSaveError(null);
     try {
-      await regeneratePhotoScanCaption({ data: { agentId, postId: post.id } });
+      const videoUrl = post.metadata?.media_type === "video" ? post.metadata?.media_url : undefined;
+      if (videoUrl) {
+        const frames = await extractVideoFrames(videoUrl, 5);
+        const caption = await captionVideoFrames({ data: { agentId, frames } });
+        await applyRegeneratedVideoCaption({
+          data: { agentId, postId: post.id, title: caption.description, content: caption.suggestedPost },
+        });
+      } else {
+        await regeneratePhotoScanCaption({ data: { agentId, postId: post.id } });
+      }
       onChanged();
     } catch (e) {
       setSaveError(e instanceof Error ? e.message : String(e));
@@ -3195,7 +3381,13 @@ function PostCard({
               </Button>
               {hasRescannablePhoto && (
                 <Button variant="secondary" onClick={regenerateCaption} disabled={busy || regenerating}>
-                  {regenerating ? "Rescanning…" : "Rescan this photo"}
+                  {regenerating
+                    ? post.metadata?.media_type === "video"
+                      ? "Watching…"
+                      : "Rescanning…"
+                    : post.metadata?.media_type === "video"
+                      ? "Rescan this video"
+                      : "Rescan this photo"}
                 </Button>
               )}
               {photoUrl && !driveFileId && (

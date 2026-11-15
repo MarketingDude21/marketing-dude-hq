@@ -6830,6 +6830,19 @@ function ContentCalendarTab({
   // place Generate lives, and it can be run as many times as needed.
   const [counts, setCounts] = useState<Record<string, number | null>>({});
   const [archivedCounts, setArchivedCounts] = useState<Record<string, number>>({});
+  // "Generate Now" / "Scan My Media Library" right on the month card — added
+  // 2026-11-15 per Mike's screenshot feedback: "You shouldn't generate it
+  // first or click on the month of yet. It should be on this screen, the
+  // first click... You click the month and you also click the generate now
+  // right there. And then it goes to the next screen, or you scan the
+  // photos from right here." Only shown on a month with no content yet
+  // (see renderMonthCard) — once a month has content, clicking the card
+  // just opens straight into MonthWorkspace, which already shows it; these
+  // two just run the same calls MonthWorkspace's own buttons do, then
+  // navigate there so the result is right there waiting.
+  const [generatingId, setGeneratingId] = useState<string | null>(null);
+  const [scanningId, setScanningId] = useState<string | null>(null);
+  const [actionError, setActionError] = useState<Record<string, string>>({});
 
   function loadCountsFor(list: CalendarMonth[]) {
     for (const m of list) {
@@ -6855,30 +6868,82 @@ function ContentCalendarTab({
     setError(null);
     setCounts({});
     setArchivedCounts({});
+    autoOpenedRef.current = false;
     listCalendarMonths()
       .then((m) => {
         setMonths(m);
         loadCountsFor(m);
-        // Auto-open the month instead of making every visit start at the
-        // picker — added 2026-09-29 per Mike: "once it's generated... it
-        // should stay open to what was generated on that one screen and not
-        // reset ever... unless someone archives or deletes that month's
-        // content." Combined with lifting activeMonth up to Workspace, this
-        // means: with the usual one-active-month setup, the workspace opens
-        // straight to it on first load and stays open across tab switches;
-        // with more than one month, the picker still shows (no way to guess
-        // which one is meant), same as before.
-        if (!activeMonth && !autoOpenedRef.current && m.length === 1) {
-          autoOpenedRef.current = true;
-          setActiveMonth(m[0]!);
-        }
       })
       .catch((e) => setError(e instanceof Error ? e.message : String(e)));
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [agentId]);
 
+  // Auto-land on whichever month already has content instead of making
+  // every visit start at the picker — widened 2026-11-15 per Mike: "When
+  // either or is done, that's the screen that they land on when they log
+  // back into this section, unless they deleted that month's content or
+  // those calendars." Previously this only fired when there was exactly
+  // one month total (regardless of content), which is why he still had to
+  // click into December himself. Runs off `counts` (not the months list
+  // load above) because counts arrive one listMarketingPosts call per
+  // month, after the months themselves — this effect just waits for all of
+  // them to report in before deciding.
+  useEffect(() => {
+    if (!months || activeMonth || autoOpenedRef.current) return;
+    if (months.length > 1 && Object.keys(counts).length < months.length) return;
+    const withContent = months.filter((m) => (counts[m.id] ?? 0) > 0);
+    if (withContent.length === 1) {
+      autoOpenedRef.current = true;
+      setActiveMonth(withContent[0]!);
+    } else if (withContent.length === 0 && months.length === 1) {
+      // Nothing generated anywhere yet and there's only one month to pick
+      // between — same "nothing to choose" case the old logic covered.
+      autoOpenedRef.current = true;
+      setActiveMonth(months[0]!);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [months, counts]);
+
   function setNote(monthId: string, text: string) {
     setNoteByMonth((prev) => ({ ...prev, [monthId]: text }));
+  }
+
+  function setActionErr(monthId: string, text: string) {
+    setActionError((prev) => ({ ...prev, [monthId]: text }));
+  }
+
+  // Same calls MonthWorkspace's own "Generate Now" / "Scan My Media
+  // Library" buttons make — run from the card itself so picking the month
+  // and picking the generation method happen on the one click Mike asked
+  // for, then land on MonthWorkspace to show the result. Only offered on a
+  // month with no content yet (renderMonthCard), so this never needs
+  // generate()'s replace-and-warn dance — there's nothing here to replace.
+  async function generateFromList(m: CalendarMonth) {
+    setGeneratingId(m.id);
+    setActionErr(m.id, "");
+    try {
+      await generateMonthlyBatch({
+        data: { agentId, monthId: m.id, month: m.month, useHashtags: false, useEmojis: false },
+      });
+      setActiveMonth(m);
+    } catch (e) {
+      setActionErr(m.id, e instanceof Error ? e.message : String(e));
+    } finally {
+      setGeneratingId(null);
+    }
+  }
+
+  async function scanFromList(m: CalendarMonth) {
+    setScanningId(m.id);
+    setActionErr(m.id, "");
+    try {
+      await scanMediaLibraryForMonth({ data: { agentId, month: m.month } });
+      setActiveMonth(m);
+    } catch (e) {
+      setActionErr(m.id, e instanceof Error ? e.message : String(e));
+    } finally {
+      setScanningId(null);
+    }
   }
 
   async function archiveFromList(m: CalendarMonth) {
@@ -6917,6 +6982,9 @@ function ContentCalendarTab({
 
   function renderMonthCard(m: CalendarMonth, archived: boolean) {
     const busy = archivingId === m.id;
+    const hasContent = (counts[m.id] ?? 0) > 0;
+    const genBusy = generatingId === m.id;
+    const scanBusy = scanningId === m.id;
     // FIXED 2026-11-06 per Mike: "This button doesn't always click. Sometime
     // I need to click it 3-5 times before it works." Root cause: only the
     // "October 2026" text itself was wrapped in a <button> (sized to its own
@@ -6942,7 +7010,7 @@ function ContentCalendarTab({
         <span className="min-w-0 text-sm font-semibold">{m.month}</span>
         {archived ? (
           <p className="text-[11px] text-muted-foreground">Archived — click the month to create fresh content.</p>
-        ) : (
+        ) : hasContent ? (
           <button
             onClick={(e) => {
               e.stopPropagation();
@@ -6954,7 +7022,24 @@ function ContentCalendarTab({
           >
             {busy ? "Archiving…" : "Archive"}
           </button>
+        ) : (
+          // The decision lives right here now, not inside the month —
+          // added 2026-11-15 per Mike: "You click the month and you also
+          // click the generate now right there. And then it goes to the
+          // next screen, or you scan the photos from right here." Once
+          // either call lands, setActiveMonth takes them straight into
+          // MonthWorkspace already showing what was just created — same
+          // place "Generate Now" / "Scan My Media Library" there go.
+          <div className="flex flex-col items-stretch gap-1.5" onClick={(e) => e.stopPropagation()}>
+            <Button onClick={() => generateFromList(m)} disabled={genBusy || scanBusy}>
+              {genBusy ? "Generating…" : "Generate Now"}
+            </Button>
+            <Button variant="secondary" onClick={() => scanFromList(m)} disabled={genBusy || scanBusy}>
+              {scanBusy ? "Scanning…" : "Scan My Media Library"}
+            </Button>
+          </div>
         )}
+        {actionError[m.id] && <p className="text-[11px] text-destructive">{actionError[m.id]}</p>}
         {noteByMonth[m.id] && <p className="text-[11px] text-muted-foreground">{noteByMonth[m.id]}</p>}
       </div>
     );

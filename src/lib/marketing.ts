@@ -6340,16 +6340,30 @@ export const scanMediaLibraryForMonth = createServerFn({ method: "POST" })
       // exactly one local slot (Mike: "don't overthink that piece," so this
       // is the clean 1/1 split rather than the "1 to 2" he also floated),
       // then split whatever's left as evenly as possible between real
-      // estate reminders and personal brand. Any slot with no naturally-
-      // classified candidate left just doesn't get filled rather than
-      // forcing a bad match — same honesty principle as the rest of this
-      // design: no fake fit just to hit a number.
+      // estate reminders and personal brand.
       const remaining = [...scanned];
       const take = (lane: Scanned["lane"]): Scanned | undefined => {
         const idx = remaining.findIndex((s) => s.lane === lane);
         if (idx === -1) return undefined;
         return remaining.splice(idx, 1)[0];
       };
+      // FIXED 2026-11-15 per Mike: "the photo post did only give me 5. It
+      // should give me 10." Root cause: gratitude/local only ever take ONE
+      // candidate each, but those regexes (classifyScanLane) are broad, so a
+      // library with several coffee-shop/beach/thank-you-ish photos left
+      // most of `remaining` stranded as surplus "gratitude"/"local" items
+      // that the real_estate/personal_brand fill loop below could never
+      // reach (it only ever called take("real_estate") / take("personal_
+      // brand")) — so the loop hit `break` and stopped well short of
+      // targetCount even with plenty of successfully-captioned photos left
+      // unused. takeAny() is the fix: once both business lanes are
+      // exhausted for a slot, fall back to ANY remaining scanned photo
+      // (regardless of its original lane) as personal-brand-ish filler —
+      // a second "local" or "gratitude" shot is still perfectly good
+      // content once the one dedicated slot for that lane is filled. A
+      // slot only goes unfilled when `scanned` itself is genuinely smaller
+      // than targetCount — never because of this stranding bug.
+      const takeAny = (): Scanned | undefined => remaining.shift();
 
       const chosen: Scanned[] = [];
       const gratitude = take("gratitude");
@@ -6363,10 +6377,16 @@ export const scanMediaLibraryForMonth = createServerFn({ method: "POST" })
       for (let i = 0; i < slotsLeft; i++) {
         const preferReal = wantRealEstate > 0 && (wantPersonalBrand === 0 || i % 2 === 0);
         const picked = preferReal
-          ? (take("real_estate") ?? take("personal_brand"))
-          : (take("personal_brand") ?? take("real_estate"));
+          ? (take("real_estate") ?? take("personal_brand") ?? takeAny())
+          : (take("personal_brand") ?? take("real_estate") ?? takeAny());
         if (!picked) break; // pool's genuinely out of unused photos — stop rather than pad with nothing
-        if (picked.lane === "real_estate" || preferReal) wantRealEstate = Math.max(0, wantRealEstate - 1);
+        // Decrement whichever counter this slot was actually standing in
+        // for — not just whatever `preferReal` said going in — so a
+        // fallback pick (including a takeAny() one) still balances the
+        // 4/4 split instead of quietly overcounting one side.
+        if (picked.lane === "real_estate") wantRealEstate = Math.max(0, wantRealEstate - 1);
+        else if (picked.lane === "personal_brand") wantPersonalBrand = Math.max(0, wantPersonalBrand - 1);
+        else if (preferReal) wantRealEstate = Math.max(0, wantRealEstate - 1);
         else wantPersonalBrand = Math.max(0, wantPersonalBrand - 1);
         chosen.push(picked);
       }

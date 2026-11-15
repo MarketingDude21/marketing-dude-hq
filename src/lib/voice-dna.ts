@@ -734,16 +734,36 @@ export const generateAgentSocialConnectLink = createServerFn({ method: "POST" })
     // Upload-Post's own error for that is swallowed here on purpose — the
     // profile existing is exactly the state we want before generating a
     // link for it, not a real failure.
-    try {
-      await fetch(`${UPLOAD_POST_API_BASE}/uploadposts/users`, {
-        method: "POST",
-        headers: { Authorization: `Apikey ${apiKey}`, "Content-Type": "application/json" },
-        body: JSON.stringify({ username }),
-      });
-    } catch {
-      // A network hiccup creating the profile isn't fatal by itself — the
-      // generate-jwt call right below fails with a clear error if the
-      // profile genuinely isn't there.
+    //
+    // FIXED 2026-11-15 per Mike's report — "error on connecting to FB and
+    // IG here" (Upload-Post error 404 generating the connect link). Root
+    // cause, confirmed against Upload-Post's own API docs: this used to
+    // swallow EVERY failure here, not just "already exists" — a real
+    // failure (rate limit, malformed response, anything) left the profile
+    // never actually created, and the very next generate-jwt call below
+    // then 404s with their documented PROFILE_NOT_FOUND, which is exactly
+    // the symptom Mike hit. Now only an actual "already exists" response is
+    // treated as non-fatal; anything else surfaces Upload-Post's real error
+    // instead of silently proceeding to a call that's doomed to fail.
+    const createRes = await fetch(`${UPLOAD_POST_API_BASE}/uploadposts/users`, {
+      method: "POST",
+      headers: { Authorization: `Apikey ${apiKey}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ username }),
+    }).catch((e) => {
+      throw new Error(
+        `Couldn't reach Upload-Post to set up this profile: ${e instanceof Error ? e.message : String(e)}`,
+      );
+    });
+    if (!createRes.ok) {
+      const createJson = (await createRes.json().catch(() => ({}))) as { error?: string };
+      const alreadyExists = /exist/i.test(createJson.error ?? "");
+      if (!alreadyExists) {
+        throw new Error(
+          createJson.error
+            ? `Upload-Post error creating this profile: ${createJson.error}`
+            : `Upload-Post error (${createRes.status}) creating this profile.`,
+        );
+      }
     }
 
     const jwtRes = await fetch(`${UPLOAD_POST_API_BASE}/uploadposts/users/generate-jwt`, {

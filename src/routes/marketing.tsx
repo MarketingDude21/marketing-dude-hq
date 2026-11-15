@@ -98,7 +98,7 @@ import {
 // schedule box below should show platform options or a "connect first"
 // prompt. No cycle: voice-dna.ts imports FROM marketing.ts, not the other
 // way, and this file is a third module importing from both.
-import { getAgentSocialConnectStatus, type AgentSocialConnectStatus } from "@/lib/voice-dna";
+import { getAgentSocialConnectStatus, getAgentVoiceProfile, type AgentSocialConnectStatus } from "@/lib/voice-dna";
 // Type-only import (erased at build) — the runtime docx library is loaded
 // lazily inside buildContentDocxBlob() below instead of imported at the top
 // of the file, so its ~170KB gzipped bundle only ever downloads for someone
@@ -398,7 +398,7 @@ function isIOSDevice(): boolean {
 // against any value/onChange pair instead of one indexed answers array. Tap
 // to start, tap again to stop; speech is appended to whatever was already
 // typed, so it can be mixed with typing.
-function MicButton({ value, onChange }: { value: string; onChange: (v: string) => void }) {
+export function MicButton({ value, onChange }: { value: string; onChange: (v: string) => void }) {
   const [supported] = useState<boolean>(() => Boolean(getSpeechRecognitionCtor()));
   const [listening, setListening] = useState(false);
   const [label, setLabel] = useState<string | null>(null);
@@ -762,7 +762,9 @@ function MarketingPage() {
         agentName={selected.name}
         onChangeAgent={access.role === "admin" ? () => setSelected(null) : undefined}
       />
-      <Workspace agentId={selected.id} agentEmail={selected.email} isAdmin={access.role === "admin"} />
+      <OnboardingGate agentId={selected.id} isAdmin={access.role === "admin"}>
+        <Workspace agentId={selected.id} agentEmail={selected.email} isAdmin={access.role === "admin"} />
+      </OnboardingGate>
     </AppShell>
   );
 }
@@ -782,6 +784,89 @@ function MarketingPage() {
 // branch) — a little duplication, but it keeps each page's access flow
 // simple and means nothing about how Monthly Marketing's admin tools work
 // had to be touched to add these two new pages.
+// Onboarding gate — added 2026-11-15 per Mike: "The DNA Questionnaire should
+// be the first thing they see on this page and step 1 for the entire app.
+// Everything else in the app should be locked out until the DNA
+// Questionnaire is answered and headshot and logo are uploaded." Wraps
+// every agent-scoped page's actual content (Create My Monthly Content,
+// Individual Content, Upload Photos/Videos — anywhere AgentScopedPage or
+// MarketingPage's own Workspace render is the entry point) so none of them
+// are usable until that agent's Voice DNA interview is done AND a headshot
+// AND a logo are on file — the same 3-field check voice.tsx itself now
+// gates its own page below Headshot & Logo with, kept in sync here rather
+// than guessed independently.
+//
+// Admin bypass, same reasoning as voice.tsx's own gate: an admin acting on
+// an agent's behalf is how onboarding usually gets finished in the first
+// place (uploading a headshot, running the interview with them on a call),
+// so locking admin out here would make it impossible to ever do that setup.
+function OnboardingGate({
+  agentId,
+  isAdmin,
+  children,
+}: {
+  agentId: string;
+  isAdmin: boolean;
+  children: React.ReactNode;
+}) {
+  const [profile, setProfile] = useState<{
+    voice_summary: string | null;
+    headshot_url: string | null;
+    logo_url: string | null;
+  } | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (isAdmin) return;
+    setProfile(null);
+    setError(null);
+    getAgentVoiceProfile({ data: { agentId } })
+      .then((p) => setProfile(p))
+      .catch((e) => setError(e instanceof Error ? e.message : String(e)));
+  }, [agentId, isAdmin]);
+
+  if (isAdmin) return <>{children}</>;
+
+  if (error)
+    return (
+      <Card className="mt-5">
+        <p className="text-sm text-destructive">{error}</p>
+      </Card>
+    );
+  if (!profile)
+    return (
+      <Card className="mt-5">
+        <p className="text-sm text-muted-foreground">Loading…</p>
+      </Card>
+    );
+
+  const complete = Boolean(profile.voice_summary) && Boolean(profile.headshot_url) && Boolean(profile.logo_url);
+  if (!complete) {
+    const missing = [
+      !profile.voice_summary && "the Voice DNA interview",
+      !profile.headshot_url && "a headshot",
+      !profile.logo_url && "a logo",
+    ].filter((x): x is string => Boolean(x));
+    return (
+      <Card className="mt-5">
+        <h2 className="font-display text-lg font-semibold">Finish setting up your brand first</h2>
+        <p className="mt-2 text-sm text-muted-foreground">
+          This section unlocks once you've completed {missing.join(", ")} — everything here is built from your Voice
+          DNA, headshot, and logo, so there isn't anything useful to show until those are in place.
+        </p>
+        <Link
+          to="/voice"
+          className="mt-4 inline-block rounded-2xl bg-primary px-5 py-2.5 text-sm font-semibold text-primary-foreground shadow-lg shadow-primary/30 transition-transform hover:-translate-y-0.5"
+        >
+          Go finish my brand setup
+        </Link>
+      </Card>
+    );
+  }
+
+  return <>{children}</>;
+}
+
 export function AgentScopedPage({
   title,
   tagline,
@@ -964,12 +1049,14 @@ export function AgentScopedPage({
         agentName={selected.name}
         onChangeAgent={access.role === "admin" ? () => setSelected(null) : undefined}
       />
-      {children({
-        agentId: selected.id,
-        agentEmail: selected.email,
-        isAdmin: access.role === "admin",
-        agentName: selected.name,
-      })}
+      <OnboardingGate agentId={selected.id} isAdmin={access.role === "admin"}>
+        {children({
+          agentId: selected.id,
+          agentEmail: selected.email,
+          isAdmin: access.role === "admin",
+          agentName: selected.name,
+        })}
+      </OnboardingGate>
     </AppShell>
   );
 }

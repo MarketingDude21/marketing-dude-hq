@@ -5325,7 +5325,22 @@ export const generateMonthlyBatch = createServerFn({ method: "POST" })
 // same set (2026-09-20). Mirrors BATCH_SOURCES in marketing.tsx (kept as a
 // separate constant there since the frontend needs it for display grouping,
 // not data mutation, but the values must always match).
-const BATCH_CONTENT_SOURCES = new Set(["content_calendar", "drive_photo_scan", "library_photo_scan"]);
+//
+// FIXED 2026-11-15: "library_video_scan" (the "Scan my videos"/"Scan Videos"
+// source) was already in marketing.tsx's BATCH_SOURCES since 2026-11-14, but
+// never made it into this server-side set — a real gap, not an intentional
+// split. It meant a scanned video Reel showed up fine in the review grid
+// (client-side filter) but was invisible to deleteMonthContent/
+// archiveMonthContent/restoreArchivedBatch/approveBatch's own batch-count
+// queries (all server-side, all keyed off this set), so it could never be
+// cleanly deleted, archived, restored, or counted as part of "this month's
+// batch" the same way every other scanned post already was.
+const BATCH_CONTENT_SOURCES = new Set([
+  "content_calendar",
+  "drive_photo_scan",
+  "library_photo_scan",
+  "library_video_scan",
+]);
 
 // Deletes a month's generated content for one agent so it can be
 // regenerated cleanly — added 2026-09-18 per Mike: "Put a delete in case we
@@ -6456,7 +6471,18 @@ export const scanMediaLibraryForMonth = createServerFn({ method: "POST" })
 // separate round trip from this list.
 export const listAgentScannableVideos = createServerFn({ method: "GET" })
   .middleware([requireSupabaseAuth])
-  .inputValidator((data: { agentId: string; maxVideos?: number }) => data)
+  .inputValidator(
+    (data: {
+      agentId: string;
+      maxVideos?: number;
+      // Added 2026-11-15 for the new monthly "Scan Videos" button, which —
+      // unlike this list's original caller (one-shot "Scan my videos" on
+      // the Reels chat tab) — can be called again later the same month and
+      // needs to skip videos already turned into a Reel, same reasoning as
+      // scanAgentLibraryPhotos/scanMediaLibraryForMonth's excludeFileIds.
+      excludeFileIds?: string[];
+    }) => data,
+  )
   .handler(
     async ({
       data,
@@ -6475,7 +6501,8 @@ export const listAgentScannableVideos = createServerFn({ method: "GET" })
         .limit(50);
       if (error) throw error;
       const maxVideos = data.maxVideos ?? 3;
-      const toReturn = (videos ?? []).filter((v) => v.url).slice(0, maxVideos);
+      const excludeIds = new Set(data.excludeFileIds ?? []);
+      const toReturn = (videos ?? []).filter((v) => v.url && !excludeIds.has(v.id)).slice(0, maxVideos);
       // Notes aren't fetched here — captionVideoFrames below looks them up
       // itself by mediaId at caption time (see its comment) so a note added
       // between this list call and that one isn't missed.

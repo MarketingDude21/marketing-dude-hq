@@ -27,7 +27,7 @@ import {
   createMediaUploadUrl,
   finalizeMediaUpload,
   replaceMediaFile,
-  setMediaTags,
+  setMediaNotes,
   markMediaUsed,
   restoreMediaToAvailable,
   deleteMarketingMedia,
@@ -1654,7 +1654,7 @@ function ChatHub({
       for (const v of res.videos) {
         try {
           const frames = await extractVideoFrames(v.url, 5);
-          const caption = await captionVideoFrames({ data: { agentId, frames } });
+          const caption = await captionVideoFrames({ data: { agentId, frames, mediaId: v.id } });
           await logPhotoScanToChat({
             data: {
               agentId,
@@ -1693,28 +1693,42 @@ function ChatHub({
         Tap the mic and just talk — that's the fastest way to feed your Marketing Dude.
       </p>
 
-      <div className="mt-4 flex flex-wrap items-center justify-between gap-2">
-        <div className="flex flex-wrap gap-1 rounded-full border border-border bg-glass p-1 w-fit">
-          {(["post", "email", "video_script", "reels", "photo_scan"] as ChatMode[]).map((m) => (
-            <button
-              key={m}
-              onClick={() => setMode(m)}
-              className={`rounded-full px-4 py-1.5 text-sm font-medium transition-colors ${
-                mode === m ? "bg-secondary text-foreground" : "text-muted-foreground hover:text-foreground"
-              }`}
-            >
-              {CHAT_MODE_LABELS[m]}
-            </button>
-          ))}
+      {/* REDESIGNED 2026-11-15 per Mike, off a screenshot of this wrapping
+          into several uneven pill rows on mobile: "The buttons and options
+          are all over the place the UI needs to be extremely simple to
+          use... How would you lay out this section?" Previously a
+          flex-wrap pill list that broke across 2-4 rows depending on screen
+          width, with "Clear thread" squeezed into whatever space was left
+          on the first row. Now: one single-row, horizontally-scrollable
+          pill strip (the standard mobile pattern for "more tabs than fit" —
+          swipe instead of wrap) on every breakpoint, with "Clear thread"
+          moved to its own tidy row underneath instead of competing for
+          space with the tabs. */}
+      <div
+        className="mt-4 flex items-center gap-1 overflow-x-auto rounded-full border border-border bg-glass p-1 [&::-webkit-scrollbar]:hidden"
+        style={{ scrollbarWidth: "none" }}
+      >
+        {(["post", "email", "video_script", "reels", "photo_scan"] as ChatMode[]).map((m) => (
           <button
-            disabled
-            title="Coming soon — unlocks once a carousel brand/template direction is set"
-            className="cursor-not-allowed rounded-full px-4 py-1.5 text-sm font-medium text-muted-foreground/50"
+            key={m}
+            onClick={() => setMode(m)}
+            className={`shrink-0 whitespace-nowrap rounded-full px-4 py-1.5 text-sm font-medium transition-colors ${
+              mode === m ? "bg-secondary text-foreground" : "text-muted-foreground hover:text-foreground"
+            }`}
           >
-            Carousel (coming soon)
+            {CHAT_MODE_LABELS[m]}
           </button>
-        </div>
+        ))}
+        <button
+          disabled
+          title="Coming soon — unlocks once a carousel brand/template direction is set"
+          className="shrink-0 cursor-not-allowed whitespace-nowrap rounded-full px-4 py-1.5 text-sm font-medium text-muted-foreground/50"
+        >
+          Carousel (coming soon)
+        </button>
+      </div>
 
+      <div className="mt-2 flex justify-end">
         {messages !== null &&
           messages.length > 0 &&
           (confirmingClear ? (
@@ -3111,7 +3125,12 @@ function PostCard({
       const videoUrl = post.metadata?.media_type === "video" ? post.metadata?.media_url : undefined;
       if (videoUrl) {
         const frames = await extractVideoFrames(videoUrl, 5);
-        const caption = await captionVideoFrames({ data: { agentId, frames } });
+        // media_id (when this video came from the Media Library) lets the
+        // caption call look up any notes the agent added — see
+        // captionVideoFrames in marketing.ts.
+        const caption = await captionVideoFrames({
+          data: { agentId, frames, ...(post.metadata?.media_id ? { mediaId: post.metadata.media_id } : {}) },
+        });
         await applyRegeneratedVideoCaption({
           data: { agentId, postId: post.id, title: caption.description, content: caption.suggestedPost },
         });
@@ -3800,6 +3819,11 @@ function ScheduleToSocialBox({ agentId, post, onChanged }: { agentId: string; po
   const [connectError, setConnectError] = useState<string | null>(null);
   const [open, setOpen] = useState(false);
   const [platforms, setPlatforms] = useState<UploadPostPlatform[]>([]);
+  // "Publish now" vs "Schedule for later" — added 2026-11-15 per Mike:
+  // "there shiuld be a publish now option in any and all scheduling."
+  // Defaults to scheduling (the only option before this) so existing muscle
+  // memory/date-time inputs don't move.
+  const [publishMode, setPublishMode] = useState<"schedule" | "now">("schedule");
   const [date, setDate] = useState(() => (post.scheduled_for ? post.scheduled_for.slice(0, 10) : ""));
   const [time, setTime] = useState("09:00");
   const [facebookPageId, setFacebookPageId] = useState("");
@@ -3835,7 +3859,7 @@ function ScheduleToSocialBox({ agentId, post, onChanged }: { agentId: string; po
       setError("Pick at least one platform.");
       return;
     }
-    if (!date) {
+    if (publishMode === "schedule" && !date) {
       setError("Pick a date to post.");
       return;
     }
@@ -3843,14 +3867,17 @@ function ScheduleToSocialBox({ agentId, post, onChanged }: { agentId: string; po
     setError(null);
     try {
       const timezone = Intl.DateTimeFormat().resolvedOptions().timeZone;
-      const scheduledDate = new Date(`${date}T${time || "09:00"}:00`).toISOString();
+      // Omitting scheduledDate entirely is what makes scheduleAgentPostToSocial
+      // publish right now instead of queuing a scheduled job — see its
+      // comment in marketing.ts.
+      const scheduledDate =
+        publishMode === "schedule" ? new Date(`${date}T${time || "09:00"}:00`).toISOString() : undefined;
       await scheduleAgentPostToSocial({
         data: {
           agentId,
           postId: post.id,
           platforms,
-          scheduledDate,
-          timezone,
+          ...(scheduledDate ? { scheduledDate, timezone } : {}),
           ...(facebookPageId ? { facebookPageId } : {}),
         },
       });
@@ -3999,31 +4026,53 @@ function ScheduleToSocialBox({ agentId, post, onChanged }: { agentId: string; po
             </label>
           )}
 
-          <div className="flex flex-wrap gap-3">
-            <label className="text-xs text-muted-foreground">
-              Date
-              <input
-                type="date"
-                value={date}
-                onChange={(e) => setDate(e.target.value)}
-                className="mt-1 block rounded-xl border border-border bg-glass px-3 py-1.5 text-sm outline-none"
-              />
-            </label>
-            <label className="text-xs text-muted-foreground">
-              Time
-              <input
-                type="time"
-                value={time}
-                onChange={(e) => setTime(e.target.value)}
-                className="mt-1 block rounded-xl border border-border bg-glass px-3 py-1.5 text-sm outline-none"
-              />
-            </label>
+          <div className="flex flex-wrap gap-1 rounded-full border border-border bg-glass p-1 w-fit">
+            {(["schedule", "now"] as const).map((pm) => (
+              <button
+                key={pm}
+                onClick={() => setPublishMode(pm)}
+                className={`rounded-full px-3 py-1 text-xs font-semibold transition-colors ${
+                  publishMode === pm ? "bg-secondary text-foreground" : "text-muted-foreground hover:text-foreground"
+                }`}
+              >
+                {pm === "now" ? "Publish now" : "Schedule for later"}
+              </button>
+            ))}
           </div>
+
+          {publishMode === "schedule" && (
+            <div className="flex flex-wrap gap-3">
+              <label className="text-xs text-muted-foreground">
+                Date
+                <input
+                  type="date"
+                  value={date}
+                  onChange={(e) => setDate(e.target.value)}
+                  className="mt-1 block rounded-xl border border-border bg-glass px-3 py-1.5 text-sm outline-none"
+                />
+              </label>
+              <label className="text-xs text-muted-foreground">
+                Time
+                <input
+                  type="time"
+                  value={time}
+                  onChange={(e) => setTime(e.target.value)}
+                  className="mt-1 block rounded-xl border border-border bg-glass px-3 py-1.5 text-sm outline-none"
+                />
+              </label>
+            </div>
+          )}
 
           {error && <p className="text-xs text-destructive">{error}</p>}
 
           <Button onClick={submitSchedule} disabled={busy}>
-            {busy ? "Scheduling…" : "Schedule it"}
+            {busy
+              ? publishMode === "now"
+                ? "Publishing…"
+                : "Scheduling…"
+              : publishMode === "now"
+                ? "Publish now"
+                : "Schedule it"}
           </Button>
         </>
       )}
@@ -5446,25 +5495,6 @@ async function downloadRemoteFile(url: string, filename: string) {
   }
 }
 
-// Same fixed vocabulary marketing.ts's PHOTO_TAG_OPTIONS uses for matching —
-// kept as its own small client-side copy rather than importing the server
-// module's export, so nothing about the server bundle is a dependency of
-// this chip UI. Keep these two lists in sync if the vocabulary ever changes.
-const PHOTO_TAG_OPTIONS = [
-  "outdoor portrait",
-  "desk or work",
-  "neighborhood walk",
-  "coffee or local spot",
-  "with clients",
-  "car or on the go",
-  "family",
-  "holiday or seasonal",
-  "listing or property",
-  "community event",
-  "casual lifestyle",
-  "behind the scenes",
-] as const;
-
 // Admin-only card on the Media tab that surfaces the public upload link for
 // FIXED (2026-09-28) — per Mike, on the Media tab right after switching to
 // an agent: "I put in this agent's Google Drive folder and it's saying that
@@ -5802,19 +5832,48 @@ export function MediaTab({ agentId, isAdmin }: { agentId: string; isAdmin: boole
     }
   }
 
-  // Tags feed assignSuggestedMedia's category matching (marketing.ts) —
-  // added per Mike's request (2026-09-17) so photo suggestions can be
-  // smarter than plain FIFO. Toggling a chip saves immediately, optimistic
-  // in the grid, so tagging a whole library doesn't need a separate save
-  // step per item.
-  async function toggleTag(item: MediaRow, tag: string) {
-    const nextTags = item.tags.includes(tag) ? item.tags.filter((t) => t !== tag) : [...item.tags, tag];
-    setMedia((prev) => (prev ? prev.map((m) => (m.id === item.id ? { ...m, tags: nextTags } : m)) : prev));
+  // Tag chips (and the matching setMediaTags call) removed 2026-11-15 per
+  // Mike, off a screenshot of the grid: "remove the tags from the view
+  // here. I dont see any use for them do you? Lets remove, but add an edit
+  // button so the user can make notes if they want." Replaced below with
+  // free-text notes, hidden by default behind a "Details" expand — see
+  // toggleDetails/saveNotes. The `tags` column and assignSuggestedMedia's
+  // category matching in marketing.ts are untouched (this is a UI change,
+  // not a schema/matching change) — new and existing untagged items just
+  // match on their fallback "neutral" bucket same as always.
+  //
+  // Only one card's Details panel is open at a time — simpler than tracking
+  // a per-card draft, and matches how the rest of this app opens one editor
+  // at a time rather than several at once.
+  const [expandedId, setExpandedId] = useState<string | null>(null);
+  const [notesDraft, setNotesDraft] = useState("");
+  const [savingNotes, setSavingNotes] = useState(false);
+
+  function toggleDetails(item: MediaRow) {
+    if (expandedId === item.id) {
+      setExpandedId(null);
+      return;
+    }
+    setExpandedId(item.id);
+    setNotesDraft(item.notes ?? "");
+  }
+
+  // Looked up fresh server-side by captionPhotoInVoice/captionVideoFramesInVoice
+  // every time this item gets (re)scanned — see marketing.ts — so this save
+  // alone is enough to make a note "count" toward future captions, no
+  // separate wiring needed here.
+  async function saveNotes(item: MediaRow) {
+    setSavingNotes(true);
+    setError(null);
     try {
-      await setMediaTags({ data: { agentId, mediaId: item.id, tags: nextTags } });
+      await setMediaNotes({ data: { agentId, mediaId: item.id, notes: notesDraft } });
+      const saved = notesDraft.trim() || null;
+      setMedia((prev) => (prev ? prev.map((m) => (m.id === item.id ? { ...m, notes: saved } : m)) : prev));
+      setExpandedId(null);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
-      setMedia((prev) => (prev ? prev.map((m) => (m.id === item.id ? { ...m, tags: item.tags } : m)) : prev));
+    } finally {
+      setSavingNotes(false);
     }
   }
 
@@ -5914,23 +5973,45 @@ export function MediaTab({ agentId, isAdmin }: { agentId: string; isAdmin: boole
                   {m.source === "upload" ? "Uploaded" : "Drive"}
                 </span>
               </div>
-              <div className="flex flex-wrap gap-1 px-2 pt-2">
-                {PHOTO_TAG_OPTIONS.map((tag) => {
-                  const active = m.tags.includes(tag);
-                  return (
-                    <button
-                      key={tag}
-                      onClick={() => toggleTag(m, tag)}
-                      className={`rounded-full border px-2 py-0.5 text-[10px] font-medium transition-colors ${
-                        active
-                          ? "border-primary bg-primary text-primary-foreground"
-                          : "border-border text-muted-foreground hover:border-primary/50"
-                      }`}
-                    >
-                      {tag}
-                    </button>
-                  );
-                })}
+              {/* Notes — replaces the tag chips 2026-11-15 per Mike. Hidden
+                  by default on both desktop and mobile (per his note on the
+                  same request: "Those notes are not available unless you
+                  click to enlarge") — this "Details" link is the enlarge
+                  step; the textarea only renders once it's clicked. */}
+              <div className="px-2 pt-2">
+                <button
+                  onClick={() => toggleDetails(m)}
+                  className="text-[11px] font-semibold text-muted-foreground underline hover:text-foreground"
+                >
+                  {expandedId === m.id ? "Hide details" : m.notes ? "Details" : "Add notes"}
+                </button>
+                {expandedId === m.id && (
+                  <div className="mt-2 space-y-2 rounded-xl border border-border bg-background/40 p-2">
+                    <textarea
+                      value={notesDraft}
+                      onChange={(e) => setNotesDraft(e.target.value)}
+                      placeholder='e.g. "Me and my aunt Sue"'
+                      rows={2}
+                      maxLength={500}
+                      className="w-full resize-none rounded-lg border border-border bg-glass px-2 py-1.5 text-xs outline-none"
+                    />
+                    <div className="flex items-center gap-2">
+                      <button
+                        onClick={() => saveNotes(m)}
+                        disabled={savingNotes}
+                        className="rounded-full bg-primary px-3 py-1 text-[11px] font-semibold text-primary-foreground disabled:opacity-50"
+                      >
+                        {savingNotes ? "Saving…" : "Save"}
+                      </button>
+                      <button
+                        onClick={() => setExpandedId(null)}
+                        className="text-[11px] font-medium text-muted-foreground hover:text-foreground"
+                      >
+                        Cancel
+                      </button>
+                    </div>
+                  </div>
+                )}
               </div>
               <div className="flex flex-wrap gap-1 p-2">
                 {status === "available" ? (

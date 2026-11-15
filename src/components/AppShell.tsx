@@ -28,12 +28,18 @@ import logoWhite from "@/assets/logo-white.png";
 // Dude" at its new /posts route, and "Build My Brand" → "My Brand". Icons
 // added alongside the rename since this list now also drives the mobile
 // tile grid below, which needs something more visual than just a label.
+//
+// RENAMED AGAIN 2026-11-15 per Mike, off the nav screenshot: "Call 'Media'
+// Upload Photos/Videos. Make My Marketing Dude to 'Individual Content'" —
+// the /posts and /media routes themselves keep their internal names
+// (AgentScopedPage's title prop in posts.tsx/media.tsx — updated to match),
+// only the label shown here changes.
 const NAV = [
   { to: "/database", label: "Build My Database", exact: false, Icon: Database },
   { to: "/voice", label: "My Brand", exact: false, Icon: Sparkles },
   { to: "/marketing", label: "Create My Monthly Content", exact: false, Icon: Calendar },
-  { to: "/posts", label: "My Marketing Dude", exact: false, Icon: MessagesSquare },
-  { to: "/media", label: "Media", exact: false, Icon: Image },
+  { to: "/posts", label: "Individual Content", exact: false, Icon: MessagesSquare },
+  { to: "/media", label: "Upload Photos/Videos", exact: false, Icon: Image },
   { to: "/account", label: "Account", exact: false, Icon: UserCircle },
 ] as const;
 

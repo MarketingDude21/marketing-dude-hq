@@ -56,6 +56,7 @@ import {
   restoreArchivedBatch,
   scanAgentDrivePhotos,
   scanAgentLibraryPhotos,
+  scanMediaLibraryForMonth,
   addPhotoPostsToBatch,
   regeneratePhotoScanCaption,
   approveBatch,
@@ -7264,6 +7265,14 @@ function MonthWorkspace({
   const [generating, setGenerating] = useState(false);
   const [genError, setGenError] = useState<string | null>(null);
   const [lastBatchId, setLastBatchId] = useState<string | null>(null);
+  // "Scan My Media Library for This Month's Content" — the second, parallel
+  // path next to Generate Now, added 2026-11-15. Deliberately its own
+  // state, not shared with generating/genError above, since the two run
+  // independently and a user could plausibly want to see one's result
+  // without it being clobbered by the other.
+  const [scanning, setScanning] = useState(false);
+  const [scanError, setScanError] = useState<string | null>(null);
+  const [scanNote, setScanNote] = useState<string | null>(null);
   const [posts, setPosts] = useState<Post[] | null>(null);
   const [postsError, setPostsError] = useState<string | null>(null);
   // Defaults open (2026-09-18, per Mike: "have it already open... I want that
@@ -7477,6 +7486,42 @@ function MonthWorkspace({
     }
   }
 
+  // Additive by design, unlike generate() above — clicking this again is
+  // "scan more," not "replace," so it never deletes anything first. Skips
+  // photos already turned into a pending scan post this month (collected
+  // from batchPosts below) so a second click naturally reaches for FRESH
+  // photos instead of re-scanning ones already sitting in review.
+  async function scanLibrary() {
+    setScanning(true);
+    setScanError(null);
+    setScanNote(null);
+    try {
+      const alreadyScanned = batchPosts
+        .filter((p) => p.metadata?.source === "library_photo_scan")
+        .map((p) => p.metadata?.media_id)
+        .filter((id): id is string => Boolean(id));
+      const res = await scanMediaLibraryForMonth({
+        data: { agentId, month: folder.month, excludeFileIds: alreadyScanned },
+      });
+      setLastBatchId(res.batchId ?? lastBatchId);
+      if (res.created === 0) {
+        setScanNote("No unused photos left to scan — upload more to the Media Library, then scan again.");
+      } else if (res.created < res.requested) {
+        setScanNote(
+          `Created ${res.created} of ${res.requested} — only ${res.available} unused photo${res.available === 1 ? "" : "s"} ` +
+            "were available to scan. Upload more and scan again for a fuller month.",
+        );
+      } else {
+        setScanNote(`Created ${res.created} posts from your photos — review them below before anything's scheduled.`);
+      }
+      loadPosts();
+    } catch (e) {
+      setScanError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setScanning(false);
+    }
+  }
+
   // Explicit confirmation text alongside the download — added per Mike's
   // report (2026-09-18) that Approve All seemed to do nothing until he
   // navigated away and back. The download itself is one signal something
@@ -7576,6 +7621,15 @@ function MonthWorkspace({
                 Cancel
               </Button>
             )}
+            {/* Second, parallel path next to Generate Now — added 2026-11-15
+                per Mike's photo-first redesign. Deliberately NOT a toggle or
+                a replacement for the button above: both stay real, working
+                options so there's an actual side-by-side comparison on real
+                agents, same reasoning as the rest of
+                claude/photo-first-monthly-content-scoping.md. */}
+            <Button variant="secondary" onClick={scanLibrary} disabled={scanning}>
+              {scanning ? "Scanning…" : "Scan My Media Library for This Month's Content"}
+            </Button>
           </div>
         </div>
         {generateArmed && !generating && (
@@ -7585,6 +7639,8 @@ function MonthWorkspace({
           </p>
         )}
         {genError && <p className="mt-2 text-xs text-destructive">{genError}</p>}
+        {scanError && <p className="mt-2 text-xs text-destructive">{scanError}</p>}
+        {scanNote && <p className="mt-2 text-xs text-muted-foreground">{scanNote}</p>}
       </Card>
 
       {/* Moved here (right under Generate Now) 2026-09-29 per Mike: "Public

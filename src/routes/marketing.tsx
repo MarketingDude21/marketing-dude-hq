@@ -206,7 +206,15 @@ const CATEGORY_META: Record<ContentCategory, { label: string; icon: string; acce
 function categorizePost(post: Post): ContentCategory {
   if (post.content_type === "email") return "email";
   if (post.content_type === "video") return "video";
-  return post.metadata?.canva_link ? "canva" : "post";
+  // Widened 2026-11-15 per Mike, re: the new "Scan Videos" button: "The
+  // videos will just scan as reels. They won't be posts. They'll be called
+  // reels." Any post whose actual attached media is a video — a Canva
+  // template Reel (canva_link, no real media) and a scanned-from-footage
+  // Reel (metadata.media_type === "video", a real playable clip) alike —
+  // shows under "Reels," never "Posts." This also reclassifies the
+  // existing "Scan my videos" (Reels chat tab) posts the same way, since
+  // they were always conceptually Reels too, just never bucketed as one.
+  return post.metadata?.canva_link || post.metadata?.media_type === "video" ? "canva" : "post";
 }
 
 function Card({ children, className = "" }: { children: React.ReactNode; className?: string }) {
@@ -7358,6 +7366,14 @@ function MonthWorkspace({
   const [scanning, setScanning] = useState(false);
   const [scanError, setScanError] = useState<string | null>(null);
   const [scanNote, setScanNote] = useState<string | null>(null);
+  // "Scan Videos" — the Reels counterpart, added 2026-11-15 per Mike: "next
+  // to the blue button that says scan photos, there should just be a scan
+  // videos... it should do the exact same thing as the photo tool does."
+  // Own state for the same reason scanning/scanError/scanNote above are
+  // separate from generating/genError — these two scans run independently.
+  const [scanningVideos, setScanningVideos] = useState(false);
+  const [scanVideoError, setScanVideoError] = useState<string | null>(null);
+  const [scanVideoNote, setScanVideoNote] = useState<string | null>(null);
   const [posts, setPosts] = useState<Post[] | null>(null);
   const [postsError, setPostsError] = useState<string | null>(null);
   // Defaults open (2026-09-18, per Mike: "have it already open... I want that
@@ -7607,6 +7623,114 @@ function MonthWorkspace({
     }
   }
 
+  // "Scan Videos" — the Reels counterpart to Scan My Media Library, added
+  // 2026-11-15 per Mike: "next to the blue button that says scan photos,
+  // there should just be a scan videos. And it should do the exact same
+  // thing as the photo tool does." Can't be one server round trip like
+  // scanLibrary above — Claude's vision API reads images, not video bytes,
+  // and this server has no video decoder, so frames have to come from the
+  // browser (extractVideoFrames, same as the existing "Scan my videos" tool
+  // on the Reels chat tab) before a caption call can happen at all. Each
+  // video is captioned and saved as its own round trip; one failing doesn't
+  // stop the rest.
+  //
+  // Capped at 4 PER MONTH, not "4 per click" — per Mike: "we should be able
+  // to scan up to 4 videos per month... as long as it has them, it'll scan
+  // up to 4 per month." Unlike scanLibrary's photos (no ceiling, just click
+  // again for more), this counts how many library-scanned video Reels this
+  // month already has and only asks for the rest, refusing outright once 4
+  // exist — archiving or deleting one frees up a slot for a different video.
+  const MAX_VIDEO_REELS_PER_MONTH = 4;
+
+  async function scanVideos() {
+    setScanningVideos(true);
+    setScanVideoError(null);
+    setScanVideoNote(null);
+    try {
+      const alreadyScanned = batchPosts
+        .filter((p) => p.metadata?.source === "library_video_scan")
+        .map((p) => p.metadata?.media_id)
+        .filter((id): id is string => Boolean(id));
+      const remainingSlots = MAX_VIDEO_REELS_PER_MONTH - alreadyScanned.length;
+      if (remainingSlots <= 0) {
+        setScanVideoNote(
+          `This month already has its ${MAX_VIDEO_REELS_PER_MONTH} scanned video Reels — that's the monthly cap. ` +
+            "Archive or delete one below to make room for a different video.",
+        );
+        return;
+      }
+      const res = await listAgentScannableVideos({
+        data: { agentId, maxVideos: remainingSlots, excludeFileIds: alreadyScanned },
+      });
+      if (!res.videos.length) {
+        setScanVideoNote("No new unused short-form videos found in your Media Library — upload some, then scan again.");
+        return;
+      }
+      const items: {
+        title: string;
+        content: string;
+        source: "library";
+        sourceId: string;
+        thumbnailUrl: string;
+        textOverlaySuggestions: string[];
+        mediaType: "video";
+        mediaUrl: string;
+      }[] = [];
+      const failures: string[] = [];
+      for (const v of res.videos) {
+        try {
+          const frames = await extractVideoFrames(v.url, 5);
+          const caption = await captionVideoFrames({ data: { agentId, frames, mediaId: v.id } });
+          items.push({
+            title: caption.description.slice(0, 60),
+            content: caption.suggestedPost,
+            source: "library",
+            sourceId: v.id,
+            thumbnailUrl: `data:image/jpeg;base64,${frames[0]}`,
+            textOverlaySuggestions: caption.textOverlaySuggestions,
+            mediaType: "video",
+            mediaUrl: v.url,
+          });
+        } catch (e) {
+          failures.push(e instanceof Error ? e.message : String(e));
+        }
+      }
+      if (items.length) {
+        await addPhotoPostsToBatch({
+          data: { agentId, month: folder.month, batchId: activeBatchId ?? undefined, items },
+        });
+        loadPosts();
+      }
+      const madeIt = alreadyScanned.length + items.length;
+      // Honest about partial failure the same way scanLibrary's "created X
+      // of Y" is — a video that failed to extract frames or caption isn't
+      // silently dropped from the count.
+      const failureSuffix =
+        failures.length > 0
+          ? ` (${failures.length} other video${failures.length === 1 ? "" : "s"} couldn't be read.)`
+          : "";
+      if (items.length === 0) {
+        setScanVideoError(failures[0] ?? "Couldn't read any of those videos — try again.");
+      } else if (madeIt < MAX_VIDEO_REELS_PER_MONTH) {
+        setScanVideoNote(
+          `Scanned ${items.length} video${items.length === 1 ? "" : "s"} into Reels (${madeIt} of ` +
+            `${MAX_VIDEO_REELS_PER_MONTH} this month) — review ${items.length === 1 ? "it" : "them"} below. Upload more ` +
+            `short-form video to reach the cap.${failureSuffix}`,
+        );
+      } else {
+        setScanVideoNote(
+          `Scanned ${items.length} video${items.length === 1 ? "" : "s"} into Reels (${madeIt} of ` +
+            `${MAX_VIDEO_REELS_PER_MONTH} this month) — review ${items.length === 1 ? "it" : "them"} below before ` +
+            `anything's scheduled.${failureSuffix}`,
+        );
+      }
+    } catch (e) {
+      setScanVideoError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setScanningVideos(false);
+    }
+  }
+
   // Explicit confirmation text alongside the download — added per Mike's
   // report (2026-09-18) that Approve All seemed to do nothing until he
   // navigated away and back. The download itself is one signal something
@@ -7715,6 +7839,14 @@ function MonthWorkspace({
             <Button variant="secondary" onClick={scanLibrary} disabled={scanning}>
               {scanning ? "Scanning…" : "Scan My Media Library for This Month's Content"}
             </Button>
+            {/* Reels counterpart, added 2026-11-15 per Mike: "next to the
+                blue button that says scan photos, there should just be a
+                scan videos." Same approve/edit/flag review as every other
+                post — nothing publishes itself just because it came from a
+                scan. */}
+            <Button variant="secondary" onClick={scanVideos} disabled={scanningVideos}>
+              {scanningVideos ? "Scanning…" : "Scan Videos"}
+            </Button>
           </div>
         </div>
         {generateArmed && !generating && (
@@ -7726,6 +7858,8 @@ function MonthWorkspace({
         {genError && <p className="mt-2 text-xs text-destructive">{genError}</p>}
         {scanError && <p className="mt-2 text-xs text-destructive">{scanError}</p>}
         {scanNote && <p className="mt-2 text-xs text-muted-foreground">{scanNote}</p>}
+        {scanVideoError && <p className="mt-2 text-xs text-destructive">{scanVideoError}</p>}
+        {scanVideoNote && <p className="mt-2 text-xs text-muted-foreground">{scanVideoNote}</p>}
       </Card>
 
       {/* Moved here (right under Generate Now) 2026-09-29 per Mike: "Public

@@ -42,6 +42,12 @@ import {
 // that logic. See the "Build My Brand — admin act as agent" comment block
 // in voice-dna.ts for the full story on why this page needed it.
 import { getMarketingAccess, listMarketingAgents, type MarketingAccess } from "@/lib/marketing";
+// MicButton is a UI component (not a server function), so it comes from the
+// routes file where it's defined, same path posts.tsx/media.tsx already use
+// to reuse AgentScopedPage from this same file — added 2026-11-15 so Content
+// Branding Strategy and the Bio Writer's free-text fields get the same
+// voice-dictation input every other long-text box in the app already has.
+import { MicButton } from "@/routes/marketing";
 
 export const Route = createFileRoute("/voice")({
   head: () => ({
@@ -1121,6 +1127,15 @@ function VoiceWorkspace({
 
   const question = VOICE_DNA_QUESTIONS[currentQuestion] ?? VOICE_DNA_QUESTIONS[0]!;
   const progressPct = Math.round((currentQuestion / VOICE_DNA_QUESTIONS.length) * 100);
+  // Onboarding gate — added 2026-11-15 per Mike: "The DNA Questionnaire
+  // should be the first thing they see on this page and step 1 for the
+  // entire app. Everything else in the app should be locked out until the
+  // DNA Questionnaire is answered and headshot and logo are uploaded."
+  // Admin bypass: an admin acting on an agent's behalf is how an agent's
+  // onboarding usually gets finished in the first place (uploading their
+  // headshot/logo, filling in Business Info for them) — locking admin out
+  // of this same page would make it impossible to ever do that.
+  const onboardingLocked = !isAdmin && !(stage === "done" && headshotUrl && logoUrl);
 
   return (
     <AppShell>
@@ -1140,631 +1155,6 @@ function VoiceWorkspace({
             )}
           </div>
         )}
-
-        {/* Brand Assets (2026-09-28) — headshot + logo, per Mike: "the whole
-            Build My Brand section should be a place where they could take
-            their interview. They should also be able to upload their
-            headshots and logos to this section... this needs to be the
-            build my brand section... it needs to incorporate anything and
-            everything that they would have for building their own personal
-            brand." Shown above the interview, on every stage, since these
-            aren't part of the linear interview flow — upload/replace either
-            one any time. Built now: upload + storage + display, tagged so
-            we always know whose brand each asset belongs to. NOT built yet
-            (no spec from Mike to build against): automatic brand-color
-            extraction from these images, a bio builder, and Facebook/
-            YouTube header generation — Mike flagged those as "eventually"
-            additions to this same section; tracked in build-status.md as
-            roadmap, not part of this pass. */}
-        <div className="mb-5 rounded-3xl border border-border bg-glass p-6 backdrop-blur-2xl">
-          <h2 className="font-display text-lg font-semibold">Headshot & Logo</h2>
-          <p className="mt-1 text-sm text-muted-foreground">
-            Upload a headshot and your logo — these will power your brand colors and everything else we build for you
-            going forward.
-          </p>
-          <div className="mt-4 grid grid-cols-1 gap-4 sm:grid-cols-2">
-            {[
-              { kind: "headshot" as const, label: "Headshot", url: headshotUrl },
-              { kind: "logo" as const, label: "Logo", url: logoUrl },
-            ].map((slot) => (
-              <div
-                key={slot.kind}
-                className="flex items-center gap-4 rounded-2xl border border-border bg-background/40 p-4"
-              >
-                <div className="grid size-16 shrink-0 place-items-center overflow-hidden rounded-2xl border border-border bg-muted">
-                  {slot.url ? (
-                    <img src={slot.url} alt={slot.label} className="size-full object-cover" />
-                  ) : (
-                    <span className="text-[10px] text-muted-foreground">No {slot.label.toLowerCase()}</span>
-                  )}
-                </div>
-                <div className="min-w-0 flex-1">
-                  <p className="text-sm font-medium">{slot.label}</p>
-                  <div className="mt-1.5 flex flex-wrap items-center gap-2">
-                    <label className="inline-block cursor-pointer rounded-full border border-border bg-glass px-3 py-1.5 text-xs font-semibold transition-colors hover:bg-secondary">
-                      {uploadingKind === slot.kind ? "Uploading…" : slot.url ? "Replace" : "Choose file"}
-                      <input
-                        type="file"
-                        accept="image/*"
-                        className="hidden"
-                        disabled={uploadingKind !== null}
-                        onChange={(e) => {
-                          const file = e.target.files?.[0];
-                          e.target.value = "";
-                          if (file) uploadBrandAsset(file, slot.kind);
-                        }}
-                      />
-                    </label>
-                    {/* Downloadable (2026-10-22) per Mike: "when somebody
-                        uploads their headshot and their logo, we need it to
-                        be downloadable so that we can download it from
-                        there and then use it." These are already public
-                        Storage URLs (see finalizeBrandAssetUpload in
-                        voice-dna.ts) - this just gives an explicit download
-                        affordance instead of relying on right-click-save. */}
-                    {slot.url && (
-                      <a
-                        href={slot.url}
-                        download
-                        className="inline-block rounded-full border border-border bg-glass px-3 py-1.5 text-xs font-semibold transition-colors hover:bg-secondary"
-                      >
-                        Download
-                      </a>
-                    )}
-                  </div>
-                </div>
-              </div>
-            ))}
-          </div>
-          {brandAssetError && <p className="mt-3 text-xs text-destructive">{brandAssetError}</p>}
-        </div>
-
-        {/* Generate My Branding Kit (2026-11-13) — per Mike: "we want to
-            turn this app into here's who I am and what I look like, now
-            give me a whole branding kit with the click of a button." Runs
-            Scan My Website (if a website's on file), the Brand Bio Writer,
-            and Branding Graphics in one go — see handleGenerateBrandKit.
-            Placed right under Headshot & Logo since that's literally "who
-            I am and what I look like," everything else below still works
-            on its own for re-runs/tweaks (a different tone, a different
-            template, re-picking the background photo). */}
-        <div className="mb-5 rounded-3xl border border-primary/40 bg-glass p-6 backdrop-blur-2xl">
-          <h2 className="font-display text-lg font-semibold">Generate My Branding Kit</h2>
-          <p className="mt-1 text-sm text-muted-foreground">
-            One click: scans your website if you've added one, writes all 5 bios below, and builds your YouTube banner
-            and Facebook cover — all from your headshot, logo, and Voice DNA.
-          </p>
-          <div className="mt-4 flex items-center gap-3">
-            <button
-              onClick={handleGenerateBrandKit}
-              disabled={kitGenerating || !headshotUrl}
-              className="rounded-xl bg-primary px-5 py-2.5 text-sm font-semibold text-primary-foreground shadow-lg shadow-primary/30 transition-transform hover:-translate-y-0.5 disabled:opacity-60"
-            >
-              {kitGenerating ? (kitStatus ?? "Building your kit…") : "Generate my branding kit"}
-            </button>
-            {!headshotUrl && <p className="text-xs text-muted-foreground">Upload a headshot above first.</p>}
-          </div>
-        </div>
-
-        {/* Business Info (2026-10-22) — per Mike: "beneath the headshot logo
-            section, we should put in the rest of their information, where
-            they could put their phone number, their website, their license
-            number if applicable, their email address, and the address, like
-            where their office location is." Live independent of interview
-            stage, same as Headshot & Logo above — saved with its own
-            button, not gated behind finishing the 16-question interview.
-            Phone is the same canonical number the interview's own Basics
-            step edits (see handleSaveBusinessInfo). */}
-        <div className="mb-5 rounded-3xl border border-border bg-glass p-6 backdrop-blur-2xl">
-          <h2 className="font-display text-lg font-semibold">Business Info</h2>
-          <p className="mt-1 text-sm text-muted-foreground">
-            The contact details your brand assets and bio will be built from.
-          </p>
-          <div className="mt-4 grid grid-cols-1 gap-3 sm:grid-cols-2">
-            <label className="block">
-              <span className="text-xs font-medium text-muted-foreground">Phone</span>
-              <input
-                value={basics.phone}
-                onChange={(e) => setBasics((b) => ({ ...b, phone: e.target.value }))}
-                className="mt-1 w-full rounded-xl border border-border bg-background/60 px-3 py-2 text-sm outline-none ring-ring transition focus:ring-2"
-              />
-            </label>
-            <label className="block">
-              <span className="text-xs font-medium text-muted-foreground">Website</span>
-              <input
-                value={businessInfo.website}
-                onChange={(e) => setBusinessInfo((b) => ({ ...b, website: e.target.value }))}
-                className="mt-1 w-full rounded-xl border border-border bg-background/60 px-3 py-2 text-sm outline-none ring-ring transition focus:ring-2"
-              />
-            </label>
-            <label className="block">
-              <span className="text-xs font-medium text-muted-foreground">License number (if applicable)</span>
-              <input
-                value={businessInfo.licenseNumber}
-                onChange={(e) => setBusinessInfo((b) => ({ ...b, licenseNumber: e.target.value }))}
-                className="mt-1 w-full rounded-xl border border-border bg-background/60 px-3 py-2 text-sm outline-none ring-ring transition focus:ring-2"
-              />
-            </label>
-            <label className="block">
-              <span className="text-xs font-medium text-muted-foreground">Email</span>
-              <input
-                value={businessInfo.email}
-                onChange={(e) => setBusinessInfo((b) => ({ ...b, email: e.target.value }))}
-                className="mt-1 w-full rounded-xl border border-border bg-background/60 px-3 py-2 text-sm outline-none ring-ring transition focus:ring-2"
-              />
-            </label>
-            <label className="block sm:col-span-2">
-              <span className="text-xs font-medium text-muted-foreground">Office address</span>
-              <input
-                value={businessInfo.officeAddress}
-                onChange={(e) => setBusinessInfo((b) => ({ ...b, officeAddress: e.target.value }))}
-                className="mt-1 w-full rounded-xl border border-border bg-background/60 px-3 py-2 text-sm outline-none ring-ring transition focus:ring-2"
-              />
-            </label>
-          </div>
-          <div className="mt-4 flex items-center gap-3">
-            <button
-              onClick={handleSaveBusinessInfo}
-              disabled={businessInfoSaving}
-              className="rounded-xl bg-primary px-4 py-2 text-xs font-semibold text-primary-foreground shadow-lg shadow-primary/30 transition-transform hover:-translate-y-0.5 disabled:opacity-60"
-            >
-              {businessInfoSaving ? "Saving…" : "Save business info"}
-            </button>
-            {businessInfoStatus && <p className="text-xs text-muted-foreground">{businessInfoStatus}</p>}
-          </div>
-
-          {/* Scan My Website (2026-11-13) — per Mike: "you should be able to
-              scan their website and create content too, to grab other
-              images etc if need be, but the only thing you should need is
-              headshot and logo." Pulls the page's title/description (woven
-              into the bios below as extra context) and a few photos
-              (re-hosted, selectable as an optional Branding Graphics
-              background further down) — see scanAgentWebsite in
-              voice-dna.ts. Entirely optional; nothing downstream requires
-              it. */}
-          <div className="mt-4 border-t border-border pt-4">
-            <div className="flex flex-wrap items-center gap-3">
-              <button
-                onClick={handleScanWebsite}
-                disabled={scanningWebsite || !businessInfo.website.trim()}
-                className="rounded-xl border border-border bg-glass px-4 py-2 text-xs font-semibold transition-colors hover:bg-secondary disabled:opacity-60"
-              >
-                {scanningWebsite ? "Scanning…" : websiteScan ? "Re-scan website" : "Scan my website"}
-              </button>
-              <p className="text-xs text-muted-foreground">
-                Optional — pulls a bit of copy and a few photos from your own site to help write your bios and build
-                your graphics.
-              </p>
-            </div>
-            {scanError && <p className="mt-2 text-xs text-destructive">{scanError}</p>}
-            {websiteScan && !scanError && (
-              <div className="mt-3 rounded-xl border border-border bg-background/40 p-3">
-                <p className="text-xs text-muted-foreground">
-                  {websiteScan.title ? <span className="font-medium text-foreground">{websiteScan.title}</span> : null}
-                  {websiteScan.description ? ` — ${websiteScan.description}` : ""}
-                  {!websiteScan.title && !websiteScan.description
-                    ? "Scanned — no page title or description found."
-                    : ""}
-                </p>
-                {websiteScan.images.length > 0 && (
-                  <p className="mt-1.5 text-[11px] text-muted-foreground">
-                    Found {websiteScan.images.length} photo{websiteScan.images.length === 1 ? "" : "s"} — pick one as a
-                    background in Branding Graphics below.
-                  </p>
-                )}
-              </div>
-            )}
-          </div>
-        </div>
-
-        {/* Content Branding Strategy (2026-10-22) — per Mike: "once somebody
-            is finished with the interview... I want to add a section...
-            called their content branding strategy. This section will just
-            have a document that I can upload inside of here that'll also
-            play into their voice DNA profile." Also live independent of
-            interview stage. UPDATED 2026-11-05 — Mike asked whether this
-            could "connect to" an agent's own existing custom GPT or Claude
-            project directly; neither OpenAI nor Anthropic expose an API for
-            a third party to read someone else's account that way, so this
-            is the real answer instead: paste or upload whatever you already
-            gave your GPT/Claude (its instructions, its knowledge files)
-            right here. Now auto-extracts .docx and .pdf client side too
-            (mammoth/pdf.js), not just .txt/.md, since a brand kit or a
-            custom GPT's knowledge file is almost always one of those — see
-            handleContentStrategyFile. Also doubles as where Mike uploads a
-            brand kit/content strategy HE builds for an agent himself — the
-            admin "Change agent" picker above switches this whole page to
-            any agent, Content Branding Strategy included, same as Business
-            Info already does. Once saved, this gets woven into every
-            content-generation prompt built from this agent's Voice DNA (see
-            withContentBrandingStrategy in marketing.ts). */}
-        <div className="mb-5 rounded-3xl border border-border bg-glass p-6 backdrop-blur-2xl">
-          <h2 className="font-display text-lg font-semibold">Content Branding Strategy</h2>
-          <p className="mt-1 text-sm text-muted-foreground">
-            Optional — a content/brand strategy doc for this agent (recurring series ideas, content pillars, tone
-            notes). Already built a custom GPT or a Claude project for this agent's brand voice? Paste its instructions
-            here, or upload the file(s) you gave it — this is where that goes. Upload a file or paste below; it gets
-            factored in alongside their Voice DNA every time we write for them.
-          </p>
-          <label className="mt-3 inline-block cursor-pointer rounded-full border border-border bg-glass px-3 py-1.5 text-xs font-semibold transition-colors hover:bg-secondary">
-            Upload a .txt/.md/.docx/.pdf file
-            <input
-              type="file"
-              accept=".txt,.md,.docx,.pdf,text/plain,text/markdown,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-              className="hidden"
-              onChange={(e) => {
-                const file = e.target.files?.[0];
-                e.target.value = "";
-                if (file) handleContentStrategyFile(file);
-              }}
-            />
-          </label>
-          <textarea
-            value={contentStrategy}
-            onChange={(e) => setContentStrategy(e.target.value)}
-            placeholder="Paste or upload this agent's content branding strategy here…"
-            rows={8}
-            className="mt-3 w-full resize-y rounded-2xl border border-border bg-background/60 px-4 py-3 text-sm outline-none ring-ring transition focus:ring-2"
-          />
-          <div className="mt-3 flex items-center gap-3">
-            <button
-              onClick={handleSaveContentStrategy}
-              disabled={contentStrategySaving}
-              className="rounded-xl bg-primary px-4 py-2 text-xs font-semibold text-primary-foreground shadow-lg shadow-primary/30 transition-transform hover:-translate-y-0.5 disabled:opacity-60"
-            >
-              {contentStrategySaving ? "Saving…" : "Save content strategy"}
-            </button>
-            {contentStrategyStatus && <p className="text-xs text-muted-foreground">{contentStrategyStatus}</p>}
-          </div>
-        </div>
-
-        {/* Social Media Handles (2026-11-13) — per Mike: "we should also
-            plug in their social media handles, anywhere else where you
-            could pull public information on them, so that you can write a
-            bio." We asked Mike whether to actually scrape these live;
-            getting no clear answer, we went with the safer default he
-            pointed us toward ("you know what my goals are") — these are
-            reference text only, fed into the bio prompt below, never
-            fetched or scraped. Scraping Instagram/Facebook/LinkedIn/
-            Zillow/Trulia is fragile and likely against each platform's
-            ToS, and none of them offer a public API for this. */}
-        <div className="mb-5 rounded-3xl border border-border bg-glass p-6 backdrop-blur-2xl">
-          <h2 className="font-display text-lg font-semibold">Social Media Handles</h2>
-          <p className="mt-1 text-sm text-muted-foreground">
-            Optional — your usernames/profile links. We use these as reference when writing your bios below (never
-            scraped or fetched automatically), and weave the relevant ones in naturally.
-          </p>
-          <div className="mt-4 grid grid-cols-1 gap-3 sm:grid-cols-2">
-            {(
-              [
-                { key: "instagram" as const, label: "Instagram", placeholder: "@yourname" },
-                { key: "facebook" as const, label: "Facebook", placeholder: "facebook.com/yourname" },
-                { key: "linkedin" as const, label: "LinkedIn", placeholder: "linkedin.com/in/yourname" },
-                { key: "youtube" as const, label: "YouTube", placeholder: "youtube.com/@yourname" },
-                { key: "tiktok" as const, label: "TikTok", placeholder: "@yourname" },
-                { key: "zillow" as const, label: "Zillow profile", placeholder: "zillow.com/profile/yourname" },
-                { key: "trulia" as const, label: "Trulia profile", placeholder: "trulia.com/profile/yourname" },
-              ] satisfies { key: keyof AgentSocialHandles; label: string; placeholder: string }[]
-            ).map((field) => (
-              <label key={field.key} className="block">
-                <span className="text-xs font-medium text-muted-foreground">{field.label}</span>
-                <input
-                  value={socialHandles[field.key]}
-                  onChange={(e) => setSocialHandles((s) => ({ ...s, [field.key]: e.target.value }))}
-                  placeholder={field.placeholder}
-                  className="mt-1 w-full rounded-xl border border-border bg-background/60 px-3 py-2 text-sm outline-none ring-ring transition focus:ring-2"
-                />
-              </label>
-            ))}
-          </div>
-          <div className="mt-4 flex items-center gap-3">
-            <button
-              onClick={handleSaveSocialHandles}
-              disabled={socialHandlesSaving}
-              className="rounded-xl bg-primary px-4 py-2 text-xs font-semibold text-primary-foreground shadow-lg shadow-primary/30 transition-transform hover:-translate-y-0.5 disabled:opacity-60"
-            >
-              {socialHandlesSaving ? "Saving…" : "Save handles"}
-            </button>
-            {socialHandlesStatus && <p className="text-xs text-muted-foreground">{socialHandlesStatus}</p>}
-          </div>
-        </div>
-
-        {/* Connect Facebook & Instagram (2026-11-15) — Phase 1 of scheduling
-            content directly to Meta, per Mike: "All we want to do is be
-            able to schedule our content with the photos directly into
-            Meta, Instagram, and Facebook... I don't want to deal with a
-            lot of the dev right now." Goes through Upload-Post rather than
-            a Meta app of our own — see claude/upload-post-scheduling-
-            scoping.md for why. This card only connects the account; actual
-            scheduling of a post happens from the Content Calendar once an
-            agent is connected here. */}
-        <div className="mb-5 rounded-3xl border border-border bg-glass p-6 backdrop-blur-2xl">
-          <h2 className="font-display text-lg font-semibold">Connect Facebook &amp; Instagram</h2>
-          <p className="mt-1 text-sm text-muted-foreground">
-            Connect your real Facebook Page and Instagram Business/Creator account once, so posts from the Content
-            Calendar can be scheduled straight to them. This opens a secure page hosted by our scheduling provider —
-            your login never passes through this app.
-          </p>
-
-          {connectStatusError && (
-            <p className="mt-3 text-xs text-destructive">
-              {connectStatusError}
-              {connectStatusError.includes("UPLOAD_POST_API_KEY") ? null : (
-                <>
-                  {" "}
-                  <button onClick={loadConnectStatus} className="underline hover:text-foreground">
-                    Try again
-                  </button>
-                </>
-              )}
-            </p>
-          )}
-
-          {!connectStatusError && (
-            <div className="mt-3 flex flex-wrap items-center gap-2">
-              {(["facebook", "instagram"] as const).map((platform) => {
-                const isConnected = Boolean(connectStatus?.platforms.includes(platform));
-                return (
-                  <span
-                    key={platform}
-                    className={`rounded-full px-3 py-1 text-xs font-semibold ${
-                      isConnected ? "bg-primary/15 text-primary" : "bg-muted text-muted-foreground"
-                    }`}
-                  >
-                    {platform === "facebook" ? "Facebook" : "Instagram"} — {isConnected ? "Connected" : "Not connected"}
-                  </span>
-                );
-              })}
-              {connectStatus && connectStatus.platforms.includes("facebook") && (
-                <span className="text-xs text-muted-foreground">
-                  {connectStatus.facebookPages.length > 1
-                    ? `${connectStatus.facebookPages.length} Pages available — pick one when scheduling`
-                    : connectStatus.facebookPages.length === 1
-                      ? `Page: ${connectStatus.facebookPages[0]?.name}`
-                      : null}
-                </span>
-              )}
-            </div>
-          )}
-
-          <div className="mt-4 flex items-center gap-3">
-            <button
-              onClick={handleConnectSocial}
-              disabled={connecting}
-              className="rounded-xl bg-primary px-4 py-2 text-xs font-semibold text-primary-foreground shadow-lg shadow-primary/30 transition-transform hover:-translate-y-0.5 disabled:opacity-60"
-            >
-              {connecting
-                ? "Opening…"
-                : connectStatus?.connected
-                  ? "Reconnect / manage accounts"
-                  : "Connect Facebook & Instagram"}
-            </button>
-            <button
-              onClick={loadConnectStatus}
-              className="text-xs font-medium text-muted-foreground underline hover:text-foreground"
-            >
-              Refresh status
-            </button>
-          </div>
-        </div>
-
-        {/* Brand Bio Writer (2026-11-13) — per Mike: "we need to create a
-            done-for-you bio section that can be created just based on what
-            they've already created in that section... this should be no
-            different than I'm just typing in Claude. I need you to write a
-            bio based upon who I am... maybe we can rate it by, like, how do
-            you want to be — professional, personable, funny, relatable."
-            Pulls Voice DNA + Business Info + Content Branding Strategy +
-            the handles above into one prompt (see buildBrandBioPrompt in
-            voice-dna.ts) and returns 5 platform-specific variants in one
-            call. */}
-        <div className="mb-5 rounded-3xl border border-border bg-glass p-6 backdrop-blur-2xl">
-          <h2 className="font-display text-lg font-semibold">Brand Bio Writer</h2>
-          <p className="mt-1 text-sm text-muted-foreground">
-            Done-for-you bios for everywhere you need one — Instagram, Facebook, LinkedIn, your Zillow/Trulia profile,
-            and your website or YouTube About section — written from your Voice DNA, business info, and handles above.
-          </p>
-          <div className="mt-4">
-            <span className="text-xs font-medium text-muted-foreground">Tone</span>
-            <div className="mt-1.5 flex flex-wrap gap-1 rounded-full border border-border bg-glass p-1 backdrop-blur-xl w-fit">
-              {(["professional", "personable", "funny", "relatable"] as const satisfies BrandBioTone[]).map((t) => (
-                <button
-                  key={t}
-                  onClick={() => setBioTone(t)}
-                  className={`rounded-full px-4 py-1.5 text-sm font-medium capitalize transition-colors ${
-                    bioTone === t ? "bg-secondary text-foreground" : "text-muted-foreground hover:text-foreground"
-                  }`}
-                >
-                  {t}
-                </button>
-              ))}
-            </div>
-          </div>
-          <label className="mt-4 block">
-            <span className="text-xs font-medium text-muted-foreground">Anything else we should know? (optional)</span>
-            <textarea
-              value={bioExtraNotes}
-              onChange={(e) => setBioExtraNotes(e.target.value)}
-              placeholder="Hobbies, background, family, what makes you different — anything you want woven in."
-              rows={3}
-              className="mt-1 w-full resize-y rounded-2xl border border-border bg-background/60 px-4 py-3 text-sm outline-none ring-ring transition focus:ring-2"
-            />
-          </label>
-          <div className="mt-4 flex items-center gap-3">
-            <button
-              onClick={handleGenerateBios}
-              disabled={bioGenerating}
-              className="rounded-xl bg-primary px-4 py-2 text-xs font-semibold text-primary-foreground shadow-lg shadow-primary/30 transition-transform hover:-translate-y-0.5 disabled:opacity-60"
-            >
-              {bioGenerating ? "Writing your bios…" : bioResult ? "Regenerate bios" : "Write my bios"}
-            </button>
-            {bioError && <p className="text-xs text-destructive">{bioError}</p>}
-          </div>
-          {bioResult && (
-            <div className="mt-5 space-y-4">
-              {(
-                [
-                  { key: "instagram" as const, label: "Instagram bio", counter: true },
-                  { key: "facebook" as const, label: "Facebook intro" },
-                  { key: "linkedin" as const, label: "LinkedIn about" },
-                  { key: "realtorProfile" as const, label: "Realtor profile (Zillow / Trulia)" },
-                  { key: "websiteAbout" as const, label: "Website / YouTube about" },
-                ] satisfies { key: keyof BrandBioResult; label: string; counter?: boolean }[]
-              ).map((variant) => {
-                const text = bioResult[variant.key];
-                return (
-                  <div key={variant.key} className="rounded-2xl border border-border bg-background/40 p-4">
-                    <div className="flex items-center justify-between gap-3">
-                      <p className="text-sm font-semibold">{variant.label}</p>
-                      <button
-                        onClick={() => copyBioText(variant.key, text)}
-                        className="shrink-0 rounded-full border border-border bg-glass px-3 py-1 text-xs font-semibold transition-colors hover:bg-secondary"
-                      >
-                        {bioCopiedKey === variant.key ? "Copied!" : "Copy"}
-                      </button>
-                    </div>
-                    <p className="mt-2 whitespace-pre-wrap text-sm text-muted-foreground">{text}</p>
-                    {variant.counter && (
-                      <p className="mt-1.5 text-[11px] text-muted-foreground">{text.length} / 150 characters</p>
-                    )}
-                  </div>
-                );
-              })}
-            </div>
-          )}
-        </div>
-
-        {/* Branding Graphics v2 — real AI image generation (2026-11-13).
-            Mike's original ask: "take the headshot they uploaded and the
-            logo and be able to create really nice-looking YouTube headers,
-            Facebook covers... a couple different versions." The first pass
-            at this drew shapes on a <canvas> by hand; his reaction to that
-            ("worst cover photo ever... use all your resources... pretend
-            you are a graphic designer") is why this now calls an actual
-            image-generation model (OpenAI's gpt-image-1 — the model behind
-            image generation in ChatGPT, which he pointed at directly)
-            server-side with a real art-directed prompt, instead of drawing
-            shapes ourselves — see generateBrandGraphicAI in voice-dna.ts.
-            Needs an OPENAI_API_KEY secret added in Lovable Cloud →
-            Secrets (same setup as the existing ANTHROPIC_API_KEY) — the
-            error below says so plainly if it's missing. */}
-        <div className="mb-5 rounded-3xl border border-border bg-glass p-6 backdrop-blur-2xl">
-          <h2 className="font-display text-lg font-semibold">Branding Graphics</h2>
-          <p className="mt-1 text-sm text-muted-foreground">
-            A YouTube channel banner and a Facebook cover, designed by AI from your headshot, logo, brand color, and (if
-            you've scanned it) your website. Pick a style, adjust your tagline, and generate — download either one as a
-            PNG. Each generation takes a real image-generation model a little while, so this can take up to a minute.
-          </p>
-          {!headshotUrl && (
-            <p className="mt-3 text-xs text-destructive">Upload a headshot in the section above first.</p>
-          )}
-          <div className="mt-4">
-            <span className="text-xs font-medium text-muted-foreground">Style</span>
-            <div className="mt-1.5 flex flex-wrap gap-1 rounded-full border border-border bg-glass p-1 backdrop-blur-xl w-fit">
-              {(["bold-split", "photo-backdrop", "centered-minimal"] as const satisfies BrandGraphicTemplate[]).map(
-                (t) => (
-                  <button
-                    key={t}
-                    onClick={() => setGraphicTemplate(t)}
-                    className={`rounded-full px-4 py-1.5 text-sm font-medium transition-colors ${
-                      graphicTemplate === t
-                        ? "bg-secondary text-foreground"
-                        : "text-muted-foreground hover:text-foreground"
-                    }`}
-                  >
-                    {t === "bold-split"
-                      ? "Bold editorial"
-                      : t === "photo-backdrop"
-                        ? "Photo backdrop"
-                        : "Clean minimal"}
-                  </button>
-                ),
-              )}
-            </div>
-          </div>
-          <label className="mt-4 block">
-            <span className="text-xs font-medium text-muted-foreground">Tagline</span>
-            <input
-              value={graphicTagline ?? ""}
-              onChange={(e) => setGraphicTagline(e.target.value)}
-              placeholder="Real Estate Agent — Austin, TX"
-              className="mt-1 w-full rounded-xl border border-border bg-background/60 px-3 py-2 text-sm outline-none ring-ring transition focus:ring-2"
-            />
-          </label>
-          {/* Background photo (2026-11-13) — optional, only shows up once
-              Scan My Website (above, in Business Info) has actually found
-              photos. For the Photo Backdrop style this becomes the actual
-              background; for the other 2 styles it's used only as color/
-              mood inspiration. Picking "None" (the default when nothing's
-              been scanned) still produces a full designed graphic from
-              just headshot + logo, per Mike's "only thing you should
-              need." */}
-          {websiteScan && websiteScan.images.length > 0 && (
-            <div className="mt-4">
-              <span className="text-xs font-medium text-muted-foreground">Background photo (from your website)</span>
-              <div className="mt-1.5 flex flex-wrap gap-2">
-                <button
-                  onClick={() => setSelectedBackgroundImage(null)}
-                  className={`grid h-14 w-20 shrink-0 place-items-center rounded-lg border text-[10px] font-medium transition-colors ${
-                    selectedBackgroundImage === null
-                      ? "border-primary bg-secondary text-foreground"
-                      : "border-border bg-background/40 text-muted-foreground hover:bg-secondary"
-                  }`}
-                >
-                  None
-                </button>
-                {websiteScan.images.map((url) => (
-                  <button
-                    key={url}
-                    onClick={() => setSelectedBackgroundImage(url)}
-                    className={`h-14 w-20 shrink-0 overflow-hidden rounded-lg border-2 transition-colors ${
-                      selectedBackgroundImage === url ? "border-primary" : "border-transparent hover:border-border"
-                    }`}
-                  >
-                    <img src={url} alt="" className="size-full object-cover" />
-                  </button>
-                ))}
-              </div>
-            </div>
-          )}
-          <div className="mt-4 flex items-center gap-3">
-            <button
-              onClick={() => handleGenerateGraphics()}
-              disabled={graphicGenerating || !headshotUrl}
-              className="rounded-xl bg-primary px-4 py-2 text-xs font-semibold text-primary-foreground shadow-lg shadow-primary/30 transition-transform hover:-translate-y-0.5 disabled:opacity-60"
-            >
-              {graphicGenerating ? "Designing your graphics…" : "Generate graphics"}
-            </button>
-            {graphicError && <p className="text-xs text-destructive">{graphicError}</p>}
-          </div>
-          {(graphicPreviews.youtube || graphicPreviews.facebook) && (
-            <div className="mt-5 grid grid-cols-1 gap-4 sm:grid-cols-2">
-              {(
-                [
-                  { key: "youtube" as const, label: "YouTube banner" },
-                  { key: "facebook" as const, label: "Facebook cover" },
-                ] satisfies { key: BrandGraphicFormat; label: string }[]
-              ).map((item) => {
-                const url = graphicPreviews[item.key];
-                if (!url) return null;
-                return (
-                  <div key={item.key} className="rounded-2xl border border-border bg-background/40 p-4">
-                    <p className="text-sm font-semibold">{item.label}</p>
-                    <div className="mt-2 overflow-hidden rounded-xl border border-border bg-muted">
-                      <img src={url} alt={item.label} className="w-full object-cover" />
-                    </div>
-                    <button
-                      onClick={() => downloadGraphic(item.key)}
-                      className="mt-3 rounded-full border border-border bg-glass px-3 py-1.5 text-xs font-semibold transition-colors hover:bg-secondary"
-                    >
-                      Download
-                    </button>
-                  </div>
-                );
-              })}
-            </div>
-          )}
-        </div>
 
         {stage === "intro" && (
           <div className="rounded-3xl border border-border bg-glass p-8 backdrop-blur-2xl">
@@ -2089,6 +1479,667 @@ function VoiceWorkspace({
               </Link>
             </div>
           </div>
+        )}
+
+        {/* Brand Assets (2026-09-28) — headshot + logo, per Mike: "the whole
+            Build My Brand section should be a place where they could take
+            their interview. They should also be able to upload their
+            headshots and logos to this section... this needs to be the
+            build my brand section... it needs to incorporate anything and
+            everything that they would have for building their own personal
+            brand." Shown above the interview, on every stage, since these
+            aren't part of the linear interview flow — upload/replace either
+            one any time. Built now: upload + storage + display, tagged so
+            we always know whose brand each asset belongs to. NOT built yet
+            (no spec from Mike to build against): automatic brand-color
+            extraction from these images, a bio builder, and Facebook/
+            YouTube header generation — Mike flagged those as "eventually"
+            additions to this same section; tracked in build-status.md as
+            roadmap, not part of this pass. */}
+        <div className="mb-5 rounded-3xl border border-border bg-glass p-6 backdrop-blur-2xl">
+          <h2 className="font-display text-lg font-semibold">Headshot & Logo</h2>
+          <p className="mt-1 text-sm text-muted-foreground">
+            Upload a headshot and your logo — these will power your brand colors and everything else we build for you
+            going forward.
+          </p>
+          <div className="mt-4 grid grid-cols-1 gap-4 sm:grid-cols-2">
+            {[
+              { kind: "headshot" as const, label: "Headshot", url: headshotUrl },
+              { kind: "logo" as const, label: "Logo", url: logoUrl },
+            ].map((slot) => (
+              <div
+                key={slot.kind}
+                className="flex items-center gap-4 rounded-2xl border border-border bg-background/40 p-4"
+              >
+                <div className="grid size-16 shrink-0 place-items-center overflow-hidden rounded-2xl border border-border bg-muted">
+                  {slot.url ? (
+                    <img src={slot.url} alt={slot.label} className="size-full object-cover" />
+                  ) : (
+                    <span className="text-[10px] text-muted-foreground">No {slot.label.toLowerCase()}</span>
+                  )}
+                </div>
+                <div className="min-w-0 flex-1">
+                  <p className="text-sm font-medium">{slot.label}</p>
+                  <div className="mt-1.5 flex flex-wrap items-center gap-2">
+                    <label className="inline-block cursor-pointer rounded-full border border-border bg-glass px-3 py-1.5 text-xs font-semibold transition-colors hover:bg-secondary">
+                      {uploadingKind === slot.kind ? "Uploading…" : slot.url ? "Replace" : "Choose file"}
+                      <input
+                        type="file"
+                        accept="image/*"
+                        className="hidden"
+                        disabled={uploadingKind !== null}
+                        onChange={(e) => {
+                          const file = e.target.files?.[0];
+                          e.target.value = "";
+                          if (file) uploadBrandAsset(file, slot.kind);
+                        }}
+                      />
+                    </label>
+                    {/* Downloadable (2026-10-22) per Mike: "when somebody
+                        uploads their headshot and their logo, we need it to
+                        be downloadable so that we can download it from
+                        there and then use it." These are already public
+                        Storage URLs (see finalizeBrandAssetUpload in
+                        voice-dna.ts) - this just gives an explicit download
+                        affordance instead of relying on right-click-save. */}
+                    {slot.url && (
+                      <a
+                        href={slot.url}
+                        download
+                        className="inline-block rounded-full border border-border bg-glass px-3 py-1.5 text-xs font-semibold transition-colors hover:bg-secondary"
+                      >
+                        Download
+                      </a>
+                    )}
+                  </div>
+                </div>
+              </div>
+            ))}
+          </div>
+          {brandAssetError && <p className="mt-3 text-xs text-destructive">{brandAssetError}</p>}
+        </div>
+
+        {/* Everything below Headshot & Logo stays locked until the Voice
+            DNA interview is complete (stage "done") AND both a headshot
+            and a logo are on file — per Mike: writing a bio, building a
+            branding kit, or generating header graphics all need real brand
+            colors, a real headshot, and real information about this
+            person, none of which exist yet before that. */}
+        {onboardingLocked ? (
+          <div className="rounded-3xl border border-dashed border-border bg-glass p-8 text-center backdrop-blur-2xl">
+            <p className="font-display text-lg font-semibold">
+              Finish the steps above to unlock the rest of your brand kit
+            </p>
+            <p className="mx-auto mt-2 max-w-md text-sm text-muted-foreground">
+              Your branding kit, bios, Business Info, and header graphics all get built from your Voice DNA interview,
+              headshot, and logo — finish the interview above and upload both, and everything below unlocks
+              automatically.
+            </p>
+          </div>
+        ) : (
+          <>
+            {/* Generate My Branding Kit (2026-11-13) — per Mike: "we want to
+            turn this app into here's who I am and what I look like, now
+            give me a whole branding kit with the click of a button." Runs
+            Scan My Website (if a website's on file), the Brand Bio Writer,
+            and Branding Graphics in one go — see handleGenerateBrandKit.
+            Placed right under Headshot & Logo since that's literally "who
+            I am and what I look like," everything else below still works
+            on its own for re-runs/tweaks (a different tone, a different
+            template, re-picking the background photo). */}
+            <div className="mb-5 rounded-3xl border border-primary/40 bg-glass p-6 backdrop-blur-2xl">
+              <h2 className="font-display text-lg font-semibold">Generate My Branding Kit</h2>
+              <p className="mt-1 text-sm text-muted-foreground">
+                One click: scans your website if you've added one, writes all 5 bios below, and builds your YouTube
+                banner and Facebook cover — all from your headshot, logo, and Voice DNA.
+              </p>
+              <div className="mt-4 flex items-center gap-3">
+                <button
+                  onClick={handleGenerateBrandKit}
+                  disabled={kitGenerating || !headshotUrl}
+                  className="rounded-xl bg-primary px-5 py-2.5 text-sm font-semibold text-primary-foreground shadow-lg shadow-primary/30 transition-transform hover:-translate-y-0.5 disabled:opacity-60"
+                >
+                  {kitGenerating ? (kitStatus ?? "Building your kit…") : "Generate my branding kit"}
+                </button>
+                {!headshotUrl && <p className="text-xs text-muted-foreground">Upload a headshot above first.</p>}
+              </div>
+            </div>
+
+            {/* Business Info (2026-10-22) — per Mike: "beneath the headshot logo
+            section, we should put in the rest of their information, where
+            they could put their phone number, their website, their license
+            number if applicable, their email address, and the address, like
+            where their office location is." Live independent of interview
+            stage, same as Headshot & Logo above — saved with its own
+            button, not gated behind finishing the 16-question interview.
+            Phone is the same canonical number the interview's own Basics
+            step edits (see handleSaveBusinessInfo). */}
+            <div className="mb-5 rounded-3xl border border-border bg-glass p-6 backdrop-blur-2xl">
+              <h2 className="font-display text-lg font-semibold">Business Info</h2>
+              <p className="mt-1 text-sm text-muted-foreground">
+                The contact details your brand assets and bio will be built from.
+              </p>
+              <div className="mt-4 grid grid-cols-1 gap-3 sm:grid-cols-2">
+                <label className="block">
+                  <span className="text-xs font-medium text-muted-foreground">Phone</span>
+                  <input
+                    value={basics.phone}
+                    onChange={(e) => setBasics((b) => ({ ...b, phone: e.target.value }))}
+                    className="mt-1 w-full rounded-xl border border-border bg-background/60 px-3 py-2 text-sm outline-none ring-ring transition focus:ring-2"
+                  />
+                </label>
+                <label className="block">
+                  <span className="text-xs font-medium text-muted-foreground">Website</span>
+                  <input
+                    value={businessInfo.website}
+                    onChange={(e) => setBusinessInfo((b) => ({ ...b, website: e.target.value }))}
+                    className="mt-1 w-full rounded-xl border border-border bg-background/60 px-3 py-2 text-sm outline-none ring-ring transition focus:ring-2"
+                  />
+                </label>
+                <label className="block">
+                  <span className="text-xs font-medium text-muted-foreground">License number (if applicable)</span>
+                  <input
+                    value={businessInfo.licenseNumber}
+                    onChange={(e) => setBusinessInfo((b) => ({ ...b, licenseNumber: e.target.value }))}
+                    className="mt-1 w-full rounded-xl border border-border bg-background/60 px-3 py-2 text-sm outline-none ring-ring transition focus:ring-2"
+                  />
+                </label>
+                <label className="block">
+                  <span className="text-xs font-medium text-muted-foreground">Email</span>
+                  <input
+                    value={businessInfo.email}
+                    onChange={(e) => setBusinessInfo((b) => ({ ...b, email: e.target.value }))}
+                    className="mt-1 w-full rounded-xl border border-border bg-background/60 px-3 py-2 text-sm outline-none ring-ring transition focus:ring-2"
+                  />
+                </label>
+                <label className="block sm:col-span-2">
+                  <span className="text-xs font-medium text-muted-foreground">Office address</span>
+                  <input
+                    value={businessInfo.officeAddress}
+                    onChange={(e) => setBusinessInfo((b) => ({ ...b, officeAddress: e.target.value }))}
+                    className="mt-1 w-full rounded-xl border border-border bg-background/60 px-3 py-2 text-sm outline-none ring-ring transition focus:ring-2"
+                  />
+                </label>
+              </div>
+              <div className="mt-4 flex items-center gap-3">
+                <button
+                  onClick={handleSaveBusinessInfo}
+                  disabled={businessInfoSaving}
+                  className="rounded-xl bg-primary px-4 py-2 text-xs font-semibold text-primary-foreground shadow-lg shadow-primary/30 transition-transform hover:-translate-y-0.5 disabled:opacity-60"
+                >
+                  {businessInfoSaving ? "Saving…" : "Save business info"}
+                </button>
+                {businessInfoStatus && <p className="text-xs text-muted-foreground">{businessInfoStatus}</p>}
+              </div>
+
+              {/* Scan My Website (2026-11-13) — per Mike: "you should be able to
+              scan their website and create content too, to grab other
+              images etc if need be, but the only thing you should need is
+              headshot and logo." Pulls the page's title/description (woven
+              into the bios below as extra context) and a few photos
+              (re-hosted, selectable as an optional Branding Graphics
+              background further down) — see scanAgentWebsite in
+              voice-dna.ts. Entirely optional; nothing downstream requires
+              it. */}
+              <div className="mt-4 border-t border-border pt-4">
+                <div className="flex flex-wrap items-center gap-3">
+                  <button
+                    onClick={handleScanWebsite}
+                    disabled={scanningWebsite || !businessInfo.website.trim()}
+                    className="rounded-xl border border-border bg-glass px-4 py-2 text-xs font-semibold transition-colors hover:bg-secondary disabled:opacity-60"
+                  >
+                    {scanningWebsite ? "Scanning…" : websiteScan ? "Re-scan website" : "Scan my website"}
+                  </button>
+                  <p className="text-xs text-muted-foreground">
+                    Optional — pulls a bit of copy and a few photos from your own site to help write your bios and build
+                    your graphics.
+                  </p>
+                </div>
+                {scanError && <p className="mt-2 text-xs text-destructive">{scanError}</p>}
+                {websiteScan && !scanError && (
+                  <div className="mt-3 rounded-xl border border-border bg-background/40 p-3">
+                    <p className="text-xs text-muted-foreground">
+                      {websiteScan.title ? (
+                        <span className="font-medium text-foreground">{websiteScan.title}</span>
+                      ) : null}
+                      {websiteScan.description ? ` — ${websiteScan.description}` : ""}
+                      {!websiteScan.title && !websiteScan.description
+                        ? "Scanned — no page title or description found."
+                        : ""}
+                    </p>
+                    {websiteScan.images.length > 0 && (
+                      <p className="mt-1.5 text-[11px] text-muted-foreground">
+                        Found {websiteScan.images.length} photo{websiteScan.images.length === 1 ? "" : "s"} — pick one
+                        as a background in Branding Graphics below.
+                      </p>
+                    )}
+                  </div>
+                )}
+              </div>
+            </div>
+
+            {/* Content Branding Strategy (2026-10-22) — per Mike: "once somebody
+            is finished with the interview... I want to add a section...
+            called their content branding strategy. This section will just
+            have a document that I can upload inside of here that'll also
+            play into their voice DNA profile." Also live independent of
+            interview stage. UPDATED 2026-11-05 — Mike asked whether this
+            could "connect to" an agent's own existing custom GPT or Claude
+            project directly; neither OpenAI nor Anthropic expose an API for
+            a third party to read someone else's account that way, so this
+            is the real answer instead: paste or upload whatever you already
+            gave your GPT/Claude (its instructions, its knowledge files)
+            right here. Now auto-extracts .docx and .pdf client side too
+            (mammoth/pdf.js), not just .txt/.md, since a brand kit or a
+            custom GPT's knowledge file is almost always one of those — see
+            handleContentStrategyFile. Also doubles as where Mike uploads a
+            brand kit/content strategy HE builds for an agent himself — the
+            admin "Change agent" picker above switches this whole page to
+            any agent, Content Branding Strategy included, same as Business
+            Info already does. Once saved, this gets woven into every
+            content-generation prompt built from this agent's Voice DNA (see
+            withContentBrandingStrategy in marketing.ts). */}
+            <div className="mb-5 rounded-3xl border border-border bg-glass p-6 backdrop-blur-2xl">
+              <h2 className="font-display text-lg font-semibold">Content Branding Strategy</h2>
+              <p className="mt-1 text-sm text-muted-foreground">
+                Optional — a content/brand strategy doc for this agent (recurring series ideas, content pillars, tone
+                notes). Already built a custom GPT or a Claude project for this agent's brand voice? Paste its
+                instructions here, or upload the file(s) you gave it — this is where that goes. Upload a file or paste
+                below; it gets factored in alongside their Voice DNA every time we write for them.
+              </p>
+              <label className="mt-3 inline-block cursor-pointer rounded-full border border-border bg-glass px-3 py-1.5 text-xs font-semibold transition-colors hover:bg-secondary">
+                Upload a .txt/.md/.docx/.pdf file
+                <input
+                  type="file"
+                  accept=".txt,.md,.docx,.pdf,text/plain,text/markdown,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+                  className="hidden"
+                  onChange={(e) => {
+                    const file = e.target.files?.[0];
+                    e.target.value = "";
+                    if (file) handleContentStrategyFile(file);
+                  }}
+                />
+              </label>
+              <div className="mt-3 flex justify-end">
+                <MicButton value={contentStrategy} onChange={setContentStrategy} />
+              </div>
+              <textarea
+                value={contentStrategy}
+                onChange={(e) => setContentStrategy(e.target.value)}
+                placeholder="Paste or upload this agent's content branding strategy here…"
+                rows={8}
+                className="mt-3 w-full resize-y rounded-2xl border border-border bg-background/60 px-4 py-3 text-sm outline-none ring-ring transition focus:ring-2"
+              />
+              <div className="mt-3 flex items-center gap-3">
+                <button
+                  onClick={handleSaveContentStrategy}
+                  disabled={contentStrategySaving}
+                  className="rounded-xl bg-primary px-4 py-2 text-xs font-semibold text-primary-foreground shadow-lg shadow-primary/30 transition-transform hover:-translate-y-0.5 disabled:opacity-60"
+                >
+                  {contentStrategySaving ? "Saving…" : "Save content strategy"}
+                </button>
+                {contentStrategyStatus && <p className="text-xs text-muted-foreground">{contentStrategyStatus}</p>}
+              </div>
+            </div>
+
+            {/* Social Media Handles (2026-11-13) — per Mike: "we should also
+            plug in their social media handles, anywhere else where you
+            could pull public information on them, so that you can write a
+            bio." We asked Mike whether to actually scrape these live;
+            getting no clear answer, we went with the safer default he
+            pointed us toward ("you know what my goals are") — these are
+            reference text only, fed into the bio prompt below, never
+            fetched or scraped. Scraping Instagram/Facebook/LinkedIn/
+            Zillow/Trulia is fragile and likely against each platform's
+            ToS, and none of them offer a public API for this. */}
+            <div className="mb-5 rounded-3xl border border-border bg-glass p-6 backdrop-blur-2xl">
+              <h2 className="font-display text-lg font-semibold">Social Media Handles</h2>
+              <p className="mt-1 text-sm text-muted-foreground">
+                Optional — your usernames/profile links. We use these as reference when writing your bios below (never
+                scraped or fetched automatically), and weave the relevant ones in naturally.
+              </p>
+              <div className="mt-4 grid grid-cols-1 gap-3 sm:grid-cols-2">
+                {(
+                  [
+                    { key: "instagram" as const, label: "Instagram", placeholder: "@yourname" },
+                    { key: "facebook" as const, label: "Facebook", placeholder: "facebook.com/yourname" },
+                    { key: "linkedin" as const, label: "LinkedIn", placeholder: "linkedin.com/in/yourname" },
+                    { key: "youtube" as const, label: "YouTube", placeholder: "youtube.com/@yourname" },
+                    { key: "tiktok" as const, label: "TikTok", placeholder: "@yourname" },
+                    { key: "zillow" as const, label: "Zillow profile", placeholder: "zillow.com/profile/yourname" },
+                    { key: "trulia" as const, label: "Trulia profile", placeholder: "trulia.com/profile/yourname" },
+                  ] satisfies { key: keyof AgentSocialHandles; label: string; placeholder: string }[]
+                ).map((field) => (
+                  <label key={field.key} className="block">
+                    <span className="text-xs font-medium text-muted-foreground">{field.label}</span>
+                    <input
+                      value={socialHandles[field.key]}
+                      onChange={(e) => setSocialHandles((s) => ({ ...s, [field.key]: e.target.value }))}
+                      placeholder={field.placeholder}
+                      className="mt-1 w-full rounded-xl border border-border bg-background/60 px-3 py-2 text-sm outline-none ring-ring transition focus:ring-2"
+                    />
+                  </label>
+                ))}
+              </div>
+              <div className="mt-4 flex items-center gap-3">
+                <button
+                  onClick={handleSaveSocialHandles}
+                  disabled={socialHandlesSaving}
+                  className="rounded-xl bg-primary px-4 py-2 text-xs font-semibold text-primary-foreground shadow-lg shadow-primary/30 transition-transform hover:-translate-y-0.5 disabled:opacity-60"
+                >
+                  {socialHandlesSaving ? "Saving…" : "Save handles"}
+                </button>
+                {socialHandlesStatus && <p className="text-xs text-muted-foreground">{socialHandlesStatus}</p>}
+              </div>
+            </div>
+
+            {/* Connect Facebook & Instagram (2026-11-15) — Phase 1 of scheduling
+            content directly to Meta, per Mike: "All we want to do is be
+            able to schedule our content with the photos directly into
+            Meta, Instagram, and Facebook... I don't want to deal with a
+            lot of the dev right now." Goes through Upload-Post rather than
+            a Meta app of our own — see claude/upload-post-scheduling-
+            scoping.md for why. This card only connects the account; actual
+            scheduling of a post happens from the Content Calendar once an
+            agent is connected here. */}
+            <div className="mb-5 rounded-3xl border border-border bg-glass p-6 backdrop-blur-2xl">
+              <h2 className="font-display text-lg font-semibold">Connect Facebook &amp; Instagram</h2>
+              <p className="mt-1 text-sm text-muted-foreground">
+                Connect your real Facebook Page and Instagram Business/Creator account once, so posts from the Content
+                Calendar can be scheduled straight to them. This opens a secure page hosted by our scheduling provider —
+                your login never passes through this app.
+              </p>
+
+              {connectStatusError && (
+                <p className="mt-3 text-xs text-destructive">
+                  {connectStatusError}
+                  {connectStatusError.includes("UPLOAD_POST_API_KEY") ? null : (
+                    <>
+                      {" "}
+                      <button onClick={loadConnectStatus} className="underline hover:text-foreground">
+                        Try again
+                      </button>
+                    </>
+                  )}
+                </p>
+              )}
+
+              {!connectStatusError && (
+                <div className="mt-3 flex flex-wrap items-center gap-2">
+                  {(["facebook", "instagram"] as const).map((platform) => {
+                    const isConnected = Boolean(connectStatus?.platforms.includes(platform));
+                    return (
+                      <span
+                        key={platform}
+                        className={`rounded-full px-3 py-1 text-xs font-semibold ${
+                          isConnected ? "bg-primary/15 text-primary" : "bg-muted text-muted-foreground"
+                        }`}
+                      >
+                        {platform === "facebook" ? "Facebook" : "Instagram"} —{" "}
+                        {isConnected ? "Connected" : "Not connected"}
+                      </span>
+                    );
+                  })}
+                  {connectStatus && connectStatus.platforms.includes("facebook") && (
+                    <span className="text-xs text-muted-foreground">
+                      {connectStatus.facebookPages.length > 1
+                        ? `${connectStatus.facebookPages.length} Pages available — pick one when scheduling`
+                        : connectStatus.facebookPages.length === 1
+                          ? `Page: ${connectStatus.facebookPages[0]?.name}`
+                          : null}
+                    </span>
+                  )}
+                </div>
+              )}
+
+              <div className="mt-4 flex items-center gap-3">
+                <button
+                  onClick={handleConnectSocial}
+                  disabled={connecting}
+                  className="rounded-xl bg-primary px-4 py-2 text-xs font-semibold text-primary-foreground shadow-lg shadow-primary/30 transition-transform hover:-translate-y-0.5 disabled:opacity-60"
+                >
+                  {connecting
+                    ? "Opening…"
+                    : connectStatus?.connected
+                      ? "Reconnect / manage accounts"
+                      : "Connect Facebook & Instagram"}
+                </button>
+                <button
+                  onClick={loadConnectStatus}
+                  className="text-xs font-medium text-muted-foreground underline hover:text-foreground"
+                >
+                  Refresh status
+                </button>
+              </div>
+            </div>
+
+            {/* Brand Bio Writer (2026-11-13) — per Mike: "we need to create a
+            done-for-you bio section that can be created just based on what
+            they've already created in that section... this should be no
+            different than I'm just typing in Claude. I need you to write a
+            bio based upon who I am... maybe we can rate it by, like, how do
+            you want to be — professional, personable, funny, relatable."
+            Pulls Voice DNA + Business Info + Content Branding Strategy +
+            the handles above into one prompt (see buildBrandBioPrompt in
+            voice-dna.ts) and returns 5 platform-specific variants in one
+            call. */}
+            <div className="mb-5 rounded-3xl border border-border bg-glass p-6 backdrop-blur-2xl">
+              <h2 className="font-display text-lg font-semibold">Brand Bio Writer</h2>
+              <p className="mt-1 text-sm text-muted-foreground">
+                Done-for-you bios for everywhere you need one — Instagram, Facebook, LinkedIn, your Zillow/Trulia
+                profile, and your website or YouTube About section — written from your Voice DNA, business info, and
+                handles above.
+              </p>
+              <div className="mt-4">
+                <span className="text-xs font-medium text-muted-foreground">Tone</span>
+                <div className="mt-1.5 flex flex-wrap gap-1 rounded-full border border-border bg-glass p-1 backdrop-blur-xl w-fit">
+                  {(["professional", "personable", "funny", "relatable"] as const satisfies BrandBioTone[]).map((t) => (
+                    <button
+                      key={t}
+                      onClick={() => setBioTone(t)}
+                      className={`rounded-full px-4 py-1.5 text-sm font-medium capitalize transition-colors ${
+                        bioTone === t ? "bg-secondary text-foreground" : "text-muted-foreground hover:text-foreground"
+                      }`}
+                    >
+                      {t}
+                    </button>
+                  ))}
+                </div>
+              </div>
+              <label className="mt-4 block">
+                <div className="flex items-center justify-between gap-2">
+                  <span className="text-xs font-medium text-muted-foreground">
+                    Anything else we should know? (optional)
+                  </span>
+                  <MicButton value={bioExtraNotes} onChange={setBioExtraNotes} />
+                </div>
+                <textarea
+                  value={bioExtraNotes}
+                  onChange={(e) => setBioExtraNotes(e.target.value)}
+                  placeholder="Hobbies, background, family, what makes you different — anything you want woven in."
+                  rows={3}
+                  className="mt-1 w-full resize-y rounded-2xl border border-border bg-background/60 px-4 py-3 text-sm outline-none ring-ring transition focus:ring-2"
+                />
+              </label>
+              <div className="mt-4 flex items-center gap-3">
+                <button
+                  onClick={handleGenerateBios}
+                  disabled={bioGenerating}
+                  className="rounded-xl bg-primary px-4 py-2 text-xs font-semibold text-primary-foreground shadow-lg shadow-primary/30 transition-transform hover:-translate-y-0.5 disabled:opacity-60"
+                >
+                  {bioGenerating ? "Writing your bios…" : bioResult ? "Regenerate bios" : "Write my bios"}
+                </button>
+                {bioError && <p className="text-xs text-destructive">{bioError}</p>}
+              </div>
+              {bioResult && (
+                <div className="mt-5 space-y-4">
+                  {(
+                    [
+                      { key: "instagram" as const, label: "Instagram bio", counter: true },
+                      { key: "facebook" as const, label: "Facebook intro" },
+                      { key: "linkedin" as const, label: "LinkedIn about" },
+                      { key: "realtorProfile" as const, label: "Realtor profile (Zillow / Trulia)" },
+                      { key: "websiteAbout" as const, label: "Website / YouTube about" },
+                    ] satisfies { key: keyof BrandBioResult; label: string; counter?: boolean }[]
+                  ).map((variant) => {
+                    const text = bioResult[variant.key];
+                    return (
+                      <div key={variant.key} className="rounded-2xl border border-border bg-background/40 p-4">
+                        <div className="flex items-center justify-between gap-3">
+                          <p className="text-sm font-semibold">{variant.label}</p>
+                          <button
+                            onClick={() => copyBioText(variant.key, text)}
+                            className="shrink-0 rounded-full border border-border bg-glass px-3 py-1 text-xs font-semibold transition-colors hover:bg-secondary"
+                          >
+                            {bioCopiedKey === variant.key ? "Copied!" : "Copy"}
+                          </button>
+                        </div>
+                        <p className="mt-2 whitespace-pre-wrap text-sm text-muted-foreground">{text}</p>
+                        {variant.counter && (
+                          <p className="mt-1.5 text-[11px] text-muted-foreground">{text.length} / 150 characters</p>
+                        )}
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+
+            {/* Branding Graphics v2 — real AI image generation (2026-11-13).
+            Mike's original ask: "take the headshot they uploaded and the
+            logo and be able to create really nice-looking YouTube headers,
+            Facebook covers... a couple different versions." The first pass
+            at this drew shapes on a <canvas> by hand; his reaction to that
+            ("worst cover photo ever... use all your resources... pretend
+            you are a graphic designer") is why this now calls an actual
+            image-generation model (OpenAI's gpt-image-1 — the model behind
+            image generation in ChatGPT, which he pointed at directly)
+            server-side with a real art-directed prompt, instead of drawing
+            shapes ourselves — see generateBrandGraphicAI in voice-dna.ts.
+            Needs an OPENAI_API_KEY secret added in Lovable Cloud →
+            Secrets (same setup as the existing ANTHROPIC_API_KEY) — the
+            error below says so plainly if it's missing. */}
+            <div className="mb-5 rounded-3xl border border-border bg-glass p-6 backdrop-blur-2xl">
+              <h2 className="font-display text-lg font-semibold">Branding Graphics</h2>
+              <p className="mt-1 text-sm text-muted-foreground">
+                A YouTube channel banner and a Facebook cover, designed by AI from your headshot, logo, brand color, and
+                (if you've scanned it) your website. Pick a style, adjust your tagline, and generate — download either
+                one as a PNG. Each generation takes a real image-generation model a little while, so this can take up to
+                a minute.
+              </p>
+              {!headshotUrl && (
+                <p className="mt-3 text-xs text-destructive">Upload a headshot in the section above first.</p>
+              )}
+              <div className="mt-4">
+                <span className="text-xs font-medium text-muted-foreground">Style</span>
+                <div className="mt-1.5 flex flex-wrap gap-1 rounded-full border border-border bg-glass p-1 backdrop-blur-xl w-fit">
+                  {(["bold-split", "photo-backdrop", "centered-minimal"] as const satisfies BrandGraphicTemplate[]).map(
+                    (t) => (
+                      <button
+                        key={t}
+                        onClick={() => setGraphicTemplate(t)}
+                        className={`rounded-full px-4 py-1.5 text-sm font-medium transition-colors ${
+                          graphicTemplate === t
+                            ? "bg-secondary text-foreground"
+                            : "text-muted-foreground hover:text-foreground"
+                        }`}
+                      >
+                        {t === "bold-split"
+                          ? "Bold editorial"
+                          : t === "photo-backdrop"
+                            ? "Photo backdrop"
+                            : "Clean minimal"}
+                      </button>
+                    ),
+                  )}
+                </div>
+              </div>
+              <label className="mt-4 block">
+                <span className="text-xs font-medium text-muted-foreground">Tagline</span>
+                <input
+                  value={graphicTagline ?? ""}
+                  onChange={(e) => setGraphicTagline(e.target.value)}
+                  placeholder="Real Estate Agent — Austin, TX"
+                  className="mt-1 w-full rounded-xl border border-border bg-background/60 px-3 py-2 text-sm outline-none ring-ring transition focus:ring-2"
+                />
+              </label>
+              {/* Background photo (2026-11-13) — optional, only shows up once
+              Scan My Website (above, in Business Info) has actually found
+              photos. For the Photo Backdrop style this becomes the actual
+              background; for the other 2 styles it's used only as color/
+              mood inspiration. Picking "None" (the default when nothing's
+              been scanned) still produces a full designed graphic from
+              just headshot + logo, per Mike's "only thing you should
+              need." */}
+              {websiteScan && websiteScan.images.length > 0 && (
+                <div className="mt-4">
+                  <span className="text-xs font-medium text-muted-foreground">
+                    Background photo (from your website)
+                  </span>
+                  <div className="mt-1.5 flex flex-wrap gap-2">
+                    <button
+                      onClick={() => setSelectedBackgroundImage(null)}
+                      className={`grid h-14 w-20 shrink-0 place-items-center rounded-lg border text-[10px] font-medium transition-colors ${
+                        selectedBackgroundImage === null
+                          ? "border-primary bg-secondary text-foreground"
+                          : "border-border bg-background/40 text-muted-foreground hover:bg-secondary"
+                      }`}
+                    >
+                      None
+                    </button>
+                    {websiteScan.images.map((url) => (
+                      <button
+                        key={url}
+                        onClick={() => setSelectedBackgroundImage(url)}
+                        className={`h-14 w-20 shrink-0 overflow-hidden rounded-lg border-2 transition-colors ${
+                          selectedBackgroundImage === url ? "border-primary" : "border-transparent hover:border-border"
+                        }`}
+                      >
+                        <img src={url} alt="" className="size-full object-cover" />
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              )}
+              <div className="mt-4 flex items-center gap-3">
+                <button
+                  onClick={() => handleGenerateGraphics()}
+                  disabled={graphicGenerating || !headshotUrl}
+                  className="rounded-xl bg-primary px-4 py-2 text-xs font-semibold text-primary-foreground shadow-lg shadow-primary/30 transition-transform hover:-translate-y-0.5 disabled:opacity-60"
+                >
+                  {graphicGenerating ? "Designing your graphics…" : "Generate graphics"}
+                </button>
+                {graphicError && <p className="text-xs text-destructive">{graphicError}</p>}
+              </div>
+              {(graphicPreviews.youtube || graphicPreviews.facebook) && (
+                <div className="mt-5 grid grid-cols-1 gap-4 sm:grid-cols-2">
+                  {(
+                    [
+                      { key: "youtube" as const, label: "YouTube banner" },
+                      { key: "facebook" as const, label: "Facebook cover" },
+                    ] satisfies { key: BrandGraphicFormat; label: string }[]
+                  ).map((item) => {
+                    const url = graphicPreviews[item.key];
+                    if (!url) return null;
+                    return (
+                      <div key={item.key} className="rounded-2xl border border-border bg-background/40 p-4">
+                        <p className="text-sm font-semibold">{item.label}</p>
+                        <div className="mt-2 overflow-hidden rounded-xl border border-border bg-muted">
+                          <img src={url} alt={item.label} className="w-full object-cover" />
+                        </div>
+                        <button
+                          onClick={() => downloadGraphic(item.key)}
+                          className="mt-3 rounded-full border border-border bg-glass px-3 py-1.5 text-xs font-semibold transition-colors hover:bg-secondary"
+                        >
+                          Download
+                        </button>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+          </>
         )}
       </div>
     </AppShell>

@@ -235,6 +235,15 @@ export type PostMetadata = {
   // (e.g. the post's photo didn't come from a scan) — the editor still works
   // fine with a blank line to type into.
   text_overlay_suggestions?: string[] | undefined;
+  // Which strategic slot this post was picked to fill when it came from
+  // scanMediaLibraryForMonth (2026-11-15) — "gratitude" (the one thank you/
+  // referral post), "local" (the one local favorite/recommendation post),
+  // or "real_estate"/"personal_brand" (the even split of business-reminder
+  // vs. fly on the wall content that fills out the rest of the 10), per
+  // content-calendar-strategy.md's monthly mix. Absent on every other post
+  // source — this is purely a label for review/learning, it never changes
+  // what was actually written.
+  scan_lane?: "gratitude" | "local" | "real_estate" | "personal_brand" | undefined;
   // Meta scheduling via Upload-Post (2026-11-15) — see scheduleAgentPostToSocial
   // below and claude/upload-post-scheduling-scoping.md for the full plan.
   // upload_post_job_id is Upload-Post's own id for a SCHEDULED post (absent
@@ -330,6 +339,32 @@ function getPreferredPhotoTypes(postType: "real_estate" | "appreciation" | "comm
     default:
       return ["neutral", "community", "real_estate", "appreciation"];
   }
+}
+
+// Sorts a scanned photo into one of the four slots content-calendar-
+// strategy.md's monthly mix calls for, used by scanMediaLibraryForMonth
+// below. Added 2026-11-15 per Mike: "1 referral/thank you, 1 to 2 local
+// shout outs, and an equal split of real estate reminders/personal brand
+// for the rest." Deliberately reads the AI's OWN one-sentence description
+// of the photo (from captionPhotoInVoice) rather than a fixed tag chip —
+// richer signal, and it's grounded in what the photo actually shows instead
+// of whatever category the agent happened to tag it. Same keyword-regex
+// approach as classifyPostType above, just pointed at different text and a
+// different, four-way split instead of that function's own bucket set —
+// kept this as its own function rather than reusing classifyPostType
+// directly since "gratitude" and "local" here are specific individual slots
+// (exactly one or two posts a month), not general categories.
+function classifyScanLane(description: string): "gratitude" | "local" | "real_estate" | "personal_brand" {
+  const text = (description || "").toLowerCase();
+  const isGratitude = /client|referral|thank|grateful|customer|closing gift|repeat business|past client/.test(text);
+  const isLocal =
+    /local|coffee|restaurant|cafe|park|trail|beach|shop|spot|downtown|farmers market|neighborhood spot/.test(text);
+  const isRealEstate =
+    /listing|sold|closing|open house|showing|sign|desk|office|contract|keys|inspection|for sale/.test(text);
+  if (isGratitude) return "gratitude";
+  if (isLocal) return "local";
+  if (isRealEstate) return "real_estate";
+  return "personal_brand";
 }
 
 function classifyMediaCategory(tags: string[], mediaType: string): string {
@@ -6179,6 +6214,211 @@ export const scanAgentLibraryPhotos = createServerFn({ method: "POST" })
       totalPhotos: photos?.length ?? 0,
     };
   });
+
+// The second, parallel path alongside generateMonthlyBatch — added
+// 2026-11-15 per Mike's photo-first redesign (see
+// claude/photo-first-monthly-content-scoping.md for the full conversation):
+// "Generate Monthly Content" stays completely unchanged as the baseline: a
+// human-written calendar doc, rewritten in voice. This is the new button
+// next to it, "Scan My Media Library for This Month's Content" — no doc,
+// no pre-written concept, the agent's own unused photos ARE the content.
+// One real Claude vision call per photo (captionPhotoInVoice, same engine
+// Scan My Photos already uses one photo at a time) plus one cheap text
+// classification (classifyScanLane, no extra AI call) to sort the result
+// into the strategic mix content-calendar-strategy.md calls for — this is
+// deliberately NOT a from-scratch build, it's the existing per-photo
+// engine, wired up to run across a whole pool at once and land in the
+// right slots, same as Mike asked for: "don't overthink that piece."
+export const scanMediaLibraryForMonth = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator((data: { agentId: string; month: string; targetCount?: number; excludeFileIds?: string[] }) => data)
+  .handler(
+    async ({
+      data,
+      context,
+    }): Promise<{
+      ok: true;
+      batchId: string | null;
+      created: number;
+      requested: number;
+      scanned: number;
+      available: number;
+      lanes: Record<"gratitude" | "local" | "real_estate" | "personal_brand", number>;
+    }> => {
+      const email = (context.claims as { email?: string } | undefined)?.email;
+      await requireAgentAccess(context.userId, email, data.agentId);
+      const anthropicKey = process.env["ANTHROPIC_API_KEY"];
+      if (!anthropicKey)
+        throw new Error("Content generation isn't configured yet — add ANTHROPIC_API_KEY in Lovable Cloud → Secrets.");
+
+      const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+      const { data: agent, error: agentErr } = await supabaseAdmin
+        .from("agents")
+        .select("full_name, market_area, voice_summary, voice_answers")
+        .eq("id", data.agentId)
+        .maybeSingle();
+      if (agentErr) throw agentErr;
+      const agentName = agent?.full_name ?? "the agent";
+      const agentCity = agent?.market_area ?? "their market";
+      // Same hard gate generateMonthlyBatch applies — see its own comment
+      // for why (Mike, 2026-09-30: "the prerequisite to start generating
+      // their monthly content — they have to take the interview first").
+      // This is just as real a content-creation path as that one, so it
+      // gets the same gate rather than quietly skipping it.
+      if (!agent?.voice_summary) {
+        throw new Error(
+          `${agentName} hasn't completed the Voice DNA interview yet — monthly content can't be generated until that's done. Complete the interview in Voice DNA first, then come back and scan this month's content.`,
+        );
+      }
+      const voiceDna = withContentBrandingStrategy(agent.voice_summary, agent.voice_answers);
+      const learnedFeedback = await fetchLearnedFeedback(data.agentId);
+
+      const targetCount = Math.max(1, Math.min(30, data.targetCount ?? 10));
+      // Pool bigger than the target so there's real material to sort into
+      // all four slots, not just whatever happened to be oldest — capped so
+      // one click never fires off more vision calls than it has to.
+      const poolSize = Math.min(40, Math.max(targetCount * 2, 16));
+      const excludeIds = new Set(data.excludeFileIds ?? []);
+
+      const { data: photos, error } = await supabaseAdmin
+        .from("agent_photos")
+        .select("id, url, media_type, notes, created_at")
+        .eq("agent_id", data.agentId)
+        .eq("status", "available")
+        .order("created_at", { ascending: true })
+        .limit(200);
+      if (error) throw error;
+
+      const pool = (photos ?? [])
+        .filter((p) => p.url && p.media_type !== "video" && !excludeIds.has(p.id))
+        .slice(0, poolSize);
+
+      type Scanned = {
+        id: string;
+        url: string;
+        description: string;
+        suggestedPost: string;
+        textOverlaySuggestions: string[];
+        lane: "gratitude" | "local" | "real_estate" | "personal_brand";
+      };
+
+      const scanned = (
+        await Promise.all(
+          pool.map(async (p): Promise<Scanned | null> => {
+            try {
+              const imgRes = await fetch(p.url!);
+              if (!imgRes.ok) return null;
+              const arrayBuffer = await imgRes.arrayBuffer();
+              const contentType = imgRes.headers.get("content-type") || "image/jpeg";
+              const caption = await captionPhotoInVoice(
+                arrayBuffer,
+                contentType,
+                anthropicKey,
+                agentName,
+                agentCity,
+                voiceDna,
+                learnedFeedback,
+                p.notes,
+              );
+              if (!caption) return null;
+              return {
+                id: p.id,
+                url: p.url!,
+                description: caption.description,
+                suggestedPost: caption.suggestedPost,
+                textOverlaySuggestions: caption.textOverlaySuggestions,
+                lane: classifyScanLane(caption.description),
+              };
+            } catch {
+              return null;
+            }
+          }),
+        )
+      ).filter((s): s is Scanned => Boolean(s));
+
+      // Fill the month's mix in priority order — exactly one gratitude slot,
+      // exactly one local slot (Mike: "don't overthink that piece," so this
+      // is the clean 1/1 split rather than the "1 to 2" he also floated),
+      // then split whatever's left as evenly as possible between real
+      // estate reminders and personal brand. Any slot with no naturally-
+      // classified candidate left just doesn't get filled rather than
+      // forcing a bad match — same honesty principle as the rest of this
+      // design: no fake fit just to hit a number.
+      const remaining = [...scanned];
+      const take = (lane: Scanned["lane"]): Scanned | undefined => {
+        const idx = remaining.findIndex((s) => s.lane === lane);
+        if (idx === -1) return undefined;
+        return remaining.splice(idx, 1)[0];
+      };
+
+      const chosen: Scanned[] = [];
+      const gratitude = take("gratitude");
+      if (gratitude) chosen.push(gratitude);
+      const local = take("local");
+      if (local) chosen.push(local);
+
+      const slotsLeft = targetCount - chosen.length;
+      let wantRealEstate = Math.ceil(slotsLeft / 2);
+      let wantPersonalBrand = slotsLeft - wantRealEstate;
+      for (let i = 0; i < slotsLeft; i++) {
+        const preferReal = wantRealEstate > 0 && (wantPersonalBrand === 0 || i % 2 === 0);
+        const picked = preferReal
+          ? (take("real_estate") ?? take("personal_brand"))
+          : (take("personal_brand") ?? take("real_estate"));
+        if (!picked) break; // pool's genuinely out of unused photos — stop rather than pad with nothing
+        if (picked.lane === "real_estate" || preferReal) wantRealEstate = Math.max(0, wantRealEstate - 1);
+        else wantPersonalBrand = Math.max(0, wantPersonalBrand - 1);
+        chosen.push(picked);
+      }
+
+      if (!chosen.length) {
+        return {
+          ok: true,
+          batchId: null,
+          created: 0,
+          requested: targetCount,
+          scanned: scanned.length,
+          available: pool.length,
+          lanes: { gratitude: 0, local: 0, real_estate: 0, personal_brand: 0 },
+        };
+      }
+
+      const batchId = `${data.agentId}-${data.month}-${Date.now()}-scan`;
+      const rows: TablesInsert<"generated_posts">[] = chosen.map((s) => ({
+        agent_id: data.agentId,
+        content: s.suggestedPost,
+        content_type: "post",
+        title: s.description.slice(0, 60),
+        status: "pending",
+        month: data.month,
+        metadata: {
+          batch_id: batchId,
+          month: data.month,
+          source: "library_photo_scan",
+          media_id: s.id,
+          media_url: s.url,
+          media_type: "image",
+          text_overlay_suggestions: s.textOverlaySuggestions,
+          scan_lane: s.lane,
+        },
+      }));
+      const { error: insertErr } = await supabaseAdmin.from("generated_posts").insert(rows);
+      if (insertErr) throw insertErr;
+
+      const lanes = { gratitude: 0, local: 0, real_estate: 0, personal_brand: 0 };
+      chosen.forEach((s) => lanes[s.lane]++);
+
+      return {
+        ok: true,
+        batchId,
+        created: rows.length,
+        requested: targetCount,
+        scanned: scanned.length,
+        available: pool.length,
+        lanes,
+      };
+    },
+  );
 
 // Lists unused short-form videos from the agent's Media Library, for the
 // new "Scan my videos" button on the Reels tab (2026-11-14). Library only

@@ -14,8 +14,7 @@ export const Route = createFileRoute("/")({
       { property: "og:title", content: "Your Marketing Dude" },
       {
         property: "og:description",
-        content:
-          "AI that runs your database and marketing — not AI that gives you more to do.",
+        content: "AI that runs your database and marketing — not AI that gives you more to do.",
       },
       { property: "og:type", content: "website" },
       { name: "twitter:card", content: "summary_large_image" },
@@ -72,26 +71,45 @@ const DOES = [
 function WorkspaceHome() {
   const { user } = useAuth();
   const firstName = user?.email?.split("@")[0] ?? "there";
+  const displayName = firstName.charAt(0).toUpperCase() + firstName.slice(1);
 
   return (
     <div className="pt-2">
       <div className="mb-6 inline-flex items-center gap-2 rounded-full border border-border bg-glass px-3 py-1 text-xs font-medium text-muted-foreground backdrop-blur-xl">
-        <span className="size-1.5 rounded-full bg-accent" /> Your database ·
-        your voice · your marketing, handled
+        <span className="size-1.5 rounded-full bg-accent" /> Your database · your voice · your marketing, handled
       </div>
-      <h1 className="font-display text-3xl font-bold leading-tight tracking-tight md:text-4xl">
+
+      {/* Mobile-only simplified greeting (2026-11-15) per Mike: "ON Mobile
+          whne on the home screen should only say What up [name]. What Would
+          You Like To Do? Then Show The icons only below." The icon tiles
+          he means are AppShell's mobile nav grid, which already renders
+          above this page on every route — this is just the one-line prompt
+          that sits above it, not a second nav. Desktop keeps the fuller
+          "Welcome back" copy right below (hidden on mobile) since it has no
+          icon-tile nav of its own to lead into. */}
+      <h1 className="font-display text-2xl font-bold leading-tight tracking-tight md:hidden">
+        What's up, {displayName}?
+      </h1>
+      <p className="mt-1 text-muted-foreground md:hidden">What would you like to do?</p>
+
+      <h1 className="hidden font-display text-3xl font-bold leading-tight tracking-tight md:block md:text-4xl">
         Welcome back.
         <br />
         <span className="bg-gradient-to-r from-primary to-accent bg-clip-text text-transparent">
           Your marketing is already moving.
         </span>
       </h1>
-      <p className="mt-3 max-w-lg text-muted-foreground">
-        Pick up where you left off, {firstName.charAt(0).toUpperCase() + firstName.slice(1)} —
-        everything below runs off one profile: your sphere, your voice, your market.
+      <p className="mt-3 hidden max-w-lg text-muted-foreground md:block">
+        Pick up where you left off, {displayName} — everything below runs off one profile: your sphere, your voice, your
+        market.
       </p>
 
-      <div className="mt-8 grid grid-cols-1 gap-5 md:grid-cols-3">
+      {/* These 3 module cards duplicate AppShell's mobile icon-tile nav
+          (added 2026-11-13) and read as a second landing page on a phone —
+          per Mike: "We dont need the bottom 3 squares its redundant and
+          looks liek a landig page." Desktop keeps them (no icon-tile nav
+          there to lead into instead). */}
+      <div className="mt-8 hidden gap-5 md:grid md:grid-cols-3">
         {MODULES.map((m) => (
           <Link
             key={m.to}
@@ -101,16 +119,13 @@ function WorkspaceHome() {
             <div
               className={`mb-4 inline-flex items-center gap-2 rounded-full px-3 py-1 text-xs font-semibold ${m.tagClass}`}
             >
-              <span className={`size-1.5 rounded-full ${m.dotClass}`} />{" "}
-              {m.tag}
+              <span className={`size-1.5 rounded-full ${m.dotClass}`} /> {m.tag}
             </div>
             <h3 className="font-display text-lg font-semibold">{m.title}</h3>
             <p className="mt-2 text-sm text-muted-foreground">{m.short}</p>
             <div className="mt-5 flex items-center justify-between">
               <span className="text-xs text-muted-foreground/70">{m.meta}</span>
-              <span className="text-sm font-semibold text-foreground group-hover:text-accent">
-                {m.action} →
-              </span>
+              <span className="text-sm font-semibold text-foreground group-hover:text-accent">{m.action} →</span>
             </div>
           </Link>
         ))}
@@ -125,8 +140,7 @@ function LandingHome() {
       {/* hero */}
       <section className="col-span-12 lg:col-span-7">
         <div className="mb-5 inline-flex items-center gap-2 rounded-full border border-border bg-glass px-3 py-1 text-xs font-medium text-muted-foreground backdrop-blur-xl">
-          <span className="size-1.5 rounded-full bg-accent" /> Your database ·
-          your voice · your marketing, handled
+          <span className="size-1.5 rounded-full bg-accent" /> Your database · your voice · your marketing, handled
         </div>
         <h1 className="font-display text-5xl font-bold leading-[0.98] tracking-tight md:text-6xl">
           AI that runs your marketing.
@@ -136,16 +150,11 @@ function LandingHome() {
           </span>
         </h1>
         <p className="mt-5 max-w-lg text-lg text-muted-foreground">
-          Most AI hands you a blank box and a caption. Your Marketing Dude
-          already knows your sphere, your market and how you talk — so it
-          decides who to reach, writes it in your voice, and hands it to you
-          ready to send.
+          Most AI hands you a blank box and a caption. Your Marketing Dude already knows your sphere, your market and
+          how you talk — so it decides who to reach, writes it in your voice, and hands it to you ready to send.
         </p>
         <div className="mt-8 flex flex-wrap items-center gap-3">
-          <Link
-            to="/voice"
-            className="rounded-full bg-foreground px-6 py-3 text-sm font-semibold text-ink"
-          >
+          <Link to="/voice" className="rounded-full bg-foreground px-6 py-3 text-sm font-semibold text-ink">
             Teach it my voice
           </Link>
           <Link
@@ -158,21 +167,15 @@ function LandingHome() {
         <div className="mt-9 grid max-w-md grid-cols-3 gap-6">
           <div>
             <div className="font-display text-2xl font-bold">1</div>
-            <div className="text-xs text-muted-foreground">
-              system, not five tools
-            </div>
+            <div className="text-xs text-muted-foreground">system, not five tools</div>
           </div>
           <div>
             <div className="font-display text-2xl font-bold">0</div>
-            <div className="text-xs text-muted-foreground">
-              blank pages to stare at
-            </div>
+            <div className="text-xs text-muted-foreground">blank pages to stare at</div>
           </div>
           <div>
             <div className="font-display text-2xl font-bold">30</div>
-            <div className="text-xs text-muted-foreground">
-              days of marketing, drafted
-            </div>
+            <div className="text-xs text-muted-foreground">days of marketing, drafted</div>
           </div>
         </div>
       </section>
@@ -182,12 +185,9 @@ function LandingHome() {
         <div className="relative h-full overflow-hidden rounded-3xl border border-border bg-glass p-6 backdrop-blur-2xl">
           <div className="absolute -right-16 -top-16 h-40 w-40 rounded-full bg-accent/20 blur-2xl" />
           <div className="relative">
-            <div className="font-display text-base font-semibold">
-              It already knows your business
-            </div>
+            <div className="font-display text-base font-semibold">It already knows your business</div>
             <p className="mt-1 text-xs text-muted-foreground">
-              One profile behind every module — so nothing starts from
-              scratch.
+              One profile behind every module — so nothing starts from scratch.
             </p>
             <div className="mt-5 space-y-3">
               {[
@@ -196,27 +196,17 @@ function LandingHome() {
                 ["Your market", "Local news, listings, neighborhood stories"],
                 ["Your history", "Every edit sharpens the next draft"],
               ].map(([label, detail]) => (
-                <div
-                  key={label}
-                  className="flex items-center justify-between gap-3 rounded-xl bg-secondary px-4 py-3"
-                >
+                <div key={label} className="flex items-center justify-between gap-3 rounded-xl bg-secondary px-4 py-3">
                   <span className="text-sm text-foreground/70">{label}</span>
-                  <span className="text-right text-xs font-medium text-foreground">
-                    {detail}
-                  </span>
+                  <span className="text-right text-xs font-medium text-foreground">{detail}</span>
                 </div>
               ))}
             </div>
             <div className="mt-5 rounded-xl bg-gradient-to-r from-primary/20 to-accent/20 p-4">
-              <div className="text-xs uppercase tracking-widest text-muted-foreground">
-                The idea
-              </div>
-              <div className="mt-1 font-display text-2xl font-bold">
-                Stop figuring out marketing
-              </div>
+              <div className="text-xs uppercase tracking-widest text-muted-foreground">The idea</div>
+              <div className="mt-1 font-display text-2xl font-bold">Stop figuring out marketing</div>
               <div className="mt-1 text-xs text-muted-foreground">
-                Your relationships and your listings become consistent
-                marketing — without you managing it.
+                Your relationships and your listings become consistent marketing — without you managing it.
               </div>
             </div>
           </div>
@@ -226,19 +216,12 @@ function LandingHome() {
       {/* what it does */}
       <section className="col-span-12 mt-4">
         <div className="mb-4 flex items-end justify-between">
-          <h2 className="font-display text-xl font-semibold">
-            What it handles for you
-          </h2>
-          <span className="hidden text-sm text-muted-foreground sm:inline">
-            Database → voice → content → follow-up
-          </span>
+          <h2 className="font-display text-xl font-semibold">What it handles for you</h2>
+          <span className="hidden text-sm text-muted-foreground sm:inline">Database → voice → content → follow-up</span>
         </div>
         <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3">
           {DOES.map(([label, detail]) => (
-            <div
-              key={label}
-              className="rounded-2xl border border-border bg-glass p-5 backdrop-blur-xl"
-            >
+            <div key={label} className="rounded-2xl border border-border bg-glass p-5 backdrop-blur-xl">
               <div className="font-display text-sm font-semibold">{label}</div>
               <p className="mt-1.5 text-sm text-muted-foreground">{detail}</p>
             </div>
@@ -250,9 +233,7 @@ function LandingHome() {
       <section className="col-span-12 mt-4">
         <div className="mb-4 flex items-end justify-between">
           <h2 className="font-display text-xl font-semibold">Your workspace</h2>
-          <span className="text-sm text-muted-foreground">
-            Pick up where you left off
-          </span>
+          <span className="text-sm text-muted-foreground">Pick up where you left off</span>
         </div>
         <div className="grid grid-cols-1 gap-5 md:grid-cols-3">
           {MODULES.map((m) => (
@@ -264,18 +245,13 @@ function LandingHome() {
               <div
                 className={`mb-4 inline-flex items-center gap-2 rounded-full px-3 py-1 text-xs font-semibold ${m.tagClass}`}
               >
-                <span className={`size-1.5 rounded-full ${m.dotClass}`} />{" "}
-                {m.tag}
+                <span className={`size-1.5 rounded-full ${m.dotClass}`} /> {m.tag}
               </div>
               <h3 className="font-display text-lg font-semibold">{m.title}</h3>
               <p className="mt-2 text-sm text-muted-foreground">{m.desc}</p>
               <div className="mt-5 flex items-center justify-between">
-                <span className="text-xs text-muted-foreground/70">
-                  {m.meta}
-                </span>
-                <span className="text-sm font-semibold text-foreground group-hover:text-accent">
-                  {m.action} →
-                </span>
+                <span className="text-xs text-muted-foreground/70">{m.meta}</span>
+                <span className="text-sm font-semibold text-foreground group-hover:text-accent">{m.action} →</span>
               </div>
             </Link>
           ))}
@@ -288,9 +264,5 @@ function LandingHome() {
 function HomePage() {
   const { user, loading } = useAuth();
 
-  return (
-    <AppShell>
-      {loading ? null : user ? <WorkspaceHome /> : <LandingHome />}
-    </AppShell>
-  );
+  return <AppShell>{loading ? null : user ? <WorkspaceHome /> : <LandingHome />}</AppShell>;
 }

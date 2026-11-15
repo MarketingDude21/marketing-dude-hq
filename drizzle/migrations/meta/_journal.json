@@ -15,6 +15,13 @@
       "when": 1793350665822,
       "tag": "0001_sso_exchange_support",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1794713428345,
+      "tag": "0002_add_notes_to_agent_photos",
+      "breakpoints": true
     }
   ]
 }

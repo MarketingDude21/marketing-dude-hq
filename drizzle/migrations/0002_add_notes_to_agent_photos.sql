@@ -1,0 +1,1 @@
+ALTER TABLE public.agent_photos ADD COLUMN IF NOT EXISTS notes text;

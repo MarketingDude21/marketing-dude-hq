@@ -113,6 +113,7 @@ export type Database = {
           created_at: string
           id: string
           media_type: string
+          notes: string | null
           source: string
           status: string
           storage_path: string | null
@@ -128,6 +129,7 @@ export type Database = {
           created_at?: string
           id?: string
           media_type?: string
+          notes?: string | null
           source?: string
           status?: string
           storage_path?: string | null
@@ -143,6 +145,7 @@ export type Database = {
           created_at?: string
           id?: string
           media_type?: string
+          notes?: string | null
           source?: string
           status?: string
           storage_path?: string | null

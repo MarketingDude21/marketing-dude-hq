@@ -238,9 +238,9 @@ export type PostMetadata = {
   // Meta scheduling via Upload-Post (2026-11-15) — see scheduleAgentPostToSocial
   // below and claude/upload-post-scheduling-scoping.md for the full plan.
   // upload_post_job_id is Upload-Post's own id for a SCHEDULED post (absent
-  // when a post publishes immediately instead, which this app never asks
-  // for — everything goes through scheduled_date); upload_post_status is
-  // refreshed from their /status endpoint, not assumed to stay accurate
+  // for "Publish now," which omits scheduled_date entirely and publishes
+  // immediately instead — see scheduleAgentPostToSocial); upload_post_status
+  // is refreshed from their /status endpoint, not assumed to stay accurate
   // forever on its own.
   upload_post_job_id?: string | null | undefined;
   upload_post_platforms?: string[] | undefined;
@@ -1677,6 +1677,13 @@ export type MediaRow = {
   url: string | null;
   caption: string | null;
   tags: string[];
+  // Free-text notes, added 2026-11-15 replacing the tag-chip editor per
+  // Mike: "remove the tags... add an edit button so the user can make
+  // notes if they want... if user adds notes the system takes it into
+  // consideration." See setMediaNotes below and the `notes` arg threaded
+  // into captionPhotoInVoice/captionVideoFramesInVoice — run
+  // media-notes-migration.sql once before this column exists.
+  notes: string | null;
   media_type: "photo" | "video";
   source: "upload" | "drive";
   status: "available" | "used";
@@ -1693,7 +1700,7 @@ export const listMarketingMedia = createServerFn({ method: "GET" })
     const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
     let query = supabaseAdmin
       .from("agent_photos")
-      .select("id, url, caption, tags, media_type, source, status, created_at, used_at")
+      .select("id, url, caption, tags, notes, media_type, source, status, created_at, used_at")
       .eq("agent_id", data.agentId)
       .order("created_at", { ascending: false });
     if (data.status) query = query.eq("status", data.status);
@@ -1825,6 +1832,42 @@ export const setMediaTags = createServerFn({ method: "POST" })
     const { error } = await supabaseAdmin
       .from("agent_photos")
       .update({ tags, updated_at: new Date().toISOString() })
+      .eq("id", data.mediaId);
+    if (error) throw error;
+    return { ok: true };
+  });
+
+// Free-text notes on a media item — added 2026-11-15 per Mike, replacing
+// the tag-chip editor in the Media tab's default grid view: "remove the
+// tags from the view here. I dont see any use for them... add an edit
+// button so the user can make notes if they want... Ex: 'Me and my aunt
+// sue.'" Hidden by default in the grid (shown only via the "Details"
+// expand, see MediaTab in marketing.tsx), and — unlike tags, which were
+// always a data label with no AI involvement — these ARE read by
+// captionPhotoInVoice/captionVideoFramesInVoice whenever this item gets
+// scanned or rescanned, so a note like "this is my aunt Sue, not a
+// client" actually changes what gets written, not just how the grid
+// displays. Run media-notes-migration.sql once before this column exists.
+export const setMediaNotes = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator((data: { agentId: string; mediaId: string; notes: string }) => data)
+  .handler(async ({ data, context }): Promise<{ ok: true }> => {
+    const email = (context.claims as { email?: string } | undefined)?.email;
+    await requireAgentAccess(context.userId, email, data.agentId);
+    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+    const { data: existing, error: fetchErr } = await supabaseAdmin
+      .from("agent_photos")
+      .select("agent_id")
+      .eq("id", data.mediaId)
+      .maybeSingle();
+    if (fetchErr) throw fetchErr;
+    if (!existing || existing.agent_id !== data.agentId) {
+      throw new Error("Media not found for this agent.");
+    }
+    const notes = data.notes.trim().slice(0, 500);
+    const { error } = await supabaseAdmin
+      .from("agent_photos")
+      .update({ notes: notes || null, updated_at: new Date().toISOString() })
       .eq("id", data.mediaId);
     if (error) throw error;
     return { ok: true };
@@ -5350,7 +5393,13 @@ export const scheduleAgentPostToSocial = createServerFn({ method: "POST" })
       agentId: string;
       postId: string;
       platforms: UploadPostPlatform[];
-      scheduledDate: string; // ISO-8601, in the future
+      // Optional as of 2026-11-15 per Mike: "there shiuld be a publish now
+      // option in any and all scheduling." Upload-Post's own documented
+      // behavior for both /upload_photos and /upload (video) is "omit for
+      // immediate upload" — so leaving this out is what publishes right
+      // now instead of queuing a scheduled job. ISO-8601, in the future,
+      // when provided.
+      scheduledDate?: string;
       timezone?: string;
       facebookPageId?: string;
     }) => data,
@@ -5372,24 +5421,41 @@ export const scheduleAgentPostToSocial = createServerFn({ method: "POST" })
     if (!post || post.agent_id !== data.agentId) throw new Error("Post not found for this agent.");
 
     const meta = (post.metadata ?? {}) as PostMetadata;
-    const photoUrl = meta.media_url || meta.drive_download_url || meta.drive_thumbnail_url;
-    if (!photoUrl) {
+    const mediaUrl = meta.media_url || meta.drive_download_url || meta.drive_thumbnail_url;
+    if (!mediaUrl) {
       throw new Error(
-        "This post has no photo attached yet — Upload-Post needs an image to post to Instagram/Facebook.",
+        "This post has no photo or video attached yet — Upload-Post needs media to post to Instagram/Facebook.",
       );
     }
+    // A real video post (content_type "post", metadata.media_type ===
+    // "video" — a Reel saved from "Scan my videos" or the Media Library,
+    // NOT a Canva-template isReel row, which has no media_url and never
+    // reaches here) goes through Upload-Post's video endpoint instead of
+    // its photo one — added 2026-11-15 per Mike: "If there is a social
+    // post scheduled or reel its needs ability to schedule too." The two
+    // endpoints aren't interchangeable: /upload_photos rejects a video URL,
+    // and /upload (confirmed against Upload-Post's own docs,
+    // docs.upload-post.com/api/upload-video) takes a single `video` field
+    // instead of `photos[]`, defaulting Instagram's media_type to REELS.
+    const isVideo = meta.media_type === "video";
 
     const form = new FormData();
     form.append("user", username);
     for (const p of data.platforms) form.append("platform[]", p);
-    form.append("photos[]", photoUrl);
+    if (isVideo) {
+      form.append("video", mediaUrl);
+    } else {
+      form.append("photos[]", mediaUrl);
+    }
     form.append("title", post.content || post.title || "");
-    form.append("scheduled_date", data.scheduledDate);
+    // Omitted entirely for "Publish now" — see the scheduledDate comment
+    // on the input type above.
+    if (data.scheduledDate) form.append("scheduled_date", data.scheduledDate);
     if (data.timezone) form.append("timezone", data.timezone);
     if (data.facebookPageId) form.append("facebook_page_id", data.facebookPageId);
     form.append("external_id", post.id);
 
-    const res = await fetch(`${UPLOAD_POST_API_BASE}/upload_photos`, {
+    const res = await fetch(`${UPLOAD_POST_API_BASE}/${isVideo ? "upload" : "upload_photos"}`, {
       method: "POST",
       headers: { Authorization: `Apikey ${apiKey}` },
       body: form,
@@ -5415,7 +5481,7 @@ export const scheduleAgentPostToSocial = createServerFn({ method: "POST" })
           ...meta,
           upload_post_job_id: jobId,
           upload_post_platforms: data.platforms,
-          upload_post_scheduled_for: data.scheduledDate,
+          upload_post_scheduled_for: data.scheduledDate ?? null,
           upload_post_timezone: data.timezone ?? null,
           upload_post_facebook_page_id: data.facebookPageId ?? null,
           upload_post_status: jobId ? "scheduled" : "posted",
@@ -5693,6 +5759,12 @@ async function captionPhotoInVoice(
   // required) so this stays easy to call without fetching feedback first
   // in a context that doesn't have it handy.
   learnedFeedback?: string,
+  // The agent's own free-text note on this exact media item, added 2026-11-15
+  // per Mike: "if user adds notes the system takes it into consideration."
+  // E.g. "me and my aunt sue" tells Claude who's actually in frame instead
+  // of guessing — folded into the prompt as context, not a caption to
+  // repeat verbatim.
+  agentNotes?: string | null,
 ): Promise<{ description: string; suggestedPost: string; textOverlaySuggestions: string[] } | null> {
   const base64 = Buffer.from(imageBytes).toString("base64");
   // FIXED (2026-09-30) — per Mike: "when I rescan image it gives error,"
@@ -5753,6 +5825,9 @@ async function captionPhotoInVoice(
     `${TEXT_ON_SCREEN_FRAMEWORKS}\n\n` +
     "These are suggestions only — the agent will pick, edit, or ignore them, so give real variety across the 3 rather than three versions of the same line.\n\n" +
     (learnedFeedback ?? "") +
+    (agentNotes?.trim()
+      ? `\n\nNOTE FROM THE AGENT ABOUT THIS PHOTO: "${agentNotes.trim()}" — use this to understand who/what is actually in the photo (e.g. a specific person's name, a relationship, context a photo alone can't show), but don't just repeat it verbatim as the caption.\n`
+      : "") +
     "\n\nOutput format:\nDESCRIPTION: [one sentence of what you see]\nPOST: [the social media caption]\nTEXT OVERLAYS:\n1. [short overlay line]\n2. [short overlay line]\n3. [short overlay line]";
 
   const res = await fetch("https://api.anthropic.com/v1/messages", {
@@ -5837,6 +5912,9 @@ async function captionVideoFramesInVoice(
   agentCity: string | undefined,
   voiceDna: string | undefined,
   learnedFeedback?: string,
+  // Same idea as captionPhotoInVoice's agentNotes above — the agent's own
+  // note on this video, added 2026-11-15.
+  agentNotes?: string | null,
 ): Promise<{ description: string; suggestedPost: string; textOverlaySuggestions: string[] } | null> {
   if (!frames.length) return null;
   const prompt =
@@ -5851,6 +5929,9 @@ async function captionVideoFramesInVoice(
     `${TEXT_ON_SCREEN_FRAMEWORKS}\n\n` +
     "These are suggestions only — the agent will pick, edit, or ignore them, so give real variety across the 3 rather than three versions of the same line.\n\n" +
     (learnedFeedback ?? "") +
+    (agentNotes?.trim()
+      ? `\n\nNOTE FROM THE AGENT ABOUT THIS VIDEO: "${agentNotes.trim()}" — use this to understand who/what is actually in the clip (e.g. a specific person's name, a relationship, context the frames alone can't show), but don't just repeat it verbatim as the caption.\n`
+      : "") +
     "\n\nOutput format:\nDESCRIPTION: [one sentence of what's happening in the clip]\nPOST: [the social media caption]\nTEXT OVERLAYS:\n1. [short overlay line]\n2. [short overlay line]\n3. [short overlay line]";
 
   const res = await fetch("https://api.anthropic.com/v1/messages", {
@@ -6045,7 +6126,7 @@ export const scanAgentLibraryPhotos = createServerFn({ method: "POST" })
 
     const { data: photos, error } = await supabaseAdmin
       .from("agent_photos")
-      .select("id, url, media_type, created_at")
+      .select("id, url, media_type, notes, created_at")
       .eq("agent_id", data.agentId)
       .eq("status", "available")
       .order("created_at", { ascending: true })
@@ -6074,6 +6155,7 @@ export const scanAgentLibraryPhotos = createServerFn({ method: "POST" })
             agentCity,
             voiceDna,
             learnedFeedback,
+            p.notes,
           );
           if (!caption) return null;
           return {
@@ -6134,6 +6216,9 @@ export const listAgentScannableVideos = createServerFn({ method: "GET" })
       if (error) throw error;
       const maxVideos = data.maxVideos ?? 3;
       const toReturn = (videos ?? []).filter((v) => v.url).slice(0, maxVideos);
+      // Notes aren't fetched here — captionVideoFrames below looks them up
+      // itself by mediaId at caption time (see its comment) so a note added
+      // between this list call and that one isn't missed.
       return {
         videos: toReturn.map((v) => ({ id: v.id, url: v.url!, fileName: v.id })),
         totalVideos: videos?.length ?? 0,
@@ -6150,7 +6235,17 @@ export const listAgentScannableVideos = createServerFn({ method: "GET" })
 // Shotstack instead of being encoded here).
 export const captionVideoFrames = createServerFn({ method: "POST" })
   .middleware([requireSupabaseAuth])
-  .inputValidator((data: { agentId: string; frames: string[] }) => data)
+  .inputValidator(
+    (data: {
+      agentId: string;
+      frames: string[];
+      // The Media Library row these frames were extracted from — added
+      // 2026-11-15 so this can look up that item's notes (if any) and fold
+      // them into the prompt. Optional so this still works for anything
+      // that ever calls it without a library id handy.
+      mediaId?: string;
+    }) => data,
+  )
   .handler(
     async ({
       data,
@@ -6178,6 +6273,19 @@ export const captionVideoFrames = createServerFn({ method: "POST" })
       const voiceDna = withContentBrandingStrategyOptional(agent?.voice_summary ?? undefined, agent?.voice_answers);
       const learnedFeedback = await fetchLearnedFeedback(data.agentId);
 
+      // Looked up fresh here (not passed from the client) so a note added
+      // after this video was first listed is never missed — same reasoning
+      // as regeneratePhotoScanCaption's photo-side lookup above.
+      let agentNotes: string | null = null;
+      if (data.mediaId) {
+        const { data: mediaRow } = await supabaseAdmin
+          .from("agent_photos")
+          .select("notes")
+          .eq("id", data.mediaId)
+          .maybeSingle();
+        agentNotes = mediaRow?.notes ?? null;
+      }
+
       const caption = await captionVideoFramesInVoice(
         frames,
         anthropicKey,
@@ -6185,6 +6293,7 @@ export const captionVideoFrames = createServerFn({ method: "POST" })
         agentCity,
         voiceDna,
         learnedFeedback,
+        agentNotes,
       );
       if (!caption) throw new Error("Claude didn't return a usable caption for this video — try again.");
       return caption;
@@ -6413,6 +6522,21 @@ export const regeneratePhotoScanCaption = createServerFn({ method: "POST" })
       }
     }
 
+    // Looked up fresh at rescan time (not cached from the original scan) so
+    // a note added to the Media Library AFTER the post was first created —
+    // "Me and my aunt sue," say — still gets picked up the next time this
+    // photo is rescanned. Only applies to a Media Library source (media_id);
+    // a Drive photo has no agent_photos row/notes at all.
+    let agentNotes: string | null = null;
+    if (metadata.media_id) {
+      const { data: mediaRow } = await supabaseAdmin
+        .from("agent_photos")
+        .select("notes")
+        .eq("id", metadata.media_id)
+        .maybeSingle();
+      agentNotes = mediaRow?.notes ?? null;
+    }
+
     const caption = await captionPhotoInVoice(
       arrayBuffer,
       mediaType,
@@ -6421,6 +6545,7 @@ export const regeneratePhotoScanCaption = createServerFn({ method: "POST" })
       agentCity,
       voiceDna,
       learnedFeedback,
+      agentNotes,
     );
     if (!caption) throw new Error("Claude didn't return a usable caption for this photo — try again.");
 

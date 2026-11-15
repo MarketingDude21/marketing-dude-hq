@@ -11,15 +11,15 @@ import { AgentScopedPage, MediaTab } from "@/routes/marketing";
 export const Route = createFileRoute("/media")({
   head: () => ({
     meta: [
-      { title: "Media — Your Marketing Dude" },
+      { title: "Upload Photos/Videos — Your Marketing Dude" },
       {
         name: "description",
-        content: "Your photo and video library — upload, tag, and download what's ready to use.",
+        content: "Your photo and video library — upload, add notes, and download what's ready to use.",
       },
-      { property: "og:title", content: "Media — Your Marketing Dude" },
+      { property: "og:title", content: "Upload Photos/Videos — Your Marketing Dude" },
       {
         property: "og:description",
-        content: "Your photo and video library — upload, tag, and download what's ready to use.",
+        content: "Your photo and video library — upload, add notes, and download what's ready to use.",
       },
       { property: "og:type", content: "website" },
       { name: "twitter:card", content: "summary_large_image" },
@@ -28,9 +28,15 @@ export const Route = createFileRoute("/media")({
   component: MediaPage,
 });
 
+// Renamed 2026-11-15 per Mike: "Call 'Media' Upload Photos/Videos." Tagline
+// also dropped "tag" the same round the tag chips came out of the grid
+// itself (see MediaTab in marketing.tsx) in favor of free-text notes.
 function MediaPage() {
   return (
-    <AgentScopedPage title="Media" tagline="Your photo and video library — upload, tag, and download what's ready to use.">
+    <AgentScopedPage
+      title="Upload Photos/Videos"
+      tagline="Your photo and video library — upload, add notes, and download what's ready to use."
+    >
       {({ agentId, isAdmin }) => (
         <div className="mt-5">
           <MediaTab agentId={agentId} isAdmin={isAdmin} />

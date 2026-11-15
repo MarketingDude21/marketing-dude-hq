@@ -4222,6 +4222,18 @@ export const logPhotoScanToChat = createServerFn({ method: "POST" })
       // stores string values (see ChatMessageRow), so this gets JSON-encoded
       // below rather than given its own array column.
       textOverlaySuggestions?: string[];
+      // Added 2026-11-14 for "Scan my videos" on the Reels tab. mode lets
+      // that scan log into the Reels thread instead of always "photo_scan"
+      // (defaults to "photo_scan" so the existing Scan My Photos caller
+      // above doesn't need to change) — without this a video suggestion
+      // scanned while sitting on the Reels tab would silently show up on a
+      // different tab instead. mediaType/mediaUrl carry the real video
+      // through to ChatMessageBubble's "Save as post" (see there), since
+      // thumbnailUrl for a video is just one representative frame, not
+      // something that can be posted on its own.
+      mode?: ChatMode;
+      mediaType?: "photo" | "video";
+      mediaUrl?: string;
     }) => data,
   )
   .handler(async ({ data, context }): Promise<{ ok: true; message: ChatMessageRow }> => {
@@ -4233,7 +4245,7 @@ export const logPhotoScanToChat = createServerFn({ method: "POST" })
       .insert({
         agent_id: data.agentId,
         role: "assistant",
-        mode: "photo_scan",
+        mode: data.mode ?? "photo_scan",
         content: data.suggestedPost,
         metadata: {
           source: data.source,
@@ -4241,6 +4253,8 @@ export const logPhotoScanToChat = createServerFn({ method: "POST" })
           thumbnailUrl: data.thumbnailUrl,
           fileName: data.fileName,
           textOverlaySuggestions: JSON.stringify(data.textOverlaySuggestions ?? []),
+          ...(data.mediaType ? { mediaType: data.mediaType } : {}),
+          ...(data.mediaUrl ? { mediaUrl: data.mediaUrl } : {}),
         },
       })
       .select("id, role, content, mode, metadata, created_at")
@@ -5764,6 +5778,17 @@ async function captionPhotoInVoice(
     .map((b) => b.text ?? "")
     .join("")
     .trim();
+  return parseVoiceCaptionResponse(raw);
+}
+
+// Shared DESCRIPTION/POST/TEXT OVERLAYS parser — pulled out of
+// captionPhotoInVoice unchanged (2026-11-14) so captionVideoFramesInVoice
+// below (same output format, different input) doesn't duplicate it.
+function parseVoiceCaptionResponse(raw: string): {
+  description: string;
+  suggestedPost: string;
+  textOverlaySuggestions: string[];
+} {
   const descMatch = raw.match(/DESCRIPTION:\s*(.+)/i);
   // Stops at TEXT OVERLAYS: (non-greedy, lookahead) instead of the old
   // greedy [\s\S]+ to end of string — otherwise POST would swallow the new
@@ -5788,6 +5813,73 @@ async function captionPhotoInVoice(
     suggestedPost: postMatch ? postMatch[1]!.trim() : raw,
     textOverlaySuggestions,
   };
+}
+
+// Video version of captionPhotoInVoice — added 2026-11-14 per Mike, twice
+// over: he hit "Claude can't read [this]" trying to Rescan a video post
+// (regeneratePhotoScanCaption only ever supported photos — Claude's vision
+// API genuinely can't decode video bytes directly, confirmed against
+// Anthropic's own docs: "Claude doesn't natively process video as a single
+// object yet... sample frames yourself and send them as a sequence of
+// static images"), and separately asked outright for the Reels tab to
+// "scan your videos... just like scan your photos works now." Frame
+// sampling has to happen in the BROWSER (extractVideoFrames in
+// marketing.tsx) — this Cloudflare-hosted server has no ffmpeg/video
+// decoder of its own, same reason the Reel builder's own renders go through
+// Shotstack instead of encoding anything here. This just takes whatever
+// frames the browser already extracted and sends them to Claude as
+// multiple images in ONE call (in time order), with a prompt that asks for
+// one caption/overlay set describing the clip as a whole, not per-frame.
+async function captionVideoFramesInVoice(
+  frames: string[], // base64 JPEG, no "data:" prefix — always image/jpeg, see captionVideoFrames below
+  anthropicKey: string,
+  agentName: string | undefined,
+  agentCity: string | undefined,
+  voiceDna: string | undefined,
+  learnedFeedback?: string,
+): Promise<{ description: string; suggestedPost: string; textOverlaySuggestions: string[] } | null> {
+  if (!frames.length) return null;
+  const prompt =
+    `You are creating a social media Reel caption for a real estate agent named ${agentName ?? "the agent"} in ${agentCity ?? "their city"}.\n\n` +
+    `VOICE DNA:\n${voiceDna ?? "Warm, authentic, conversational. Sounds like a real person, not a real estate agent."}\n\n` +
+    `The images above are ${frames.length} frames captured in order across one short video clip — NOT separate photos. Treat them as a single clip: look at how the frames change from one to the next to understand what's actually happening/being said/being shown throughout it, start to finish.\n\n` +
+    "Write a social media post that:\n1. Starts from what's actually happening across the clip — the setting, the mood, the moment, any obvious action or story arc between frames\n2. Sounds EXACTLY like this person based on their Voice DNA above\n3. Is 1-3 sentences max — short, human, texted-a-friend energy\n4. Leans playful, funny, or personality-driven by default — treat this as a chance to make them look like a real person with a life, not a corporate agent. But always work in a light, natural reminder that " +
+    `${agentName ?? "this person"} is in real estate — a quick aside, a joke, a callback, a one-liner — even when the clip has nothing to do with real estate. Keep the real estate nod small: a wink, never the whole point of the post, and never a pitch or a listing plug. If the clip IS an unmistakable real estate moment (a listing, a closing, a sign, a showing, a walkthrough), let real estate be more central, same playful voice. Only skip the real estate nod entirely on the rare clip where working one in would be genuinely awkward or forced.\n` +
+    '5. Does NOT mention any specific location, city, neighborhood, or place name\n6. NO hyphens, NO corporate language, NO AI-tell phrases, no "As a real estate professional" or any version of that\n7. Standard capitalization — never write in all lowercase\n\n' +
+    "Also describe what's happening in the clip in one short sentence.\n\n" +
+    "Separately, write 3 short text-overlay options for this Reel (not captions, just the on-screen text itself), each using a different one of these frameworks, whichever actually fit what's happening in THIS clip:\n\n" +
+    `${TEXT_ON_SCREEN_FRAMEWORKS}\n\n` +
+    "These are suggestions only — the agent will pick, edit, or ignore them, so give real variety across the 3 rather than three versions of the same line.\n\n" +
+    (learnedFeedback ?? "") +
+    "\n\nOutput format:\nDESCRIPTION: [one sentence of what's happening in the clip]\nPOST: [the social media caption]\nTEXT OVERLAYS:\n1. [short overlay line]\n2. [short overlay line]\n3. [short overlay line]";
+
+  const res = await fetch("https://api.anthropic.com/v1/messages", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "x-api-key": anthropicKey, "anthropic-version": "2023-06-01" },
+    body: JSON.stringify({
+      model: "claude-haiku-4-5-20251001",
+      max_tokens: 450,
+      messages: [
+        {
+          role: "user",
+          content: [
+            ...frames.map((b64) => ({
+              type: "image" as const,
+              source: { type: "base64" as const, media_type: "image/jpeg" as const, data: b64 },
+            })),
+            { type: "text", text: prompt },
+          ],
+        },
+      ],
+    }),
+  });
+  const claudeData = (await res.json()) as { content?: { text?: string }[]; error?: { message?: string } };
+  if (!res.ok) throw new Error(claudeData.error?.message ?? "Claude API error");
+  const raw = (claudeData.content ?? [])
+    .map((b) => b.text ?? "")
+    .join("")
+    .trim();
+  return parseVoiceCaptionResponse(raw);
 }
 
 export const scanAgentDrivePhotos = createServerFn({ method: "POST" })
@@ -6006,6 +6098,135 @@ export const scanAgentLibraryPhotos = createServerFn({ method: "POST" })
     };
   });
 
+// Lists unused short-form videos from the agent's Media Library, for the
+// new "Scan my videos" button on the Reels tab (2026-11-14). Library only
+// for now, not Drive — the existing Reel/video-trim builder has the exact
+// same scope boundary (videoClip.url only ever comes from a Media Library
+// row, never a Drive file), for the same underlying reason: a Drive file
+// needs this server's own OAuth token on every request, and handing that
+// token to the browser so it could fetch Drive video bytes itself (to
+// extract frames client-side — see extractVideoFrames in marketing.tsx)
+// would leak a token scoped to EVERY agent's Drive, not just this one.
+// Nothing here calls Claude — this is just the list, same division of
+// labor as scanAgentLibraryPhotos (list + fetch) vs captionPhotoInVoice
+// (the actual vision call), split the same way for the same reason: frame
+// extraction has to happen in the browser, so the caption call below is a
+// separate round trip from this list.
+export const listAgentScannableVideos = createServerFn({ method: "GET" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator((data: { agentId: string; maxVideos?: number }) => data)
+  .handler(
+    async ({
+      data,
+      context,
+    }): Promise<{ videos: { id: string; url: string; fileName: string }[]; totalVideos: number }> => {
+      const email = (context.claims as { email?: string } | undefined)?.email;
+      await requireAgentAccess(context.userId, email, data.agentId);
+      const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+      const { data: videos, error } = await supabaseAdmin
+        .from("agent_photos")
+        .select("id, url")
+        .eq("agent_id", data.agentId)
+        .eq("status", "available")
+        .eq("media_type", "video")
+        .order("created_at", { ascending: true })
+        .limit(50);
+      if (error) throw error;
+      const maxVideos = data.maxVideos ?? 3;
+      const toReturn = (videos ?? []).filter((v) => v.url).slice(0, maxVideos);
+      return {
+        videos: toReturn.map((v) => ({ id: v.id, url: v.url!, fileName: v.id })),
+        totalVideos: videos?.length ?? 0,
+      };
+    },
+  );
+
+// Takes frames the BROWSER already extracted from one video (see
+// extractVideoFrames in marketing.tsx) and writes one caption/overlay set
+// for the whole clip — the video-input counterpart to captionPhotoInVoice,
+// called as its own round trip from listAgentScannableVideos above because
+// this server has no way to pull frames out of a video itself (no ffmpeg on
+// Cloudflare's edge runtime — same reason video Reel renders go through
+// Shotstack instead of being encoded here).
+export const captionVideoFrames = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator((data: { agentId: string; frames: string[] }) => data)
+  .handler(
+    async ({
+      data,
+      context,
+    }): Promise<{ description: string; suggestedPost: string; textOverlaySuggestions: string[] }> => {
+      const email = (context.claims as { email?: string } | undefined)?.email;
+      await requireAgentAccess(context.userId, email, data.agentId);
+      const anthropicKey = process.env["ANTHROPIC_API_KEY"];
+      if (!anthropicKey)
+        throw new Error("Video captioning isn't configured yet — add ANTHROPIC_API_KEY in Lovable Cloud → Secrets.");
+      if (!data.frames.length) throw new Error("No video frames came through to look at — try scanning again.");
+      // Cost/latency guard — 5 frames (what extractVideoFrames sends) is
+      // already past what a caption call needs; this just stops a bad
+      // client payload from sending Claude an unbounded number of images.
+      const frames = data.frames.slice(0, 8);
+
+      const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+      const { data: agent } = await supabaseAdmin
+        .from("agents")
+        .select("full_name, market_area, voice_summary, voice_answers")
+        .eq("id", data.agentId)
+        .maybeSingle();
+      const agentName = agent?.full_name ?? undefined;
+      const agentCity = agent?.market_area ?? undefined;
+      const voiceDna = withContentBrandingStrategyOptional(agent?.voice_summary ?? undefined, agent?.voice_answers);
+      const learnedFeedback = await fetchLearnedFeedback(data.agentId);
+
+      const caption = await captionVideoFramesInVoice(
+        frames,
+        anthropicKey,
+        agentName,
+        agentCity,
+        voiceDna,
+        learnedFeedback,
+      );
+      if (!caption) throw new Error("Claude didn't return a usable caption for this video — try again.");
+      return caption;
+    },
+  );
+
+// Writes a caption the CLIENT already got from captionVideoFrames above
+// onto an existing post — the "Rescan this photo" button's video
+// counterpart. That button (regeneratePhotoScanCaption, PostCard) used to
+// hard-fail on a video post with "Claude can't read [this] directly",
+// Mike's exact report (2026-11-14) — it does its own frame fetch AND its
+// own Claude call entirely server-side, which only ever worked for a real
+// image. A video needs the browser to extract frames first (no video
+// decoder on this server), so PostCard now branches: a photo post still
+// goes straight through regeneratePhotoScanCaption unchanged, a video post
+// extracts frames client-side, calls captionVideoFrames for the caption,
+// then calls this just to write {title, content} onto the post — same
+// final update regeneratePhotoScanCaption does, just split into 2 small
+// round trips instead of 1 big one so the frame extraction can sit between
+// them.
+export const applyRegeneratedVideoCaption = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator((data: { agentId: string; postId: string; title: string; content: string }) => data)
+  .handler(async ({ data, context }): Promise<{ ok: true }> => {
+    const email = (context.claims as { email?: string } | undefined)?.email;
+    await requireAgentAccess(context.userId, email, data.agentId);
+    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+    const { data: existing, error: fetchErr } = await supabaseAdmin
+      .from("generated_posts")
+      .select("agent_id")
+      .eq("id", data.postId)
+      .maybeSingle();
+    if (fetchErr) throw fetchErr;
+    if (!existing || existing.agent_id !== data.agentId) throw new Error("Post not found for this agent.");
+    const { error } = await supabaseAdmin
+      .from("generated_posts")
+      .update({ title: data.title, content: data.content, updated_at: new Date().toISOString() })
+      .eq("id", data.postId);
+    if (error) throw error;
+    return { ok: true };
+  });
+
 export const addPhotoPostsToBatch = createServerFn({ method: "POST" })
   .middleware([requireSupabaseAuth])
   .inputValidator(
@@ -6022,6 +6243,15 @@ export const addPhotoPostsToBatch = createServerFn({ method: "POST" })
         // Carried through so the post keeps its scan-time overlay suggestions
         // for the Content Calendar's text editor — see PostMetadata.text_overlay_suggestions.
         textOverlaySuggestions?: string[] | undefined;
+        // Added 2026-11-14 for the new "Scan my videos" (Reels tab) path —
+        // library source only (see listAgentScannableVideos above for why
+        // Drive isn't included here yet). When mediaType is "video",
+        // thumbnailUrl is just a representative frame for the on-screen
+        // preview — mediaUrl is the REAL playable video to actually attach
+        // to the post, same distinction PostCard already draws via
+        // metadata.media_type/media_url for every other video post.
+        mediaType?: "photo" | "video" | undefined;
+        mediaUrl?: string | undefined;
       }[];
     }) => data,
   )
@@ -6048,15 +6278,25 @@ export const addPhotoPostsToBatch = createServerFn({ method: "POST" })
               drive_download_url: driveDownloadUrl(item.sourceId),
               text_overlay_suggestions: item.textOverlaySuggestions ?? [],
             }
-          : {
-              batch_id: data.batchId ?? null,
-              month: data.month,
-              source: "library_photo_scan",
-              media_id: item.sourceId,
-              media_url: item.thumbnailUrl,
-              media_type: "image",
-              text_overlay_suggestions: item.textOverlaySuggestions ?? [],
-            },
+          : item.mediaType === "video"
+            ? {
+                batch_id: data.batchId ?? null,
+                month: data.month,
+                source: "library_video_scan",
+                media_id: item.sourceId,
+                media_url: item.mediaUrl || item.thumbnailUrl,
+                media_type: "video",
+                text_overlay_suggestions: item.textOverlaySuggestions ?? [],
+              }
+            : {
+                batch_id: data.batchId ?? null,
+                month: data.month,
+                source: "library_photo_scan",
+                media_id: item.sourceId,
+                media_url: item.thumbnailUrl,
+                media_type: "image",
+                text_overlay_suggestions: item.textOverlaySuggestions ?? [],
+              },
     }));
     const { error } = await supabaseAdmin.from("generated_posts").insert(rows);
     if (error) throw error;
@@ -6158,8 +6398,17 @@ export const regeneratePhotoScanCaption = createServerFn({ method: "POST" })
       // bytes to Claude labeled as a type they aren't (which is what used
       // to happen, and is exactly what produced "Could not process image").
       if (!CLAUDE_SUPPORTED_IMAGE_TYPES.includes(mediaType)) {
+        // A real video hitting this branch means PostCard's video check
+        // (post.metadata?.media_type === "video") didn't catch it before
+        // calling this — this message used to say "likely HEIC/HEIF" even
+        // for an actual video, which is exactly what Mike reported
+        // ("claude cannot read videos") and isn't the real fix (PostCard's
+        // new branch + applyRegeneratedVideoCaption above is), but this
+        // error is at least accurate now if that branch is ever bypassed.
         throw new Error(
-          `This photo is a format Claude can't read directly (${mediaType || "unknown"} — likely HEIC/HEIF from an iPhone). Re-upload it as a JPEG or PNG on the Media tab, then rescan.`,
+          mediaType.startsWith("video/")
+            ? "This post's video can't be rescanned here directly — Claude's vision API reads images, not video. Use the Rescan button on the post card, which extracts frames from the video in your browser first."
+            : `This photo is a format Claude can't read directly (${mediaType || "unknown"} — likely HEIC/HEIF from an iPhone). Re-upload it as a JPEG or PNG on the Media tab, then rescan.`,
         );
       }
     }

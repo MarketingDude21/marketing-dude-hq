@@ -1,5 +1,5 @@
 import { createFileRoute, Link } from "@tanstack/react-router";
-import { AppShell } from "@/components/AppShell";
+import { AppShell, useOnboardingLock } from "@/components/AppShell";
 import { useAuth } from "@/hooks/useAuth";
 
 export const Route = createFileRoute("/")({
@@ -70,6 +70,7 @@ const DOES = [
 
 function WorkspaceHome() {
   const { user } = useAuth();
+  const onboardingLocked = useOnboardingLock();
   const firstName = user?.email?.split("@")[0] ?? "there";
   const displayName = firstName.charAt(0).toUpperCase() + firstName.slice(1);
 
@@ -110,25 +111,55 @@ function WorkspaceHome() {
           looks liek a landig page." Desktop keeps them (no icon-tile nav
           there to lead into instead). */}
       <div className="mt-8 hidden gap-5 md:grid md:grid-cols-3">
-        {MODULES.map((m) => (
-          <Link
-            key={m.to}
-            to={m.to}
-            className="group rounded-3xl border border-border bg-glass p-6 backdrop-blur-2xl transition hover:bg-secondary"
-          >
-            <div
-              className={`mb-4 inline-flex items-center gap-2 rounded-full px-3 py-1 text-xs font-semibold ${m.tagClass}`}
+        {MODULES.map((m) => {
+          // Greyed out the same way AppShell's nav is (2026-11-16) — these
+          // 3 cards duplicate that nav, so a locked agent shouldn't get a
+          // second clickable path into a module they're not onboarded for.
+          // "/voice" (Voice DNA) is deliberately exempt — it's where the
+          // lock gets cleared.
+          const isLocked = onboardingLocked && m.to !== "/voice";
+          if (isLocked) {
+            return (
+              <div
+                key={m.to}
+                title="Finish your Voice DNA profile, headshot, and logo in My Brand first"
+                aria-disabled="true"
+                className="cursor-not-allowed rounded-3xl border border-border bg-glass p-6 opacity-40 backdrop-blur-2xl"
+              >
+                <div
+                  className={`mb-4 inline-flex items-center gap-2 rounded-full px-3 py-1 text-xs font-semibold ${m.tagClass}`}
+                >
+                  <span className={`size-1.5 rounded-full ${m.dotClass}`} /> {m.tag}
+                </div>
+                <h3 className="font-display text-lg font-semibold">{m.title}</h3>
+                <p className="mt-2 text-sm text-muted-foreground">{m.short}</p>
+                <div className="mt-5 flex items-center justify-between">
+                  <span className="text-xs text-muted-foreground/70">Locked</span>
+                  <span className="text-sm font-semibold text-muted-foreground">Finish My Brand first</span>
+                </div>
+              </div>
+            );
+          }
+          return (
+            <Link
+              key={m.to}
+              to={m.to}
+              className="group rounded-3xl border border-border bg-glass p-6 backdrop-blur-2xl transition hover:bg-secondary"
             >
-              <span className={`size-1.5 rounded-full ${m.dotClass}`} /> {m.tag}
-            </div>
-            <h3 className="font-display text-lg font-semibold">{m.title}</h3>
-            <p className="mt-2 text-sm text-muted-foreground">{m.short}</p>
-            <div className="mt-5 flex items-center justify-between">
-              <span className="text-xs text-muted-foreground/70">{m.meta}</span>
-              <span className="text-sm font-semibold text-foreground group-hover:text-accent">{m.action} →</span>
-            </div>
-          </Link>
-        ))}
+              <div
+                className={`mb-4 inline-flex items-center gap-2 rounded-full px-3 py-1 text-xs font-semibold ${m.tagClass}`}
+              >
+                <span className={`size-1.5 rounded-full ${m.dotClass}`} /> {m.tag}
+              </div>
+              <h3 className="font-display text-lg font-semibold">{m.title}</h3>
+              <p className="mt-2 text-sm text-muted-foreground">{m.short}</p>
+              <div className="mt-5 flex items-center justify-between">
+                <span className="text-xs text-muted-foreground/70">{m.meta}</span>
+                <span className="text-sm font-semibold text-foreground group-hover:text-accent">{m.action} →</span>
+              </div>
+            </Link>
+          );
+        })}
       </div>
     </div>
   );

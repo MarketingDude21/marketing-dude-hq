@@ -119,6 +119,15 @@ export type AgentBusinessInfo = {
   licenseNumber: string;
   email: string;
   officeAddress: string;
+  // Added 2026-11-16 per Mike: "how should people contact you? What is
+  // your call to action?... that CTA needs to be embedded through all of
+  // the profile headers or about sections... so that it's sunk throughout."
+  // Free text rather than another phone/website/email field — this is the
+  // AGENT'S OWN framing of it ("Call or text me anytime", "DM me on
+  // Instagram @...", "Book a free call at ..."), which buildBioContextBlock
+  // and buildBrandGraphicPrompt below both prefer over assembling a raw
+  // contact line themselves once this is filled in.
+  contactCta: string;
 };
 
 // Added 2026-11-13 per Mike: "we should also plug in their social media
@@ -476,6 +485,7 @@ export const saveAgentBusinessInfo = createServerFn({ method: "POST" })
       licenseNumber: string;
       email: string;
       officeAddress: string;
+      contactCta: string;
     }) => data,
   )
   .handler(async ({ data, context }): Promise<{ ok: true } | { ok: false; error: string }> => {
@@ -498,6 +508,7 @@ export const saveAgentBusinessInfo = createServerFn({ method: "POST" })
         licenseNumber: data.licenseNumber.trim(),
         email: data.email.trim(),
         officeAddress: data.officeAddress.trim(),
+        contactCta: data.contactCta.trim(),
       },
     };
 
@@ -989,7 +1000,41 @@ const BRAND_BIO_TONE_DESCRIPTIONS: Record<BrandBioTone, string> = {
     "Down-to-earth and real, like a text from a friend who happens to sell real estate — nothing that sounds rehearsed.",
 };
 
-function buildBrandBioPrompt(opts: {
+export type BrandBioVariant = keyof BrandBioResult;
+
+const BRAND_BIO_VARIANT_LABELS: Record<BrandBioVariant, string> = {
+  instagram: "INSTAGRAM",
+  facebook: "FACEBOOK",
+  linkedin: "LINKEDIN",
+  realtorProfile: "REALTOR PROFILE",
+  websiteAbout: "WEBSITE ABOUT",
+};
+
+// Each variant's spec, shared by the full 5-bio generator just below
+// (buildBrandBioPrompt) and the single-bio rewrite flow added 2026-11-16
+// (buildSingleBioRewritePrompt, regenerateBrandBio) further down — per
+// Mike: "when it says to regenerate bios, you need the ability to add
+// feedback, maybe rewrite per bio or add feedback per bio." A
+// feedback-driven rewrite of just the Instagram bio, say, still gets held
+// to the exact same length/format rules a from-scratch generation would.
+const BRAND_BIO_VARIANT_SPECS: Record<BrandBioVariant, string> = {
+  instagram:
+    "Under 150 characters total — Instagram enforces this as a hard limit. Punchy, can use relevant emojis, line breaks are fine, end pointing at their link or a DM. Not full sentences — bio-style fragments are fine.",
+  facebook: `2-3 sentences for Facebook's "Intro" field on their profile. Warm, personable, first person.`,
+  linkedin: `A professional "About" summary, 4-6 sentences, first person. More polished than the others but still unmistakably this specific person, never corporate boilerplate.`,
+  realtorProfile:
+    "For Zillow/Trulia/Realtor.com-style public agent profiles. Consumer-facing and trust-building, 3-5 sentences, first person, mentions their market area and what makes working with them worth it.",
+  websiteAbout:
+    "The longest one — 2-3 short paragraphs for their website's About page or a YouTube channel description. Tells a real story, not just a credentials list, first person.",
+};
+
+// Factored out of buildBrandBioPrompt 2026-11-16 so the single-bio rewrite
+// prompt below can share the exact same agent context instead of a second,
+// driftable copy of it. Deliberately returns a string that ends exactly
+// where "TONE REQUESTED:" should be concatenated next (see both call
+// sites) — not a standalone paragraph — to reproduce the original prompt's
+// spacing byte-for-byte.
+function buildBioContextBlock(opts: {
   name: string;
   city: string;
   phone: string;
@@ -998,8 +1043,6 @@ function buildBrandBioPrompt(opts: {
   voiceSummary: string | null;
   contentBrandingStrategy: string | undefined;
   websiteScan: WebsiteScan | undefined;
-  tone: BrandBioTone;
-  extraNotes: string;
 }): string {
   const bi = opts.businessInfo;
   const sh = opts.socialHandles;
@@ -1007,7 +1050,10 @@ function buildBrandBioPrompt(opts: {
     `Phone: ${opts.phone || "(not given)"}\n` +
     `Website: ${bi?.website || "(not given)"}\n` +
     `Email: ${bi?.email || "(not given)"}\n` +
-    `License: ${bi?.licenseNumber || "(not given)"}`;
+    `License: ${bi?.licenseNumber || "(not given)"}` +
+    (bi?.contactCta?.trim()
+      ? `\nTheir own call-to-action (use this, don't invent a different one): ${bi.contactCta.trim()}`
+      : "");
   const handles =
     `Instagram: ${sh?.instagram || "(not given)"}\n` +
     `Facebook: ${sh?.facebook || "(not given)"}\n` +
@@ -1017,9 +1063,7 @@ function buildBrandBioPrompt(opts: {
     `Zillow: ${sh?.zillow || "(not given)"}\n` +
     `Trulia: ${sh?.trulia || "(not given)"}`;
 
-  return `You are writing branding bio copy for a real estate agent — their own "about me" text, reused wherever they need to introduce themselves. This is NOT a social media post or caption.
-
-Agent: ${opts.name}, serving ${opts.city || "their local market"}.
+  return `Agent: ${opts.name}, serving ${opts.city || "their local market"}.
 
 CONTACT:
 ${contact}
@@ -1034,26 +1078,89 @@ ${opts.contentBrandingStrategy ? `BRAND/CONTENT STRATEGY NOTES:\n${opts.contentB
     opts.websiteScan?.title || opts.websiteScan?.description
       ? `FROM THEIR OWN WEBSITE (scanned automatically, reference only — real specifics to draw from, not something to quote verbatim):\nTitle: ${opts.websiteScan.title || "(none)"}\nDescription: ${opts.websiteScan.description || "(none)"}\n\n`
       : ""
-  }TONE REQUESTED: ${BRAND_BIO_TONE_DESCRIPTIONS[opts.tone]}
+  }`;
+}
 
-${opts.extraNotes.trim() ? `ADDITIONAL NOTES FROM THE AGENT:\n${opts.extraNotes.trim()}\n\n` : ""}Write 5 distinct bios below, each written for exactly where it will be used — don't write one generic bio and repeat it. Pull from the Voice DNA so every version still sounds like THIS specific person. NEVER use real-estate-agent clichés: no "passionate about," "navigating the market," "your trusted advisor," "dedicated to excellence," or similar. No hyphens used as dashes. First person throughout.
+function buildBrandBioPrompt(opts: {
+  name: string;
+  city: string;
+  phone: string;
+  businessInfo: AgentBusinessInfo | undefined;
+  socialHandles: AgentSocialHandles | undefined;
+  voiceSummary: string | null;
+  contentBrandingStrategy: string | undefined;
+  websiteScan: WebsiteScan | undefined;
+  tone: BrandBioTone;
+  extraNotes: string;
+}): string {
+  return `You are writing branding bio copy for a real estate agent — their own "about me" text, reused wherever they need to introduce themselves. This is NOT a social media post or caption.
+
+${buildBioContextBlock(opts)}TONE REQUESTED: ${BRAND_BIO_TONE_DESCRIPTIONS[opts.tone]}
+
+${opts.extraNotes.trim() ? `ADDITIONAL NOTES FROM THE AGENT:\n${opts.extraNotes.trim()}\n\n` : ""}Write 5 distinct bios below, each written for exactly where it will be used — don't write one generic bio and repeat it. Pull from the Voice DNA so every version still sounds like THIS specific person. NEVER use real-estate-agent clichés: no "passionate about," "navigating the market," "your trusted advisor," "dedicated to excellence," or similar. No hyphens used as dashes. First person throughout.${
+    opts.businessInfo?.contactCta?.trim()
+      ? ` Every one of the 5 bios below must end by naturally working in this agent's call-to-action — "${opts.businessInfo.contactCta.trim()}" — phrased to fit that specific platform (a casual nudge for Instagram, a slightly more formal close for LinkedIn, etc.), not copy-pasted verbatim each time.`
+      : ""
+  }
 
 Output ONLY in this exact format, nothing before or after:
 
 INSTAGRAM:
-[Under 150 characters total — Instagram enforces this as a hard limit. Punchy, can use relevant emojis, line breaks are fine, end pointing at their link or a DM. Not full sentences — bio-style fragments are fine.]
+[${BRAND_BIO_VARIANT_SPECS.instagram}]
 
 FACEBOOK:
-[2-3 sentences for Facebook's "Intro" field on their profile. Warm, personable, first person.]
+[${BRAND_BIO_VARIANT_SPECS.facebook}]
 
 LINKEDIN:
-[A professional "About" summary, 4-6 sentences, first person. More polished than the others but still unmistakably this specific person, never corporate boilerplate.]
+[${BRAND_BIO_VARIANT_SPECS.linkedin}]
 
 REALTOR PROFILE:
-[For Zillow/Trulia/Realtor.com-style public agent profiles. Consumer-facing and trust-building, 3-5 sentences, first person, mentions their market area and what makes working with them worth it.]
+[${BRAND_BIO_VARIANT_SPECS.realtorProfile}]
 
 WEBSITE ABOUT:
-[The longest one — 2-3 short paragraphs for their website's About page or a YouTube channel description. Tells a real story, not just a credentials list, first person.]`;
+[${BRAND_BIO_VARIANT_SPECS.websiteAbout}]`;
+}
+
+// Single-bio rewrite (2026-11-16) — per Mike: "when it says to regenerate
+// bios, you need the ability to add feedback, maybe rewrite per bio or add
+// feedback per bio." Regenerating all 5 from scratch (generateBrandBios
+// above) throws away any of the 4 the agent was happy with just to fix the
+// 1 they weren't — this targets exactly one variant instead, using the
+// agent's own note on what's wrong with it plus the same context/tone as
+// the original generation, and returns just that one piece of text.
+function buildSingleBioRewritePrompt(opts: {
+  name: string;
+  city: string;
+  phone: string;
+  businessInfo: AgentBusinessInfo | undefined;
+  socialHandles: AgentSocialHandles | undefined;
+  voiceSummary: string | null;
+  contentBrandingStrategy: string | undefined;
+  websiteScan: WebsiteScan | undefined;
+  tone: BrandBioTone;
+  variant: BrandBioVariant;
+  currentText: string;
+  feedback: string;
+}): string {
+  return `You are rewriting ONE piece of branding bio copy for a real estate agent — their own "about me" text. This is NOT a social media post or caption.
+
+${buildBioContextBlock(opts)}TONE REQUESTED: ${BRAND_BIO_TONE_DESCRIPTIONS[opts.tone]}
+
+THIS IS THE ${BRAND_BIO_VARIANT_LABELS[opts.variant]} VERSION. Spec: ${BRAND_BIO_VARIANT_SPECS[opts.variant]}
+
+CURRENT DRAFT:
+${opts.currentText || "(nothing written yet)"}
+
+FEEDBACK FROM THE AGENT ON THIS DRAFT:
+${opts.feedback.trim()}
+
+Rewrite it to address that feedback directly. Keep it in the same voice and tone as requested above, pull from the Voice DNA so it still sounds like this specific person, and still follow the spec exactly (especially any length limit). NEVER use real-estate-agent clichés: no "passionate about," "navigating the market," "your trusted advisor," "dedicated to excellence," or similar. No hyphens used as dashes. First person throughout.${
+    opts.businessInfo?.contactCta?.trim()
+      ? ` Still naturally work in this agent's call-to-action — "${opts.businessInfo.contactCta.trim()}" — phrased to fit this platform, unless the feedback above specifically asks to drop or change it.`
+      : ""
+  }
+
+Output ONLY the rewritten text, nothing before or after — no label, no quotation marks, no commentary.`;
 }
 
 export const generateBrandBios = createServerFn({ method: "POST" })
@@ -1133,6 +1240,72 @@ export const generateBrandBios = createServerFn({ method: "POST" })
     return result;
   });
 
+// See buildSingleBioRewritePrompt above for why this exists alongside
+// generateBrandBios: a targeted rewrite of one variant, from the agent's
+// own feedback on the current draft, instead of regenerating all 5.
+export const regenerateBrandBio = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .validator(
+    (data: { agentId: string; tone: BrandBioTone; variant: BrandBioVariant; currentText: string; feedback: string }) =>
+      data,
+  )
+  .handler(async ({ data, context }): Promise<{ text: string }> => {
+    const email = (context.claims as { email?: string } | undefined)?.email;
+    await requireAgentAccess(context.userId, email, data.agentId);
+    const apiKey = process.env["ANTHROPIC_API_KEY"];
+    if (!apiKey) {
+      throw new Error("Bio generation isn't configured yet — add ANTHROPIC_API_KEY in Lovable Cloud → Secrets.");
+    }
+    if (!data.feedback.trim()) {
+      throw new Error("Add a note on what to change first.");
+    }
+
+    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+    const { data: row, error } = await supabaseAdmin
+      .from("agents")
+      .select("full_name, market_area, phone, voice_answers, voice_summary")
+      .eq("id", data.agentId)
+      .maybeSingle();
+    if (error) throw error;
+    if (!row) throw new Error("Couldn't find this agent.");
+
+    const voiceAnswers = (row.voice_answers as VoiceDnaAnswers | null) ?? null;
+    const prompt = buildSingleBioRewritePrompt({
+      name: row.full_name ?? "this agent",
+      city: row.market_area ?? "",
+      phone: row.phone ?? "",
+      businessInfo: voiceAnswers?.businessInfo,
+      socialHandles: voiceAnswers?.socialHandles,
+      voiceSummary: row.voice_summary,
+      contentBrandingStrategy: voiceAnswers?.contentBrandingStrategy,
+      websiteScan: voiceAnswers?.websiteScan,
+      tone: data.tone,
+      variant: data.variant,
+      currentText: data.currentText,
+      feedback: data.feedback,
+    });
+
+    const res = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "x-api-key": apiKey, "anthropic-version": "2023-06-01" },
+      body: JSON.stringify({
+        model: "claude-haiku-4-5-20251001",
+        max_tokens: 800,
+        messages: [{ role: "user", content: prompt }],
+      }),
+    });
+    const json = (await res.json()) as AnthropicResponse;
+    if (!res.ok) {
+      throw new Error(json.error?.message ?? `Claude API error (${res.status})`);
+    }
+    const text = (json.content ?? [])
+      .map((block) => block.text ?? "")
+      .join("")
+      .trim();
+    if (!text) throw new Error("Empty response from Claude — try again.");
+    return { text };
+  });
+
 // Branding Graphics v2 — real AI image generation (2026-11-13). The first
 // version of this (see renderBrandGraphic, formerly in voice.tsx) drew
 // shapes on a <canvas> by hand: a circle, a gradient, some text. Mike's
@@ -1176,13 +1349,23 @@ function buildBrandGraphicPrompt(opts: {
   website: string;
   email: string;
   licenseNumber: string;
+  contactCta: string;
   brandColorHex: string | null;
   template: BrandGraphicTemplate;
   hasLogo: boolean;
   hasBackgroundPhoto: boolean;
 }): string {
-  const contactParts = [opts.phone, opts.website, opts.email].map((s) => s.trim()).filter(Boolean);
-  const contactLine = contactParts.join("   •   ");
+  // Added 2026-11-16 per Mike's "that CTA or call to action needs to be
+  // embedded through all of the profile headers... so that it's sunk
+  // throughout" — when the agent's given their own CTA, it replaces the
+  // raw phone/website/email join as the contact line text (still rendered
+  // the same way in the design), same idea as buildBioContextBlock above.
+  const contactLine = opts.contactCta.trim()
+    ? opts.contactCta.trim()
+    : [opts.phone, opts.website, opts.email]
+        .map((s) => s.trim())
+        .filter(Boolean)
+        .join("   •   ");
 
   return `You are a senior graphic designer creating a professional real estate marketing banner (usable as both a YouTube channel banner and a Facebook cover photo) for a real estate agent. Output a single polished, high-end, realistic marketing graphic — not a mockup, not a collage, not a template with placeholder-looking text. This needs to look like it came out of a real design agency.
 
@@ -1206,7 +1389,63 @@ Tagline: "${opts.tagline}"
 ${contactLine ? `Contact line (small, in a clean row, can include simple minimal icons): "${contactLine}"` : ""}
 ${opts.licenseNumber.trim() ? `License line (small, subtle): "License #${opts.licenseNumber.trim()}"` : ""}
 
-CRITICAL COMPOSITION CONSTRAINT: This image will be cropped to several different wide aspect ratios afterward (some much shorter/wider than this canvas). Keep the headshot and ALL text — name, tagline, contact line, license — vertically centered within the middle 50% of the frame, with generous, visually intentional (not empty-looking) background extending to the very top and bottom edges. Nothing essential can be near the top or bottom edge.
+CRITICAL COMPOSITION CONSTRAINT: This image gets cropped twice after you generate it — first down to a wide banner shape, then AGAIN by YouTube and Facebook themselves, which each silently crop further to their own "safe area" on top of that (YouTube in particular only guarantees the center ~60% width x ~25% height of a banner is ever visible on every device — phones and tablets crop in hard from both the sides and top/bottom). So: keep the headshot and ALL text — name, tagline, contact line, license — centered within the middle 55% of the frame horizontally AND the middle 25% of the frame vertically. Treat that center band as the only area that's guaranteed to ever be seen. Fill everything outside it with generous, visually intentional (not empty-looking) background/texture/gradient that looks deliberate if it gets cropped away entirely — nothing essential anywhere near the top, bottom, left, or right edges.
+
+Landscape orientation. No watermarks, no stock-photo text, no placeholder text of any kind.`;
+}
+
+// Refine/re-prompt (2026-11-16) — per Mike: "you need the ability to
+// reprompt it and also add files for the user... I might want to switch
+// out the photo or something in the background... It's not giving me any
+// options." Rather than a second from-scratch generation (which would
+// redesign everything, not just the one thing the agent wants changed),
+// this feeds the PREVIOUS master image back in as the first reference
+// image alongside a prompt that instructs the model to change only what
+// was asked and preserve the rest — see generateBrandGraphicAI below for
+// how baseImageUrl/refinementNote route here instead of
+// buildBrandGraphicPrompt.
+function buildBrandGraphicRefinementPrompt(opts: {
+  name: string;
+  tagline: string;
+  phone: string;
+  website: string;
+  email: string;
+  licenseNumber: string;
+  contactCta: string;
+  brandColorHex: string | null;
+  template: BrandGraphicTemplate;
+  hasLogo: boolean;
+  hasBackgroundPhoto: boolean;
+  refinementNote: string;
+}): string {
+  const contactLine = opts.contactCta.trim()
+    ? opts.contactCta.trim()
+    : [opts.phone, opts.website, opts.email]
+        .map((s) => s.trim())
+        .filter(Boolean)
+        .join("   •   ");
+
+  return `You are a senior graphic designer. The FIRST image attached is a real estate marketing banner you designed previously for this same agent — do not start over or redesign it from scratch. Make ONLY the specific change requested below, and keep everything else about it (layout, style, colors, typography, headshot placement, logo placement, all text) exactly as it already is unless the requested change itself requires otherwise.
+
+REQUESTED CHANGE: "${opts.refinementNote.trim()}"
+
+${BRAND_GRAPHIC_TEMPLATE_BRIEFS[opts.template]}
+
+${opts.brandColorHex ? `BRAND COLOR: ${opts.brandColorHex} — keep using this unless the requested change says otherwise.` : ""}
+
+IMAGES PROVIDED: The first image is the existing design to edit (described above) — treat it as the source of truth for everything the requested change doesn't mention. The second image is this agent's real headshot — use their actual likeness, do not alter their face or replace it with a generic person.${opts.hasLogo ? " The third image is their company/team logo — preserve its exact design, never redrawn or altered." : ""}${
+    opts.hasBackgroundPhoto
+      ? ` The ${opts.hasLogo ? "fourth" : "third"} image is a real photo from this agent's own website — use it only if the requested change calls for a new or different background, otherwise ignore it.`
+      : ""
+  }
+
+TEXT TO RENDER (keep exactly as in the existing design unless the requested change says to alter it — exact spelling, bold and perfectly legible, real typography):
+Name: "${opts.name}"
+Tagline: "${opts.tagline}"
+${contactLine ? `Contact line: "${contactLine}"` : ""}
+${opts.licenseNumber.trim() ? `License line: "License #${opts.licenseNumber.trim()}"` : ""}
+
+CRITICAL COMPOSITION CONSTRAINT (unchanged from the original design, do not break this while making the requested edit): This image gets cropped twice after you generate it — first down to a wide banner shape, then AGAIN by YouTube and Facebook themselves, which each crop further to their own "safe area." Keep the headshot and ALL text centered within the middle 55% of the frame horizontally AND the middle 25% of the frame vertically. Nothing essential anywhere near the top, bottom, left, or right edges.
 
 Landscape orientation. No watermarks, no stock-photo text, no placeholder text of any kind.`;
 }
@@ -1220,8 +1459,16 @@ async function fetchAsBlob(url: string): Promise<Blob> {
 export const generateBrandGraphicAI = createServerFn({ method: "POST" })
   .middleware([requireSupabaseAuth])
   .validator(
-    (data: { agentId: string; template: BrandGraphicTemplate; tagline: string; backgroundImageUrl: string | null }) =>
-      data,
+    (data: {
+      agentId: string;
+      template: BrandGraphicTemplate;
+      tagline: string;
+      backgroundImageUrl: string | null;
+      // Both present together = refine an existing design rather than
+      // generate a fresh one — see buildBrandGraphicRefinementPrompt above.
+      refinementNote?: string;
+      baseImageUrl?: string | null;
+    }) => data,
   )
   .handler(async ({ data, context }): Promise<{ imageUrl: string }> => {
     const email = (context.claims as { email?: string } | undefined)?.email;
@@ -1245,19 +1492,36 @@ export const generateBrandGraphicAI = createServerFn({ method: "POST" })
 
     const voiceAnswers = (row.voice_answers as VoiceDnaAnswers | null) ?? null;
     const bi = voiceAnswers?.businessInfo;
+    const isRefinement = Boolean(data.refinementNote?.trim() && data.baseImageUrl);
 
-    const prompt = buildBrandGraphicPrompt({
-      name: row.full_name ?? "Your Name",
-      tagline: data.tagline.trim() || "Real Estate Agent",
-      phone: row.phone ?? "",
-      website: bi?.website ?? "",
-      email: bi?.email ?? "",
-      licenseNumber: bi?.licenseNumber ?? "",
-      brandColorHex: voiceAnswers?.websiteScan?.brandColor ?? null,
-      template: data.template,
-      hasLogo: Boolean(row.logo_url),
-      hasBackgroundPhoto: Boolean(data.backgroundImageUrl),
-    });
+    const prompt = isRefinement
+      ? buildBrandGraphicRefinementPrompt({
+          name: row.full_name ?? "Your Name",
+          tagline: data.tagline.trim() || "Real Estate Agent",
+          phone: row.phone ?? "",
+          website: bi?.website ?? "",
+          email: bi?.email ?? "",
+          licenseNumber: bi?.licenseNumber ?? "",
+          contactCta: bi?.contactCta ?? "",
+          brandColorHex: voiceAnswers?.websiteScan?.brandColor ?? null,
+          template: data.template,
+          hasLogo: Boolean(row.logo_url),
+          hasBackgroundPhoto: Boolean(data.backgroundImageUrl),
+          refinementNote: data.refinementNote ?? "",
+        })
+      : buildBrandGraphicPrompt({
+          name: row.full_name ?? "Your Name",
+          tagline: data.tagline.trim() || "Real Estate Agent",
+          phone: row.phone ?? "",
+          website: bi?.website ?? "",
+          email: bi?.email ?? "",
+          licenseNumber: bi?.licenseNumber ?? "",
+          contactCta: bi?.contactCta ?? "",
+          brandColorHex: voiceAnswers?.websiteScan?.brandColor ?? null,
+          template: data.template,
+          hasLogo: Boolean(row.logo_url),
+          hasBackgroundPhoto: Boolean(data.backgroundImageUrl),
+        });
 
     // Model pinned here, not hardcoded as a bare literal: OpenAI shut down
     // the original gpt-image-1 entirely on 2026-10-23 (confirmed on their
@@ -1285,6 +1549,12 @@ export const generateBrandGraphicAI = createServerFn({ method: "POST" })
     // fidelity. Worth the extra cost/latency for something an agent will
     // actually publish.
     formData.append("quality", "high");
+    // Refinement mode puts the previous master image FIRST — matching the
+    // "the first image is the existing design to edit" ordinal language in
+    // buildBrandGraphicRefinementPrompt above.
+    if (isRefinement && data.baseImageUrl) {
+      formData.append("image[]", await fetchAsBlob(data.baseImageUrl), "previous-design.png");
+    }
     formData.append("image[]", await fetchAsBlob(row.headshot_url), "headshot.png");
     if (row.logo_url) formData.append("image[]", await fetchAsBlob(row.logo_url), "logo.png");
     if (data.backgroundImageUrl)
@@ -1336,7 +1606,7 @@ export const generateBrandGraphicAI = createServerFn({ method: "POST" })
 // thing that makes sense for a single profile photo/logo slot.
 export const createBrandAssetUploadUrl = createServerFn({ method: "POST" })
   .middleware([requireSupabaseAuth])
-  .validator((data: { agentId: string; fileName: string; kind: "headshot" | "logo" }) => data)
+  .validator((data: { agentId: string; fileName: string; kind: "headshot" | "logo" | "customBackground" }) => data)
   .handler(async ({ data, context }): Promise<{ path: string; token: string }> => {
     const email = (context.claims as { email?: string } | undefined)?.email;
     await requireAgentAccess(context.userId, email, data.agentId);
@@ -1350,7 +1620,7 @@ export const createBrandAssetUploadUrl = createServerFn({ method: "POST" })
 
 export const finalizeBrandAssetUpload = createServerFn({ method: "POST" })
   .middleware([requireSupabaseAuth])
-  .validator((data: { agentId: string; storagePath: string; kind: "headshot" | "logo" }) => data)
+  .validator((data: { agentId: string; storagePath: string; kind: "headshot" | "logo" | "customBackground" }) => data)
   .handler(async ({ data, context }): Promise<{ ok: true; url: string }> => {
     const email = (context.claims as { email?: string } | undefined)?.email;
     await requireAgentAccess(context.userId, email, data.agentId);
@@ -1359,6 +1629,15 @@ export const finalizeBrandAssetUpload = createServerFn({ method: "POST" })
     }
     const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
     const { data: pub } = supabaseAdmin.storage.from("media").getPublicUrl(data.storagePath);
+    // A custom background (2026-11-16, for Branding Graphics' "upload your
+    // own" option) isn't a profile slot like headshot/logo — there's no
+    // agents-table column for it and no "replace the one on file" meaning,
+    // it's just another image the agent can pick as a graphic's
+    // background, so this skips the agents-table update entirely and just
+    // hands back the public URL for the client to use directly.
+    if (data.kind === "customBackground") {
+      return { ok: true, url: pub.publicUrl };
+    }
     // Explicit branches rather than a computed { [column]: ... } key — the
     // computed form widens to a generic string index signature and doesn't
     // type-check against the generated Update type.

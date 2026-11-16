@@ -373,6 +373,14 @@ function VoiceWorkspace({
   // stale one instead of it firing late against a session the user already
   // left.
   const micStartTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Stall watchdog (2026-11-16, second pass) — per Mike: "It says it was
+  // recording but nothing was transcribing." A session can go fully silent
+  // mid-answer — no more onresult, but also no onerror and no onend — so
+  // the mic truthfully keeps showing "Listening..." while nothing is
+  // actually being transcribed, with no browser event ever signaling
+  // anything is wrong. Tracked in a ref, same reason as the start watchdog
+  // above.
+  const micStallIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   // Brand assets (2026-09-28) — headshot + logo, live independent of
   // interview stage so they can be uploaded/replaced any time.
@@ -870,6 +878,10 @@ function VoiceWorkspace({
       clearTimeout(micStartTimeoutRef.current);
       micStartTimeoutRef.current = null;
     }
+    if (micStallIntervalRef.current) {
+      clearInterval(micStallIntervalRef.current);
+      micStallIntervalRef.current = null;
+    }
     const r = recogRef.current;
     if (r) {
       r.onstart = null;
@@ -915,12 +927,20 @@ function VoiceWorkspace({
     let finalTranscript = "";
     let started = false;
     let sessionEnded = false;
+    let lastActivityAt = Date.now();
     const qIndex = currentQuestion;
 
     function clearStartWatchdog() {
       if (micStartTimeoutRef.current) {
         clearTimeout(micStartTimeoutRef.current);
         micStartTimeoutRef.current = null;
+      }
+    }
+
+    function clearStallWatchdog() {
+      if (micStallIntervalRef.current) {
+        clearInterval(micStallIntervalRef.current);
+        micStallIntervalRef.current = null;
       }
     }
 
@@ -935,6 +955,7 @@ function VoiceWorkspace({
     micStartTimeoutRef.current = setTimeout(() => {
       if (started) return;
       sessionEnded = true;
+      clearStallWatchdog();
       micStartTimeoutRef.current = null;
       try {
         recog.abort();
@@ -956,6 +977,7 @@ function VoiceWorkspace({
       if (sessionEnded) return;
       sessionEnded = true;
       clearStartWatchdog();
+      clearStallWatchdog();
       setMicListening(false);
       baseText = baseText + finalTranscript;
       finalTranscript = "";
@@ -966,8 +988,32 @@ function VoiceWorkspace({
       }
     }
 
+    // FIXED (2026-11-16, second pass) — per Mike: "It says it was recording
+    // but nothing was transcribing." This is the real, deeper bug behind
+    // that: a session can go fully silent mid-answer — the engine just
+    // stops processing audio, with no error and no end, so the mic
+    // honestly reports "still listening" forever while zero further text
+    // ever arrives. Nothing in the Web Speech API tells us this happened,
+    // so this checks for it directly: if 7 full seconds pass with no new
+    // interim or final result while a session is supposedly live, don't
+    // keep waiting on an event that may never come — tear this instance
+    // down and start a fresh one, keeping whatever was already captured.
+    const STALL_MS = 7000;
+    micStallIntervalRef.current = setInterval(() => {
+      if (sessionEnded || !started) return;
+      if (Date.now() - lastActivityAt > STALL_MS) {
+        finishSession(true);
+        try {
+          recog.abort();
+        } catch {
+          // ignore
+        }
+      }
+    }, 1500);
+
     recog.onstart = () => {
       started = true;
+      lastActivityAt = Date.now();
       clearStartWatchdog();
       setMicListening(true);
       micDeniedRef.current = false;
@@ -976,6 +1022,7 @@ function VoiceWorkspace({
     };
 
     recog.onresult = (e: any) => {
+      lastActivityAt = Date.now();
       let interim = "";
       for (let i = e.resultIndex; i < e.results.length; i++) {
         if (e.results[i].isFinal) {
@@ -1002,6 +1049,7 @@ function VoiceWorkspace({
         userStoppedMicRef.current = true;
         sessionEnded = true;
         clearStartWatchdog();
+        clearStallWatchdog();
         setMicListening(false);
         resetMicUI(
           "Mic access blocked — check your browser/site settings and allow microphone access, or just type below.",
@@ -1025,6 +1073,7 @@ function VoiceWorkspace({
         userStoppedMicRef.current = true;
         sessionEnded = true;
         clearStartWatchdog();
+        clearStallWatchdog();
         setMicListening(false);
         resetMicUI("Network hiccup — tap the mic to try again, or type below.");
         return;
@@ -1032,6 +1081,7 @@ function VoiceWorkspace({
       userStoppedMicRef.current = true;
       sessionEnded = true;
       clearStartWatchdog();
+      clearStallWatchdog();
       setMicListening(false);
       resetMicUI("Error — please type your answer below.");
     };

@@ -190,10 +190,18 @@ function getSpeechRecognitionCtor(): (new () => SpeechRecognitionLike) | undefin
   return w.SpeechRecognition ?? w.webkitSpeechRecognition;
 }
 
-function isIOSDevice(): boolean {
+// WIDENED (2026-11-16) — per Mike: the interview's mic "isn't working...
+// not even catching anything" on mobile. `continuous` recognition (what
+// this flag turns off) is a well-documented source of exactly that failure
+// mode on mobile Chrome/Android, not just iOS — this was only ever
+// checking for iOS, so Android got the less reliable continuous mode this
+// was specifically meant to avoid. Same rename+widen applied to the
+// identical helper in marketing.tsx's MicButton.
+function isMobileDevice(): boolean {
   if (typeof navigator === "undefined") return false;
   return (
-    /iPad|iPhone|iPod/.test(navigator.userAgent) || (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1)
+    /iPad|iPhone|iPod|Android|Mobi/i.test(navigator.userAgent) ||
+    (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1)
   );
 }
 
@@ -360,6 +368,11 @@ function VoiceWorkspace({
   const recogRef = useRef<SpeechRecognitionLike | null>(null);
   const userStoppedMicRef = useRef(false);
   const micDeniedRef = useRef(false);
+  // Watchdog for a `.start()` that returns without the engine ever actually
+  // engaging (2026-11-16 fix) — tracked in a ref so killMic() can cancel a
+  // stale one instead of it firing late against a session the user already
+  // left.
+  const micStartTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // Brand assets (2026-09-28) — headshot + logo, live independent of
   // interview stage so they can be uploaded/replaced any time.
@@ -853,6 +866,10 @@ function VoiceWorkspace({
   }, [currentQuestion]);
 
   function killMic() {
+    if (micStartTimeoutRef.current) {
+      clearTimeout(micStartTimeoutRef.current);
+      micStartTimeoutRef.current = null;
+    }
     const r = recogRef.current;
     if (r) {
       r.onstart = null;
@@ -892,13 +909,66 @@ function VoiceWorkspace({
     const Ctor = getSpeechRecognitionCtor();
     if (!Ctor) return;
     const recog = new Ctor();
-    recog.continuous = !isIOSDevice();
+    recog.continuous = !isMobileDevice();
     recog.interimResults = true;
     recog.lang = "en-US";
     let finalTranscript = "";
+    let started = false;
+    let sessionEnded = false;
     const qIndex = currentQuestion;
 
+    function clearStartWatchdog() {
+      if (micStartTimeoutRef.current) {
+        clearTimeout(micStartTimeoutRef.current);
+        micStartTimeoutRef.current = null;
+      }
+    }
+
+    // FIXED (2026-11-16) — per Mike, the mic sometimes wasn't catching
+    // anything at all. `.start()` can return without throwing on some
+    // mobile browsers while the recognition engine never actually engages
+    // — no onstart, no onresult, no onerror, nothing — which used to leave
+    // the UI stuck showing "Listening... tap to stop" forever with nothing
+    // ever recorded and no visible sign anything was wrong. If `onstart`
+    // hasn't fired within 4s of calling start(), treat it as a failed
+    // start instead of hanging silently.
+    micStartTimeoutRef.current = setTimeout(() => {
+      if (started) return;
+      sessionEnded = true;
+      micStartTimeoutRef.current = null;
+      try {
+        recog.abort();
+      } catch {
+        // ignore
+      }
+      if (recogRef.current === recog) recogRef.current = null;
+      if (!userStoppedMicRef.current && !micDeniedRef.current) {
+        resetMicUI("Mic didn't start — tap to try again, or just type your answer.");
+      }
+    }, 4000);
+
+    // Centralizes the "this recognition session is over" decision so
+    // `onend` and the `no-speech`/`aborted` error cases below — which don't
+    // reliably both fire together across every mobile browser — can't both
+    // try to restart (or stop) at once. Whichever gets there first wins;
+    // `sessionEnded` makes the other a no-op.
+    function finishSession(shouldRestart: boolean) {
+      if (sessionEnded) return;
+      sessionEnded = true;
+      clearStartWatchdog();
+      setMicListening(false);
+      baseText = baseText + finalTranscript;
+      finalTranscript = "";
+      if (shouldRestart && !userStoppedMicRef.current && !micDeniedRef.current) {
+        attemptRestart(baseText, 0);
+      } else if (!userStoppedMicRef.current && !micDeniedRef.current) {
+        resetMicUI();
+      }
+    }
+
     recog.onstart = () => {
+      started = true;
+      clearStartWatchdog();
       setMicListening(true);
       micDeniedRef.current = false;
       finalTranscript = "";
@@ -923,41 +993,54 @@ function VoiceWorkspace({
     };
 
     recog.onend = () => {
-      setMicListening(false);
-      baseText = baseText + finalTranscript;
-      if (!userStoppedMicRef.current && !micDeniedRef.current) {
-        attemptRestart(baseText, 0);
-        return;
-      }
-      resetMicUI();
+      finishSession(true);
     };
 
     recog.onerror = (e: any) => {
-      setMicListening(false);
       if (e.error === "not-allowed" || e.error === "service-not-allowed") {
         micDeniedRef.current = true;
         userStoppedMicRef.current = true;
+        sessionEnded = true;
+        clearStartWatchdog();
+        setMicListening(false);
         resetMicUI(
           "Mic access blocked — check your browser/site settings and allow microphone access, or just type below.",
         );
         return;
       }
-      if (e.error === "no-speech") return;
-      if (e.error === "network") {
-        resetMicUI("Network hiccup — tap the mic to try again, or type below.");
-        userStoppedMicRef.current = true;
+      // FIXED (2026-11-16) — these two used to just `return`, relying on
+      // `onend` to also fire right after and handle the restart. Not every
+      // mobile browser's Web Speech implementation is that consistent
+      // about always firing `end` after an error, so a mid-answer pause (a
+      // completely normal "no-speech" moment while someone's thinking)
+      // could silently kill the session with the UI never changing — the
+      // user keeps talking into what looks like a live mic that's actually
+      // already dead. Now explicitly restarts (or stops) right here
+      // instead of hoping `onend` follows.
+      if (e.error === "no-speech" || e.error === "aborted") {
+        finishSession(true);
         return;
       }
-      if (e.error === "aborted") return;
-      resetMicUI("Error — please type your answer below.");
+      if (e.error === "network") {
+        userStoppedMicRef.current = true;
+        sessionEnded = true;
+        clearStartWatchdog();
+        setMicListening(false);
+        resetMicUI("Network hiccup — tap the mic to try again, or type below.");
+        return;
+      }
       userStoppedMicRef.current = true;
+      sessionEnded = true;
+      clearStartWatchdog();
+      setMicListening(false);
+      resetMicUI("Error — please type your answer below.");
     };
 
     recogRef.current = recog;
     recog.start();
   }
 
-  function toggleMic() {
+  async function toggleMic() {
     if (!micSupported) return;
     if (micListening) {
       userStoppedMicRef.current = true;
@@ -968,6 +1051,29 @@ function VoiceWorkspace({
     userStoppedMicRef.current = false;
     micDeniedRef.current = false;
     killMic();
+
+    // FIXED (2026-11-16) — per Mike, mic wasn't catching anything at all on
+    // mobile. Going straight to SpeechRecognition's own permission prompt
+    // is unreliable on several mobile browsers (notably iOS Safari) — it
+    // can silently do nothing instead of prompting or erroring, which
+    // looks exactly like "the mic isn't catching anything" from the
+    // outside. Asking for the real OS mic permission via getUserMedia
+    // first forces an actual prompt (or an actual, catchable denial)
+    // before SpeechRecognition is ever touched.
+    if (navigator.mediaDevices?.getUserMedia) {
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        stream.getTracks().forEach((t) => t.stop());
+      } catch {
+        micDeniedRef.current = true;
+        userStoppedMicRef.current = true;
+        resetMicUI(
+          "Mic access blocked — check your browser/site settings and allow microphone access, or just type below.",
+        );
+        return;
+      }
+    }
+
     let base = answers[currentQuestion] ?? "";
     if (base && !base.endsWith(" ")) base += " ";
     attemptRestart(base, 0);

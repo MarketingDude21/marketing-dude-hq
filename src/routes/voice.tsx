@@ -22,6 +22,7 @@ import {
   saveContentBrandingStrategy,
   saveAgentSocialHandles,
   generateBrandBios,
+  regenerateBrandBio,
   scanAgentWebsite,
   generateBrandGraphicAI,
   getAgentSocialConnectStatus,
@@ -32,6 +33,7 @@ import {
   type AgentSocialHandles,
   type BrandBioResult,
   type BrandBioTone,
+  type BrandBioVariant,
   type WebsiteScan,
   type BrandGraphicTemplate,
   type AgentSocialConnectStatus,
@@ -73,7 +75,13 @@ type Stage = "loading" | "intro" | "basics" | "interview" | "areas" | "generatin
 
 type Basics = { fullName: string; marketArea: string; phone: string };
 const EMPTY_BASICS: Basics = { fullName: "", marketArea: "", phone: "" };
-const EMPTY_BUSINESS_INFO: AgentBusinessInfo = { website: "", licenseNumber: "", email: "", officeAddress: "" };
+const EMPTY_BUSINESS_INFO: AgentBusinessInfo = {
+  website: "",
+  licenseNumber: "",
+  email: "",
+  officeAddress: "",
+  contactCta: "",
+};
 const EMPTY_SOCIAL_HANDLES: AgentSocialHandles = {
   instagram: "",
   facebook: "",
@@ -104,9 +112,25 @@ function emptyAnswers(): string[] {
 // without a second (paid) API call per format.
 type BrandGraphicFormat = "youtube" | "facebook";
 
+// Dimensions researched 2026-11-16 directly against each platform's own
+// specs, not third-party guesses:
+// - YouTube: recommended upload is 2560x1440 (min 2048x1152); Google's own
+//   docs put the "safe area" that survives every device's cropping at
+//   1546x423 centered in that canvas (support.google.com/youtube/answer/
+//   10456525 and /12950272) — a much tighter band than this app previously
+//   assumed.
+// - Facebook: Meta's own Help Center (facebook.com/help/125379114252045)
+//   states the recommended cover photo size as 851x315 (not the 820x312
+//   this constant used to carry, which was a third-party number, not
+//   Meta's). Meta's own page states no safe-zone/profile-overlap figure —
+//   third-party sources disagree with each other on that by a wide margin
+//   (anywhere from "center 640x312" to "center 820x312"), so there's no
+//   single authoritative number to encode here; the combined safe-zone
+//   constraint below (in buildBrandGraphicPrompt) is deliberately
+//   conservative enough to cover that whole range.
 const BRAND_GRAPHIC_SIZES: Record<BrandGraphicFormat, { width: number; height: number; fileSuffix: string }> = {
   youtube: { width: 2560, height: 1440, fileSuffix: "YouTube-Banner" },
-  facebook: { width: 820, height: 312, fileSuffix: "Facebook-Cover" },
+  facebook: { width: 851, height: 315, fileSuffix: "Facebook-Cover" },
 };
 
 function loadImage(url: string): Promise<HTMLImageElement> {
@@ -449,6 +473,16 @@ function VoiceWorkspace({
   const [bioError, setBioError] = useState<string | null>(null);
   const [bioResult, setBioResult] = useState<BrandBioResult | null>(null);
   const [bioCopiedKey, setBioCopiedKey] = useState<string | null>(null);
+  // Per-bio feedback/rewrite (2026-11-16) — per Mike: "when it says to
+  // regenerate bios, you need the ability to add feedback, maybe rewrite
+  // per bio or add feedback per bio." Keyed by variant so each of the 5
+  // cards has its own open/closed feedback box, draft text, and in-flight
+  // state, independent of the other 4 — see regenerateBrandBio in
+  // voice-dna.ts, which rewrites only the one variant being edited.
+  const [bioFeedbackOpen, setBioFeedbackOpen] = useState<Partial<Record<BrandBioVariant, boolean>>>({});
+  const [bioFeedbackText, setBioFeedbackText] = useState<Partial<Record<BrandBioVariant, string>>>({});
+  const [bioRewriting, setBioRewriting] = useState<BrandBioVariant | null>(null);
+  const [bioRewriteError, setBioRewriteError] = useState<Partial<Record<BrandBioVariant, string>>>({});
 
   // Branding Graphics (2026-11-13) — per Mike: "take the headshot they
   // uploaded and the logo and be able to create really nice-looking
@@ -462,6 +496,21 @@ function VoiceWorkspace({
   const [graphicGenerating, setGraphicGenerating] = useState(false);
   const [graphicError, setGraphicError] = useState<string | null>(null);
   const [graphicPreviews, setGraphicPreviews] = useState<Partial<Record<BrandGraphicFormat, string>>>({});
+  // Refine/re-prompt (2026-11-16) — graphicMasterUrl remembers the
+  // AI-generated master image behind the current previews, so "Apply this
+  // change" below can edit THAT specific image instead of starting over.
+  // See handleRefineGraphics and buildBrandGraphicRefinementPrompt.
+  const [graphicMasterUrl, setGraphicMasterUrl] = useState<string | null>(null);
+  const [graphicRefineNote, setGraphicRefineNote] = useState("");
+  const [graphicRefining, setGraphicRefining] = useState(false);
+  // Custom background upload (2026-11-16) — per Mike: "add files for the
+  // user... I might want to switch out the photo." Lets an agent use their
+  // own photo as the Branding Graphics background instead of only the
+  // ones Scan My Website found. Uses the same signed-upload-URL pattern as
+  // uploadBrandAsset below, with kind "customBackground" (see
+  // createBrandAssetUploadUrl/finalizeBrandAssetUpload in voice-dna.ts).
+  const [customBackgrounds, setCustomBackgrounds] = useState<string[]>([]);
+  const [uploadingCustomBackground, setUploadingCustomBackground] = useState(false);
   // "None" (pure gradient, headshot + logo only — Mike's "only thing you
   // should need") is the default; a scanned website photo is opt-in.
   const [selectedBackgroundImage, setSelectedBackgroundImage] = useState<string | null>(null);
@@ -493,7 +542,14 @@ function VoiceWorkspace({
           setHeadshotUrl(data.headshot_url);
           setLogoUrl(data.logo_url);
           const stored = data.voice_answers;
-          setBusinessInfo(stored?.businessInfo ?? EMPTY_BUSINESS_INFO);
+          // Spread over EMPTY_BUSINESS_INFO rather than using a stored
+          // record as-is — contactCta was added 2026-11-16, so any agent
+          // who saved Business Info before that has a stored object
+          // missing that key, which would otherwise hand the contactCta
+          // input `undefined` instead of "".
+          setBusinessInfo(
+            stored?.businessInfo ? { ...EMPTY_BUSINESS_INFO, ...stored.businessInfo } : EMPTY_BUSINESS_INFO,
+          );
           setContentStrategy(stored?.contentBrandingStrategy ?? "");
           setSocialHandles(stored?.socialHandles ?? EMPTY_SOCIAL_HANDLES);
           setWebsiteScan(stored?.websiteScan ?? null);
@@ -567,6 +623,31 @@ function VoiceWorkspace({
     }
   }
 
+  // Custom background upload (2026-11-16) — same signed-upload-URL
+  // pattern as uploadBrandAsset above, kind "customBackground" (see
+  // createBrandAssetUploadUrl/finalizeBrandAssetUpload in voice-dna.ts).
+  // Appends to the picker instead of replacing anything, and selects it
+  // right away so the next "Generate graphics" uses it without an extra
+  // click.
+  async function handleUploadCustomBackground(file: File) {
+    setGraphicError(null);
+    setUploadingCustomBackground(true);
+    try {
+      const { path, token } = await createBrandAssetUploadUrl({
+        data: { agentId, fileName: file.name, kind: "customBackground" },
+      });
+      const { error: uploadErr } = await supabase.storage.from("media").uploadToSignedUrl(path, token, file);
+      if (uploadErr) throw uploadErr;
+      const result = await finalizeBrandAssetUpload({ data: { agentId, storagePath: path, kind: "customBackground" } });
+      setCustomBackgrounds((prev) => [...prev, result.url]);
+      setSelectedBackgroundImage(result.url);
+    } catch (e) {
+      setGraphicError(e instanceof Error ? e.message : "Couldn't upload that photo.");
+    } finally {
+      setUploadingCustomBackground(false);
+    }
+  }
+
   async function handleSaveBusinessInfo() {
     setBusinessInfoSaving(true);
     setBusinessInfoStatus(null);
@@ -579,6 +660,7 @@ function VoiceWorkspace({
           licenseNumber: businessInfo.licenseNumber,
           email: businessInfo.email,
           officeAddress: businessInfo.officeAddress,
+          contactCta: businessInfo.contactCta,
         },
       });
       setBusinessInfoStatus(result.ok ? "Saved." : `Could not save: ${result.error}`);
@@ -660,6 +742,32 @@ function VoiceWorkspace({
     }
   }
 
+  async function handleRewriteBio(variant: BrandBioVariant) {
+    if (!bioResult) return;
+    const feedback = (bioFeedbackText[variant] ?? "").trim();
+    if (!feedback) {
+      setBioRewriteError((prev) => ({ ...prev, [variant]: "Add a note on what to change first." }));
+      return;
+    }
+    setBioRewriting(variant);
+    setBioRewriteError((prev) => ({ ...prev, [variant]: undefined }));
+    try {
+      const { text } = await regenerateBrandBio({
+        data: { agentId, tone: bioTone, variant, currentText: bioResult[variant], feedback },
+      });
+      setBioResult((prev) => (prev ? { ...prev, [variant]: text } : prev));
+      setBioFeedbackText((prev) => ({ ...prev, [variant]: "" }));
+      setBioFeedbackOpen((prev) => ({ ...prev, [variant]: false }));
+    } catch (e) {
+      setBioRewriteError((prev) => ({
+        ...prev,
+        [variant]: e instanceof Error ? e.message : "Something went wrong rewriting this one.",
+      }));
+    } finally {
+      setBioRewriting(null);
+    }
+  }
+
   function copyBioText(key: string, text: string) {
     if (!text) return;
     const done = () => {
@@ -698,24 +806,72 @@ function VoiceWorkspace({
       const { imageUrl } = await generateBrandGraphicAI({
         data: { agentId, template: graphicTemplate, tagline, backgroundImageUrl },
       });
-      const formats: BrandGraphicFormat[] = ["youtube", "facebook"];
-      const entries = await Promise.all(
-        formats.map(async (format) => {
-          const blob = await cropMasterGraphic(imageUrl, format);
-          return [format, URL.createObjectURL(blob)] as const;
-        }),
-      );
-      setGraphicPreviews((prev) => {
-        // Revoke the previous round's object URLs before replacing them —
-        // these aren't tiny, and nothing else holds a reference once a new
-        // preview replaces the old <img src>.
-        Object.values(prev).forEach((url) => url && URL.revokeObjectURL(url));
-        return Object.fromEntries(entries);
-      });
+      await applyMasterGraphic(imageUrl);
+      // A fresh from-scratch generation starts a new editing lineage — any
+      // refine note typed against the PREVIOUS master no longer applies.
+      setGraphicRefineNote("");
     } catch (e) {
       setGraphicError(e instanceof Error ? e.message : "Something went wrong generating these graphics.");
     } finally {
       setGraphicGenerating(false);
+    }
+  }
+
+  // Shared by handleGenerateGraphics and handleRefineGraphics below —
+  // crops the one AI-generated master image into both platform previews
+  // and remembers its URL so a later refine call has something to edit.
+  async function applyMasterGraphic(imageUrl: string) {
+    const formats: BrandGraphicFormat[] = ["youtube", "facebook"];
+    const entries = await Promise.all(
+      formats.map(async (format) => {
+        const blob = await cropMasterGraphic(imageUrl, format);
+        return [format, URL.createObjectURL(blob)] as const;
+      }),
+    );
+    setGraphicPreviews((prev) => {
+      // Revoke the previous round's object URLs before replacing them —
+      // these aren't tiny, and nothing else holds a reference once a new
+      // preview replaces the old <img src>.
+      Object.values(prev).forEach((url) => url && URL.revokeObjectURL(url));
+      return Object.fromEntries(entries);
+    });
+    setGraphicMasterUrl(imageUrl);
+  }
+
+  // Refine/re-prompt (2026-11-16) — per Mike: "the ability to reprompt it
+  // and also add files for the user... I might want to switch out the
+  // photo or something in the background... It's not giving me any
+  // options." Edits the EXISTING master image (graphicMasterUrl) instead
+  // of generating a brand new design from scratch — see
+  // buildBrandGraphicRefinementPrompt in voice-dna.ts for how the
+  // refinement note + previous image get turned into a targeted edit.
+  async function handleRefineGraphics() {
+    if (!graphicMasterUrl) return;
+    const note = graphicRefineNote.trim();
+    if (!note) {
+      setGraphicError("Describe what you'd like to change first.");
+      return;
+    }
+    setGraphicRefining(true);
+    setGraphicError(null);
+    try {
+      const tagline = (graphicTagline ?? "Real Estate Agent").trim() || "Real Estate Agent";
+      const { imageUrl } = await generateBrandGraphicAI({
+        data: {
+          agentId,
+          template: graphicTemplate,
+          tagline,
+          backgroundImageUrl: selectedBackgroundImage,
+          refinementNote: note,
+          baseImageUrl: graphicMasterUrl,
+        },
+      });
+      await applyMasterGraphic(imageUrl);
+      setGraphicRefineNote("");
+    } catch (e) {
+      setGraphicError(e instanceof Error ? e.message : "Something went wrong applying that change.");
+    } finally {
+      setGraphicRefining(false);
     }
   }
 
@@ -1816,6 +1972,34 @@ function VoiceWorkspace({
                     className="mt-1 w-full rounded-xl border border-border bg-background/60 px-3 py-2 text-sm outline-none ring-ring transition focus:ring-2"
                   />
                 </label>
+                {/* Contact CTA (2026-11-16) — per Mike: "how should people
+                contact you? What is your call to action?... that CTA needs
+                to be embedded through all of the profile headers or about
+                sections... so that it's sunk throughout." In the agent's
+                own words, not another phone/website field — see
+                buildBioContextBlock and buildBrandGraphicPrompt in
+                voice-dna.ts for where this actually gets used. */}
+                <label className="block sm:col-span-2">
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="text-xs font-medium text-muted-foreground">
+                      Contact CTA — how should people reach you?
+                    </span>
+                    <MicButton
+                      value={businessInfo.contactCta}
+                      onChange={(v) => setBusinessInfo((b) => ({ ...b, contactCta: v }))}
+                    />
+                  </div>
+                  <input
+                    value={businessInfo.contactCta}
+                    onChange={(e) => setBusinessInfo((b) => ({ ...b, contactCta: e.target.value }))}
+                    placeholder="e.g. Call or text me anytime at (555) 123-4567, or DM me here"
+                    className="mt-1 w-full rounded-xl border border-border bg-background/60 px-3 py-2 text-sm outline-none ring-ring transition focus:ring-2"
+                  />
+                  <p className="mt-1 text-[11px] text-muted-foreground">
+                    This gets woven into every bio below and into your graphics' contact line, so it's consistent
+                    everywhere instead of just a phone number.
+                  </p>
+                </label>
               </div>
               <div className="mt-4 flex items-center gap-3">
                 <button
@@ -2154,6 +2338,60 @@ function VoiceWorkspace({
                         {variant.counter && (
                           <p className="mt-1.5 text-[11px] text-muted-foreground">{text.length} / 150 characters</p>
                         )}
+                        {/* Per-bio feedback/rewrite (2026-11-16) — per Mike:
+                        "maybe rewrite per bio or add feedback per bio."
+                        Rewrites just this one variant via
+                        regenerateBrandBio, leaving the other 4 untouched. */}
+                        <div className="mt-3 border-t border-border pt-3">
+                          {bioFeedbackOpen[variant.key] ? (
+                            <div>
+                              <div className="flex items-center justify-between gap-2">
+                                <span className="text-xs font-medium text-muted-foreground">What should change?</span>
+                                <MicButton
+                                  value={bioFeedbackText[variant.key] ?? ""}
+                                  onChange={(v) => setBioFeedbackText((prev) => ({ ...prev, [variant.key]: v }))}
+                                />
+                              </div>
+                              <textarea
+                                value={bioFeedbackText[variant.key] ?? ""}
+                                onChange={(e) =>
+                                  setBioFeedbackText((prev) => ({ ...prev, [variant.key]: e.target.value }))
+                                }
+                                placeholder="e.g. make it shorter, drop the joke, lead with how long I've been in the area"
+                                rows={2}
+                                className="mt-1 w-full resize-y rounded-xl border border-border bg-background/60 px-3 py-2 text-sm outline-none ring-ring transition focus:ring-2"
+                              />
+                              <div className="mt-2 flex items-center gap-2">
+                                <button
+                                  onClick={() => handleRewriteBio(variant.key)}
+                                  disabled={bioRewriting === variant.key}
+                                  className="rounded-lg bg-primary px-3 py-1.5 text-xs font-semibold text-primary-foreground shadow shadow-primary/30 transition-transform hover:-translate-y-0.5 disabled:opacity-60"
+                                >
+                                  {bioRewriting === variant.key ? "Rewriting…" : "Rewrite this one"}
+                                </button>
+                                <button
+                                  onClick={() => {
+                                    setBioFeedbackOpen((prev) => ({ ...prev, [variant.key]: false }));
+                                    setBioRewriteError((prev) => ({ ...prev, [variant.key]: undefined }));
+                                  }}
+                                  className="rounded-lg px-3 py-1.5 text-xs font-medium text-muted-foreground hover:text-foreground"
+                                >
+                                  Cancel
+                                </button>
+                              </div>
+                              {bioRewriteError[variant.key] && (
+                                <p className="mt-1.5 text-xs text-destructive">{bioRewriteError[variant.key]}</p>
+                              )}
+                            </div>
+                          ) : (
+                            <button
+                              onClick={() => setBioFeedbackOpen((prev) => ({ ...prev, [variant.key]: true }))}
+                              className="text-xs font-semibold text-muted-foreground transition-colors hover:text-foreground"
+                            >
+                              Add feedback / rewrite this one
+                            </button>
+                          )}
+                        </div>
                       </div>
                     );
                   })}
@@ -2227,36 +2465,62 @@ function VoiceWorkspace({
               been scanned) still produces a full designed graphic from
               just headshot + logo, per Mike's "only thing you should
               need." */}
-              {websiteScan && websiteScan.images.length > 0 && (
-                <div className="mt-4">
-                  <span className="text-xs font-medium text-muted-foreground">
-                    Background photo (from your website)
-                  </span>
-                  <div className="mt-1.5 flex flex-wrap gap-2">
+              {/* Background photo picker — widened 2026-11-16 per Mike:
+              "add files for the user. For example, I might want to switch
+              out the photo or something in the background." Previously
+              only showed up once Scan My Website found photos; now always
+              visible so an agent with no website (or who just wants a
+              different photo entirely) can upload their own via the
+              "Upload your own" tile — see handleUploadCustomBackground and
+              the customBackground upload kind in voice-dna.ts. */}
+              <div className="mt-4">
+                <span className="text-xs font-medium text-muted-foreground">Background photo</span>
+                <div className="mt-1.5 flex flex-wrap gap-2">
+                  <button
+                    onClick={() => setSelectedBackgroundImage(null)}
+                    className={`grid h-14 w-20 shrink-0 place-items-center rounded-lg border text-[10px] font-medium transition-colors ${
+                      selectedBackgroundImage === null
+                        ? "border-primary bg-secondary text-foreground"
+                        : "border-border bg-background/40 text-muted-foreground hover:bg-secondary"
+                    }`}
+                  >
+                    None
+                  </button>
+                  {[...(websiteScan?.images ?? []), ...customBackgrounds].map((url) => (
                     <button
-                      onClick={() => setSelectedBackgroundImage(null)}
-                      className={`grid h-14 w-20 shrink-0 place-items-center rounded-lg border text-[10px] font-medium transition-colors ${
-                        selectedBackgroundImage === null
-                          ? "border-primary bg-secondary text-foreground"
-                          : "border-border bg-background/40 text-muted-foreground hover:bg-secondary"
+                      key={url}
+                      onClick={() => setSelectedBackgroundImage(url)}
+                      className={`h-14 w-20 shrink-0 overflow-hidden rounded-lg border-2 transition-colors ${
+                        selectedBackgroundImage === url ? "border-primary" : "border-transparent hover:border-border"
                       }`}
                     >
-                      None
+                      <img src={url} alt="" className="size-full object-cover" />
                     </button>
-                    {websiteScan.images.map((url) => (
-                      <button
-                        key={url}
-                        onClick={() => setSelectedBackgroundImage(url)}
-                        className={`h-14 w-20 shrink-0 overflow-hidden rounded-lg border-2 transition-colors ${
-                          selectedBackgroundImage === url ? "border-primary" : "border-transparent hover:border-border"
-                        }`}
-                      >
-                        <img src={url} alt="" className="size-full object-cover" />
-                      </button>
-                    ))}
-                  </div>
+                  ))}
+                  <label
+                    className={`grid h-14 w-20 shrink-0 cursor-pointer place-items-center rounded-lg border border-dashed border-border bg-background/40 text-center text-[10px] font-medium text-muted-foreground transition-colors hover:bg-secondary ${
+                      uploadingCustomBackground ? "opacity-60" : ""
+                    }`}
+                  >
+                    {uploadingCustomBackground ? "Uploading…" : "+ Upload your own"}
+                    <input
+                      type="file"
+                      accept="image/*"
+                      className="hidden"
+                      disabled={uploadingCustomBackground}
+                      onChange={(e) => {
+                        const file = e.target.files?.[0];
+                        e.target.value = "";
+                        if (file) void handleUploadCustomBackground(file);
+                      }}
+                    />
+                  </label>
                 </div>
-              )}
+                <p className="mt-1.5 text-[11px] text-muted-foreground">
+                  From your website, or upload your own — used as the full background for Photo backdrop, or just
+                  color/mood inspiration for the other styles.
+                </p>
+              </div>
               <div className="mt-4 flex items-center gap-3">
                 <button
                   onClick={() => handleGenerateGraphics()}
@@ -2292,6 +2556,38 @@ function VoiceWorkspace({
                       </div>
                     );
                   })}
+                </div>
+              )}
+              {/* Refine/re-prompt (2026-11-16) — per Mike: "you need the
+              ability to reprompt it... I might want to switch out the
+              photo or something in the background... It's not giving me
+              any options." Edits the current design in place instead of
+              starting over — see handleRefineGraphics. Only shows once
+              there's a design to edit. */}
+              {graphicMasterUrl && (
+                <div className="mt-5 rounded-2xl border border-border bg-background/40 p-4">
+                  <p className="text-sm font-semibold">Want to change something?</p>
+                  <p className="mt-1 text-xs text-muted-foreground">
+                    Describe just the change — the rest of the design stays as-is. e.g. "swap the background for a beach
+                    instead of Chicago" or "make the tagline smaller."
+                  </p>
+                  <div className="mt-2 flex items-start gap-2">
+                    <textarea
+                      value={graphicRefineNote}
+                      onChange={(e) => setGraphicRefineNote(e.target.value)}
+                      placeholder="What should change?"
+                      rows={2}
+                      className="w-full resize-y rounded-xl border border-border bg-background/60 px-3 py-2 text-sm outline-none ring-ring transition focus:ring-2"
+                    />
+                    <MicButton value={graphicRefineNote} onChange={setGraphicRefineNote} />
+                  </div>
+                  <button
+                    onClick={handleRefineGraphics}
+                    disabled={graphicRefining || graphicGenerating}
+                    className="mt-2 rounded-xl bg-primary px-4 py-2 text-xs font-semibold text-primary-foreground shadow-lg shadow-primary/30 transition-transform hover:-translate-y-0.5 disabled:opacity-60"
+                  >
+                    {graphicRefining ? "Applying your change…" : "Apply this change"}
+                  </button>
                 </div>
               )}
             </div>

@@ -384,10 +384,18 @@ function getSpeechRecognitionCtor(): (new () => SpeechRecognitionLike) | undefin
   return w.SpeechRecognition ?? w.webkitSpeechRecognition;
 }
 
-function isIOSDevice(): boolean {
+// WIDENED (2026-11-16) — per Mike: the mic "isn't working... not even
+// catching anything" on mobile. `continuous` recognition (what this flag
+// turns off) is a well-documented source of exactly that failure mode on
+// mobile Chrome/Android, not just iOS — this was only ever checking for
+// iOS, so Android got the less reliable continuous mode this was
+// specifically meant to avoid. Same rename+widen applied to the identical
+// helper in voice.tsx's Voice DNA interview mic.
+function isMobileDevice(): boolean {
   if (typeof navigator === "undefined") return false;
   return (
-    /iPad|iPhone|iPod/.test(navigator.userAgent) || (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1)
+    /iPad|iPhone|iPod|Android|Mobi/i.test(navigator.userAgent) ||
+    (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1)
   );
 }
 
@@ -407,9 +415,18 @@ export function MicButton({ value, onChange }: { value: string; onChange: (v: st
   const deniedRef = useRef(false);
   const valueRef = useRef(value);
   valueRef.current = value;
+  // Watchdog for a `.start()` that returns without the engine ever
+  // actually engaging (2026-11-16 fix) — kept in a ref so the unmount
+  // cleanup and the manual-stop branch of toggle() can both cancel a
+  // stale one instead of it firing late.
+  const startTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   useEffect(() => {
     return () => {
+      if (startTimeoutRef.current) {
+        clearTimeout(startTimeoutRef.current);
+        startTimeoutRef.current = null;
+      }
       const r = recogRef.current;
       if (r) {
         r.onstart = null;
@@ -449,12 +466,57 @@ export function MicButton({ value, onChange }: { value: string; onChange: (v: st
     const Ctor = getSpeechRecognitionCtor();
     if (!Ctor) return;
     const recog = new Ctor();
-    recog.continuous = !isIOSDevice();
+    recog.continuous = !isMobileDevice();
     recog.interimResults = true;
     recog.lang = "en-US";
     let finalTranscript = "";
+    let started = false;
+    let sessionEnded = false;
+
+    function clearStartWatchdog() {
+      if (startTimeoutRef.current) {
+        clearTimeout(startTimeoutRef.current);
+        startTimeoutRef.current = null;
+      }
+    }
+
+    // Same fix as voice.tsx's startRecognitionInstance (2026-11-16): a
+    // watchdog for a `.start()` that returns without ever actually
+    // engaging (no events at all, mic stuck showing "Listening…" forever
+    // with nothing captured), and a single finishSession() so `onend` and
+    // the `no-speech`/`aborted` error cases can't both try to restart.
+    startTimeoutRef.current = setTimeout(() => {
+      if (started) return;
+      sessionEnded = true;
+      startTimeoutRef.current = null;
+      try {
+        recog.abort();
+      } catch {
+        // ignore
+      }
+      if (recogRef.current === recog) recogRef.current = null;
+      if (!userStoppedRef.current && !deniedRef.current) {
+        resetUI("Mic didn't start — tap to try again, or just type.");
+      }
+    }, 4000);
+
+    function finishSession(shouldRestart: boolean) {
+      if (sessionEnded) return;
+      sessionEnded = true;
+      clearStartWatchdog();
+      setListening(false);
+      baseText = baseText + finalTranscript;
+      finalTranscript = "";
+      if (shouldRestart && !userStoppedRef.current && !deniedRef.current) {
+        attemptRestart(baseText, 0);
+      } else if (!userStoppedRef.current && !deniedRef.current) {
+        resetUI();
+      }
+    }
 
     recog.onstart = () => {
+      started = true;
+      clearStartWatchdog();
       setListening(true);
       deniedRef.current = false;
       finalTranscript = "";
@@ -469,40 +531,52 @@ export function MicButton({ value, onChange }: { value: string; onChange: (v: st
       onChange(baseText + finalTranscript + interim);
     };
     recog.onend = () => {
-      setListening(false);
-      baseText = baseText + finalTranscript;
-      if (!userStoppedRef.current && !deniedRef.current) {
-        attemptRestart(baseText, 0);
-        return;
-      }
-      resetUI();
+      finishSession(true);
     };
     recog.onerror = (e: any) => {
-      setListening(false);
       if (e.error === "not-allowed" || e.error === "service-not-allowed") {
         deniedRef.current = true;
         userStoppedRef.current = true;
+        sessionEnded = true;
+        clearStartWatchdog();
+        setListening(false);
         resetUI("Mic access blocked — allow microphone access, or just type.");
         return;
       }
-      if (e.error === "no-speech" || e.error === "aborted") return;
-      if (e.error === "network") {
-        resetUI("Network hiccup — tap to try again.");
-        userStoppedRef.current = true;
+      // FIXED (2026-11-16) — see voice.tsx's identical fix: don't rely on
+      // `onend` also firing after a "no-speech"/"aborted" error on every
+      // mobile browser. Restart (or stop) explicitly right here instead.
+      if (e.error === "no-speech" || e.error === "aborted") {
+        finishSession(true);
         return;
       }
-      resetUI("Error — please type instead.");
+      if (e.error === "network") {
+        userStoppedRef.current = true;
+        sessionEnded = true;
+        clearStartWatchdog();
+        setListening(false);
+        resetUI("Network hiccup — tap to try again.");
+        return;
+      }
       userStoppedRef.current = true;
+      sessionEnded = true;
+      clearStartWatchdog();
+      setListening(false);
+      resetUI("Error — please type instead.");
     };
 
     recogRef.current = recog;
     recog.start();
   }
 
-  function toggle() {
+  async function toggle() {
     if (!supported) return;
     if (listening) {
       userStoppedRef.current = true;
+      if (startTimeoutRef.current) {
+        clearTimeout(startTimeoutRef.current);
+        startTimeoutRef.current = null;
+      }
       const r = recogRef.current;
       if (r) {
         try {
@@ -516,6 +590,23 @@ export function MicButton({ value, onChange }: { value: string; onChange: (v: st
     }
     userStoppedRef.current = false;
     deniedRef.current = false;
+
+    // Same fix as voice.tsx's Voice DNA interview mic (2026-11-16): ask for
+    // the real OS mic permission directly before ever touching
+    // SpeechRecognition, since its own permission prompt is unreliable on
+    // several mobile browsers and can silently do nothing instead.
+    if (navigator.mediaDevices?.getUserMedia) {
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        stream.getTracks().forEach((t) => t.stop());
+      } catch {
+        deniedRef.current = true;
+        userStoppedRef.current = true;
+        resetUI("Mic access blocked — allow microphone access, or just type.");
+        return;
+      }
+    }
+
     startInstance(valueRef.current);
   }
 

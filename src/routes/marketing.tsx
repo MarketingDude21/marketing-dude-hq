@@ -420,12 +420,21 @@ export function MicButton({ value, onChange }: { value: string; onChange: (v: st
   // cleanup and the manual-stop branch of toggle() can both cancel a
   // stale one instead of it firing late.
   const startTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Stall watchdog (2026-11-16, second pass) — same fix as voice.tsx's
+  // identical one: a session can go fully silent mid-dictation with no
+  // error and no end, so the UI truthfully keeps showing "Listening…"
+  // while nothing is actually being transcribed.
+  const stallIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   useEffect(() => {
     return () => {
       if (startTimeoutRef.current) {
         clearTimeout(startTimeoutRef.current);
         startTimeoutRef.current = null;
+      }
+      if (stallIntervalRef.current) {
+        clearInterval(stallIntervalRef.current);
+        stallIntervalRef.current = null;
       }
       const r = recogRef.current;
       if (r) {
@@ -472,11 +481,19 @@ export function MicButton({ value, onChange }: { value: string; onChange: (v: st
     let finalTranscript = "";
     let started = false;
     let sessionEnded = false;
+    let lastActivityAt = Date.now();
 
     function clearStartWatchdog() {
       if (startTimeoutRef.current) {
         clearTimeout(startTimeoutRef.current);
         startTimeoutRef.current = null;
+      }
+    }
+
+    function clearStallWatchdog() {
+      if (stallIntervalRef.current) {
+        clearInterval(stallIntervalRef.current);
+        stallIntervalRef.current = null;
       }
     }
 
@@ -488,6 +505,7 @@ export function MicButton({ value, onChange }: { value: string; onChange: (v: st
     startTimeoutRef.current = setTimeout(() => {
       if (started) return;
       sessionEnded = true;
+      clearStallWatchdog();
       startTimeoutRef.current = null;
       try {
         recog.abort();
@@ -504,6 +522,7 @@ export function MicButton({ value, onChange }: { value: string; onChange: (v: st
       if (sessionEnded) return;
       sessionEnded = true;
       clearStartWatchdog();
+      clearStallWatchdog();
       setListening(false);
       baseText = baseText + finalTranscript;
       finalTranscript = "";
@@ -514,8 +533,27 @@ export function MicButton({ value, onChange }: { value: string; onChange: (v: st
       }
     }
 
+    // Same fix as voice.tsx's identical stall watchdog (2026-11-16, second
+    // pass), per Mike: "It says it was recording but nothing was
+    // transcribing." If 7s pass with no new result while supposedly
+    // listening, don't wait on an event that may never come — tear this
+    // instance down and start a fresh one, keeping whatever was captured.
+    const STALL_MS = 7000;
+    stallIntervalRef.current = setInterval(() => {
+      if (sessionEnded || !started) return;
+      if (Date.now() - lastActivityAt > STALL_MS) {
+        finishSession(true);
+        try {
+          recog.abort();
+        } catch {
+          // ignore
+        }
+      }
+    }, 1500);
+
     recog.onstart = () => {
       started = true;
+      lastActivityAt = Date.now();
       clearStartWatchdog();
       setListening(true);
       deniedRef.current = false;
@@ -523,6 +561,7 @@ export function MicButton({ value, onChange }: { value: string; onChange: (v: st
       setLabel("Listening… tap to stop");
     };
     recog.onresult = (e: any) => {
+      lastActivityAt = Date.now();
       let interim = "";
       for (let i = e.resultIndex; i < e.results.length; i++) {
         if (e.results[i].isFinal) finalTranscript += e.results[i][0].transcript + " ";
@@ -539,6 +578,7 @@ export function MicButton({ value, onChange }: { value: string; onChange: (v: st
         userStoppedRef.current = true;
         sessionEnded = true;
         clearStartWatchdog();
+        clearStallWatchdog();
         setListening(false);
         resetUI("Mic access blocked — allow microphone access, or just type.");
         return;
@@ -554,6 +594,7 @@ export function MicButton({ value, onChange }: { value: string; onChange: (v: st
         userStoppedRef.current = true;
         sessionEnded = true;
         clearStartWatchdog();
+        clearStallWatchdog();
         setListening(false);
         resetUI("Network hiccup — tap to try again.");
         return;
@@ -561,6 +602,7 @@ export function MicButton({ value, onChange }: { value: string; onChange: (v: st
       userStoppedRef.current = true;
       sessionEnded = true;
       clearStartWatchdog();
+      clearStallWatchdog();
       setListening(false);
       resetUI("Error — please type instead.");
     };
@@ -576,6 +618,10 @@ export function MicButton({ value, onChange }: { value: string; onChange: (v: st
       if (startTimeoutRef.current) {
         clearTimeout(startTimeoutRef.current);
         startTimeoutRef.current = null;
+      }
+      if (stallIntervalRef.current) {
+        clearInterval(stallIntervalRef.current);
+        stallIntervalRef.current = null;
       }
       const r = recogRef.current;
       if (r) {

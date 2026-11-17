@@ -5067,71 +5067,75 @@ export const generateMonthlyBatch = createServerFn({ method: "POST" })
     const batchId = `${data.agentId}-${data.month}-${Date.now()}`;
     const rows: TablesInsert<"generated_posts">[] = [];
 
-    // Posts — one combined prompt, same REWRITTEN-block format the old app used.
-    if (postDocs.length) {
-      const postPrompt =
-        "You are the best real estate social media copywriter in the country. Your specialty: writing posts that remind people someone is in real estate without ever preaching about it. Every post tells a small story. Every post has a clear point. Every post sounds like a real person.\n\n" +
-        `You are writing for ${agentName} in ${agentCity}.\n\n` +
-        `VOICE DNA:\n${dna}\n\n` +
-        "RULES — follow every one:\n" +
-        "- Write a COMPLETE post. Every sentence must connect to the next. The post must make full sense start to finish.\n" +
-        "- Open with a scene or a pain point — never a summary or a general statement.\n" +
-        "- Write to ONE person, not an audience — like you're talking to one friend, not posting to a crowd.\n" +
-        "- Tell a story or make a single clear point. If you cannot explain what the post is about in one sentence, rewrite it.\n" +
-        "- 2 to 4 sentences max. Short. Punchy. Human.\n" +
-        "- No hyphens used as dashes anywhere, and no hyphens in compound modifiers either (write well known, not well-known)\n" +
-        '- No "As a real estate professional" or any version of that\n' +
-        '- No "Navigating the market" — never\n' +
-        "- No corporate language. No buzzwords. No filler.\n" +
-        "- Standard capitalization always. First letter of every sentence capitalized.\n" +
-        "- Real estate should feel like a casual aside, not the whole point\n" +
-        `- The post should remind people ${agentName} is in real estate — not sell them on it\n` +
-        "- AUTHENTICITY CHECK: Read it out loud. If it sounds like an ad, rewrite it. If a real person would never say this, rewrite it.\n" +
-        (data.useHashtags ? "- Add 2-3 relevant hashtags at the very end\n" : "- NO hashtags\n") +
-        (data.useEmojis ? "- A couple of relevant emojis are welcome if they feel natural\n" : "- NO emojis\n") +
-        learnedFeedback +
-        "\nFor each post below:\n1. Read the CONCEPT and ORIGINAL carefully\n2. Find the story or the human truth in it\n3. Write it clearly in the agent's voice\n4. Make sure the last sentence lands and the whole post makes sense\n\n" +
-        "Output format for each post:\nPOST [N]: [TITLE]\nREWRITTEN: [complete caption]\n---\n\n" +
-        "Posts to write:\n" +
-        postDocs.map((p, i) => `POST ${i + 1}: ${p.title}\nCONCEPT: ${p.goal}\nORIGINAL: ${p.copy}`).join("\n\n");
+    // Posts — one Claude call PER post, same Promise.all pattern as
+    // emails/videos below. FIXED 2026-11-18 per Mike, round 2 on this same
+    // bug: even after the previous round keyed parsing off each post's own
+    // printed "POST N:" number (instead of splitting on "---"), captions
+    // were STILL landing on the wrong post — his own example: a Thanksgiving
+    // -dinner-recommendations post titled "What's Your Go-To Local Spot for
+    // Thanksgiving Dinner Help?" came back with a caption that was actually
+    // the rewrite of a totally different post, "I've Been Thinking About the
+    // People This Job Has Brought Into My Life." Both posts' own Post
+    // Goal/Image Suggestions were confirmed correct in the calendar editor,
+    // and the generated post's title and image direction were both still
+    // correct too — only the caption text itself was wrong. That rules out
+    // a parsing bug (parsing was already fixed) and points at the actual
+    // root cause: this was still ONE Claude call writing every post in the
+    // month at once, and a month can easily have several thematically
+    // similar posts (this month had multiple separate Thanksgiving-angle
+    // posts) all sitting in that same shared context together. Even with
+    // each post correctly labeled "POST N:" going in, the model can still
+    // blend or conflate similar concepts ACROSS posts while writing — a
+    // generation-level mixup, not a parsing one, and no amount of parsing
+    // the output more carefully can fix content that was already conflated
+    // before it was ever printed. The only fix that makes this structurally
+    // impossible rather than just less likely: give each post its own
+    // separate Claude call with ONLY that one post's own title/goal/copy in
+    // its context — no other post's concept is ever visible to a given call,
+    // so there is nothing left for the model to mix up between posts. This
+    // is exactly the pattern emails and videos already use below (and
+    // neither of those has ever had this symptom reported), so posts now
+    // matches them exactly, including the same per-item try/catch so one
+    // bad post can't stall or drop the rest of the batch.
+    const media = await assignSuggestedMedia(
+      data.agentId,
+      postDocs.map((d) => ({ direction: d.image, title: d.title, copy: d.copy })),
+    );
+    const postResults = await Promise.all(
+      postDocs.map(async (doc, i): Promise<TablesInsert<"generated_posts"> | null> => {
+        const postPrompt =
+          "You are the best real estate social media copywriter in the country. Your specialty: writing posts that remind people someone is in real estate without ever preaching about it. Every post tells a small story. Every post has a clear point. Every post sounds like a real person.\n\n" +
+          `You are writing for ${agentName} in ${agentCity}.\n\n` +
+          `VOICE DNA:\n${dna}\n\n` +
+          "RULES — follow every one:\n" +
+          "- Write a COMPLETE post. Every sentence must connect to the next. The post must make full sense start to finish.\n" +
+          "- Open with a scene or a pain point — never a summary or a general statement.\n" +
+          "- Write to ONE person, not an audience — like you're talking to one friend, not posting to a crowd.\n" +
+          "- Tell a story or make a single clear point. If you cannot explain what the post is about in one sentence, rewrite it.\n" +
+          "- 2 to 4 sentences max. Short. Punchy. Human.\n" +
+          "- No hyphens used as dashes anywhere, and no hyphens in compound modifiers either (write well known, not well-known)\n" +
+          '- No "As a real estate professional" or any version of that\n' +
+          '- No "Navigating the market" — never\n' +
+          "- No corporate language. No buzzwords. No filler.\n" +
+          "- Standard capitalization always. First letter of every sentence capitalized.\n" +
+          "- Real estate should feel like a casual aside, not the whole point\n" +
+          `- The post should remind people ${agentName} is in real estate — not sell them on it\n` +
+          "- AUTHENTICITY CHECK: Read it out loud. If it sounds like an ad, rewrite it. If a real person would never say this, rewrite it.\n" +
+          "- Stay strictly on THIS post's own concept below. Do not pull in or blend ideas from any other post.\n" +
+          (data.useHashtags ? "- Add 2-3 relevant hashtags at the very end\n" : "- NO hashtags\n") +
+          (data.useEmojis ? "- A couple of relevant emojis are welcome if they feel natural\n" : "- NO emojis\n") +
+          learnedFeedback +
+          "\nRead the CONCEPT and ORIGINAL below carefully, find the story or the human truth in THIS post only, write it clearly in the agent's voice, and make sure the last sentence lands and the whole post makes sense.\n\n" +
+          `TITLE: ${doc.title}\nCONCEPT: ${doc.goal}\nORIGINAL: ${doc.copy}\n\n` +
+          "Output format:\nREWRITTEN: [complete caption for this post only]";
 
-      const raw = await callClaude(anthropicKey, postPrompt, 4000, { webSearch: true });
-
-      // Parse by the actual "POST N:" number Claude printed, never by
-      // position in an array split on the literal "---" divider. FIXED
-      // 2026-11-17 per Mike: titles and captions were showing up mixed
-      // between posts in the content calendar. Root cause — splitting the
-      // raw response on every "---" breaks the instant a caption itself
-      // contains a "---" (which Claude writes freely and naturally; same
-      // root cause as the markdown-copy bug already fixed elsewhere in this
-      // app). One stray "---" inside post 2's caption shifted every block
-      // after it by one, so post 3 kept its own correct title (titles are
-      // pulled from postDocs by position, never from the model's text) but
-      // got stapled to post 2's caption, post 4 got post 3's, and so on for
-      // the rest of the batch — exactly the "titles and captions don't
-      // match" symptom. Matching on each post's own printed number instead
-      // means an accidental "---" inside a caption can no longer shift
-      // anything downstream. This also resolves the photo mismatch Mike
-      // saw: the photo picker below was already keyed to each post's real
-      // title/copy by position, so it was choosing correctly all along —
-      // it just looked wrong sitting next to the wrong, shifted caption.
-      const postBlocks = new Map<number, string>();
-      const postRe = /POST\s*(\d+)\s*:[\s\S]*?REWRITTEN:\s*([\s\S]*?)(?=\n*POST\s*\d+\s*:|$)/g;
-      let pm: RegExpExecArray | null;
-      while ((pm = postRe.exec(raw))) {
-        const num = Number.parseInt(pm[1]!, 10);
-        const text = cleanCopy((pm[2] ?? "").trim());
-        if (!Number.isNaN(num) && text) postBlocks.set(num, text);
-      }
-      const media = await assignSuggestedMedia(
-        data.agentId,
-        postDocs.map((d) => ({ direction: d.image, title: d.title, copy: d.copy })),
-      );
-      postDocs.forEach((doc, i) => {
-        const rewritten = postBlocks.get(i + 1) ?? "";
-        const pick = media[i] ?? null;
-        if (rewritten && doc) {
-          rows.push({
+        try {
+          const raw = await callClaude(anthropicKey, postPrompt, 800, { webSearch: true });
+          const rm = raw.match(/REWRITTEN:\s*([\s\S]*)$/);
+          const rewritten = cleanCopy((rm ? rm[1]! : raw).trim());
+          if (!rewritten) return null;
+          const pick = media[i] ?? null;
+          return {
             agent_id: data.agentId,
             content: rewritten,
             content_type: "post",
@@ -5154,10 +5158,14 @@ export const generateMonthlyBatch = createServerFn({ method: "POST" })
               drive_thumbnail_url: pick?.source === "drive" ? pick.driveThumbnailUrl : null,
               drive_download_url: pick?.source === "drive" ? driveDownloadUrl(pick.driveFileId) : null,
             },
-          });
+          };
+        } catch {
+          // Skip this post, keep generating the rest — same resilience pattern as emails/videos below.
+          return null;
         }
-      });
-    }
+      }),
+    );
+    for (const r of postResults) if (r) rows.push(r);
 
     // Emails — one prompt per doc, same brief-vs-prewritten detection as
     // before. Changed 2026-09-20 from a sequential for-loop to Promise.all:

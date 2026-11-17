@@ -837,6 +837,24 @@ export const scanAgentWebsite = createServerFn({ method: "POST" })
     }
     const baseUrl = /^https?:\/\//i.test(rawWebsite) ? rawWebsite : `https://${rawWebsite}`;
 
+    // FIXED 2026-11-18 per Mike: scanning real.hw-realty.com (a real IDX/MLS
+    // real estate site) failed with "Couldn't reach that site (520)" even
+    // though the site itself is live and loads fine in a real browser —
+    // confirmed directly by fetching it the normal way. Root cause: this
+    // was identifying itself with a self-naming bot User-Agent
+    // ("...YourMarketingDudeBot/1.0...") and nothing else a browser would
+    // normally send (no Accept, no Accept-Language) — exactly the
+    // fingerprint that a bot-protection layer (Cloudflare and similar, very
+    // commonly sitting in front of IDX/MLS real estate sites specifically,
+    // since their listing-data feeds are under license and get scraped
+    // often) blocks or challenges on sight, which is what a 520 here usually
+    // actually means. This is the agent's OWN site, scanned at their own
+    // request for their own benefit — there's nothing to hide here, so
+    // requesting it the way an ordinary visitor's browser would (a real
+    // browser User-Agent plus the headers a real browser sends) is the
+    // honest fix, not a workaround: it's what lets a legitimate request
+    // through sites that reflexively block anything self-identifying as a
+    // bot, which is most real estate IDX platforms.
     async function fetchWithTimeout(url: string, timeoutMs: number, extraHeaders?: Record<string, string>) {
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), timeoutMs);
@@ -845,7 +863,10 @@ export const scanAgentWebsite = createServerFn({ method: "POST" })
           signal: controller.signal,
           redirect: "follow",
           headers: {
-            "User-Agent": "Mozilla/5.0 (compatible; YourMarketingDudeBot/1.0; +https://yourmarketingdude.com)",
+            "User-Agent":
+              "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+            Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
             ...extraHeaders,
           },
         });
@@ -1024,8 +1045,18 @@ const BRAND_BIO_VARIANT_SPECS: Record<BrandBioVariant, string> = {
   linkedin: `A professional "About" summary, 4-6 sentences, first person. More polished than the others but still unmistakably this specific person, never corporate boilerplate.`,
   realtorProfile:
     "For Zillow/Trulia/Realtor.com-style public agent profiles. Consumer-facing and trust-building, 3-5 sentences, first person, mentions their market area and what makes working with them worth it.",
+  // Updated 2026-11-18 per Mike: "Their YouTube info should always include
+  // phone, email and website contact information... like this for example
+  // Rich Maston / 954.461.3818 / rich@hw-realty.com" — regardless of
+  // whether the agent has filled in a Contact CTA. The CTA (when set)
+  // already gets woven as a natural closing line in buildBrandBioPrompt
+  // below; this is a SEPARATE, unconditional requirement specifically for
+  // this one variant, since a real YouTube channel's About section
+  // conventionally ends with a plain, literal business-contact block
+  // (name/phone/email/website on their own lines), not just a prose CTA —
+  // and that block needs to be there every time, CTA or no CTA.
   websiteAbout:
-    "The longest one — 2-3 short paragraphs for their website's About page or a YouTube channel description. Tells a real story, not just a credentials list, first person.",
+    'The longest one — 2-3 short paragraphs for their website\'s About page or a YouTube channel description. Tells a real story, not just a credentials list, first person. ALWAYS end with a short, clearly separated contact block on its own lines — their name, then phone, then website, then email, each on its own line, reproduced exactly from the Agent/CONTACT details above (skip any one of those that says "(not given)"). Include this literal contact block every single time, even if a call-to-action sentence appears earlier in the bio — a real YouTube/website About page always closes with plain contact details on their own lines, separate from and in addition to any call-to-action.',
 };
 
 // Factored out of buildBrandBioPrompt 2026-11-16 so the single-bio rewrite
@@ -1389,7 +1420,7 @@ Tagline: "${opts.tagline}"
 ${contactLine ? `Contact line (small, in a clean row, can include simple minimal icons): "${contactLine}"` : ""}
 ${opts.licenseNumber.trim() ? `License line (small, subtle): "License #${opts.licenseNumber.trim()}"` : ""}
 
-CRITICAL COMPOSITION CONSTRAINT: This image gets cropped twice after you generate it — first down to a wide banner shape, then AGAIN by YouTube and Facebook themselves, which each silently crop further to their own "safe area" on top of that (YouTube in particular only guarantees the center ~60% width x ~25% height of a banner is ever visible on every device — phones and tablets crop in hard from both the sides and top/bottom). So: keep the headshot and ALL text — name, tagline, contact line, license — centered within the middle 55% of the frame horizontally AND the middle 25% of the frame vertically. Treat that center band as the only area that's guaranteed to ever be seen. Fill everything outside it with generous, visually intentional (not empty-looking) background/texture/gradient that looks deliberate if it gets cropped away entirely — nothing essential anywhere near the top, bottom, left, or right edges.
+CRITICAL COMPOSITION CONSTRAINT — read this twice, it has gone wrong before: This image gets cropped TWICE after you generate it — first down to a wide banner shape, then AGAIN by YouTube and Facebook themselves, which each silently crop further to their own "safe area" on top of that. The last two banners made this way came back with the agent's name running almost the full width of the image, and a logo sitting right at the very top — both got sliced off, unusable. Do not repeat that. Be far more conservative than feels natural: picture a thin letterboxed strip sitting in the dead center of the frame — only about 45% of the full width, and only about 20% of the full height, like a wide short rectangle floating in the middle of a much bigger canvas. The headshot, the agent's name, the tagline, the contact line, and the license line must ALL sit entirely inside that thin center strip, with clear, visible breathing room between them and the strip's own edges — nowhere close to touching it. If the name is more than about half the strip's own width, it is too big — shrink it. The logo, if there is one, goes in a corner but must stay close to the vertical center band too, never near the top or bottom edge, since corners are the first thing lost to cropping. Everything outside that center strip — which is MOST of the image — is pure background: gradient, texture, color, or (for the photo-backdrop style) the backdrop photo itself, and it must look fully complete and intentional on its own, as if everything outside the strip will be sliced away entirely, because it will be. When in doubt, make every element smaller and closer to dead center than feels right.
 
 Landscape orientation. No watermarks, no stock-photo text, no placeholder text of any kind.`;
 }
@@ -1445,7 +1476,7 @@ Tagline: "${opts.tagline}"
 ${contactLine ? `Contact line: "${contactLine}"` : ""}
 ${opts.licenseNumber.trim() ? `License line: "License #${opts.licenseNumber.trim()}"` : ""}
 
-CRITICAL COMPOSITION CONSTRAINT (unchanged from the original design, do not break this while making the requested edit): This image gets cropped twice after you generate it — first down to a wide banner shape, then AGAIN by YouTube and Facebook themselves, which each crop further to their own "safe area." Keep the headshot and ALL text centered within the middle 55% of the frame horizontally AND the middle 25% of the frame vertically. Nothing essential anywhere near the top, bottom, left, or right edges.
+CRITICAL COMPOSITION CONSTRAINT (apply this even if the existing design above doesn't fully follow it — do not just copy its current positioning if it's too close to an edge): This image gets cropped TWICE after you generate it — first down to a wide banner shape, then AGAIN by YouTube and Facebook themselves, which each crop further to their own "safe area." Picture a thin letterboxed strip sitting in the dead center of the frame — only about 45% of the full width, and only about 20% of the full height. The headshot and ALL text (name, tagline, contact line, license) must sit entirely inside that thin center strip, with clear breathing room from its edges — not touching it. The logo stays close to the vertical center band too, never near the top or bottom edge. If the existing design already has something crowding an edge (a logo near the top, text running near the full width), treat fixing that as part of making the requested change look right, even if the agent didn't explicitly ask for it — a design that gets cut off in actual use was never really "working" to begin with.
 
 Landscape orientation. No watermarks, no stock-photo text, no placeholder text of any kind.`;
 }

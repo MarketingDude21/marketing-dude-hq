@@ -5321,7 +5321,25 @@ export const generateMonthlyBatch = createServerFn({ method: "POST" })
           // 2026-09-posts.md) — the search step itself eats into the same
           // response budget as the script text, and 600 was sized for a
           // 150-word script with no search involved.
-          const vraw = cleanCopy(await callClaude(anthropicKey, videoPrompt, 1200, { webSearch: true }));
+          const videoRaw = await callClaude(anthropicKey, videoPrompt, 1200, { webSearch: true });
+          // FIXED 2026-11-18 per Mike's screenshot: with web search on,
+          // Claude narrates its own search ("I'll search for some current
+          // information about these New Jersey communities... Great, I have
+          // solid local information now. Here's the script:") as plain text
+          // BEFORE the actual formatted script — callClaude joins every text
+          // block the model emits with no separator, so that narration was
+          // landing right in `content`, on screen above the real HOOK/BODY/
+          // CLOSE script. Posts and emails above already guard against this
+          // exact thing by extracting only the text after their own
+          // "REWRITTEN:"/"EMAIL BODY:" label; this path never had that
+          // guard, so narration only ever showed up here, on video scripts,
+          // and only on the hyper-local templates that actually trigger a
+          // search. Fixed the same way: keep only "HOOK (...)" onward,
+          // dropping anything Claude wrote before it. Falls back to the
+          // full raw text if the model ever skips the HOOK label entirely,
+          // so a format slip never means an empty script.
+          const hookMatch = videoRaw.match(/HOOK\s*(?:\([^)]*\))?\s*:[\s\S]*$/i);
+          const vraw = cleanCopy((hookMatch ? hookMatch[0] : videoRaw).trim());
           return {
             agent_id: data.agentId,
             content: vraw,

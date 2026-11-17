@@ -217,6 +217,120 @@ function categorizePost(post: Post): ContentCategory {
   return post.metadata?.canva_link || post.metadata?.media_type === "video" ? "canva" : "post";
 }
 
+// Lightweight markdown handling for AI-written content (2026-11-17) — per
+// Mike, off a screenshot of a video script pasted into Word with literal
+// "**WHAT THE EXEMPTION DOES**" and "---" showing up as raw characters
+// instead of real bold text and a real section break: "we need the
+// scripts to be formatted so we can copy and paste them into a word
+// document." The content itself (and the chat reply it came from) was
+// always rendered as one plain-text blob — CSS white-space:pre-wrap only
+// draws the \n's and the literal `**`/`---` on screen exactly as written —
+// so selecting and copying it carries those same literal characters
+// straight into Word, which has no idea they were ever meant to mean
+// anything. These two helpers are the single source of truth for turning
+// that raw text into something real, shared by FormattedContent and
+// contentToClipboardFormats below (on-screen + the "Copy" button) and by
+// buildContentDocxBlob further down (the existing Export-to-Word flow).
+function parseMarkdownLine(line: string): { text: string; bold: boolean }[] {
+  const runs: { text: string; bold: boolean }[] = [];
+  const re = /\*\*(.+?)\*\*/g;
+  let lastIndex = 0;
+  let match: RegExpExecArray | null;
+  while ((match = re.exec(line))) {
+    if (match.index > lastIndex) runs.push({ text: line.slice(lastIndex, match.index), bold: false });
+    runs.push({ text: match[1] ?? "", bold: true });
+    lastIndex = match.index + match[0].length;
+  }
+  if (lastIndex < line.length) runs.push({ text: line.slice(lastIndex), bold: false });
+  return runs.length ? runs : [{ text: line, bold: false }];
+}
+
+function isDividerLine(line: string): boolean {
+  return /^-{3,}$/.test(line.trim());
+}
+
+// Renders AI-written content (chat replies, saved post/video-script/email
+// bodies) as real paragraphs with real bold text and a real divider rule,
+// instead of one plain-text blob carrying literal "**"/"---" characters.
+// Used by ChatMessageBubble and PostCard so what's ON SCREEN never shows
+// raw markdown syntax either, not just what gets copied.
+function FormattedContent({ content, className }: { content: string; className?: string }) {
+  const lines = content.split("\n");
+  return (
+    <div className={className}>
+      {lines.map((line, i) => {
+        if (isDividerLine(line)) return <hr key={i} className="my-3 border-border" />;
+        if (!line.trim()) return <div key={i} className="h-2" aria-hidden="true" />;
+        return (
+          <p key={i} className="mb-1.5 last:mb-0">
+            {parseMarkdownLine(line).map((run, j) =>
+              run.bold ? <strong key={j}>{run.text}</strong> : <span key={j}>{run.text}</span>,
+            )}
+          </p>
+        );
+      })}
+    </div>
+  );
+}
+
+// Builds the same content as FormattedContent above, but as a standalone
+// HTML string plus a clean plain-text fallback (markdown markers actually
+// removed, not just hidden), for the "Copy" button both ChatMessageBubble
+// and PostCard add below. Writing BOTH formats to the clipboard — not just
+// plain text — is what actually makes a direct paste into Word carry real
+// bold text and real paragraph breaks, rather than hoping the browser's
+// own serialization of a manual on-screen selection happens to survive
+// the trip.
+function contentToClipboardFormats(content: string): { html: string; plain: string } {
+  const lines = content.split("\n");
+  const htmlParts: string[] = [];
+  const plainParts: string[] = [];
+  for (const line of lines) {
+    if (isDividerLine(line)) {
+      htmlParts.push("<hr>");
+      plainParts.push("");
+      continue;
+    }
+    if (!line.trim()) {
+      plainParts.push("");
+      continue;
+    }
+    const runs = parseMarkdownLine(line);
+    htmlParts.push(
+      "<p>" +
+        runs
+          .map((r) => {
+            const escaped = r.text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+            return r.bold ? `<strong>${escaped}</strong>` : escaped;
+          })
+          .join("") +
+        "</p>",
+    );
+    plainParts.push(runs.map((r) => r.text).join(""));
+  }
+  return { html: htmlParts.join(""), plain: plainParts.join("\n") };
+}
+
+async function copyFormattedContent(content: string): Promise<void> {
+  const { html, plain } = contentToClipboardFormats(content);
+  try {
+    if (navigator.clipboard && "write" in navigator.clipboard && typeof ClipboardItem !== "undefined") {
+      await navigator.clipboard.write([
+        new ClipboardItem({
+          "text/html": new Blob([html], { type: "text/html" }),
+          "text/plain": new Blob([plain], { type: "text/plain" }),
+        }),
+      ]);
+      return;
+    }
+  } catch {
+    // Fall through to the plain-text-only path below — some browsers
+    // (notably older Safari, or outside a secure/user-gesture context)
+    // don't support a multi-format clipboard write.
+  }
+  await navigator.clipboard.writeText(plain);
+}
+
 function Card({ children, className = "" }: { children: React.ReactNode; className?: string }) {
   return (
     <div className={`rounded-3xl border border-border bg-glass p-6 backdrop-blur-2xl ${className}`}>{children}</div>
@@ -1571,6 +1685,22 @@ function ChatMessageBubble({ msg, agentId, onSaved }: { msg: ChatMessageRow; age
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // Copy (2026-11-17) — see FormattedContent/copyFormattedContent above for
+  // the real fix (real bold/dividers instead of literal "**"/"---"); this
+  // is just the button + its own transient "Copied!" feedback, same pattern
+  // as the bio writer's Copy button in voice.tsx.
+  const [copied, setCopied] = useState(false);
+  async function handleCopy() {
+    try {
+      await copyFormattedContent(msg.content);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2500);
+    } catch {
+      // Clipboard access can be denied/unavailable in some embedded
+      // contexts — silently do nothing rather than throw a scary error for
+      // what's just a convenience button.
+    }
+  }
   const isAssistant = msg.role === "assistant";
   const meta = (msg.metadata ?? {}) as {
     thumbnailUrl?: string;
@@ -1659,9 +1789,17 @@ function ChatMessageBubble({ msg, agentId, onSaved }: { msg: ChatMessageRow; age
             <img src={meta.thumbnailUrl} alt="" className="max-h-64 w-full object-contain" />
           </div>
         )}
-        <p className="whitespace-pre-wrap">{msg.content}</p>
+        <FormattedContent content={msg.content} className="whitespace-pre-wrap" />
         {isAssistant && (
           <div className="mt-2 flex flex-wrap items-center gap-2">
+            {/* Copy (2026-11-17) — per Mike: "we need the scripts to be
+            formatted so we can copy and paste them into a word document."
+            Writes real bold/paragraph formatting to the clipboard (see
+            copyFormattedContent above), not just the raw markdown text a
+            manual selection would otherwise carry into Word. */}
+            <Button variant="secondary" onClick={handleCopy}>
+              {copied ? "Copied!" : "Copy"}
+            </Button>
             {!saved ? (
               <Button variant="secondary" onClick={saveAsPost} disabled={saving}>
                 {saving ? "Saving…" : "Save as draft post"}
@@ -3236,6 +3374,21 @@ function PostCard({
   // in this app (no native confirm() dialog).
   const [deleteArmed, setDeleteArmed] = useState(false);
   const [deleting, setDeleting] = useState(false);
+  // Copy (2026-11-17) — per Mike, off a Word-paste screenshot showing
+  // literal "**bold**"/"---" from a video script: "we need the scripts to
+  // be formatted so we can copy and paste them into a word document." See
+  // FormattedContent/copyFormattedContent above.
+  const [copied, setCopied] = useState(false);
+  async function handleCopy() {
+    try {
+      await copyFormattedContent(post.content);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2500);
+    } catch {
+      // Convenience button — fail silently rather than surface a scary
+      // error over a denied/unavailable clipboard permission.
+    }
+  }
 
   async function deletePost() {
     if (!deleteArmed) {
@@ -3891,7 +4044,13 @@ function PostCard({
             )}
           </div>
         )}
-        <p className="whitespace-pre-wrap text-sm leading-relaxed">{post.content}</p>
+        <FormattedContent content={post.content} className="whitespace-pre-wrap text-sm leading-relaxed" />
+        <button
+          onClick={handleCopy}
+          className="mt-2 rounded-full border border-border bg-glass px-3 py-1 text-xs font-semibold transition-colors hover:bg-secondary"
+        >
+          {copied ? "Copied!" : "Copy"}
+        </button>
 
         {post.metadata?.canva_link && (
           <>
@@ -7397,8 +7556,27 @@ async function buildContentDocxBlob(batchPosts: Post[], monthLabel: string): Pro
       // written, but it means this can never again slip through unnoticed
       // the way it did this month.
       if (p.content.trim()) {
+        // Real bold TextRuns + a real divider border instead of literal
+        // "**"/"---" characters in the exported .docx — same root cause
+        // and same fix as the on-screen Copy button above (see
+        // parseMarkdownLine/isDividerLine), just targeting docx's own
+        // Paragraph/TextRun API instead of HTML.
         for (const line of p.content.split("\n")) {
-          children.push(new Paragraph({ text: line || " " }));
+          if (isDividerLine(line)) {
+            children.push(
+              new Paragraph({ text: "", border: { bottom: { style: "single", size: 6, color: "CCCCCC" } } }),
+            );
+            continue;
+          }
+          if (!line.trim()) {
+            children.push(new Paragraph({ text: " " }));
+            continue;
+          }
+          children.push(
+            new Paragraph({
+              children: parseMarkdownLine(line).map((run) => new TextRun({ text: run.text, bold: run.bold })),
+            }),
+          );
         }
       } else {
         children.push(

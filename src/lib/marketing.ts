@@ -5096,15 +5096,39 @@ export const generateMonthlyBatch = createServerFn({ method: "POST" })
         postDocs.map((p, i) => `POST ${i + 1}: ${p.title}\nCONCEPT: ${p.goal}\nORIGINAL: ${p.copy}`).join("\n\n");
 
       const raw = await callClaude(anthropicKey, postPrompt, 4000, { webSearch: true });
-      const blocks = raw.split("---").filter((b) => b.trim());
+
+      // Parse by the actual "POST N:" number Claude printed, never by
+      // position in an array split on the literal "---" divider. FIXED
+      // 2026-11-17 per Mike: titles and captions were showing up mixed
+      // between posts in the content calendar. Root cause — splitting the
+      // raw response on every "---" breaks the instant a caption itself
+      // contains a "---" (which Claude writes freely and naturally; same
+      // root cause as the markdown-copy bug already fixed elsewhere in this
+      // app). One stray "---" inside post 2's caption shifted every block
+      // after it by one, so post 3 kept its own correct title (titles are
+      // pulled from postDocs by position, never from the model's text) but
+      // got stapled to post 2's caption, post 4 got post 3's, and so on for
+      // the rest of the batch — exactly the "titles and captions don't
+      // match" symptom. Matching on each post's own printed number instead
+      // means an accidental "---" inside a caption can no longer shift
+      // anything downstream. This also resolves the photo mismatch Mike
+      // saw: the photo picker below was already keyed to each post's real
+      // title/copy by position, so it was choosing correctly all along —
+      // it just looked wrong sitting next to the wrong, shifted caption.
+      const postBlocks = new Map<number, string>();
+      const postRe = /POST\s*(\d+)\s*:[\s\S]*?REWRITTEN:\s*([\s\S]*?)(?=\n*POST\s*\d+\s*:|$)/g;
+      let pm: RegExpExecArray | null;
+      while ((pm = postRe.exec(raw))) {
+        const num = Number.parseInt(pm[1]!, 10);
+        const text = cleanCopy((pm[2] ?? "").trim());
+        if (!Number.isNaN(num) && text) postBlocks.set(num, text);
+      }
       const media = await assignSuggestedMedia(
         data.agentId,
         postDocs.map((d) => ({ direction: d.image, title: d.title, copy: d.copy })),
       );
-      blocks.forEach((block, i) => {
-        const rm = block.match(/REWRITTEN:\s*([\s\S]*?)$/);
-        const rewritten = rm ? cleanCopy(rm[1]!.trim()) : "";
-        const doc = postDocs[i];
+      postDocs.forEach((doc, i) => {
+        const rewritten = postBlocks.get(i + 1) ?? "";
         const pick = media[i] ?? null;
         if (rewritten && doc) {
           rows.push({

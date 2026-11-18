@@ -501,6 +501,17 @@ function VoiceWorkspace({
   // change" below can edit THAT specific image instead of starting over.
   // See handleRefineGraphics and buildBrandGraphicRefinementPrompt.
   const [graphicMasterUrl, setGraphicMasterUrl] = useState<string | null>(null);
+  // Remembers which background photo (or null, for the plain gradient) is
+  // actually baked into graphicMasterUrl right now — per Mike: "I chose
+  // one of the images it scanned from website but nothing happened."
+  // Picking a new thumbnail just updates selectedBackgroundImage; it only
+  // takes effect on the NEXT generate/refine call, and the refine prompt
+  // normally only swaps the background in when the typed note asks for
+  // it. Comparing this against selectedBackgroundImage in
+  // handleRefineGraphics is what lets a background-only pick (no note
+  // text) still count as a real, intentional change instead of silently
+  // doing nothing. See handleRefineGraphics below.
+  const [graphicMasterBackground, setGraphicMasterBackground] = useState<string | null>(null);
   const [graphicRefineNote, setGraphicRefineNote] = useState("");
   const [graphicRefining, setGraphicRefining] = useState(false);
   // Custom background upload (2026-11-16) — per Mike: "add files for the
@@ -807,6 +818,7 @@ function VoiceWorkspace({
         data: { agentId, template: graphicTemplate, tagline, backgroundImageUrl },
       });
       await applyMasterGraphic(imageUrl);
+      setGraphicMasterBackground(backgroundImageUrl);
       // A fresh from-scratch generation starts a new editing lineage — any
       // refine note typed against the PREVIOUS master no longer applies.
       setGraphicRefineNote("");
@@ -848,10 +860,18 @@ function VoiceWorkspace({
   async function handleRefineGraphics() {
     if (!graphicMasterUrl) return;
     const note = graphicRefineNote.trim();
-    if (!note) {
+    // Picking a different background thumbnail (or switching back to
+    // "None") is itself a real, intentional change even with no note
+    // typed — don't make the agent also describe it in words, and don't
+    // silently do nothing when they just click the photo and hit Apply.
+    const backgroundChanged = selectedBackgroundImage !== graphicMasterBackground;
+    if (!note && !backgroundChanged) {
       setGraphicError("Describe what you'd like to change first.");
       return;
     }
+    const effectiveNote = backgroundChanged
+      ? `${note ? note + " " : ""}Use the newly provided background reference photo as the new background${selectedBackgroundImage ? "" : " — actually, go back to the plain gradient background (no photo)"}.`
+      : note;
     setGraphicRefining(true);
     setGraphicError(null);
     try {
@@ -862,11 +882,12 @@ function VoiceWorkspace({
           template: graphicTemplate,
           tagline,
           backgroundImageUrl: selectedBackgroundImage,
-          refinementNote: note,
+          refinementNote: effectiveNote,
           baseImageUrl: graphicMasterUrl,
         },
       });
       await applyMasterGraphic(imageUrl);
+      setGraphicMasterBackground(selectedBackgroundImage);
       setGraphicRefineNote("");
     } catch (e) {
       setGraphicError(e instanceof Error ? e.message : "Something went wrong applying that change.");
@@ -2588,6 +2609,12 @@ function VoiceWorkspace({
                   >
                     {graphicRefining ? "Applying your change…" : "Apply this change"}
                   </button>
+                  {/* graphicError is shared with the main "Generate graphics"
+                  button far above — repeated here too so a failed refine
+                  attempt (e.g. "nothing happened" after picking a new
+                  background photo) is visible right where the agent is
+                  actually looking, not only up at the top of the card. */}
+                  {graphicError && <p className="mt-2 text-xs text-destructive">{graphicError}</p>}
                 </div>
               )}
             </div>

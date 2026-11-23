@@ -6338,12 +6338,39 @@ export const scanMediaLibraryForMonth = createServerFn({ method: "POST" })
       const voiceDna = withContentBrandingStrategy(agent.voice_summary, agent.voice_answers);
       const learnedFeedback = await fetchLearnedFeedback(data.agentId);
 
-      const targetCount = Math.max(1, Math.min(30, data.targetCount ?? 10));
+      // Bumped 10 -> 12 2026-11-23 per Mike: "Mobile should scan up to 12
+      // photos at a time." Same default either way — mobile and desktop
+      // share this one component/server call, there's no separate path to
+      // give mobile a different number.
+      const targetCount = Math.max(1, Math.min(30, data.targetCount ?? 12));
       // Pool bigger than the target so there's real material to sort into
       // all four slots, not just whatever happened to be oldest — capped so
       // one click never fires off more vision calls than it has to.
       const poolSize = Math.min(40, Math.max(targetCount * 2, 16));
       const excludeIds = new Set(data.excludeFileIds ?? []);
+      // Also exclude any photo already attached to ANY generated post for
+      // this agent, in ANY month, no matter its status — pending, approved,
+      // or flagged all still "have" that photo until the post is deleted.
+      // Added 2026-11-23 per Mike: "never double scan. Every photo can only
+      // be used one time." Without this, two different months' scans (each
+      // only ever aware of their OWN month's batchPosts via excludeFileIds
+      // above) — or this same month's scan run from the "All months" list
+      // button, which passes no excludeFileIds at all — could each
+      // independently pick the same still-"available" photo, since
+      // agent_photos.status only actually flips to "used" once a post is
+      // APPROVED (see updateMarketingPost's markPostMediaUsed call below) —
+      // a photo sitting in someone else's still-pending review queue is
+      // otherwise fair game to the pool query below. Scoped to this one
+      // agent, so it's one small extra query, not a full-table scan.
+      const { data: pendingMediaRows, error: pendingMediaErr } = await supabaseAdmin
+        .from("generated_posts")
+        .select("metadata")
+        .eq("agent_id", data.agentId);
+      if (pendingMediaErr) throw pendingMediaErr;
+      for (const row of pendingMediaRows ?? []) {
+        const mediaId = (row.metadata as { media_id?: string | null } | null)?.media_id;
+        if (mediaId) excludeIds.add(mediaId);
+      }
 
       const { data: photos, error } = await supabaseAdmin
         .from("agent_photos")

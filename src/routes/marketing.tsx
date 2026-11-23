@@ -2561,7 +2561,7 @@ function EmailPhotosPanel({
                         disabled={busy}
                         className="text-[11px] font-semibold text-muted-foreground hover:text-foreground hover:underline disabled:opacity-50"
                       >
-                        ✏️ Edit
+                        ✏️ Add Text
                       </button>
                     )}
                   </div>
@@ -3123,7 +3123,7 @@ function ReelPhotosPanel({
                         disabled={busy}
                         className="text-[11px] font-semibold text-muted-foreground hover:text-foreground hover:underline disabled:opacity-50"
                       >
-                        ✏️ Edit
+                        ✏️ Add Text
                       </button>
                     )}
                   </div>
@@ -3797,7 +3797,7 @@ function PostCard({
               )}
               {photoUrl && !driveFileId && (
                 <Button variant="secondary" onClick={() => setEditingPhotoOpen(true)} disabled={busy}>
-                  ✏️ Edit
+                  ✏️ Add Text
                 </Button>
               )}
             </div>
@@ -4105,7 +4105,7 @@ function PostCard({
             }}
             disabled={busy}
           >
-            {editorOpen ? "Close" : "Edit / Feedback"}
+            {editorOpen ? "Close" : "Feedback"}
           </Button>
           <Button variant="danger" onClick={deletePost} disabled={busy || deleting}>
             {deleting ? "Deleting…" : deleteArmed ? "Click again to confirm delete" : "Delete"}
@@ -6092,8 +6092,21 @@ export function MediaTab({ agentId, isAdmin }: { agentId: string; isAdmin: boole
   const [failedThumbs, setFailedThumbs] = useState<Set<string>>(new Set());
   // Added 2026-11-04 alongside the HEIC upload fix — lets an already-broken
   // existing photo (uploaded before that fix existed) be repaired in place
-  // instead of needing to be deleted and re-uploaded by hand.
-  const [fixingId, setFixingId] = useState<string | null>(null);
+  // instead of needing to be deleted and re-uploaded by hand. WIDENED
+  // 2026-11-23 per Mike, off a screenshot of several stuck HEIC thumbnails:
+  // "I thought we already fixed this? They need to automatically be
+  // converted." The repair itself (fixBrokenThumb below) already worked —
+  // it just only ever ran when someone clicked the button per photo, which
+  // doesn't scale to a library full of old iPhone uploads. Now runs by
+  // itself (see the <img onError> below) the instant a broken thumbnail is
+  // ever seen; fixingIds is a Set (not a single id) so several can be
+  // auto-repairing at once instead of the UI only tracking the last one.
+  const [fixingIds, setFixingIds] = useState<Set<string>>(new Set());
+  // Tracks which ids have already had an automatic attempt THIS mount, so a
+  // photo whose auto-fix itself fails (e.g. a CORS hiccup downloading the
+  // original) doesn't get retried in a loop on every re-render — the
+  // "Fix this photo" button stays as a manual retry for that case.
+  const autoFixedRef = useRef<Set<string>>(new Set());
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   function reload() {
@@ -6198,7 +6211,7 @@ export function MediaTab({ agentId, isAdmin }: { agentId: string; isAdmin: boole
   // them.
   async function fixBrokenThumb(m: MediaRow) {
     if (!m.url) return;
-    setFixingId(m.id);
+    setFixingIds((s) => new Set(s).add(m.id));
     setError(null);
     try {
       const res = await fetch(m.url);
@@ -6220,8 +6233,21 @@ export function MediaTab({ agentId, isAdmin }: { agentId: string; isAdmin: boole
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
-      setFixingId(null);
+      setFixingIds((s) => {
+        const next = new Set(s);
+        next.delete(m.id);
+        return next;
+      });
     }
+  }
+
+  // Fires the instant a thumbnail is first seen to be broken — see the
+  // onError handler below — rather than waiting for a manual click.
+  function handleBrokenThumb(m: MediaRow) {
+    setFailedThumbs((s) => new Set(s).add(m.id));
+    if (autoFixedRef.current.has(m.id)) return;
+    autoFixedRef.current.add(m.id);
+    fixBrokenThumb(m);
   }
 
   // Tag chips (and the matching setMediaTags call) removed 2026-11-15 per
@@ -6343,18 +6369,23 @@ export function MediaTab({ agentId, isAdmin }: { agentId: string; isAdmin: boole
                   src={m.url}
                   alt={m.caption ?? ""}
                   className="aspect-square w-full object-cover"
-                  onError={() => setFailedThumbs((s) => new Set(s).add(m.id))}
+                  onError={() => handleBrokenThumb(m)}
                 />
               ) : (
                 <div className="flex aspect-square w-full flex-col items-center justify-center gap-1 bg-muted p-2 text-center text-[10px] text-muted-foreground">
-                  <span>Couldn't preview this photo (likely an iPhone HEIC file)</span>
-                  <button
-                    onClick={() => fixBrokenThumb(m)}
-                    disabled={fixingId === m.id}
-                    className="mt-1 rounded-full border border-border bg-background px-2 py-1 text-[10px] font-semibold text-foreground transition-colors hover:bg-secondary disabled:opacity-50"
-                  >
-                    {fixingId === m.id ? "Fixing…" : "Fix this photo"}
-                  </button>
+                  {fixingIds.has(m.id) ? (
+                    <span>Converting this photo…</span>
+                  ) : (
+                    <>
+                      <span>Couldn't preview this photo (likely an iPhone HEIC file)</span>
+                      <button
+                        onClick={() => fixBrokenThumb(m)}
+                        className="mt-1 rounded-full border border-border bg-background px-2 py-1 text-[10px] font-semibold text-foreground transition-colors hover:bg-secondary"
+                      >
+                        Fix this photo
+                      </button>
+                    </>
+                  )}
                 </div>
               )}
               <div className="flex items-center justify-between gap-1 px-2 pt-2">
@@ -8212,25 +8243,40 @@ function MonthWorkspace({
             )}
           </div>
           <div className="flex items-center gap-3">
-            <label className="flex items-center gap-2 text-xs text-muted-foreground">
-              <input type="checkbox" checked={useHashtags} onChange={(e) => setUseHashtags(e.target.checked)} />
-              Add hashtags to posts
-            </label>
-            <label className="flex items-center gap-2 text-xs text-muted-foreground">
-              <input type="checkbox" checked={useEmojis} onChange={(e) => setUseEmojis(e.target.checked)} />
-              Add emojis to content
-            </label>
-            <Button onClick={generate} disabled={generating || docs === null}>
-              {generating
-                ? "Generating…"
-                : generateArmed
-                  ? "Click again to replace this month's content"
-                  : "Generate Now"}
-            </Button>
-            {generateArmed && !generating && (
-              <Button variant="secondary" onClick={() => setGenerateArmed(false)}>
-                Cancel
-              </Button>
+            {/* Generate Now (and its hashtag/emoji options) only make sense
+                BEFORE this month has anything in it — once it does, this is
+                the destructive "replace everything" path (see generateArmed
+                below), not a thing to repeat casually. Hidden once there's
+                already content, per Mike: "we are inside the section that
+                has already been generated so no need to tell it to generate
+                again once inside. Only thing that should happen is Scan
+                more Photos option." Scan My Media Library/Scan Videos below
+                stay visible always — those are additive (scanLibrary/
+                scanVideos never delete anything), so "scan more" is exactly
+                the one thing that should still be offered here. */}
+            {batchPosts.length === 0 && (
+              <>
+                <label className="flex items-center gap-2 text-xs text-muted-foreground">
+                  <input type="checkbox" checked={useHashtags} onChange={(e) => setUseHashtags(e.target.checked)} />
+                  Add hashtags to posts
+                </label>
+                <label className="flex items-center gap-2 text-xs text-muted-foreground">
+                  <input type="checkbox" checked={useEmojis} onChange={(e) => setUseEmojis(e.target.checked)} />
+                  Add emojis to content
+                </label>
+                <Button onClick={generate} disabled={generating || docs === null}>
+                  {generating
+                    ? "Generating…"
+                    : generateArmed
+                      ? "Click again to replace this month's content"
+                      : "Generate Now"}
+                </Button>
+                {generateArmed && !generating && (
+                  <Button variant="secondary" onClick={() => setGenerateArmed(false)}>
+                    Cancel
+                  </Button>
+                )}
+              </>
             )}
             {/* Second, parallel path next to Generate Now — added 2026-11-15
                 per Mike's photo-first redesign. Deliberately NOT a toggle or

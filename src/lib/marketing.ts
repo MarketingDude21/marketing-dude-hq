@@ -5865,6 +5865,21 @@ async function captionPhotoInVoice(
   // of guessing — folded into the prompt as context, not a caption to
   // repeat verbatim.
   agentNotes?: string | null,
+  // Added 2026-11-23 per Mike, on "Rescan this photo" giving back
+  // essentially the same caption with a word or two changed: "it needs to
+  // rescan the image and come up with a different context not just change
+  // a few words. It needs to change the content." The ROOT cause was never
+  // a broken rescan — regeneratePhotoScanCaption below correctly re-ran the
+  // whole captioning call from scratch — it's that the inputs were
+  // IDENTICAL to the original scan (same photo, same Voice DNA, same city,
+  // same notes), so Claude naturally converged on the same obvious
+  // interpretation of the photo both times; nothing in the prompt ever told
+  // it a previous caption existed, let alone to deliberately avoid it. Only
+  // passed by regeneratePhotoScanCaption's explicit rescan path — the
+  // original Scan My Media Library call never has a previous caption to
+  // avoid, so it's left undefined there and this instruction simply doesn't
+  // appear in that prompt.
+  previousCaption?: string | null,
 ): Promise<{ description: string; suggestedPost: string; textOverlaySuggestions: string[] } | null> {
   const base64 = Buffer.from(imageBytes).toString("base64");
   // FIXED (2026-09-30) — per Mike: "when I rescan image it gives error,"
@@ -5927,6 +5942,10 @@ async function captionPhotoInVoice(
     (learnedFeedback ?? "") +
     (agentNotes?.trim()
       ? `\n\nNOTE FROM THE AGENT ABOUT THIS PHOTO: "${agentNotes.trim()}" — use this to understand who/what is actually in the photo (e.g. a specific person's name, a relationship, context a photo alone can't show), but don't just repeat it verbatim as the caption.\n`
+      : "") +
+    (previousCaption?.trim()
+      ? `\n\nTHIS PHOTO WAS ALREADY CAPTIONED ONCE BEFORE — the agent asked to rescan it because they want something genuinely new, not a reword. The previous caption was:\n"${previousCaption.trim()}"\n` +
+        "Do NOT reuse that angle, story, joke, or structure, even with different words — find a DIFFERENT true thing in the same photo to build this caption around: a different detail you notice, a different mood, a different person/object in frame, a different memory or association, a different style of joke. If the previous caption focused on the setting, focus on a detail or a feeling instead (or vice versa). The two captions should read like two different people looked at this photo and each found their own thing to say about it — not like one was lightly edited into the other.\n"
       : "") +
     "\n\nOutput format:\nDESCRIPTION: [one sentence of what you see]\nPOST: [the social media caption]\nTEXT OVERLAYS:\n1. [short overlay line]\n2. [short overlay line]\n3. [short overlay line]";
 
@@ -6308,6 +6327,24 @@ export const scanMediaLibraryForMonth = createServerFn({ method: "POST" })
       requested: number;
       scanned: number;
       available: number;
+      // Added 2026-11-24 per Mike: "it's only giving me 1 photo scanned when
+      // I have several in there." Root cause: this loop fetches each pool
+      // photo's bytes straight from Storage and hands them to Claude's
+      // vision API assuming they're already a type Claude can read — a raw
+      // HEIC photo (an iPhone's default, and exactly what the HEIC-preview
+      // bug a few rounds back was about) throws inside captionPhotoInVoice,
+      // which the try/catch below silently swallows into a plain `null`,
+      // indistinguishable from any other failure. An agent whose library is
+      // mostly still-unconverted HEIC photos could see "pool of 16, scanned
+      // 1" with zero explanation why. Counted and surfaced here instead of
+      // silently dropped, so the note below can actually say what happened
+      // and point at the real fix (open the Media Library — HEIC photos now
+      // auto-convert there on their own — then scan again).
+      unsupportedFormatSkipped: number;
+      // Added 2026-11-24, same round — see excludedAlreadyAttached above for
+      // why this is tracked as its own distinct number from
+      // unsupportedFormatSkipped rather than folded into it.
+      excludedAlreadyAttached: number;
       lanes: Record<"gratitude" | "local" | "real_estate" | "personal_brand", number>;
     }> => {
       const email = (context.claims as { email?: string } | undefined)?.email;
@@ -6381,9 +6418,22 @@ export const scanMediaLibraryForMonth = createServerFn({ method: "POST" })
         .limit(200);
       if (error) throw error;
 
-      const pool = (photos ?? [])
-        .filter((p) => p.url && p.media_type !== "video" && !excludeIds.has(p.id))
-        .slice(0, poolSize);
+      // Added 2026-11-24 per Mike's own repro on his test account
+      // (mike@sweetassist.com): "I have 7 photos in there... scan my photos
+      // only returns one." Two very different things can produce that exact
+      // symptom — a still-HEIC photo failing captioning (see
+      // unsupportedFormatSkipped below), or the 2026-11-23 cross-month dedup
+      // above correctly excluding photos that are already attached to some
+      // OTHER generated_posts row for this agent, in any month or status —
+      // which on a repeatedly-reused test account, full of old posts from
+      // testing this exact feature across many rounds, is entirely plausible
+      // on its own with zero HEIC involved. Counted separately from the pool
+      // itself (before the poolSize slice, so it reflects every eligible
+      // photo the dedup actually ruled out, not just the ones that would've
+      // fit in this one scan) so the two causes are never conflated again.
+      const eligibleBeforeDedup = (photos ?? []).filter((p) => p.url && p.media_type !== "video");
+      const excludedAlreadyAttached = eligibleBeforeDedup.filter((p) => excludeIds.has(p.id)).length;
+      const pool = eligibleBeforeDedup.filter((p) => !excludeIds.has(p.id)).slice(0, poolSize);
 
       type Scanned = {
         id: string;
@@ -6394,6 +6444,7 @@ export const scanMediaLibraryForMonth = createServerFn({ method: "POST" })
         lane: "gratitude" | "local" | "real_estate" | "personal_brand";
       };
 
+      let unsupportedFormatSkipped = 0;
       const scanned = (
         await Promise.all(
           pool.map(async (p): Promise<Scanned | null> => {
@@ -6402,6 +6453,16 @@ export const scanMediaLibraryForMonth = createServerFn({ method: "POST" })
               if (!imgRes.ok) return null;
               const arrayBuffer = await imgRes.arrayBuffer();
               const contentType = imgRes.headers.get("content-type") || "image/jpeg";
+              // Checked here, before captionPhotoInVoice, rather than caught
+              // as a generic thrown error below — this is the ONE failure
+              // reason worth distinguishing and reporting back (see
+              // unsupportedFormatSkipped above), everything else (a broken
+              // URL, a transient fetch error, Claude declining to caption
+              // it) stays a silent skip same as before.
+              if (!CLAUDE_SUPPORTED_IMAGE_TYPES.includes(contentType)) {
+                unsupportedFormatSkipped++;
+                return null;
+              }
               const caption = await captionPhotoInVoice(
                 arrayBuffer,
                 contentType,
@@ -6491,6 +6552,8 @@ export const scanMediaLibraryForMonth = createServerFn({ method: "POST" })
           requested: targetCount,
           scanned: scanned.length,
           available: pool.length,
+          unsupportedFormatSkipped,
+          excludedAlreadyAttached,
           lanes: { gratitude: 0, local: 0, real_estate: 0, personal_brand: 0 },
         };
       }
@@ -6527,6 +6590,8 @@ export const scanMediaLibraryForMonth = createServerFn({ method: "POST" })
         requested: targetCount,
         scanned: scanned.length,
         available: pool.length,
+        unsupportedFormatSkipped,
+        excludedAlreadyAttached,
         lanes,
       };
     },
@@ -6805,7 +6870,7 @@ export const regeneratePhotoScanCaption = createServerFn({ method: "POST" })
     const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
     const { data: post, error } = await supabaseAdmin
       .from("generated_posts")
-      .select("agent_id, metadata")
+      .select("agent_id, content, metadata")
       .eq("id", data.postId)
       .maybeSingle();
     if (error) throw error;
@@ -6910,6 +6975,12 @@ export const regeneratePhotoScanCaption = createServerFn({ method: "POST" })
       voiceDna,
       learnedFeedback,
       agentNotes,
+      // Added 2026-11-24 per Mike: "rescan needs to come up with a different
+      // context, not just change a few words." Without this, rescanning
+      // hands Claude the exact same photo + notes + voice DNA it had the
+      // first time, so of course it comes back with something nearly
+      // identical — there's nothing telling it to avoid the previous angle.
+      post.content,
     );
     if (!caption) throw new Error("Claude didn't return a usable caption for this photo — try again.");
 

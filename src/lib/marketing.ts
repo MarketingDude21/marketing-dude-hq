@@ -1,6 +1,12 @@
 import { createServerFn } from "@tanstack/react-start";
 import { requireSupabaseAuth } from "@/integrations/supabase/auth-middleware";
 import type { TablesInsert } from "@/integrations/supabase/types";
+// Type-only import (erased at compile time, so no runtime circularity with
+// voice-dna.ts's own `import { requireAgentAccess } from "@/lib/marketing"`)
+// — reused here so the Content Tone picker on My Brand (voice.tsx) and
+// captionPhotoInVoice below share one definition of the 4 tone labels
+// instead of two that could quietly drift apart.
+import type { BrandBioTone } from "@/lib/voice-dna";
 
 // ============================================================================
 // Monthly Marketing — native integration
@@ -244,6 +250,14 @@ export type PostMetadata = {
   // source — this is purely a label for review/learning, it never changes
   // what was actually written.
   scan_lane?: "gratitude" | "local" | "real_estate" | "personal_brand" | undefined;
+  // Self-reported by captionPhotoInVoice (2026-11-24) — true when this
+  // photo's caption skipped the usual real estate nod, under Mike's "2 non
+  // real estate reminders a month" allowance. Read back by
+  // scanMediaLibraryForMonth/regeneratePhotoScanCaption (see their own
+  // reNodBudgetRemaining comments) to compute how much of this agent's
+  // monthly allowance is left. Absent/false means the nod was included,
+  // same as every post before this existed.
+  re_nod_skipped?: boolean | undefined;
   // Meta scheduling via Upload-Post (2026-11-15) — see scheduleAgentPostToSocial
   // below and claude/upload-post-scheduling-scoping.md for the full plan.
   // upload_post_job_id is Upload-Post's own id for a SCHEDULED post (absent
@@ -1663,6 +1677,231 @@ export const rewritePostContent = createServerFn({ method: "POST" })
     });
 
     return { ok: true, content: rewritten };
+  });
+
+// ============================================================================
+// Post feedback — real chat thread (2026-11-24). Replaces the one-shot
+// "type feedback -> full regeneration -> panel closes" flow above
+// (rewritePostContent) for the admin Content Calendar. Per Mike: "Our
+// feedback tool is a little weak as well. I talked ot it and totally
+// rewriote things over and didnt take anything i typed into account. The
+// user experience for the feedback tool should be no different than it is
+// in Claude. So why arent we mimimcing that? They are alreayd used to it."
+// Confirmed scope (via AskUserQuestion): a real, visible, back-and-forth
+// chat thread, applied to Content Calendar posts/emails/videos AND Brand
+// Bio Writer's per-bio feedback (see listBioFeedbackThread etc in
+// voice-dna.ts) — NOT (yet) the public token-based review link, which still
+// uses rewritePublicReviewPost below; that's a known follow-up, not in this
+// round's confirmed scope.
+//
+// Reuses agent_chat_messages (same table the "My Marketing Dude" chat hub
+// above uses) rather than a new table, with mode "post_feedback" and
+// metadata.post_id scoping each post to its own thread — the existing
+// messagesSinceLastClear/CHAT_THREAD_CLEAR_MARKER machinery (exported above
+// for this reuse) handles "Clear thread" the same way: never deletes a row,
+// just inserts a marker and reads/writes only what's after the latest one.
+//
+// Unlike the chat hub (one free-form conversation), this needs an actual
+// document attached to it — the post's current content, which the reply can
+// revise. Claude is asked to always answer in two labeled parts: a short
+// conversational REPLY (what gets shown as the assistant's chat bubble) and
+// a REVISED <KIND> section that's either the full updated content or the
+// literal string "no change" — so a question like "why'd you write it this
+// way?" gets answered without silently rewriting the post, while "make it
+// shorter" actually updates it. This mirrors how Claude's own chat keeps
+// conversation separate from the artifact/file it's working on.
+const POST_FEEDBACK_MODE = "post_feedback";
+
+function postFeedbackMatches(row: { metadata: unknown }, postId: string): boolean {
+  return (row.metadata as { post_id?: string } | null)?.post_id === postId;
+}
+
+export const listPostFeedbackThread = createServerFn({ method: "GET" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator((data: { agentId: string; postId: string }) => data)
+  .handler(async ({ data, context }): Promise<ChatMessageRow[]> => {
+    const email = (context.claims as { email?: string } | undefined)?.email;
+    await requireAgentAccess(context.userId, email, data.agentId);
+    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+    const { data: rows, error } = await supabaseAdmin
+      .from("agent_chat_messages")
+      .select("id, role, content, mode, metadata, created_at")
+      .eq("agent_id", data.agentId)
+      .eq("mode", POST_FEEDBACK_MODE)
+      .order("created_at", { ascending: true })
+      .limit(500);
+    if (error) throw error;
+    const scoped = ((rows ?? []) as unknown as ChatMessageRow[]).filter((r) => postFeedbackMatches(r, data.postId));
+    return messagesSinceLastClear(scoped);
+  });
+
+export const sendPostFeedbackMessage = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator((data: { agentId: string; postId: string; message: string }) => data)
+  .handler(async ({ data, context }): Promise<{ ok: true; reply: ChatMessageRow; revisedContent: string | null }> => {
+    const email = (context.claims as { email?: string } | undefined)?.email;
+    await requireAgentAccess(context.userId, email, data.agentId);
+    const message = data.message.trim();
+    if (!message) throw new Error("Type something first.");
+
+    const apiKey = process.env["ANTHROPIC_API_KEY"];
+    if (!apiKey) {
+      throw new Error("Content generation isn't configured yet — add ANTHROPIC_API_KEY in Lovable Cloud → Secrets.");
+    }
+
+    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+    // Fetched fresh every turn (not cached from an earlier message) so a
+    // direct edit made in the "Edit directly" box above this thread, or by
+    // an earlier turn in this same thread, is always what gets revised next.
+    const { data: existing, error: fetchErr } = await supabaseAdmin
+      .from("generated_posts")
+      .select("agent_id, content, content_type, title")
+      .eq("id", data.postId)
+      .maybeSingle();
+    if (fetchErr) throw fetchErr;
+    if (!existing || existing.agent_id !== data.agentId) {
+      throw new Error("Post not found for this agent.");
+    }
+
+    const { data: agent } = await supabaseAdmin
+      .from("agents")
+      .select("full_name, market_area, voice_summary, voice_answers")
+      .eq("id", data.agentId)
+      .maybeSingle();
+    const agentName = agent?.full_name ?? "the agent";
+    const firstName = agentName.split(" ")[0] || agentName;
+    const agentCity = agent?.market_area ?? "their market";
+    const dna = withContentBrandingStrategy(
+      agent?.voice_summary ?? "Warm, conversational, authentic real estate agent. Short posts. Real human energy.",
+      agent?.voice_answers,
+    );
+
+    const kind =
+      existing.content_type === "email"
+        ? "email"
+        : existing.content_type === "video"
+          ? "video script"
+          : "social media post";
+    const kindLabel =
+      existing.content_type === "email" ? "EMAIL" : existing.content_type === "video" ? "SCRIPT" : "POST";
+    const formatRule =
+      existing.content_type === "post"
+        ? "Keep it 2 to 4 sentences max.\n"
+        : existing.content_type === "video"
+          ? "Keep the HOOK / BODY / CLOSE format, written to be spoken, 150 words maximum.\n"
+          : "Keep the SUBJECT OPTIONS / EMAIL BODY format.\n";
+    const learnedFeedback = await fetchLearnedFeedback(data.agentId);
+
+    await supabaseAdmin.from("agent_chat_messages").insert({
+      agent_id: data.agentId,
+      role: "user",
+      mode: POST_FEEDBACK_MODE,
+      content: message,
+      metadata: { post_id: data.postId },
+    });
+
+    const { data: historyRows } = await supabaseAdmin
+      .from("agent_chat_messages")
+      .select("role, content, metadata")
+      .eq("agent_id", data.agentId)
+      .eq("mode", POST_FEEDBACK_MODE)
+      .order("created_at", { ascending: true })
+      .limit(500);
+    const scopedHistory = ((historyRows ?? []) as { role: string; content: string; metadata: unknown }[]).filter((r) =>
+      postFeedbackMatches(r, data.postId),
+    );
+    const recentHistory = messagesSinceLastClear(scopedHistory).slice(-20);
+    while (recentHistory.length && recentHistory[0]?.role !== "user") recentHistory.shift();
+    const claudeMessages = recentHistory.map((m) => ({
+      role: m.role === "assistant" ? "assistant" : "user",
+      content: m.content,
+    }));
+
+    const systemPrompt =
+      `You are going back and forth with ${agentName} about ONE specific ${kind} — an ongoing conversation about this one piece of content, not a one-shot rewrite form.\n\n` +
+      `You are writing for ${agentName} in ${agentCity}.\n\n` +
+      `VOICE DNA (this is how they actually talk):\n${dna}${learnedFeedback}\n\n` +
+      (existing.title ? `ORIGINAL CONCEPT: ${existing.title}\n` : "") +
+      `CURRENT VERSION OF THIS ${kindLabel}:\n${existing.content}\n\n` +
+      "HOW TO RESPOND:\n" +
+      "1. Respond like a real collaborator who read exactly what they just said — acknowledge it specifically, don't drift into an unrelated full rewrite.\n" +
+      "2. If they're asking for an actual change, make only the change(s) they're asking for, keeping the same concept and emotional core otherwise.\n" +
+      "3. If they're just asking a question, pushing back, or chatting, respond to that without forcing a rewrite.\n" +
+      `4. When you do revise it: write in ${firstName}'s voice, ${formatRule}No hyphens including in compound modifiers (well known, not well-known), no corporate language, standard capitalization always, sounds like a real person. Would ${firstName} actually say this?\n\n` +
+      "Output format — ALWAYS both lines, in this order, nothing else before or after:\n" +
+      "REPLY: [your short, conversational response]\n" +
+      `REVISED ${kindLabel}: [the full updated ${kind} text, or exactly "no change" if this message does not call for one]`;
+
+    const res = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "x-api-key": apiKey, "anthropic-version": "2023-06-01" },
+      body: JSON.stringify({
+        model: "claude-haiku-4-5-20251001",
+        max_tokens: existing.content_type === "email" ? 2200 : existing.content_type === "video" ? 900 : 700,
+        system: systemPrompt,
+        messages: claudeMessages,
+      }),
+    });
+    const json = (await res.json()) as { content?: { text?: string }[]; error?: { message?: string } };
+    if (!res.ok) throw new Error(json.error?.message ?? `Claude API error (${res.status})`);
+    const raw = (json.content ?? [])
+      .map((b) => b.text ?? "")
+      .join("")
+      .trim();
+    if (!raw) throw new Error("Empty response from Claude — try again.");
+
+    const replyMatch = raw.match(/REPLY:\s*([\s\S]*?)(?=\nREVISED\s|$)/i);
+    const revisedMatch = raw.match(new RegExp(`REVISED ${kindLabel}:\\s*([\\s\\S]*)`, "i"));
+    const replyText = replyMatch ? replyMatch[1]!.trim() : raw;
+    const revisedRaw = revisedMatch ? revisedMatch[1]!.trim() : "";
+    const revisedContent = revisedRaw && !/^no change\.?$/i.test(revisedRaw) ? cleanCopy(revisedRaw) : null;
+
+    if (revisedContent) {
+      const { error: updateErr } = await supabaseAdmin
+        .from("generated_posts")
+        .update({ content: revisedContent, status: "pending", updated_at: new Date().toISOString() })
+        .eq("id", data.postId);
+      if (updateErr) throw updateErr;
+      await supabaseAdmin.from("feedback_history").insert({
+        agent_id: data.agentId,
+        post_id: data.postId,
+        rating: "rewritten",
+        notes: `Feedback: "${message}" — rewritten in ${agentName}'s voice.`,
+      });
+    }
+
+    const { data: assistantRow, error: assistantInsertErr } = await supabaseAdmin
+      .from("agent_chat_messages")
+      .insert({
+        agent_id: data.agentId,
+        role: "assistant",
+        mode: POST_FEEDBACK_MODE,
+        content: replyText,
+        metadata: { post_id: data.postId },
+      })
+      .select("id, role, content, mode, metadata, created_at")
+      .single();
+    if (assistantInsertErr) throw assistantInsertErr;
+
+    return { ok: true, reply: assistantRow as unknown as ChatMessageRow, revisedContent };
+  });
+
+export const clearPostFeedbackThread = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator((data: { agentId: string; postId: string }) => data)
+  .handler(async ({ data, context }): Promise<{ ok: true }> => {
+    const email = (context.claims as { email?: string } | undefined)?.email;
+    await requireAgentAccess(context.userId, email, data.agentId);
+    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+    const { error } = await supabaseAdmin.from("agent_chat_messages").insert({
+      agent_id: data.agentId,
+      role: "system",
+      mode: POST_FEEDBACK_MODE,
+      content: "",
+      metadata: { type: CHAT_THREAD_CLEAR_MARKER, post_id: data.postId },
+    });
+    if (error) throw error;
+    return { ok: true };
   });
 
 type PhotoRow = {
@@ -3710,6 +3949,41 @@ function withContentBrandingStrategyOptional(voiceDna: string | undefined, voice
   return voiceDna ? `${voiceDna}\n\n${addendum}` : addendum;
 }
 
+// Content Tone (2026-11-24) — per Mike: "refer to the MY Brand page where
+// we have Brand Writer give 4 options of the tone of posts... follow the
+// same pattern here to choose their tone... so that's determined for their
+// content." This is the picker's OTHER half — saveAgentContentTone in
+// voice-dna.ts is where it's written, this is where it's read back and
+// turned into prompt language for captionPhotoInVoice below. Deliberately
+// its own description set rather than reusing voice-dna.ts's
+// BRAND_BIO_TONE_DESCRIPTIONS — those were written for polished "about me"
+// bio copy; this is for 1-3 sentence scanned-photo captions, so the same 4
+// labels get caption-appropriate wording instead.
+const CONTENT_TONE_DESCRIPTIONS: Record<BrandBioTone, string> = {
+  professional:
+    "Polished and credible — still warm and human, never stiff or corporate, but dial the jokes/flourish down.",
+  personable: "Warm, approachable, conversational by default — friendly without reaching for a laugh every time.",
+  funny:
+    "Playful, witty, personality-driven — treat this as a chance to make them look like a real person with a life, not a corporate agent.",
+  relatable: "Down-to-earth, like a text to a friend — plainspoken and real, nothing performed or polished.",
+};
+
+// Reads the agent's saved Content Tone choice out of voice_answers (a
+// flexible JSONB bag — see the comment on VoiceDnaAnswers in voice-dna.ts
+// for why nothing here needed a schema migration). Falls back to "funny"
+// for any agent who hasn't opened My Brand and picked one yet — that
+// matches exactly what every scanned-photo caption already did before this
+// picker existed (captionPhotoInVoice's old hardcoded "leans playful, funny,
+// or personality-driven by default" rule), so nothing changes for an agent
+// until they actively choose a different tone.
+function getAgentContentTone(voiceAnswers: unknown): BrandBioTone {
+  if (voiceAnswers && typeof voiceAnswers === "object") {
+    const tone = (voiceAnswers as { contentTone?: unknown }).contentTone;
+    if (tone === "professional" || tone === "personable" || tone === "funny" || tone === "relatable") return tone;
+  }
+  return "funny";
+}
+
 // ============================================================================
 // Native "Create content" — Phase 2, step 2. The old app sourced post/email/
 // video copy from a Google Drive content calendar (content-calendar.js, one
@@ -3964,14 +4238,18 @@ export type ChatMode = "post" | "email" | "video_script" | "reels" | "photo_scan
 // real message, never shown to the agent, never sent to Claude as
 // conversational context. See the big comment block above for why this
 // exists instead of actually deleting rows.
-const CHAT_THREAD_CLEAR_MARKER = "thread_clear";
+// Exported (2026-11-24) so the post-feedback and bio-feedback chat threads
+// (sendPostFeedbackMessage above, listBioFeedbackThread/sendBioFeedbackMessage
+// in voice-dna.ts) can reuse the exact same "clear never deletes" convention
+// on the same agent_chat_messages table instead of building a parallel one.
+export const CHAT_THREAD_CLEAR_MARKER = "thread_clear";
 
 // Shared by listAgentChatMessages and sendAgentChatMessage: given a mode's
 // full message history in chronological (ascending) order, returns only
 // what came after the most recent clear-thread marker — or everything, if
 // that mode's thread has never been cleared. The marker row itself is
 // naturally excluded since the slice starts right after it.
-function messagesSinceLastClear<T extends { metadata: unknown }>(rows: T[]): T[] {
+export function messagesSinceLastClear<T extends { metadata: unknown }>(rows: T[]): T[] {
   let lastClearIndex = -1;
   rows.forEach((r, i) => {
     if ((r.metadata as { type?: string } | null)?.type === CHAT_THREAD_CLEAR_MARKER) lastClearIndex = i;
@@ -5880,7 +6158,36 @@ async function captionPhotoInVoice(
   // avoid, so it's left undefined there and this instruction simply doesn't
   // appear in that prompt.
   previousCaption?: string | null,
-): Promise<{ description: string; suggestedPost: string; textOverlaySuggestions: string[] } | null> {
+  // Added 2026-11-24 per Mike: "refer to the MY Brand page where we have
+  // Brand Writer give 4 options of the tone of posts... follow the same
+  // pattern here." Replaces the old hardcoded "leans playful, funny, or
+  // personality-driven by default" instruction below — undefined (every
+  // caller except scanMediaLibraryForMonth) falls back to "funny" inside
+  // CONTENT_TONE_DESCRIPTIONS, worded to match the old hardcoded behavior,
+  // so nothing changes for a caller that doesn't pass this.
+  contentTone?: BrandBioTone,
+  // Added same day per Mike's "I like #2 but we can allow 2 non real estate
+  // reminders a month, let's see how it does" answer. undefined (every
+  // caller except scanMediaLibraryForMonth) keeps the old always-skippable-
+  // when-awkward wording untouched below. A number from scanMediaLibraryFor
+  // Month is this agent's remaining monthly allowance for skipping the real
+  // estate nod entirely (computed there from prior posts this month — see
+  // its own comment): >0 keeps the skip available but reframes it as a rare,
+  // reserved exception rather than a default; 0 makes the nod mandatory with
+  // no exception. This is necessarily a steer, not a hard guarantee — every
+  // photo in one Scan My Media Library batch is captioned in PARALLEL
+  // (Promise.all), so no single call knows what the others in the same
+  // batch decide. The actual count is read back afterward from each post's
+  // own self-reported "REAL ESTATE NOD:" line below (stored as
+  // metadata.re_nod_skipped) and feeds the NEXT batch's budget — it narrows
+  // how often this fires, it doesn't cap it to exactly 2 with certainty.
+  reNodBudgetRemaining?: number,
+): Promise<{
+  description: string;
+  suggestedPost: string;
+  textOverlaySuggestions: string[];
+  reNodIncluded?: boolean;
+} | null> {
   const base64 = Buffer.from(imageBytes).toString("base64");
   // FIXED (2026-09-30) — per Mike: "when I rescan image it gives error,"
   // screenshotted "Could not process image." Root cause: this used to
@@ -5929,11 +6236,19 @@ async function captionPhotoInVoice(
   // point of the post" — still explicitly never a pitch, still never
   // "As a real estate professional" territory (banned elsewhere in the
   // app's other prompts too).
+  const toneLine = CONTENT_TONE_DESCRIPTIONS[contentTone ?? "funny"];
+  const reNodTracked = reNodBudgetRemaining !== undefined;
+  const reNodRule = reNodTracked
+    ? reNodBudgetRemaining > 0
+      ? "You may skip the real estate nod entirely on THIS photo, but only if it's genuinely one of the rare ones where forcing it would feel awkward — treat that as a reserved exception, not a default. Only a couple of posts total should skip it in a given month."
+      : "Always include the real estate nod on this one, no exceptions — this agent's monthly allowance for skipping it is already used up."
+    : "Only skip the real estate nod entirely on the rare photo where working one in would be genuinely awkward or forced.";
   const prompt =
     `You are creating a social media post for a real estate agent named ${agentName ?? "the agent"} in ${agentCity ?? "their city"}.\n\n` +
     `VOICE DNA:\n${voiceDna ?? "Warm, authentic, conversational. Sounds like a real person, not a real estate agent."}\n\n` +
-    "Look at this photo and write a social media post that:\n1. Starts from what you actually see — the setting, the mood, the moment\n2. Sounds EXACTLY like this person based on their Voice DNA above\n3. Is 1-3 sentences max — short, human, texted-a-friend energy\n4. Leans playful, funny, or personality-driven by default — treat this as a chance to make them look like a real person with a life, not a corporate agent. But always work in a light, natural reminder that " +
-    `${agentName ?? "this person"} is in real estate — a quick aside, a joke, a callback, a one-liner — even when the photo has nothing to do with real estate (a coffee, a kid's game, a sunset). Keep the real estate nod small: a wink, never the whole point of the post, and never a pitch or a listing plug. If the photo IS an unmistakable real estate moment (a listing, a closing, a sign, a showing), let real estate be more central, same playful voice. Only skip the real estate nod entirely on the rare photo where working one in would be genuinely awkward or forced.\n` +
+    "Look at this photo and write a social media post that:\n1. Starts from what you actually see — the setting, the mood, the moment\n2. Sounds EXACTLY like this person based on their Voice DNA above\n3. Is 1-3 sentences max — short, human, texted-a-friend energy\n4. " +
+    `${toneLine} Always work in a light, natural reminder that ` +
+    `${agentName ?? "this person"} is in real estate — a quick aside, a joke, a callback, a one-liner — even when the photo has nothing to do with real estate (a coffee, a kid's game, a sunset). Keep the real estate nod small: a wink, never the whole point of the post, and never a pitch or a listing plug. If the photo IS an unmistakable real estate moment (a listing, a closing, a sign, a showing), let real estate be more central, same tone. ${reNodRule}\n` +
     '5. Does NOT mention any specific location, city, neighborhood, or place name\n6. NO hyphens, NO corporate language, NO AI-tell phrases, no "As a real estate professional" or any version of that\n7. Standard capitalization — never write in all lowercase\n\n' +
     "Also describe what you see in the photo in one short sentence.\n\n" +
     "Separately, this photo may end up as a Reel with short text overlaid on screen — write 3 short text-overlay options for it (not captions, just the on-screen text itself), each using a different one of these frameworks, whichever actually fit what you see in THIS photo:\n\n" +
@@ -5947,7 +6262,9 @@ async function captionPhotoInVoice(
       ? `\n\nTHIS PHOTO WAS ALREADY CAPTIONED ONCE BEFORE — the agent asked to rescan it because they want something genuinely new, not a reword. The previous caption was:\n"${previousCaption.trim()}"\n` +
         "Do NOT reuse that angle, story, joke, or structure, even with different words — find a DIFFERENT true thing in the same photo to build this caption around: a different detail you notice, a different mood, a different person/object in frame, a different memory or association, a different style of joke. If the previous caption focused on the setting, focus on a detail or a feeling instead (or vice versa). The two captions should read like two different people looked at this photo and each found their own thing to say about it — not like one was lightly edited into the other.\n"
       : "") +
-    "\n\nOutput format:\nDESCRIPTION: [one sentence of what you see]\nPOST: [the social media caption]\nTEXT OVERLAYS:\n1. [short overlay line]\n2. [short overlay line]\n3. [short overlay line]";
+    `\n\nOutput format:\nDESCRIPTION: [one sentence of what you see]\nPOST: [the social media caption]\nTEXT OVERLAYS:\n1. [short overlay line]\n2. [short overlay line]\n3. [short overlay line]${
+      reNodTracked ? "\nREAL ESTATE NOD: [included or skipped]" : ""
+    }`;
 
   const res = await fetch("https://api.anthropic.com/v1/messages", {
     method: "POST",
@@ -5972,7 +6289,15 @@ async function captionPhotoInVoice(
     .map((b) => b.text ?? "")
     .join("")
     .trim();
-  return parseVoiceCaptionResponse(raw);
+  const parsed = parseVoiceCaptionResponse(raw);
+  if (!reNodTracked) return parsed;
+  // Self-reported, not inferred — parsed here rather than inside the shared
+  // parser below since the video-captioning path (captionVideoFrames) never
+  // asks for or needs this line. Missing/unparseable defaults to "included"
+  // (the safe assumption — the nod being present is the default rule, a
+  // skip is the exception that needs explicit confirmation to count).
+  const reNodMatch = raw.match(/REAL ESTATE NOD:\s*(included|skipped)/i);
+  return { ...parsed, reNodIncluded: reNodMatch ? reNodMatch[1]!.toLowerCase() === "included" : true };
 }
 
 // Shared DESCRIPTION/POST/TEXT OVERLAYS parser — pulled out of
@@ -6374,6 +6699,11 @@ export const scanMediaLibraryForMonth = createServerFn({ method: "POST" })
       }
       const voiceDna = withContentBrandingStrategy(agent.voice_summary, agent.voice_answers);
       const learnedFeedback = await fetchLearnedFeedback(data.agentId);
+      // Content Tone (2026-11-24) — see getAgentContentTone/
+      // CONTENT_TONE_DESCRIPTIONS above and the Content Tone picker on My
+      // Brand (voice.tsx) for the full "why." Read once per scan, applied
+      // to every photo in this batch.
+      const contentTone = getAgentContentTone(agent.voice_answers);
 
       // Bumped 10 -> 12 2026-11-23 per Mike: "Mobile should scan up to 12
       // photos at a time." Same default either way — mobile and desktop
@@ -6404,10 +6734,23 @@ export const scanMediaLibraryForMonth = createServerFn({ method: "POST" })
         .select("metadata")
         .eq("agent_id", data.agentId);
       if (pendingMediaErr) throw pendingMediaErr;
+      // Real estate nod quota (2026-11-24) — per Mike: "I like #2 but we can
+      // allow 2 non real estate reminders a month, let's see how it does."
+      // Reuses this same already-fetched query (every post's metadata, this
+      // agent, every month) rather than a second round trip — each scan's
+      // insert below stamps metadata.month and metadata.re_nod_skipped, so
+      // this just filters what's already in hand for this specific month's
+      // prior skips instead of querying for them separately.
+      let priorReNodSkipsThisMonth = 0;
       for (const row of pendingMediaRows ?? []) {
-        const mediaId = (row.metadata as { media_id?: string | null } | null)?.media_id;
-        if (mediaId) excludeIds.add(mediaId);
+        const meta = row.metadata as { media_id?: string | null; month?: string; re_nod_skipped?: boolean } | null;
+        if (meta?.media_id) excludeIds.add(meta.media_id);
+        if (meta?.month === data.month && meta?.re_nod_skipped === true) priorReNodSkipsThisMonth++;
       }
+      // See the reNodBudgetRemaining comment on captionPhotoInVoice above for
+      // why this is a steer (applied identically to every photo captioned in
+      // this parallel batch below) rather than a hard, exactly-enforced cap.
+      const reNodBudgetRemaining = Math.max(0, 2 - priorReNodSkipsThisMonth);
 
       const { data: photos, error } = await supabaseAdmin
         .from("agent_photos")
@@ -6442,6 +6785,7 @@ export const scanMediaLibraryForMonth = createServerFn({ method: "POST" })
         suggestedPost: string;
         textOverlaySuggestions: string[];
         lane: "gratitude" | "local" | "real_estate" | "personal_brand";
+        reNodIncluded: boolean;
       };
 
       let unsupportedFormatSkipped = 0;
@@ -6472,6 +6816,9 @@ export const scanMediaLibraryForMonth = createServerFn({ method: "POST" })
                 voiceDna,
                 learnedFeedback,
                 p.notes,
+                undefined, // previousCaption — no rescan context on the original scan
+                contentTone,
+                reNodBudgetRemaining,
               );
               if (!caption) return null;
               return {
@@ -6481,6 +6828,11 @@ export const scanMediaLibraryForMonth = createServerFn({ method: "POST" })
                 suggestedPost: caption.suggestedPost,
                 textOverlaySuggestions: caption.textOverlaySuggestions,
                 lane: classifyScanLane(caption.description),
+                // Defaults true (nod assumed included) if the model's
+                // self-report didn't parse — matches captionPhotoInVoice's
+                // own fallback, so a parse miss never gets miscounted as a
+                // "free" skip against the monthly budget.
+                reNodIncluded: caption.reNodIncluded ?? true,
               };
             } catch {
               return null;
@@ -6575,6 +6927,11 @@ export const scanMediaLibraryForMonth = createServerFn({ method: "POST" })
           media_type: "image",
           text_overlay_suggestions: s.textOverlaySuggestions,
           scan_lane: s.lane,
+          // Self-reported by captionPhotoInVoice (see its reNodBudgetRemaining
+          // comment) — read back by THIS SAME function's own query above on
+          // every later scan this month, so the budget narrows as the month's
+          // skips accumulate across multiple scan runs/batches.
+          re_nod_skipped: !s.reNodIncluded,
         },
       }));
       const { error: insertErr } = await supabaseAdmin.from("generated_posts").insert(rows);
@@ -6891,6 +7248,26 @@ export const regeneratePhotoScanCaption = createServerFn({ method: "POST" })
     const agentCity = agent?.market_area ?? undefined;
     const voiceDna = withContentBrandingStrategyOptional(agent?.voice_summary ?? undefined, agent?.voice_answers);
     const learnedFeedback = await fetchLearnedFeedback(data.agentId);
+    const contentTone = getAgentContentTone(agent?.voice_answers);
+    // Same monthly real estate nod quota scanMediaLibraryForMonth tracks —
+    // a rescan should count against (and respect) the same "2 a month"
+    // budget, not be a free way around it. Scoped to this post's own month
+    // and excludes this post's own existing metadata (it's about to be
+    // overwritten below with this rescan's fresh self-report anyway).
+    const postMonth = (metadata as { month?: string }).month;
+    let reNodBudgetRemaining: number | undefined;
+    if (postMonth) {
+      const { data: monthRows } = await supabaseAdmin
+        .from("generated_posts")
+        .select("id, metadata")
+        .eq("agent_id", data.agentId)
+        .eq("month", postMonth);
+      const priorSkips = (monthRows ?? []).filter(
+        (row) =>
+          row.id !== data.postId && (row.metadata as { re_nod_skipped?: boolean } | null)?.re_nod_skipped === true,
+      ).length;
+      reNodBudgetRemaining = Math.max(0, 2 - priorSkips);
+    }
 
     let arrayBuffer: ArrayBuffer;
     let mediaType = "image/jpeg";
@@ -6981,12 +7358,25 @@ export const regeneratePhotoScanCaption = createServerFn({ method: "POST" })
       // first time, so of course it comes back with something nearly
       // identical — there's nothing telling it to avoid the previous angle.
       post.content,
+      contentTone,
+      reNodBudgetRemaining,
     );
     if (!caption) throw new Error("Claude didn't return a usable caption for this photo — try again.");
 
     const { error: updateErr } = await supabaseAdmin
       .from("generated_posts")
-      .update({ title: caption.description, content: caption.suggestedPost, updated_at: new Date().toISOString() })
+      .update({
+        title: caption.description,
+        content: caption.suggestedPost,
+        updated_at: new Date().toISOString(),
+        // Overwrites this post's own re_nod_skipped with the rescan's fresh
+        // self-report (see the reNodBudgetRemaining comment above) — only
+        // touched when it was actually tracked (postMonth known), so a post
+        // with no month on it keeps its metadata otherwise untouched.
+        ...(reNodBudgetRemaining !== undefined
+          ? { metadata: { ...metadata, re_nod_skipped: !(caption.reNodIncluded ?? true) } }
+          : {}),
+      })
       .eq("id", data.postId);
     if (updateErr) throw updateErr;
 

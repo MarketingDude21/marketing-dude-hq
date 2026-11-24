@@ -8038,15 +8038,48 @@ function MonthWorkspace({
         data: { agentId, month: folder.month, excludeFileIds: alreadyScanned },
       });
       setLastBatchId(res.batchId ?? lastBatchId);
+      // Added 2026-11-24 per Mike: "it's only giving me 1 photo scanned when
+      // I have several in there." A photo still sitting as raw HEIC (never
+      // opened in the Media Library to trigger the auto-convert fix a round
+      // back, or uploaded through a path that skipped conversion) fails
+      // inside the scan's own captioning step — Claude's vision API can't
+      // read it — and used to just silently vanish with no sign why, which
+      // is exactly what reads as "I have several in there" but almost
+      // nothing came out the other end. Called out by name here instead,
+      // with the actual fix (the Media Library auto-converts these now).
+      const heicNote =
+        res.unsupportedFormatSkipped > 0
+          ? ` (${res.unsupportedFormatSkipped} photo${res.unsupportedFormatSkipped === 1 ? "" : "s"} skipped — still in HEIC/an iPhone format Claude can't read yet. Open the Media Library, let those finish auto-converting, then scan again.)`
+          : "";
+      // Added 2026-11-24, same round — a photo already attached to SOME
+      // other generated post for this agent (any month, pending or
+      // approved) is deliberately excluded here so it's never scanned
+      // twice (see scanMediaLibraryForMonth's excludedAlreadyAttached
+      // comment). That's correct behavior, but on an account that's been
+      // used for repeated testing of this exact feature, it can look
+      // identical from the outside to "the scan is broken" — most of the
+      // library may already be spoken for by old test posts. Called out
+      // by name so that's distinguishable from an actual bug.
+      const dedupNote =
+        res.excludedAlreadyAttached > 0
+          ? ` (${res.excludedAlreadyAttached} photo${res.excludedAlreadyAttached === 1 ? "" : "s"} already used in another post for this agent — somewhere in this month or a different one — so skipped here too. Check Archived content or other months if that's more than expected.)`
+          : "";
+      const extraNotes = heicNote + dedupNote;
       if (res.created === 0) {
-        setScanNote("No unused photos left to scan — upload more to the Media Library, then scan again.");
+        setScanNote(
+          res.unsupportedFormatSkipped > 0 || res.excludedAlreadyAttached > 0
+            ? `No unused photos could be scanned.${extraNotes}`
+            : "No unused photos left to scan — upload more to the Media Library, then scan again.",
+        );
       } else if (res.created < res.requested) {
         setScanNote(
           `Created ${res.created} of ${res.requested} — only ${res.available} unused photo${res.available === 1 ? "" : "s"} ` +
-            "were available to scan. Upload more and scan again for a fuller month.",
+            `were available to scan.${extraNotes} Upload more and scan again for a fuller month.`,
         );
       } else {
-        setScanNote(`Created ${res.created} posts from your photos — review them below before anything's scheduled.`);
+        setScanNote(
+          `Created ${res.created} posts from your photos — review them below before anything's scheduled.${extraNotes}`,
+        );
       }
       loadPosts();
     } catch (e) {

@@ -21,8 +21,11 @@ import {
   saveAgentBusinessInfo,
   saveContentBrandingStrategy,
   saveAgentSocialHandles,
+  saveAgentContentTone,
   generateBrandBios,
-  regenerateBrandBio,
+  listBioFeedbackThread,
+  sendBioFeedbackMessage,
+  clearBioFeedbackThread,
   scanAgentWebsite,
   generateBrandGraphicAI,
   getAgentSocialConnectStatus,
@@ -43,7 +46,7 @@ import {
 // exact same way here as it already is there, instead of a second copy of
 // that logic. See the "Build My Brand — admin act as agent" comment block
 // in voice-dna.ts for the full story on why this page needed it.
-import { getMarketingAccess, listMarketingAgents, type MarketingAccess } from "@/lib/marketing";
+import { getMarketingAccess, listMarketingAgents, type MarketingAccess, type ChatMessageRow } from "@/lib/marketing";
 // MicButton is a UI component (not a server function), so it comes from the
 // routes file where it's defined, same path posts.tsx/media.tsx already use
 // to reuse AgentScopedPage from this same file — added 2026-11-15 so Content
@@ -462,6 +465,20 @@ function VoiceWorkspace({
   const [scanningWebsite, setScanningWebsite] = useState(false);
   const [scanError, setScanError] = useState<string | null>(null);
 
+  // Content Tone (2026-11-24) — per Mike: "refer to the MY Brand page where
+  // we have Brand Writer give 4 options of the tone of posts... follow the
+  // same pattern here to choose their tone... so that's determined for
+  // their content." Unlike bioTone below (re-picked fresh before every
+  // "Write my bios" click, never saved), this ONE persists — it's what
+  // scanned-photo captions use instead of a hardcoded default (see
+  // getAgentContentTone in marketing.ts). Saves immediately on click rather
+  // than needing a separate Save button, since picking a pill IS the save
+  // here — nothing else on this card to batch it with. Defaults to "funny"
+  // for anyone who hasn't opened this yet, matching the old hardcoded
+  // caption behavior exactly until they actively choose otherwise.
+  const [contentTone, setContentTone] = useState<BrandBioTone>("funny");
+  const [contentToneSaving, setContentToneSaving] = useState(false);
+
   // Brand Bio Writer (2026-11-13) — per Mike: "we need to create a
   // done-for-you bio section... rate it by professional, personable,
   // funny, relatable." See generateBrandBios in voice-dna.ts for what
@@ -473,16 +490,24 @@ function VoiceWorkspace({
   const [bioError, setBioError] = useState<string | null>(null);
   const [bioResult, setBioResult] = useState<BrandBioResult | null>(null);
   const [bioCopiedKey, setBioCopiedKey] = useState<string | null>(null);
-  // Per-bio feedback/rewrite (2026-11-16) — per Mike: "when it says to
-  // regenerate bios, you need the ability to add feedback, maybe rewrite
-  // per bio or add feedback per bio." Keyed by variant so each of the 5
-  // cards has its own open/closed feedback box, draft text, and in-flight
-  // state, independent of the other 4 — see regenerateBrandBio in
-  // voice-dna.ts, which rewrites only the one variant being edited.
+  // Per-bio feedback (2026-11-16, REWORKED 2026-11-24 into a real chat
+  // thread) — per Mike originally: "when it says to regenerate bios, you
+  // need the ability to add feedback, maybe rewrite per bio or add feedback
+  // per bio," then later: "The user experience for the feedback tool should
+  // be no different than it is in Claude." Keyed by variant so each of the 5
+  // cards has its own open/closed panel, its own visible thread, draft text,
+  // and in-flight state, independent of the other 4 — see
+  // sendBioFeedbackMessage in voice-dna.ts, which replies about (and when
+  // warranted, rewrites) only the one variant being discussed.
   const [bioFeedbackOpen, setBioFeedbackOpen] = useState<Partial<Record<BrandBioVariant, boolean>>>({});
+  const [bioFeedbackMessages, setBioFeedbackMessages] = useState<Partial<Record<BrandBioVariant, ChatMessageRow[]>>>(
+    {},
+  );
+  const [bioFeedbackLoaded, setBioFeedbackLoaded] = useState<Partial<Record<BrandBioVariant, boolean>>>({});
   const [bioFeedbackText, setBioFeedbackText] = useState<Partial<Record<BrandBioVariant, string>>>({});
   const [bioRewriting, setBioRewriting] = useState<BrandBioVariant | null>(null);
   const [bioRewriteError, setBioRewriteError] = useState<Partial<Record<BrandBioVariant, string>>>({});
+  const [bioClearArmed, setBioClearArmed] = useState<BrandBioVariant | null>(null);
 
   // Branding Graphics (2026-11-13) — per Mike: "take the headshot they
   // uploaded and the logo and be able to create really nice-looking
@@ -562,13 +587,36 @@ function VoiceWorkspace({
             stored?.businessInfo ? { ...EMPTY_BUSINESS_INFO, ...stored.businessInfo } : EMPTY_BUSINESS_INFO,
           );
           setContentStrategy(stored?.contentBrandingStrategy ?? "");
+          setContentTone(stored?.contentTone ?? "funny");
           setSocialHandles(stored?.socialHandles ?? EMPTY_SOCIAL_HANDLES);
           setWebsiteScan(stored?.websiteScan ?? null);
           setGraphicTagline(data.market_area ? `Real Estate Agent — ${data.market_area}` : "Real Estate Agent");
           if (stored?.answers?.length) {
             const restored = emptyAnswers();
-            stored.answers.forEach((a, i) => {
-              if (i < restored.length) restored[i] = a.answer ?? "";
+            // Matched by the saved QUESTION TEXT, not array position
+            // (2026-11-24) — positional restore broke the moment
+            // VOICE_DNA_QUESTIONS stopped being a fixed, never-reordered
+            // list (four questions retired, one reworded for brevity — see
+            // the big comment above that array), per Mike: "as long as this
+            // doesn't affect anyone who already took the questionnaire."
+            // Without this, an agent's old answer to a since-removed
+            // question (e.g. the old "morning routine" one) would silently
+            // land under whatever NEW question happened to occupy that same
+            // index if they ever reopened the interview. Each stored answer
+            // already carries its own question text (see VoiceDnaAnswer
+            // below), so look each CURRENT question up by that text instead:
+            // a still-current question keeps its old answer, a retired one
+            // has nothing to match and is simply dropped, and a reworded or
+            // brand-new question starts blank like it should. This only
+            // touches the live interview form's pre-fill — an agent's
+            // already-generated profile (voice_summary) is separate, static
+            // stored text and is never touched by this at all.
+            const byQuestionText = new Map(
+              stored.answers.map((a: VoiceDnaAnswer) => [a.question, a.answer ?? ""] as const),
+            );
+            VOICE_DNA_QUESTIONS.forEach((q, i) => {
+              const prior = byQuestionText.get(q.question);
+              if (prior !== undefined) restored[i] = prior;
             });
             setAnswers(restored);
           }
@@ -708,6 +756,24 @@ function VoiceWorkspace({
     }
   }
 
+  // Fires on every pill click (see the contentTone state comment above for
+  // why this has no separate Save button) — optimistic UI update first,
+  // then persist; reverts the pill if the save actually fails so the
+  // picker never silently claims a tone that didn't stick.
+  async function handleSetContentTone(tone: BrandBioTone) {
+    const previous = contentTone;
+    setContentTone(tone);
+    setContentToneSaving(true);
+    try {
+      const result = await saveAgentContentTone({ data: { agentId, tone } });
+      if (!result.ok) setContentTone(previous);
+    } catch {
+      setContentTone(previous);
+    } finally {
+      setContentToneSaving(false);
+    }
+  }
+
   // Returns the fresh scan (or null on failure) rather than just updating
   // state — handleGenerateBrandKit below chains this straight into
   // handleGenerateGraphics within the same function call, and React state
@@ -753,22 +819,46 @@ function VoiceWorkspace({
     }
   }
 
-  async function handleRewriteBio(variant: BrandBioVariant) {
+  // Opens a bio's feedback panel and lazily loads its thread the first time
+  // (not refetched on every open/close toggle within the same page visit).
+  function openBioFeedback(variant: BrandBioVariant) {
+    setBioFeedbackOpen((prev) => ({ ...prev, [variant]: true }));
+    if (bioFeedbackLoaded[variant]) return;
+    listBioFeedbackThread({ data: { agentId, variant } })
+      .then((msgs) => {
+        setBioFeedbackMessages((prev) => ({ ...prev, [variant]: msgs }));
+        setBioFeedbackLoaded((prev) => ({ ...prev, [variant]: true }));
+      })
+      .catch(() => setBioFeedbackLoaded((prev) => ({ ...prev, [variant]: true })));
+  }
+
+  async function sendBioFeedback(variant: BrandBioVariant) {
     if (!bioResult) return;
-    const feedback = (bioFeedbackText[variant] ?? "").trim();
-    if (!feedback) {
+    const message = (bioFeedbackText[variant] ?? "").trim();
+    if (!message) {
       setBioRewriteError((prev) => ({ ...prev, [variant]: "Add a note on what to change first." }));
       return;
     }
     setBioRewriting(variant);
     setBioRewriteError((prev) => ({ ...prev, [variant]: undefined }));
+    const optimistic: ChatMessageRow = {
+      id: `optimistic-${Date.now()}`,
+      role: "user",
+      content: message,
+      mode: "bio_feedback",
+      metadata: null,
+      created_at: new Date().toISOString(),
+    };
+    setBioFeedbackMessages((prev) => ({ ...prev, [variant]: [...(prev[variant] ?? []), optimistic] }));
+    setBioFeedbackText((prev) => ({ ...prev, [variant]: "" }));
     try {
-      const { text } = await regenerateBrandBio({
-        data: { agentId, tone: bioTone, variant, currentText: bioResult[variant], feedback },
+      const res = await sendBioFeedbackMessage({
+        data: { agentId, tone: bioTone, variant, currentText: bioResult[variant], message },
       });
-      setBioResult((prev) => (prev ? { ...prev, [variant]: text } : prev));
-      setBioFeedbackText((prev) => ({ ...prev, [variant]: "" }));
-      setBioFeedbackOpen((prev) => ({ ...prev, [variant]: false }));
+      setBioFeedbackMessages((prev) => ({ ...prev, [variant]: [...(prev[variant] ?? []), res.reply] }));
+      if (res.revisedText) {
+        setBioResult((prev) => (prev ? { ...prev, [variant]: res.revisedText! } : prev));
+      }
     } catch (e) {
       setBioRewriteError((prev) => ({
         ...prev,
@@ -776,6 +866,23 @@ function VoiceWorkspace({
       }));
     } finally {
       setBioRewriting(null);
+    }
+  }
+
+  async function clearBioFeedback(variant: BrandBioVariant) {
+    if (bioClearArmed !== variant) {
+      setBioClearArmed(variant);
+      return;
+    }
+    setBioClearArmed(null);
+    try {
+      await clearBioFeedbackThread({ data: { agentId, variant } });
+      setBioFeedbackMessages((prev) => ({ ...prev, [variant]: [] }));
+    } catch (e) {
+      setBioRewriteError((prev) => ({
+        ...prev,
+        [variant]: e instanceof Error ? e.message : "Couldn't clear this thread.",
+      }));
     }
   }
 
@@ -2274,6 +2381,40 @@ function VoiceWorkspace({
               </div>
             </div>
 
+            {/* Content Tone (2026-11-24) — per Mike: "refer to the MY Brand
+            page where we have Brand Writer give 4 options of the tone of
+            posts... follow the same pattern here to choose their tone...
+            so that's determined for their content." Same pill-selector
+            pattern as Brand Bio Writer's Tone picker just below, but this
+            one persists immediately (see handleSetContentTone) and drives
+            scanned-photo captions specifically — Scan My Media Library,
+            not the bios below. */}
+            <div className="mb-5 rounded-3xl border border-border bg-glass p-6 backdrop-blur-2xl">
+              <h2 className="font-display text-lg font-semibold">Content Tone</h2>
+              <p className="mt-1 text-sm text-muted-foreground">
+                Sets the default personality for captions written from your scanned photos — pick whichever feels like
+                you.
+              </p>
+              <div className="mt-4 flex flex-wrap items-center gap-2">
+                <div className="flex flex-wrap gap-1 rounded-full border border-border bg-glass p-1 backdrop-blur-xl w-fit">
+                  {(["professional", "personable", "funny", "relatable"] as const satisfies BrandBioTone[]).map((t) => (
+                    <button
+                      key={t}
+                      onClick={() => handleSetContentTone(t)}
+                      className={`rounded-full px-4 py-1.5 text-sm font-medium capitalize transition-colors ${
+                        contentTone === t
+                          ? "bg-secondary text-foreground"
+                          : "text-muted-foreground hover:text-foreground"
+                      }`}
+                    >
+                      {t}
+                    </button>
+                  ))}
+                </div>
+                {contentToneSaving && <span className="text-xs text-muted-foreground">Saving…</span>}
+              </div>
+            </div>
+
             {/* Brand Bio Writer (2026-11-13) — per Mike: "we need to create a
             done-for-you bio section that can be created just based on what
             they've already created in that section... this should be no
@@ -2359,14 +2500,50 @@ function VoiceWorkspace({
                         {variant.counter && (
                           <p className="mt-1.5 text-[11px] text-muted-foreground">{text.length} / 150 characters</p>
                         )}
-                        {/* Per-bio feedback/rewrite (2026-11-16) — per Mike:
-                        "maybe rewrite per bio or add feedback per bio."
-                        Rewrites just this one variant via
-                        regenerateBrandBio, leaving the other 4 untouched. */}
+                        {/* Per-bio feedback — REWORKED 2026-11-24 into a real
+                        chat thread, per Mike: "The user experience for the
+                        feedback tool should be no different than it is in
+                        Claude." Was a single textarea -> regenerateBrandBio
+                        -> swap; now a visible back-and-forth, scoped to just
+                        this one variant — see sendBioFeedbackMessage in
+                        voice-dna.ts. */}
                         <div className="mt-3 border-t border-border pt-3">
                           {bioFeedbackOpen[variant.key] ? (
                             <div>
                               <div className="flex items-center justify-between gap-2">
+                                <span className="text-xs font-medium text-muted-foreground">
+                                  Chat with the AI about this one
+                                </span>
+                                {(bioFeedbackMessages[variant.key]?.length ?? 0) > 0 && (
+                                  <button
+                                    onClick={() => clearBioFeedback(variant.key)}
+                                    className="text-xs font-medium text-muted-foreground underline transition-colors hover:text-foreground"
+                                  >
+                                    {bioClearArmed === variant.key ? "Click again to clear" : "Clear thread"}
+                                  </button>
+                                )}
+                              </div>
+                              {(bioFeedbackMessages[variant.key]?.length ?? 0) > 0 && (
+                                <div className="mt-2 max-h-64 space-y-2 overflow-y-auto rounded-xl border border-border bg-background/60 p-2.5">
+                                  {(bioFeedbackMessages[variant.key] ?? []).map((m) => (
+                                    <div
+                                      key={m.id}
+                                      className={`flex ${m.role === "assistant" ? "justify-start" : "justify-end"}`}
+                                    >
+                                      <div
+                                        className={`max-w-[85%] whitespace-pre-wrap rounded-xl px-3 py-2 text-sm ${
+                                          m.role === "assistant"
+                                            ? "border border-border bg-glass"
+                                            : "bg-primary text-primary-foreground"
+                                        }`}
+                                      >
+                                        {m.content}
+                                      </div>
+                                    </div>
+                                  ))}
+                                </div>
+                              )}
+                              <div className="mt-2 flex items-center justify-between gap-2">
                                 <span className="text-xs font-medium text-muted-foreground">What should change?</span>
                                 <MicButton
                                   value={bioFeedbackText[variant.key] ?? ""}
@@ -2378,17 +2555,25 @@ function VoiceWorkspace({
                                 onChange={(e) =>
                                   setBioFeedbackText((prev) => ({ ...prev, [variant.key]: e.target.value }))
                                 }
-                                placeholder="e.g. make it shorter, drop the joke, lead with how long I've been in the area"
+                                onKeyDown={(e) => {
+                                  if (e.key === "Enter" && !e.shiftKey) {
+                                    e.preventDefault();
+                                    sendBioFeedback(variant.key);
+                                  }
+                                }}
+                                placeholder="e.g. make it shorter, drop the joke, lead with how long I've been in the area (keep talking to refine it further)"
                                 rows={2}
                                 className="mt-1 w-full resize-y rounded-xl border border-border bg-background/60 px-3 py-2 text-sm outline-none ring-ring transition focus:ring-2"
                               />
                               <div className="mt-2 flex items-center gap-2">
                                 <button
-                                  onClick={() => handleRewriteBio(variant.key)}
-                                  disabled={bioRewriting === variant.key}
+                                  onClick={() => sendBioFeedback(variant.key)}
+                                  disabled={
+                                    bioRewriting === variant.key || !(bioFeedbackText[variant.key] ?? "").trim()
+                                  }
                                   className="rounded-lg bg-primary px-3 py-1.5 text-xs font-semibold text-primary-foreground shadow shadow-primary/30 transition-transform hover:-translate-y-0.5 disabled:opacity-60"
                                 >
-                                  {bioRewriting === variant.key ? "Rewriting…" : "Rewrite this one"}
+                                  {bioRewriting === variant.key ? "Sending…" : "Send"}
                                 </button>
                                 <button
                                   onClick={() => {
@@ -2397,7 +2582,7 @@ function VoiceWorkspace({
                                   }}
                                   className="rounded-lg px-3 py-1.5 text-xs font-medium text-muted-foreground hover:text-foreground"
                                 >
-                                  Cancel
+                                  Close
                                 </button>
                               </div>
                               {bioRewriteError[variant.key] && (
@@ -2406,7 +2591,7 @@ function VoiceWorkspace({
                             </div>
                           ) : (
                             <button
-                              onClick={() => setBioFeedbackOpen((prev) => ({ ...prev, [variant.key]: true }))}
+                              onClick={() => openBioFeedback(variant.key)}
                               className="text-xs font-semibold text-muted-foreground transition-colors hover:text-foreground"
                             >
                               Add feedback / rewrite this one

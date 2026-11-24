@@ -22,7 +22,9 @@ import {
   addReelPhotoFromDrive,
   updateReelPhotoInstructions,
   removeReelPhoto,
-  rewritePostContent,
+  listPostFeedbackThread,
+  sendPostFeedbackMessage,
+  clearPostFeedbackThread,
   listMarketingMedia,
   createMediaUploadUrl,
   finalizeMediaUpload,
@@ -3360,7 +3362,6 @@ function PostCard({
   // direct-edit path logs via updateMarketingPost itself, server-side, see
   // marketing.ts).
   const [editorOpen, setEditorOpen] = useState(false);
-  const [notes, setNotes] = useState("");
   const [busy, setBusy] = useState(false);
   const [saveError, setSaveError] = useState<string | null>(null);
   // Added 2026-11-04 per Mike: "we need a place where the admin or user can
@@ -3437,7 +3438,69 @@ function PostCard({
   // Safari can), so this tracks which ones failed to show a clear
   // placeholder instead of a blank box.
   const [failedLibraryThumbs, setFailedLibraryThumbs] = useState<Set<string>>(new Set());
-  const [rewriting, setRewriting] = useState(false);
+  // Feedback — real chat thread (2026-11-24), replacing the old one-shot
+  // "type feedback -> full regenerate -> panel closes" flow. See
+  // sendPostFeedbackMessage in marketing.ts for the full backstory. Loaded
+  // lazily the first time the panel opens (not on every card render, since
+  // most posts' panels never open), and kept loaded across close/reopen of
+  // this same card instance so toggling the panel doesn't re-fetch.
+  const [feedbackMessages, setFeedbackMessages] = useState<ChatMessageRow[]>([]);
+  const [feedbackLoaded, setFeedbackLoaded] = useState(false);
+  const [feedbackDraft, setFeedbackDraft] = useState("");
+  const [feedbackSending, setFeedbackSending] = useState(false);
+  const [feedbackError, setFeedbackError] = useState<string | null>(null);
+  const [feedbackClearArmed, setFeedbackClearArmed] = useState(false);
+
+  useEffect(() => {
+    if (!editorOpen || feedbackLoaded) return;
+    listPostFeedbackThread({ data: { agentId, postId: post.id } })
+      .then((msgs) => {
+        setFeedbackMessages(msgs);
+        setFeedbackLoaded(true);
+      })
+      .catch(() => setFeedbackLoaded(true)); // fail open to an empty thread rather than block the panel
+  }, [editorOpen, feedbackLoaded, agentId, post.id]);
+
+  async function sendFeedbackMessage() {
+    const message = feedbackDraft.trim();
+    if (!message || feedbackSending) return;
+    setFeedbackSending(true);
+    setFeedbackError(null);
+    const optimistic: ChatMessageRow = {
+      id: `optimistic-${Date.now()}`,
+      role: "user",
+      content: message,
+      mode: "post_feedback",
+      metadata: null,
+      created_at: new Date().toISOString(),
+    };
+    setFeedbackMessages((prev) => [...prev, optimistic]);
+    setFeedbackDraft("");
+    try {
+      const res = await sendPostFeedbackMessage({ data: { agentId, postId: post.id, message } });
+      setFeedbackMessages((prev) => [...prev, res.reply]);
+      if (res.revisedContent) onChanged();
+    } catch (e) {
+      setFeedbackError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setFeedbackSending(false);
+    }
+  }
+
+  async function clearFeedbackThread() {
+    if (!feedbackClearArmed) {
+      setFeedbackClearArmed(true);
+      return;
+    }
+    setFeedbackClearArmed(false);
+    try {
+      await clearPostFeedbackThread({ data: { agentId, postId: post.id } });
+      setFeedbackMessages([]);
+    } catch (e) {
+      setFeedbackError(e instanceof Error ? e.message : String(e));
+    }
+  }
+
   // Added 2026-09-29 per Mike: "you could rescan the photo." Re-fetches
   // whatever photo is currently on this post and asks for a fresh caption,
   // separate from Scan photos' own "get new photos" action above. WIDENED
@@ -3560,42 +3623,11 @@ function PostCard({
     }
   }
 
-  // MERGED 2026-09-29 per Mike: "The rewrite in their voice and submit
-  // feedback button should be combined. When they submit feedback it
-  // should rewrite in their voice, as well." Previously two separate
-  // actions — a bare "Submit feedback" that only flagged the post with a
-  // note (no rewrite), and a separate "Rewrite in their voice" that
-  // required its own click. Now one action does both: rewritePostContent
-  // already logs the feedback text to feedback_history (rating
-  // "rewritten") as part of doing the rewrite, so there's nothing left
-  // for a separate flag-only submission to add — it was just a second
-  // button for a subset of the same information.
-  // REWORKED 2026-09-30 per Mike: "once I submit feedback, it should all
-  // close and be good to go automatically" — a successful rewrite now closes
-  // the whole Edit/Feedback panel immediately (same as clicking the top
-  // "Close" button would) instead of leaving it open showing a "You asked /
-  // Result" transcript. A failure leaves the panel open with the typed
-  // feedback still in the box and a visible error, so retrying is just
-  // editing and hitting submit again.
-  async function submitFeedback() {
-    const feedback = notes.trim();
-    if (!feedback) {
-      setSaveError("Tell us what to fix first.");
-      return;
-    }
-    setRewriting(true);
-    setSaveError(null);
-    try {
-      await rewritePostContent({ data: { agentId, postId: post.id, feedback } });
-      setNotes("");
-      setEditorOpen(false);
-      onChanged();
-    } catch (e) {
-      setSaveError(e instanceof Error ? e.message : String(e));
-    } finally {
-      setRewriting(false);
-    }
-  }
+  // The old one-shot "Submit feedback" (rewritePostContent) lived here —
+  // replaced 2026-11-24 by the real chat thread above (sendFeedbackMessage),
+  // per Mike: "The user experience for the feedback tool should be no
+  // different than it is in Claude." See sendPostFeedbackMessage in
+  // marketing.ts for the full redesign.
 
   // Fixed 2026-09-29 per Mike's "empty photo slots" report: this used to
   // fetch once ever (`if (!mediaOptions)`) and, on any failure, silently set
@@ -4098,7 +4130,8 @@ function PostCard({
             onClick={() => {
               if (editorOpen) {
                 setDraft(post.content);
-                setNotes("");
+                setFeedbackDraft("");
+                setFeedbackClearArmed(false);
               }
               setEditorOpen((v) => !v);
             }}
@@ -4150,37 +4183,69 @@ function PostCard({
               </div>
             </div>
 
-            {/* AI feedback — same rewrite/flag flow as before, just living
-                in the same panel now instead of behind its own button.
-                REWORKED 2026-09-30 per Mike: "this needs to feel and act
-                just like ChatGPT or Claude... once I submit feedback, it
-                should all close and be good to go automatically." Enter
-                submits (Shift+Enter for a new line, same as a real chat
-                box), and a successful submit now closes the whole panel
-                immediately instead of leaving it open with a "You asked /
-                Result" transcript the user then has to close themselves. */}
+            {/* AI feedback — REWORKED 2026-11-24 into a real, persistent chat
+                thread, per Mike: "I talked to it and totally rewrote things
+                over and didnt take anything i typed into account. The user
+                experience for the feedback tool should be no different than
+                it is in Claude. So why arent we mimimcing that?" This used to
+                be a single textarea that fired one full regeneration and
+                closed the panel (see the removed submitFeedback above) — now
+                it's a visible back-and-forth: the AI answers exactly what was
+                typed (a question gets answered, not silently turned into a
+                rewrite) and only updates the post's content when a change was
+                actually asked for, same as a real chat. See
+                sendPostFeedbackMessage in marketing.ts. */}
             <div className="border-t border-border pt-4">
               <div className="flex items-center justify-between">
                 <p className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
-                  Or tell the AI what to change
+                  Chat with the AI about this
                 </p>
-                <MicButton value={notes} onChange={setNotes} />
+                {feedbackMessages.length > 0 && (
+                  <button
+                    onClick={clearFeedbackThread}
+                    className="text-xs font-medium text-muted-foreground underline transition-colors hover:text-foreground"
+                  >
+                    {feedbackClearArmed ? "Click again to clear" : "Clear thread"}
+                  </button>
+                )}
+              </div>
+              {feedbackMessages.length > 0 && (
+                <div className="mt-3 max-h-80 space-y-2 overflow-y-auto rounded-2xl border border-border bg-background/40 p-3">
+                  {feedbackMessages.map((m) => (
+                    <div key={m.id} className={`flex ${m.role === "assistant" ? "justify-start" : "justify-end"}`}>
+                      <div
+                        className={`max-w-[85%] whitespace-pre-wrap rounded-2xl px-4 py-3 text-sm ${
+                          m.role === "assistant"
+                            ? "border border-border bg-glass"
+                            : "bg-primary text-primary-foreground"
+                        }`}
+                      >
+                        {m.content}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+              <div className="mt-3 flex items-center justify-between gap-2">
+                <span className="text-xs font-medium text-muted-foreground">What should change?</span>
+                <MicButton value={feedbackDraft} onChange={setFeedbackDraft} />
               </div>
               <textarea
-                value={notes}
-                onChange={(e) => setNotes(e.target.value)}
+                value={feedbackDraft}
+                onChange={(e) => setFeedbackDraft(e.target.value)}
                 onKeyDown={(e) => {
                   if (e.key === "Enter" && !e.shiftKey) {
                     e.preventDefault();
-                    submitFeedback();
+                    sendFeedbackMessage();
                   }
                 }}
-                placeholder="What is off? Too formal, they never say this, make it shorter…"
+                placeholder="What is off? Too formal, they never say this, make it shorter… (keep talking to refine it further)"
                 className="mt-2 min-h-[80px] w-full rounded-2xl bg-muted px-4 py-3 text-sm outline-none ring-ring transition focus:ring-2"
               />
+              {feedbackError && <p className="mt-2 text-xs text-destructive">{feedbackError}</p>}
               <div className="mt-3 flex flex-wrap gap-2">
-                <Button onClick={submitFeedback} disabled={busy || rewriting || !notes.trim()}>
-                  {rewriting ? "Submitting…" : "Submit feedback →"}
+                <Button onClick={sendFeedbackMessage} disabled={busy || feedbackSending || !feedbackDraft.trim()}>
+                  {feedbackSending ? "Sending…" : "Send"}
                 </Button>
               </div>
             </div>

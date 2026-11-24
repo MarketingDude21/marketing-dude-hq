@@ -59,7 +59,6 @@ import {
   scanMediaLibraryForMonth,
   addPhotoPostsToBatch,
   regeneratePhotoScanCaption,
-  approveBatch,
   approveAllPending,
   sendContentToAgent,
   listAgentChatMessages,
@@ -7263,7 +7262,6 @@ function ContentCalendarTab({
   // two just run the same calls MonthWorkspace's own buttons do, then
   // navigate there so the result is right there waiting.
   const [generatingId, setGeneratingId] = useState<string | null>(null);
-  const [scanningId, setScanningId] = useState<string | null>(null);
   const [actionError, setActionError] = useState<Record<string, string>>({});
 
   function loadCountsFor(list: CalendarMonth[]) {
@@ -7334,37 +7332,40 @@ function ContentCalendarTab({
     setActionError((prev) => ({ ...prev, [monthId]: text }));
   }
 
-  // Same calls MonthWorkspace's own "Generate Now" / "Scan My Media
-  // Library" buttons make — run from the card itself so picking the month
-  // and picking the generation method happen on the one click Mike asked
-  // for, then land on MonthWorkspace to show the result. Only offered on a
-  // month with no content yet (renderMonthCard), so this never needs
-  // generate()'s replace-and-warn dance — there's nothing here to replace.
+  // REBUILT 2026-11-24 to match MonthWorkspace's own generateContent()
+  // consolidation (see that function's header comment for the full "one
+  // button" reasoning) — this card-level quick action now runs the photo
+  // scan AND generates this month's manually-added calendar items (emails/
+  // video scripts) together, same as the in-workspace button, instead of
+  // offering them as two separate card buttons. Only offered on a month
+  // with no content yet (renderMonthCard), so this never needs
+  // generateContent()'s replace-and-warn dance — there's nothing here to
+  // replace. Promise.allSettled so one half failing (say, no calendar items
+  // this month) never hides whether the other half actually worked.
   async function generateFromList(m: CalendarMonth) {
     setGeneratingId(m.id);
     setActionErr(m.id, "");
     try {
-      await generateMonthlyBatch({
-        data: { agentId, monthId: m.id, month: m.month, useHashtags: false, useEmojis: false },
-      });
+      const [scanSettled, calendarSettled] = await Promise.allSettled([
+        scanMediaLibraryForMonth({ data: { agentId, month: m.month } }),
+        generateMonthlyBatch({
+          data: { agentId, monthId: m.id, month: m.month, useHashtags: false, useEmojis: false },
+        }),
+      ]);
+      // Land on MonthWorkspace either way — it shows exactly what came of
+      // each half (the scan note mentions HEIC/dedup skips same as the
+      // standalone Scan button there, and generated calendar items just
+      // show up in the grid). Only surface an error here if BOTH failed;
+      // one succeeding is a real result worth seeing, not a silent partial
+      // failure.
+      if (scanSettled.status === "rejected" && calendarSettled.status === "rejected") {
+        const reason = scanSettled.reason instanceof Error ? scanSettled.reason.message : String(scanSettled.reason);
+        setActionErr(m.id, reason);
+        return;
+      }
       setActiveMonth(m);
-    } catch (e) {
-      setActionErr(m.id, e instanceof Error ? e.message : String(e));
     } finally {
       setGeneratingId(null);
-    }
-  }
-
-  async function scanFromList(m: CalendarMonth) {
-    setScanningId(m.id);
-    setActionErr(m.id, "");
-    try {
-      await scanMediaLibraryForMonth({ data: { agentId, month: m.month } });
-      setActiveMonth(m);
-    } catch (e) {
-      setActionErr(m.id, e instanceof Error ? e.message : String(e));
-    } finally {
-      setScanningId(null);
     }
   }
 
@@ -7406,7 +7407,6 @@ function ContentCalendarTab({
     const busy = archivingId === m.id;
     const hasContent = (counts[m.id] ?? 0) > 0;
     const genBusy = generatingId === m.id;
-    const scanBusy = scanningId === m.id;
     // FIXED 2026-11-06 per Mike: "This button doesn't always click. Sometime
     // I need to click it 3-5 times before it works." Root cause: only the
     // "October 2026" text itself was wrapped in a <button> (sized to its own
@@ -7448,16 +7448,16 @@ function ContentCalendarTab({
           // The decision lives right here now, not inside the month —
           // added 2026-11-15 per Mike: "You click the month and you also
           // click the generate now right there. And then it goes to the
-          // next screen, or you scan the photos from right here." Once
-          // either call lands, setActiveMonth takes them straight into
+          // next screen, or you scan the photos from right here." Once the
+          // call lands, setActiveMonth takes them straight into
           // MonthWorkspace already showing what was just created — same
-          // place "Generate Now" / "Scan My Media Library" there go.
+          // place "Generate content" there goes. Collapsed to ONE button
+          // 2026-11-24 (was Generate Now + a separate Scan My Media Library
+          // card button) to match generateFromList's own consolidation —
+          // see that function's header comment.
           <div className="flex flex-col items-stretch gap-1.5" onClick={(e) => e.stopPropagation()}>
-            <Button onClick={() => generateFromList(m)} disabled={genBusy || scanBusy}>
-              {genBusy ? "Generating…" : "Generate Now"}
-            </Button>
-            <Button variant="secondary" onClick={() => scanFromList(m)} disabled={genBusy || scanBusy}>
-              {scanBusy ? "Scanning…" : "Scan My Media Library"}
+            <Button onClick={() => generateFromList(m)} disabled={genBusy}>
+              {genBusy ? "Generating…" : "Generate content"}
             </Button>
           </div>
         )}
@@ -7790,6 +7790,12 @@ function MonthWorkspace({
   const [useEmojis, setUseEmojis] = useState(false);
   const [generating, setGenerating] = useState(false);
   const [genError, setGenError] = useState<string | null>(null);
+  // Added 2026-11-24 alongside the generateContent() consolidation — unlike
+  // the old generate() (which ran one single call and let the posts list
+  // itself be the only confirmation), the combined action now runs two
+  // independent calls (photo scan + calendar-item generation) and needs
+  // somewhere to say what each one actually did.
+  const [genNote, setGenNote] = useState<string | null>(null);
   const [lastBatchId, setLastBatchId] = useState<string | null>(null);
   // "Scan My Media Library for This Month's Content" — the second, parallel
   // path next to Generate Now, added 2026-11-15. Deliberately its own
@@ -7869,7 +7875,7 @@ function MonthWorkspace({
       const res = await archiveMonthContent({ data: { agentId, month: folder.month } });
       setArchiveNote(
         res.archived > 0
-          ? `Archived ${res.archived} piece${res.archived === 1 ? "" : "s"} of content for ${folder.month} — the review screen is clear for a fresh "Generate Now." Nothing was deleted; open "Archived content" below to restore it.`
+          ? `Archived ${res.archived} piece${res.archived === 1 ? "" : "s"} of content for ${folder.month} — the review screen is clear for a fresh "Generate content." Nothing was deleted; open "Archived content" below to restore it.`
           : "Nothing to archive — this month has no generated content for this agent yet.",
       );
       setLastBatchId(null);
@@ -7923,7 +7929,7 @@ function MonthWorkspace({
       const res = await deleteMonthContent({ data: { agentId, month: folder.month } });
       setDeleteNote(
         res.deleted > 0
-          ? `Deleted ${res.deleted} piece${res.deleted === 1 ? "" : "s"} of generated content for ${folder.month} — hit "Generate Now" above for a fresh batch.`
+          ? `Deleted ${res.deleted} piece${res.deleted === 1 ? "" : "s"} of generated content for ${folder.month} — hit "Generate content" above for a fresh batch.`
           : "Nothing to delete — this month has no generated content for this agent yet.",
       );
       setLastBatchId(null);
@@ -7989,7 +7995,84 @@ function MonthWorkspace({
   // safe, genuine "redownload" exactly as asked.
   const allApproved = batchPosts.length > 0 && batchPosts.every((p) => p.status === "approved");
 
-  async function generate() {
+  // Factored out of the old scanLibrary() 2026-11-24 so both scanLibrary
+  // (the standalone "scan more" button, unchanged) and the new combined
+  // generateContent() below (which runs this alongside generateMonthlyBatch
+  // in one click) share the exact same scan call + note wording instead of
+  // drifting apart. Returns the raw result plus the note it builds, rather
+  // than setting state directly — the caller decides where that note goes
+  // (scanLibrary's own scanNote, or folded into generateContent's combined
+  // summary).
+  async function runLibraryScan(): Promise<{
+    res: Awaited<ReturnType<typeof scanMediaLibraryForMonth>>;
+    note: string;
+  }> {
+    const alreadyScanned = batchPosts
+      .filter((p) => p.metadata?.source === "library_photo_scan")
+      .map((p) => p.metadata?.media_id)
+      .filter((id): id is string => Boolean(id));
+    const res = await scanMediaLibraryForMonth({
+      data: { agentId, month: folder.month, excludeFileIds: alreadyScanned },
+    });
+    // Added 2026-11-24 per Mike: "it's only giving me 1 photo scanned when
+    // I have several in there." A photo still sitting as raw HEIC (never
+    // opened in the Media Library to trigger the auto-convert fix a round
+    // back, or uploaded through a path that skipped conversion) fails
+    // inside the scan's own captioning step — Claude's vision API can't
+    // read it — and used to just silently vanish with no sign why, which
+    // is exactly what reads as "I have several in there" but almost
+    // nothing came out the other end. Called out by name here instead,
+    // with the actual fix (the Media Library auto-converts these now).
+    const heicNote =
+      res.unsupportedFormatSkipped > 0
+        ? ` (${res.unsupportedFormatSkipped} photo${res.unsupportedFormatSkipped === 1 ? "" : "s"} skipped — still in HEIC/an iPhone format Claude can't read yet. Open the Media Library, let those finish auto-converting, then scan again.)`
+        : "";
+    // Added 2026-11-24, same round — a photo already attached to SOME
+    // other generated post for this agent (any month, pending or
+    // approved) is deliberately excluded here so it's never scanned
+    // twice (see scanMediaLibraryForMonth's excludedAlreadyAttached
+    // comment). That's correct behavior, but on an account that's been
+    // used for repeated testing of this exact feature, it can look
+    // identical from the outside to "the scan is broken" — most of the
+    // library may already be spoken for by old test posts. Called out
+    // by name so that's distinguishable from an actual bug.
+    const dedupNote =
+      res.excludedAlreadyAttached > 0
+        ? ` (${res.excludedAlreadyAttached} photo${res.excludedAlreadyAttached === 1 ? "" : "s"} already used in another post for this agent — somewhere in this month or a different one — so skipped here too. Check Archived content or other months if that's more than expected.)`
+        : "";
+    const extraNotes = heicNote + dedupNote;
+    let note: string;
+    if (res.created === 0) {
+      note =
+        res.unsupportedFormatSkipped > 0 || res.excludedAlreadyAttached > 0
+          ? `No unused photos could be scanned.${extraNotes}`
+          : "No unused photos left to scan — upload more to the Media Library, then scan again.";
+    } else if (res.created < res.requested) {
+      note =
+        `Created ${res.created} of ${res.requested} — only ${res.available} unused photo${res.available === 1 ? "" : "s"} ` +
+        `were available to scan.${extraNotes} Upload more and scan again for a fuller month.`;
+    } else {
+      note = `Created ${res.created} posts from your photos — review them below before anything's scheduled.${extraNotes}`;
+    }
+    return { res, note };
+  }
+
+  // REBUILT 2026-11-24 per Mike: "Moving forward the basis of the system is
+  // one 'Generate content' button which triggers the scan feature... social
+  // posts we're fully switching to the scan feature vs going off of a
+  // content calendar... emails and video scripts, and reels, will still go
+  // in through [manually adding them to the content calendar] — that output
+  // will list whatever else is created on the back end" — confirmed
+  // directly: one click should do both the photo scan (now the only source
+  // for social posts) AND generate whatever email/video items are sitting
+  // in this month's calendar (unchanged — still manually added exactly as
+  // today), combined into one result. This REPLACES the old generate(),
+  // which only ever ran generateMonthlyBatch alone. Same arm/confirm/
+  // replace-everything semantics as before (nothing new here) — only what
+  // happens after confirming is different. Promise.allSettled so a failure
+  // in one half (say, the interview gate firing, or a transient error)
+  // never silently swallows the other half's real result.
+  async function generateContent() {
     // First click on a month that already has content only arms the
     // warning — see generateArmed's header comment above for why.
     if (batchPosts.length > 0 && !generateArmed) {
@@ -7999,6 +8082,7 @@ function MonthWorkspace({
     setGenerateArmed(false);
     setGenerating(true);
     setGenError(null);
+    setGenNote(null);
     try {
       // Confirmed replace: clear this month's existing batch first (the
       // same deleteMonthContent the manual Delete button below already
@@ -8008,10 +8092,40 @@ function MonthWorkspace({
       if (batchPosts.length > 0) {
         await deleteMonthContent({ data: { agentId, month: folder.month } });
       }
-      const res = await generateMonthlyBatch({
-        data: { agentId, monthId: folder.id, month: folder.month, useHashtags, useEmojis },
-      });
-      setLastBatchId(res.batchId);
+      const [scanSettled, calendarSettled] = await Promise.allSettled([
+        runLibraryScan(),
+        generateMonthlyBatch({
+          data: { agentId, monthId: folder.id, month: folder.month, useHashtags, useEmojis },
+        }),
+      ]);
+
+      let newestBatchId: string | null = null;
+      const parts: string[] = [];
+
+      if (scanSettled.status === "fulfilled") {
+        newestBatchId = scanSettled.value.res.batchId ?? newestBatchId;
+        parts.push(scanSettled.value.note);
+      } else {
+        parts.push(
+          `Photo scan for social posts failed: ${scanSettled.reason instanceof Error ? scanSettled.reason.message : String(scanSettled.reason)}`,
+        );
+      }
+
+      if (calendarSettled.status === "fulfilled") {
+        newestBatchId = calendarSettled.value.batchId ?? newestBatchId;
+        parts.push(
+          calendarSettled.value.created > 0
+            ? `Generated ${calendarSettled.value.created} piece${calendarSettled.value.created === 1 ? "" : "s"} from this month's manually-added calendar items (emails, video scripts, etc).`
+            : "No manually-added calendar items (emails, video scripts, etc) to generate this month — add some on the calendar tab if this month should have any.",
+        );
+      } else {
+        parts.push(
+          `Generating this month's calendar items failed: ${calendarSettled.reason instanceof Error ? calendarSettled.reason.message : String(calendarSettled.reason)}`,
+        );
+      }
+
+      if (newestBatchId) setLastBatchId(newestBatchId);
+      setGenNote(parts.join(" "));
       loadPosts();
     } catch (e) {
       setGenError(e instanceof Error ? e.message : String(e));
@@ -8020,67 +8134,21 @@ function MonthWorkspace({
     }
   }
 
-  // Additive by design, unlike generate() above — clicking this again is
-  // "scan more," not "replace," so it never deletes anything first. Skips
-  // photos already turned into a pending scan post this month (collected
-  // from batchPosts below) so a second click naturally reaches for FRESH
-  // photos instead of re-scanning ones already sitting in review.
+  // Additive by design, unlike generateContent() above — clicking this
+  // again is "scan more," not "replace," so it never deletes anything
+  // first. Still its own standalone button for scanning more photos later
+  // in the month without touching anything else, same as before this
+  // round's consolidation — generateContent()'s scan half (via
+  // runLibraryScan above) is the SAME call, just bundled with calendar-item
+  // generation for the month's first/fresh-start click.
   async function scanLibrary() {
     setScanning(true);
     setScanError(null);
     setScanNote(null);
     try {
-      const alreadyScanned = batchPosts
-        .filter((p) => p.metadata?.source === "library_photo_scan")
-        .map((p) => p.metadata?.media_id)
-        .filter((id): id is string => Boolean(id));
-      const res = await scanMediaLibraryForMonth({
-        data: { agentId, month: folder.month, excludeFileIds: alreadyScanned },
-      });
+      const { res, note } = await runLibraryScan();
       setLastBatchId(res.batchId ?? lastBatchId);
-      // Added 2026-11-24 per Mike: "it's only giving me 1 photo scanned when
-      // I have several in there." A photo still sitting as raw HEIC (never
-      // opened in the Media Library to trigger the auto-convert fix a round
-      // back, or uploaded through a path that skipped conversion) fails
-      // inside the scan's own captioning step — Claude's vision API can't
-      // read it — and used to just silently vanish with no sign why, which
-      // is exactly what reads as "I have several in there" but almost
-      // nothing came out the other end. Called out by name here instead,
-      // with the actual fix (the Media Library auto-converts these now).
-      const heicNote =
-        res.unsupportedFormatSkipped > 0
-          ? ` (${res.unsupportedFormatSkipped} photo${res.unsupportedFormatSkipped === 1 ? "" : "s"} skipped — still in HEIC/an iPhone format Claude can't read yet. Open the Media Library, let those finish auto-converting, then scan again.)`
-          : "";
-      // Added 2026-11-24, same round — a photo already attached to SOME
-      // other generated post for this agent (any month, pending or
-      // approved) is deliberately excluded here so it's never scanned
-      // twice (see scanMediaLibraryForMonth's excludedAlreadyAttached
-      // comment). That's correct behavior, but on an account that's been
-      // used for repeated testing of this exact feature, it can look
-      // identical from the outside to "the scan is broken" — most of the
-      // library may already be spoken for by old test posts. Called out
-      // by name so that's distinguishable from an actual bug.
-      const dedupNote =
-        res.excludedAlreadyAttached > 0
-          ? ` (${res.excludedAlreadyAttached} photo${res.excludedAlreadyAttached === 1 ? "" : "s"} already used in another post for this agent — somewhere in this month or a different one — so skipped here too. Check Archived content or other months if that's more than expected.)`
-          : "";
-      const extraNotes = heicNote + dedupNote;
-      if (res.created === 0) {
-        setScanNote(
-          res.unsupportedFormatSkipped > 0 || res.excludedAlreadyAttached > 0
-            ? `No unused photos could be scanned.${extraNotes}`
-            : "No unused photos left to scan — upload more to the Media Library, then scan again.",
-        );
-      } else if (res.created < res.requested) {
-        setScanNote(
-          `Created ${res.created} of ${res.requested} — only ${res.available} unused photo${res.available === 1 ? "" : "s"} ` +
-            `were available to scan.${extraNotes} Upload more and scan again for a fuller month.`,
-        );
-      } else {
-        setScanNote(
-          `Created ${res.created} posts from your photos — review them below before anything's scheduled.${extraNotes}`,
-        );
-      }
+      setScanNote(note);
       loadPosts();
     } catch (e) {
       setScanError(e instanceof Error ? e.message : String(e));
@@ -8215,9 +8283,26 @@ function MonthWorkspace({
     setPostsError(null);
     setApproveNote(null);
     try {
-      if (activeBatchId) {
-        await approveBatch({ data: { agentId, batchId: activeBatchId } });
-      }
+      // FIXED 2026-11-24 per Mike: "images that are approved are not being
+      // moved to used folder... when a post or piece of content is
+      // approved, the image associated with it needs to go to used
+      // folder." The mark-used helpers themselves (markPostMediaUsed /
+      // markAttachedMediaUsedForBatch) were already correct everywhere —
+      // but this button only ever approved ONE batch_id (activeBatchId,
+      // whichever generate/scan call happened to run last), while
+      // batchPosts — what's actually shown on screen and what this
+      // button's own success message claims to approve "all" of — spans
+      // EVERY batch_id this month has ever accumulated: every click of
+      // "Scan My Media Library" or "Scan Videos" stamps a brand new
+      // batch_id, same for a fresh Generate. A month scanned or generated
+      // more than once (exactly what repeated real-world use looks like)
+      // had older batches' posts silently left "pending" forever after
+      // clicking "Approve All" — so their photos never flipped to "used,"
+      // despite the on-screen message saying everything was approved. Now
+      // calls approveAllPending (agent + this month, no batch_id filter at
+      // all) so "Approve All" actually means all pending content for this
+      // month, matching both its label and its own success message.
+      await approveAllPending({ data: { agentId, month: folder.month } });
       const files = await downloadContentExport(batchPosts, folder.month);
       setApproveNote(
         `Approved ${batchPosts.length} piece${batchPosts.length === 1 ? "" : "s"} of content` +
@@ -8276,15 +8361,26 @@ function MonthWorkspace({
             )}
           </div>
           <div className="flex items-center gap-3">
-            {/* Generate Now (and its hashtag/emoji options) only make sense
-                BEFORE this month has anything in it — once it does, this is
-                the destructive "replace everything" path (see generateArmed
-                below), not a thing to repeat casually. Hidden once there's
-                already content, per Mike: "we are inside the section that
-                has already been generated so no need to tell it to generate
-                again once inside. Only thing that should happen is Scan
-                more Photos option." Scan My Media Library/Scan Videos below
-                stay visible always — those are additive (scanLibrary/
+            {/* RENAMED 2026-11-24 from "Generate Now" to "Generate content"
+                per Mike: "Moving forward the basis of the system is one
+                'Generate content' button which triggers the scan feature...
+                social posts we're fully switching to the scan feature" —
+                confirmed this one click should do BOTH the photo scan (now
+                the only source for social posts) and generate whatever
+                email/video items are sitting in this month's calendar
+                (unchanged, still manually added), combined into one result
+                (see generateContent() above). Hashtag/emoji options still
+                only apply to the calendar-item half (scanned posts have
+                their own caption logic, no hashtag/emoji toggle). Only make
+                sense BEFORE this month has anything in it — once it does,
+                this is the destructive "replace everything" path (see
+                generateArmed below), not a thing to repeat casually. Hidden
+                once there's already content, per Mike's EARLIER, still-true
+                request: "we are inside the section that has already been
+                generated so no need to tell it to generate again once
+                inside. Only thing that should happen is Scan more Photos
+                option." Scan My Media Library/Scan Videos below stay
+                visible always — those are additive (scanLibrary/
                 scanVideos never delete anything), so "scan more" is exactly
                 the one thing that should still be offered here. */}
             {batchPosts.length === 0 && (
@@ -8297,12 +8393,12 @@ function MonthWorkspace({
                   <input type="checkbox" checked={useEmojis} onChange={(e) => setUseEmojis(e.target.checked)} />
                   Add emojis to content
                 </label>
-                <Button onClick={generate} disabled={generating || docs === null}>
+                <Button onClick={generateContent} disabled={generating || docs === null}>
                   {generating
                     ? "Generating…"
                     : generateArmed
                       ? "Click again to replace this month's content"
-                      : "Generate Now"}
+                      : "Generate content"}
                 </Button>
                 {generateArmed && !generating && (
                   <Button variant="secondary" onClick={() => setGenerateArmed(false)}>
@@ -8337,6 +8433,7 @@ function MonthWorkspace({
           </p>
         )}
         {genError && <p className="mt-2 text-xs text-destructive">{genError}</p>}
+        {genNote && <p className="mt-2 text-xs text-muted-foreground">{genNote}</p>}
         {scanError && <p className="mt-2 text-xs text-destructive">{scanError}</p>}
         {scanNote && <p className="mt-2 text-xs text-muted-foreground">{scanNote}</p>}
         {scanVideoError && <p className="mt-2 text-xs text-destructive">{scanVideoError}</p>}
@@ -8418,7 +8515,7 @@ function MonthWorkspace({
         {postsError && <p className="mt-2 text-xs text-destructive">{postsError}</p>}
         {posts !== null && batchPosts.length === 0 && (
           <p className="mt-3 text-sm text-muted-foreground">
-            Nothing generated for this month yet — hit "Generate Now" above.
+            Nothing generated for this month yet — hit "Generate content" above.
           </p>
         )}
         <button

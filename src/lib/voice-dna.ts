@@ -220,7 +220,7 @@ THEIR HUMOR:
 [Specific type with real examples from their answers.]
 
 PHRASES THEY ACTUALLY USE:
-[Verbatim phrases from their answers, each in quotes.]
+[Verbatim phrases from their answers, each in quotes. This is a reference for recognizing their voice, NOT a checklist to work into every post — most posts should use NONE of these. If one ever fits a specific post naturally, at most one, and never the same one twice in a row. Overusing a listed phrase is the single fastest way to make content sound like an AI that was handed a script, which is the opposite of the goal here.]
 
 VISUAL IDENTITY:
 [What makes them recognizable on camera before anyone reads a caption — recurring item, vehicle, pet, habit they mentioned. If nothing specific was shared, write "Not specified yet."]
@@ -247,6 +247,7 @@ NEVER DO:
 - No hyphens used as dashes, ever
 - No AI-tell phrases: "as a real estate professional," "in the world of real estate," "I am passionate about," "navigating the market," "elevate," "unlock," "dive in," "game-changer"
 - No corporate or salesy language of any kind
+- Don't force in a phrase from "PHRASES THEY ACTUALLY USE" above — most posts should use none of them, and never the same one twice in a row
 - [thing that feels fake for THIS person, from their answers]
 - [thing that feels fake for THIS person, from their answers]
 

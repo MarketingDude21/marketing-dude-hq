@@ -7280,6 +7280,11 @@ function ContentCalendarTab({
 }) {
   const [months, setMonths] = useState<CalendarMonth[] | null>(null);
   const [error, setError] = useState<string | null>(null);
+  // Added 2026-11-25 alongside generateFromList's narration fix below — holds
+  // the "here's what happened to each half" note from the card's quick
+  // Generate action so it's still visible once we land in MonthWorkspace,
+  // instead of getting thrown away the instant setActiveMonth fires.
+  const [pendingWorkspaceNote, setPendingWorkspaceNote] = useState<string | null>(null);
   // Only auto-opens the single active month ONCE per real mount of this
   // component (see the effect below) — doesn't fight the "← All months"
   // back button if the user explicitly clicked it and then switched tabs
@@ -7428,6 +7433,34 @@ function ContentCalendarTab({
         setActionErr(m.id, reason);
         return;
       }
+      // REBUILT 2026-11-25 — this used to land on MonthWorkspace with zero
+      // narration of what the calendar half actually did: if the photo scan
+      // half succeeded but calendar generation silently produced 0 items (or
+      // failed outright), there was nothing here to say so — the exact shape
+      // of Mike's report for agent Jen Almeida, "only the 12 picture posts
+      // showed, no emails/video scripts/social posts that were in the
+      // calendar," with no error anywhere. Now builds the same two-part
+      // narration generateContent() already shows inside MonthWorkspace, and
+      // carries it through via pendingWorkspaceNote so it's the first thing
+      // visible on arrival instead of being thrown away.
+      const parts: string[] = [];
+      if (calendarSettled.status === "fulfilled") {
+        parts.push(
+          calendarSettled.value.created > 0
+            ? `Generated ${calendarSettled.value.created} piece${calendarSettled.value.created === 1 ? "" : "s"} from this month's manually-added calendar items (emails, video scripts, etc).`
+            : "No manually-added calendar items (emails, video scripts, etc) to generate this month — add some on the calendar tab if this month should have any.",
+        );
+      } else {
+        parts.push(
+          `Generating this month's calendar items failed: ${calendarSettled.reason instanceof Error ? calendarSettled.reason.message : String(calendarSettled.reason)}`,
+        );
+      }
+      if (scanSettled.status === "rejected") {
+        parts.push(
+          `Photo scan for social posts failed: ${scanSettled.reason instanceof Error ? scanSettled.reason.message : String(scanSettled.reason)}`,
+        );
+      }
+      setPendingWorkspaceNote(parts.join(" "));
       setActiveMonth(m);
     } finally {
       setGeneratingId(null);
@@ -7455,7 +7488,14 @@ function ContentCalendarTab({
 
   if (activeMonth) {
     return (
-      <MonthWorkspace agentId={agentId} isAdmin={isAdmin} month={activeMonth} onBack={() => setActiveMonth(null)} />
+      <MonthWorkspace
+        agentId={agentId}
+        isAdmin={isAdmin}
+        month={activeMonth}
+        onBack={() => setActiveMonth(null)}
+        initialNote={pendingWorkspaceNote}
+        onInitialNoteShown={() => setPendingWorkspaceNote(null)}
+      />
     );
   }
 
@@ -7839,11 +7879,21 @@ function MonthWorkspace({
   isAdmin,
   month: folder,
   onBack,
+  initialNote,
+  onInitialNoteShown,
 }: {
   agentId: string;
   isAdmin: boolean;
   month: CalendarMonth;
   onBack: () => void;
+  // Added 2026-11-25 — carries the Months-LIST quick-generate card's own
+  // "here's what happened to each half" narration through to this screen
+  // (see generateFromList in ManageCalendarScreen), since that card
+  // navigates straight here on success and previously had nowhere to show
+  // it. Optional because the normal path into this screen (picking a month
+  // that already has content) has no such note to show.
+  initialNote?: string | null;
+  onInitialNoteShown?: () => void;
 }) {
   const [docs, setDocs] = useState<CalendarDoc[] | null>(null);
   const [docsError, setDocsError] = useState<string | null>(null);
@@ -7860,7 +7910,15 @@ function MonthWorkspace({
   // itself be the only confirmation), the combined action now runs two
   // independent calls (photo scan + calendar-item generation) and needs
   // somewhere to say what each one actually did.
-  const [genNote, setGenNote] = useState<string | null>(null);
+  const [genNote, setGenNote] = useState<string | null>(initialNote ?? null);
+  // Runs once per mount: hands the note off to local state above, then
+  // tells the parent it's been shown so it doesn't get handed to some other
+  // month workspace later (e.g. after onBack() then picking a different
+  // month in the same session).
+  useEffect(() => {
+    if (initialNote) onInitialNoteShown?.();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
   const [lastBatchId, setLastBatchId] = useState<string | null>(null);
   // "Scan My Media Library for This Month's Content" — the second, parallel
   // path next to Generate Now, added 2026-11-15. Deliberately its own

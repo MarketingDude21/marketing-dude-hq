@@ -13,6 +13,7 @@ import { useEffect, useState } from "react";
 import { createFileRoute, Link } from "@tanstack/react-router";
 import { CheckCircle2, Circle, Lock } from "lucide-react";
 import { AgentScopedPage } from "@/routes/marketing";
+import { useOnboardingProgressContext } from "@/components/AppShell";
 import { getOnboardingProgress, MIN_ONBOARDING_PHOTOS, type OnboardingProgress } from "@/lib/marketing";
 
 export const Route = createFileRoute("/start-here")({
@@ -75,9 +76,7 @@ function StepRow({
           <Circle className="mt-0.5 size-5 shrink-0 text-muted-foreground" />
         )}
         <div>
-          <div className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
-            Step {stepNumber}
-          </div>
+          <div className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">Step {stepNumber}</div>
           <h3 className="font-display text-base font-semibold">{title}</h3>
           <p className="mt-1 text-sm text-muted-foreground">{description}</p>
           {locked && lockedNote && <p className="mt-1 text-xs text-muted-foreground/70">{lockedNote}</p>}
@@ -96,11 +95,27 @@ function StepRow({
 }
 
 function StepsChecklist({ agentId }: { agentId: string }) {
-  const [progress, setProgress] = useState<OnboardingProgress | null>(null);
+  // Added 2026-11-25 (same-day hotfix, see AppShell.tsx's
+  // useOnboardingProgressContext) — reuse AppShell's own fetch when it's for
+  // this same agentId (true for every ordinary agent looking at their own
+  // Start Here page) instead of firing a second identical round trip. Admin
+  // viewing a different agent's Start Here still gets a real, independent
+  // fetch below — shared.agentId won't match theirs, so this intentionally
+  // falls through, keeping the "no fail-open for admin" guarantee this page
+  // is built on.
+  const shared = useOnboardingProgressContext();
+  const [progress, setProgress] = useState<OnboardingProgress | null>(
+    shared.agentId === agentId ? shared.progress : null,
+  );
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
     let cancelled = false;
+    if (shared.agentId === agentId) {
+      setProgress(shared.progress);
+      setError(null);
+      return;
+    }
     setProgress(null);
     setError(null);
     getOnboardingProgress({ data: { agentId } })
@@ -113,7 +128,7 @@ function StepsChecklist({ agentId }: { agentId: string }) {
     return () => {
       cancelled = true;
     };
-  }, [agentId]);
+  }, [agentId, shared.agentId, shared.progress]);
 
   if (error) return <Card className="mt-5 text-sm text-destructive">{error}</Card>;
   if (!progress) return <Card className="mt-5 text-sm text-muted-foreground">Loading…</Card>;
@@ -124,16 +139,16 @@ function StepsChecklist({ agentId }: { agentId: string }) {
         <Card className="border-primary/40 bg-primary/5">
           <p className="text-sm font-semibold text-foreground">You're all set.</p>
           <p className="mt-1 text-sm text-muted-foreground">
-            Your account was already set up before these steps existed, so everything below is unlocked — nothing
-            to do here.
+            Your account was already set up before these steps existed, so everything below is unlocked — nothing to do
+            here.
           </p>
         </Card>
       )}
       <Card>
         <h2 className="font-display text-lg font-semibold">Get fully set up</h2>
         <p className="mt-1 text-sm text-muted-foreground">
-          4 steps, in order. Finish one and the next opens up — once your database is built, your first month's
-          content unlocks.
+          4 steps, in order. Finish one and the next opens up — once your database is built, your first month's content
+          unlocks.
         </p>
         <div className="mt-5 space-y-3">
           <StepRow

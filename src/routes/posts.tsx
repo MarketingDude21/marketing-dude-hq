@@ -6,7 +6,7 @@
 // /marketing already exports — see the comment on AgentScopedPage in
 // marketing.tsx for why this isn't just reusing MarketingPage wholesale.
 import { createFileRoute } from "@tanstack/react-router";
-import { AgentScopedPage, PostsTab } from "@/routes/marketing";
+import { AgentScopedPage, OnboardingGate, PostsTab } from "@/routes/marketing";
 
 export const Route = createFileRoute("/posts")({
   head: () => ({
@@ -33,6 +33,12 @@ export const Route = createFileRoute("/posts")({
 // together — "My Marketing Dude" still shows up inside the page as the
 // chat hub's voice/brand name (ChatHub's "Talk to your Marketing Dude…"),
 // that's unchanged, just not the page's own heading anymore.
+//
+// OnboardingGate added 2026-11-25 — previously this page only had the
+// nav-hide (AppShell), no real page-level block, so a locked agent could
+// still reach this by direct URL. Individual Content unlocks on the exact
+// same Step 3 signal as Create My Monthly Content (marketing.tsx), so it
+// reuses the same gate rather than growing a second copy of the check.
 function PostsPage() {
   return (
     <AgentScopedPage
@@ -40,9 +46,11 @@ function PostsPage() {
       tagline="Draft and save one post, email, or script at a time, in your voice."
     >
       {({ agentId, isAdmin }) => (
-        <div className="mt-5">
-          <PostsTab agentId={agentId} isAdmin={isAdmin} />
-        </div>
+        <OnboardingGate agentId={agentId} isAdmin={isAdmin}>
+          <div className="mt-5">
+            <PostsTab agentId={agentId} isAdmin={isAdmin} />
+          </div>
+        </OnboardingGate>
       )}
     </AgentScopedPage>
   );

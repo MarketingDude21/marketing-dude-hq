@@ -17,6 +17,7 @@ import { Route as MarketingRouteImport } from './routes/marketing'
 import { Route as MediaRouteImport } from './routes/media'
 import { Route as PostsRouteImport } from './routes/posts'
 import { Route as ResetPasswordRouteImport } from './routes/reset-password'
+import { Route as StartHereRouteImport } from './routes/start-here'
 import { Route as SweetAssistRouteImport } from './routes/sweet-assist'
 import { Route as VoiceRouteImport } from './routes/voice'
 import { Route as MediaUploadTokenRouteImport } from './routes/media-upload.$token'
@@ -63,6 +64,11 @@ const ResetPasswordRoute = ResetPasswordRouteImport.update({
   path: '/reset-password',
   getParentRoute: () => rootRouteImport,
 } as any)
+const StartHereRoute = StartHereRouteImport.update({
+  id: '/start-here',
+  path: '/start-here',
+  getParentRoute: () => rootRouteImport,
+} as any)
 const SweetAssistRoute = SweetAssistRouteImport.update({
   id: '/sweet-assist',
   path: '/sweet-assist',
@@ -98,6 +104,7 @@ export interface FileRoutesByFullPath {
   '/media': typeof MediaRoute
   '/posts': typeof PostsRoute
   '/reset-password': typeof ResetPasswordRoute
+  '/start-here': typeof StartHereRoute
   '/sweet-assist': typeof SweetAssistRoute
   '/voice': typeof VoiceRoute
   '/media-upload/$token': typeof MediaUploadTokenRoute
@@ -113,6 +120,7 @@ export interface FileRoutesByTo {
   '/media': typeof MediaRoute
   '/posts': typeof PostsRoute
   '/reset-password': typeof ResetPasswordRoute
+  '/start-here': typeof StartHereRoute
   '/sweet-assist': typeof SweetAssistRoute
   '/voice': typeof VoiceRoute
   '/media-upload/$token': typeof MediaUploadTokenRoute
@@ -129,6 +137,7 @@ export interface FileRoutesById {
   '/media': typeof MediaRoute
   '/posts': typeof PostsRoute
   '/reset-password': typeof ResetPasswordRoute
+  '/start-here': typeof StartHereRoute
   '/sweet-assist': typeof SweetAssistRoute
   '/voice': typeof VoiceRoute
   '/media-upload/$token': typeof MediaUploadTokenRoute
@@ -146,6 +155,7 @@ export interface FileRouteTypes {
     | '/media'
     | '/posts'
     | '/reset-password'
+    | '/start-here'
     | '/sweet-assist'
     | '/voice'
     | '/media-upload/$token'
@@ -161,6 +171,7 @@ export interface FileRouteTypes {
     | '/media'
     | '/posts'
     | '/reset-password'
+    | '/start-here'
     | '/sweet-assist'
     | '/voice'
     | '/media-upload/$token'
@@ -176,6 +187,7 @@ export interface FileRouteTypes {
     | '/media'
     | '/posts'
     | '/reset-password'
+    | '/start-here'
     | '/sweet-assist'
     | '/voice'
     | '/media-upload/$token'
@@ -192,6 +204,7 @@ export interface RootRouteChildren {
   MediaRoute: typeof MediaRoute
   PostsRoute: typeof PostsRoute
   ResetPasswordRoute: typeof ResetPasswordRoute
+  StartHereRoute: typeof StartHereRoute
   SweetAssistRoute: typeof SweetAssistRoute
   VoiceRoute: typeof VoiceRoute
   MediaUploadTokenRoute: typeof MediaUploadTokenRoute
@@ -257,6 +270,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof ResetPasswordRouteImport
       parentRoute: typeof rootRouteImport
     }
+    '/start-here': {
+      id: '/start-here'
+      path: '/start-here'
+      fullPath: '/start-here'
+      preLoaderRoute: typeof StartHereRouteImport
+      parentRoute: typeof rootRouteImport
+    }
     '/sweet-assist': {
       id: '/sweet-assist'
       path: '/sweet-assist'
@@ -304,6 +324,7 @@ const rootRouteChildren: RootRouteChildren = {
   MediaRoute: MediaRoute,
   PostsRoute: PostsRoute,
   ResetPasswordRoute: ResetPasswordRoute,
+  StartHereRoute: StartHereRoute,
   SweetAssistRoute: SweetAssistRoute,
   VoiceRoute: VoiceRoute,
   MediaUploadTokenRoute: MediaUploadTokenRoute,

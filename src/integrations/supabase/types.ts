@@ -186,6 +186,7 @@ export type Database = {
           market_area: string | null
           media_upload_token: string | null
           metadata: Json
+          onboarding_legacy: boolean
           phone: string | null
           photo_source: string
           review_token: string | null
@@ -208,6 +209,7 @@ export type Database = {
           market_area?: string | null
           media_upload_token?: string | null
           metadata?: Json
+          onboarding_legacy?: boolean
           phone?: string | null
           photo_source?: string
           review_token?: string | null
@@ -230,6 +232,7 @@ export type Database = {
           market_area?: string | null
           media_upload_token?: string | null
           metadata?: Json
+          onboarding_legacy?: boolean
           phone?: string | null
           photo_source?: string
           review_token?: string | null

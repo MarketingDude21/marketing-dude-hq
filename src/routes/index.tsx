@@ -1,5 +1,5 @@
 import { createFileRoute, Link } from "@tanstack/react-router";
-import { AppShell, useOnboardingLock } from "@/components/AppShell";
+import { AppShell, useOnboardingProgress } from "@/components/AppShell";
 import { useAuth } from "@/hooks/useAuth";
 
 export const Route = createFileRoute("/")({
@@ -23,6 +23,12 @@ export const Route = createFileRoute("/")({
   component: HomePage,
 });
 
+// requiresStep added 2026-11-25 alongside the Start Here onboarding redesign
+// (see AppShell's NAV comment) — replaces the old single "locked unless
+// voice DNA done" check with the real per-step chain: Build My Database
+// needs Step 2 (photos) done first, Monthly Marketing needs Step 3
+// (database) done, and My Voice DNA stays null/never-locked since it's
+// where Step 1 gets cleared in the first place.
 const MODULES = [
   {
     to: "/database",
@@ -34,6 +40,7 @@ const MODULES = [
     desc: "Import your contacts. We find your real sphere, clean it, tag it, and turn it into marketing lists worth mailing.",
     meta: "Who you should actually market to",
     action: "Open",
+    requiresStep: "step2Photos" as const,
   },
   {
     to: "/voice",
@@ -45,6 +52,7 @@ const MODULES = [
     desc: "A short interview teaches the system how you actually talk, so nothing it writes sounds like AI wrote it.",
     meta: "Train it once, use it forever",
     action: "Review",
+    requiresStep: null,
   },
   {
     to: "/marketing",
@@ -56,8 +64,15 @@ const MODULES = [
     desc: "Your month, written: emails, posts, video scripts and past-client touches — drafted in your voice, ready to approve.",
     meta: "This month is already drafted",
     action: "View",
+    requiresStep: "step3Database" as const,
   },
 ] as const;
+
+const MODULE_LOCK_TITLE: Record<"step1Brand" | "step2Photos" | "step3Database", string> = {
+  step1Brand: "Finish My Brand first — see Start Here",
+  step2Photos: "Upload your photos first — see Start Here",
+  step3Database: "Finish My Brand, your photos, and your database first — see Start Here",
+};
 
 const DOES = [
   ["Mines your sphere", "Finds the people actually worth marketing to"],
@@ -70,7 +85,7 @@ const DOES = [
 
 function WorkspaceHome() {
   const { user } = useAuth();
-  const onboardingLocked = useOnboardingLock();
+  const progress = useOnboardingProgress();
   const firstName = user?.email?.split("@")[0] ?? "there";
   const displayName = firstName.charAt(0).toUpperCase() + firstName.slice(1);
 
@@ -112,17 +127,18 @@ function WorkspaceHome() {
           there to lead into instead). */}
       <div className="mt-8 hidden gap-5 md:grid md:grid-cols-3">
         {MODULES.map((m) => {
-          // Greyed out the same way AppShell's nav is (2026-11-16) — these
-          // 3 cards duplicate that nav, so a locked agent shouldn't get a
-          // second clickable path into a module they're not onboarded for.
-          // "/voice" (Voice DNA) is deliberately exempt — it's where the
-          // lock gets cleared.
-          const isLocked = onboardingLocked && m.to !== "/voice";
-          if (isLocked) {
+          // Greyed out the same way AppShell's nav is (2026-11-25 rework) —
+          // these 3 cards duplicate part of that nav, so a locked agent
+          // shouldn't get a second clickable path into a module they're not
+          // onboarded for yet. Each card now checks its own requiresStep
+          // instead of one shared flag — "/voice" (Voice DNA) stays exempt,
+          // it's where Step 1 gets cleared in the first place.
+          const isLocked = m.requiresStep !== null && !progress[m.requiresStep];
+          if (isLocked && m.requiresStep) {
             return (
               <div
                 key={m.to}
-                title="Finish your Voice DNA profile, headshot, and logo in My Brand first"
+                title={MODULE_LOCK_TITLE[m.requiresStep]}
                 aria-disabled="true"
                 className="cursor-not-allowed rounded-3xl border border-border bg-glass p-6 opacity-40 backdrop-blur-2xl"
               >
@@ -135,7 +151,7 @@ function WorkspaceHome() {
                 <p className="mt-2 text-sm text-muted-foreground">{m.short}</p>
                 <div className="mt-5 flex items-center justify-between">
                   <span className="text-xs text-muted-foreground/70">Locked</span>
-                  <span className="text-sm font-semibold text-muted-foreground">Finish My Brand first</span>
+                  <span className="text-sm font-semibold text-muted-foreground">See Start Here</span>
                 </div>
               </div>
             );

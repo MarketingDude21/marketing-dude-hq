@@ -201,6 +201,7 @@ function StartHerePage() {
     <AgentScopedPage
       title="Start Here"
       tagline="The 4 steps that get your account fully set up and your first month's content unlocked."
+      skipOnboardingGate
     >
       {({ agentId }) => <StepsChecklist agentId={agentId} />}
     </AgentScopedPage>

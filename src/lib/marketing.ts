@@ -1655,8 +1655,9 @@ export const rewritePostContent = createServerFn({ method: "POST" })
       formatRule +
       "5. No hyphens, including in compound modifiers (well known, not well-known), no corporate language, sounds like a real person, not a brand\n" +
       "6. Standard capitalization always — never write in all lowercase\n" +
-      `7. AUTHENTICITY TEST: would ${firstName} actually say this?\n\n` +
-      "Output ONLY the rewritten text. Nothing else. No explanation.";
+      `7. AUTHENTICITY TEST: would ${firstName} actually say this?\n` +
+      EMOTIONAL_INTELLIGENCE_CHECK +
+      "\n\nOutput ONLY the rewritten text. Nothing else. No explanation.";
 
     const maxTokens = existing.content_type === "email" ? 2000 : existing.content_type === "video" ? 600 : 400;
     const raw = await callClaude(apiKey, prompt, maxTokens);
@@ -1827,8 +1828,9 @@ export const sendPostFeedbackMessage = createServerFn({ method: "POST" })
       "1. Respond like a real collaborator who read exactly what they just said — acknowledge it specifically, don't drift into an unrelated full rewrite.\n" +
       "2. If they're asking for an actual change, make only the change(s) they're asking for, keeping the same concept and emotional core otherwise.\n" +
       "3. If they're just asking a question, pushing back, or chatting, respond to that without forcing a rewrite.\n" +
-      `4. When you do revise it: write in ${firstName}'s voice, ${formatRule}No hyphens including in compound modifiers (well known, not well-known), no corporate language, standard capitalization always, sounds like a real person. Would ${firstName} actually say this?\n\n` +
-      "Output format — ALWAYS both lines, in this order, nothing else before or after:\n" +
+      `4. When you do revise it: write in ${firstName}'s voice, ${formatRule}No hyphens including in compound modifiers (well known, not well-known), no corporate language, standard capitalization always, sounds like a real person. Would ${firstName} actually say this?\n` +
+      EMOTIONAL_INTELLIGENCE_CHECK +
+      "\n\nOutput format — ALWAYS both lines, in this order, nothing else before or after:\n" +
       "REPLY: [your short, conversational response]\n" +
       `REVISED ${kindLabel}: [the full updated ${kind} text, or exactly "no change" if this message does not call for one]`;
 
@@ -2694,8 +2696,9 @@ export const rewritePublicReviewPost = createServerFn({ method: "POST" })
       formatRule +
       "5. No hyphens, including in compound modifiers (well known, not well-known), no corporate language, sounds like a real person, not a brand\n" +
       "6. Standard capitalization always — never write in all lowercase\n" +
-      `7. AUTHENTICITY TEST: would ${firstName} actually say this?\n\n` +
-      "Output ONLY the rewritten text. Nothing else. No explanation.";
+      `7. AUTHENTICITY TEST: would ${firstName} actually say this?\n` +
+      EMOTIONAL_INTELLIGENCE_CHECK +
+      "\n\nOutput ONLY the rewritten text. Nothing else. No explanation.";
 
     const maxTokens = existing.content_type === "email" ? 2000 : existing.content_type === "video" ? 600 : 400;
     const raw = await callClaude(apiKey, prompt, maxTokens);
@@ -4065,7 +4068,8 @@ function buildContentPrompt(
       "- Real estate should feel like a casual aside, not the whole point\n" +
       "- AUTHENTICITY CHECK: read it out loud — if a real person would never say this, rewrite it.\n" +
       (input.useHashtags ? "- Add 2-3 relevant hashtags at the very end\n" : "- NO hashtags\n") +
-      "\nOutput ONLY the finished post text — no title, no labels, no quotation marks."
+      EMOTIONAL_INTELLIGENCE_CHECK +
+      "\n\nOutput ONLY the finished post text — no title, no labels, no quotation marks."
     );
   }
 
@@ -4074,8 +4078,9 @@ function buildContentPrompt(
       `You are writing a real estate email for ${agentName} in ${agentCity}.\n\n` +
       `VOICE DNA:\n${voiceDna}\n\n` +
       `EMAIL GOAL:\n${input.goal}${extra}\n\n` +
-      "Write this email in the voice above, to ONE person, not an audience — like a personal note, not a newsletter blast. Open with a scene or a pain point, never a summary. NO hyphens, including in compound modifiers (well known, not well-known). NO corporate language. NO AI-tell phrases. Standard capitalization always.\n\n" +
-      "Output format:\nSUBJECT OPTIONS:\n1. [subject]\n2. [subject]\n3. [subject]\n\nEMAIL BODY:\n[full email in plain text, no HTML tags]"
+      "Write this email in the voice above, to ONE person, not an audience — like a personal note, not a newsletter blast. Open with a scene or a pain point, never a summary. NO hyphens, including in compound modifiers (well known, not well-known). NO corporate language. NO AI-tell phrases. Standard capitalization always." +
+      EMOTIONAL_INTELLIGENCE_CHECK +
+      "\n\nOutput format:\nSUBJECT OPTIONS:\n1. [subject]\n2. [subject]\n3. [subject]\n\nEMAIL BODY:\n[full email in plain text, no HTML tags]"
     );
   }
 
@@ -4088,7 +4093,8 @@ function buildContentPrompt(
     "HOOK (first 3 seconds — grab attention):\n[hook line]\n\n" +
     "BODY (main point, story, or insight):\n[15 to 45 seconds of content]\n\n" +
     "CLOSE (natural ending, no hard sell):\n[closing line]\n\n" +
-    "Rules: the HOOK opens with a scene or a pain point, never a summary. Written to ONE person, not an audience. Written to be SPOKEN, not read — short sentences, natural pauses. NO hyphens, including in compound modifiers (well known, not well-known). NO corporate language, NO AI phrases. Standard capitalization, never all lowercase. 150 words maximum."
+    "Rules: the HOOK opens with a scene or a pain point, never a summary. Written to ONE person, not an audience. Written to be SPOKEN, not read — short sentences, natural pauses. NO hyphens, including in compound modifiers (well known, not well-known). NO corporate language, NO AI phrases. Standard capitalization, never all lowercase. 150 words maximum." +
+    EMOTIONAL_INTELLIGENCE_CHECK
   );
 }
 
@@ -4314,7 +4320,9 @@ function buildChatSystemPrompt(
     `You are ${agentName}'s own personal marketing assistant — their "Marketing Dude," embedded in their day-to-day workflow. You know their voice and you're having an ongoing conversation with them, not filling out a form. Keep replies focused on the content they're working on; don't pad with generic assistant chatter.\n\n` +
     `You are writing for ${agentName} in ${agentCity}.\n\n` +
     `VOICE DNA:\n${voiceDna}${learnedFeedback}\n\n` +
-    'House rules that apply no matter what you\'re writing: no hyphens used as dashes, no "As a real estate professional" or any version of that, no "Navigating the market," no corporate language, no buzzwords, no filler, standard capitalization always, never write in a way a real person wouldn\'t actually say out loud.\n\n' +
+    'House rules that apply no matter what you\'re writing: no hyphens used as dashes, no "As a real estate professional" or any version of that, no "Navigating the market," no corporate language, no buzzwords, no filler, standard capitalization always, never write in a way a real person wouldn\'t actually say out loud.\n' +
+    EMOTIONAL_INTELLIGENCE_CHECK +
+    "\n\n" +
     WEB_SEARCH_INSTRUCTION +
     "\n\n" +
     CHAT_SECTION_DIRECTORY;
@@ -5093,14 +5101,46 @@ function parseVideoDoc(text: string, title: string): CalendarDocBase | null {
   return { type: "video", title, goal, hook, script };
 }
 
+// Fallback 2026-11-25 — Mike reported that for agent Jen Almeida, clicking
+// "Generate content" only produced the 12 scanned-photo posts: no emails, no
+// video scripts, and no social posts that had been manually typed into the
+// calendar by an admin. Root cause: parsePostDoc/parseEmailDoc/parseVideoDoc
+// above all require specific section headers ("Post Copy", "Email
+// Instructions", "Video Script", etc. — see the ghost placeholder text in
+// CalendarMonthItemsScreen's Add Calendar Item form), and when none of their
+// patterns match they return null outright. fetchNativeCalendarDocs below
+// then silently .filter()s out every null with no error surfaced anywhere —
+// not when the item is added, not at generation time — so a manually-typed
+// item that doesn't exactly follow the expected format just vanishes with no
+// explanation. Rather than make the admin re-learn an exact format, treat a
+// parse failure as "this is free-form text, use it directly" instead of
+// "drop it": every calendar item an admin bothered to type in should make it
+// into generation one way or another.
+function parseCalendarItemWithFallback(docType: string, cleaned: string, title: string): CalendarDocBase | null {
+  if (docType === "email") return parseEmailDoc(cleaned, title);
+  if (docType === "video") return parseVideoDoc(cleaned, title);
+  return parsePostDoc(cleaned, title);
+}
+
 function parseCalendarItem(item: { docType: string; title: string; rawText: string }): CalendarDocBase | null {
   const cleaned = item.rawText
     .replace(/\r\n/g, "\n")
     .replace(/\\([[\]().*+?^${}|\\])/g, "$1")
     .trim();
-  if (item.docType === "email") return parseEmailDoc(cleaned, item.title);
-  if (item.docType === "video") return parseVideoDoc(cleaned, item.title);
-  return parsePostDoc(cleaned, item.title);
+  const parsed = parseCalendarItemWithFallback(item.docType, cleaned, item.title);
+  if (parsed) return parsed;
+  // Nothing recognizable about the expected section structure — fall back to
+  // treating the raw text itself as the content, so the item still shows up
+  // and generates rather than disappearing. Needs at least a few real
+  // characters of text to bother with; a truly empty item still drops.
+  if (!cleaned) return null;
+  if (item.docType === "email") {
+    return { type: "email", title: item.title, goal: "", subjects: [], instructions: cleaned };
+  }
+  if (item.docType === "video") {
+    return { type: "video", title: item.title, goal: "", hook: "", script: cleaned };
+  }
+  return { type: "post", title: item.title, goal: "", image: "", canva: "", canvaDirection: "", copy: cleaned };
 }
 
 async function fetchNativeCalendarDocs(monthId: string): Promise<CalendarDoc[]> {
@@ -5186,6 +5226,30 @@ const WEB_SEARCH_TOOL = { type: "web_search_20250305", name: "web_search", max_u
 // difference from a real number.
 const WEB_SEARCH_INSTRUCTION =
   "\n\nIf writing this well depends on a real, current fact, number, or rate (today's mortgage rate, this area's current housing inventory, a local statistic, something that happened recently) — use the web search tool to look it up before you write. Never invent or estimate a specific number, date, or statistic. If you search and still can't find a solid current number, write around it in general terms instead of guessing one.";
+
+// Added 2026-11-25 per Mike, reviewing a batch of real scanned-photo
+// captions: a few lines were technically "funny"/personality-forward but
+// landed wrong — "speaking to a room full of people who actually want to
+// hear what you have to say beats showing houses most days" (reads as
+// dismissive of the actual job, which undercuts client trust), "not giving
+// a damn about work emails" (reads as blowing off clients who've reached
+// out, not just casual), and "Better never than late... showed up in
+// something I actually ironed" (jokes about being unreliable/unprepared,
+// which works against an agent whose whole pitch depends on being reliable
+// and prepared). His own framing: "we need you asking yourself this to
+// cross check every post" — so this is a mandatory self-check appended to
+// EVERY content-generation prompt in this app (every caption, post, email,
+// video script, bio, and chat reply), not a one-off fix to the scanned-
+// photo prompt alone, since the same personality-forward tone that produced
+// these lines is used everywhere, not just there. Deliberately distinct
+// from the existing "sounds like a real person"/"no corporate language"
+// rules every prompt already has — those catch stiff, fake-sounding
+// writing; this catches writing that sounds like a real person but is
+// dismissive of clients or careless about professional reliability, which
+// is a different failure mode a generically "funny/relatable" instruction
+// can still produce on its own.
+export const EMOTIONAL_INTELLIGENCE_CHECK =
+  "\n\nBEFORE YOU FINISH, read it back the way a client would — not just as a one-liner you'd laugh at. Would any line make a client think the agent doesn't actually care about them or their messages, finds the real work of being an agent (showing houses, answering clients) boring or beneath them, or is joking about being late, unreliable, or unprepared? Playful, funny, and personality-forward is good and should stay — sounding like you don't care about clients or your own reliability is not, even as a throwaway joke. If a line could land that way, rework or cut it before finishing.";
 
 // Exported (was module-private) 2026-11-05 so soi-builder.ts's new contact
 // cleanup step can reuse the exact same Claude call this file already makes
@@ -5403,7 +5467,8 @@ export const generateMonthlyBatch = createServerFn({ method: "POST" })
           (data.useHashtags ? "- Add 2-3 relevant hashtags at the very end\n" : "- NO hashtags\n") +
           (data.useEmojis ? "- A couple of relevant emojis are welcome if they feel natural\n" : "- NO emojis\n") +
           learnedFeedback +
-          "\nRead the CONCEPT and ORIGINAL below carefully, find the story or the human truth in THIS post only, write it clearly in the agent's voice, and make sure the last sentence lands and the whole post makes sense.\n\n" +
+          EMOTIONAL_INTELLIGENCE_CHECK +
+          "\n\nRead the CONCEPT and ORIGINAL below carefully, find the story or the human truth in THIS post only, write it clearly in the agent's voice, and make sure the last sentence lands and the whole post makes sense.\n\n" +
           `TITLE: ${doc.title}\nCONCEPT: ${doc.goal}\nORIGINAL: ${doc.copy}\n\n` +
           "Output format:\nREWRITTEN: [complete caption for this post only]";
 
@@ -5487,6 +5552,7 @@ export const generateMonthlyBatch = createServerFn({ method: "POST" })
               "NO hyphens, including in compound modifiers (well known, not well-known). NO corporate language. NO AI tell phrases. Standard capitalization always. " +
               (data.useEmojis ? "A couple of relevant emojis are welcome if they feel natural." : "NO emojis.") +
               learnedFeedback +
+              EMOTIONAL_INTELLIGENCE_CHECK +
               "\n\nOutput format:\nSUBJECT OPTIONS:\n1. [subject]\n2. [subject]\n3. [subject]\n\nEMAIL BODY:\n[full email — reads like a note, not a newsletter]";
           } else {
             emailPrompt =
@@ -5500,6 +5566,7 @@ export const generateMonthlyBatch = createServerFn({ method: "POST" })
               "NO hyphens, including in compound modifiers (well known, not well-known). NO corporate language. NO AI-tell phrases. Standard capitalization always. " +
               (data.useEmojis ? "A couple of relevant emojis are welcome if they feel natural." : "NO emojis.") +
               learnedFeedback +
+              EMOTIONAL_INTELLIGENCE_CHECK +
               "\n\n" +
               "Output format:\nSUBJECT OPTIONS:\n1. [subject]\n2. [subject]\n3. [subject]\n\nEMAIL BODY:\n[full email in plain text, no HTML tags]";
           }
@@ -5522,6 +5589,7 @@ export const generateMonthlyBatch = createServerFn({ method: "POST" })
               ? "- A couple of relevant emojis are welcome if they feel natural\n\n"
               : "- NO emojis\n\n") +
             learnedFeedback +
+            EMOTIONAL_INTELLIGENCE_CHECK +
             `\n\nOutput format:\nSUBJECT OPTIONS:\n${subjectBlock}\n\nEMAIL BODY:\n[the personalized email]`;
         }
 
@@ -5590,7 +5658,8 @@ export const generateMonthlyBatch = createServerFn({ method: "POST" })
           (data.useEmojis
             ? "- A couple of relevant emojis in the on-screen text are welcome if they feel natural"
             : "- NO emojis") +
-          learnedFeedback;
+          learnedFeedback +
+          EMOTIONAL_INTELLIGENCE_CHECK;
 
         try {
           // 600 -> 1200 tokens when this prompt is one of the hyper-local
@@ -6262,6 +6331,7 @@ async function captionPhotoInVoice(
       ? `\n\nTHIS PHOTO WAS ALREADY CAPTIONED ONCE BEFORE — the agent asked to rescan it because they want something genuinely new, not a reword. The previous caption was:\n"${previousCaption.trim()}"\n` +
         "Do NOT reuse that angle, story, joke, or structure, even with different words — find a DIFFERENT true thing in the same photo to build this caption around: a different detail you notice, a different mood, a different person/object in frame, a different memory or association, a different style of joke. If the previous caption focused on the setting, focus on a detail or a feeling instead (or vice versa). The two captions should read like two different people looked at this photo and each found their own thing to say about it — not like one was lightly edited into the other.\n"
       : "") +
+    EMOTIONAL_INTELLIGENCE_CHECK +
     `\n\nOutput format:\nDESCRIPTION: [one sentence of what you see]\nPOST: [the social media caption]\nTEXT OVERLAYS:\n1. [short overlay line]\n2. [short overlay line]\n3. [short overlay line]${
       reNodTracked ? "\nREAL ESTATE NOD: [included or skipped]" : ""
     }`;

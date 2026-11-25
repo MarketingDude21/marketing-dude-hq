@@ -5373,8 +5373,26 @@ const WEB_SEARCH_INSTRUCTION =
 // dismissive of clients or careless about professional reliability, which
 // is a different failure mode a generically "funny/relatable" instruction
 // can still produce on its own.
+// STRENGTHENED 2026-11-25 per Mike, same day, off a real batch of live posts
+// that had actual profanity in them and a sarcastic, deflecting tone he
+// called out directly: "these are too vulgar," and "remove the sarcasm, we
+// arent trying to be an asshole, its being a total jerk and making the
+// agents look like total assholes." Two separate additions, both absolute
+// (not "usually" or "mostly"): (1) no profanity or crude language, full
+// stop, regardless of how casual or edgy any individual agent's own voice
+// profile reads — there is also a hard regex backstop for this specifically,
+// see stripProfanity below, since this is the one thing here that can
+// actually be caught with certainty rather than judgment; (2) the original
+// 3 named patterns (doesn't care about clients, work is boring/beneath them,
+// jokes about being late/unreliable) were too narrow — this failure mode is
+// bigger than those 3 examples, so the check now asks the general question
+// directly: does this read like the agent being a jerk, mean, or dismissive
+// toward anyone (a client, a colleague, themselves), even as a joke.
 export const EMOTIONAL_INTELLIGENCE_CHECK =
-  "\n\nBEFORE YOU FINISH, read it back the way a client would — not just as a one-liner you'd laugh at. Would any line make a client think the agent doesn't actually care about them or their messages, finds the real work of being an agent (showing houses, answering clients) boring or beneath them, or is joking about being late, unreliable, or unprepared? Playful, funny, and personality-forward is good and should stay — sounding like you don't care about clients or your own reliability is not, even as a throwaway joke. If a line could land that way, rework or cut it before finishing.";
+  "\n\nBEFORE YOU FINISH, two absolute rules, then a read-back:\n" +
+  "1. NO profanity or crude language, ever, under any circumstance — not even one word, not even if the agent's own voice sounds blunt, edgy, or unfiltered. Find a clean way to say it instead.\n" +
+  "2. NO sarcasm, deflection, or joke that makes the agent sound dismissive, mean, or like a jerk toward anyone — a client, a colleague, or even themselves. Casual and funny is good; mean, eye-rolling, or 'ugh, people' in tone is not, even dressed up as relatable humor.\n" +
+  "Then read the whole thing back the way a client would, not just as a one-liner you'd laugh at writing. Would any line make a client think the agent doesn't actually care about them or their messages, finds the real work of being an agent (showing houses, answering clients) boring or beneath them, is joking about being late, unreliable, or unprepared, or is just generally being a jerk? Playful and personality-forward is good and should stay — sounding like you don't care about clients, your own reliability, or are mocking anyone is not. If a line could land that way, rework or cut it before finishing.";
 
 // Exported (was module-private) 2026-11-05 so soi-builder.ts's new contact
 // cleanup step can reuse the exact same Claude call this file already makes
@@ -5435,9 +5453,33 @@ export async function callClaude(
   return text;
 }
 
+// Added 2026-11-25 per Mike, off a batch of live captions that had actual
+// profanity in them ("this job is fucking hard"): "no swears etc... this is
+// making us look very bad... these are too vulgar." The strengthened
+// EMOTIONAL_INTELLIGENCE_CHECK instruction above is the real fix for TONE
+// (sarcasm, dismissiveness — nothing a regex can judge), but profanity
+// specifically can be caught with certainty, so this is a hard backstop
+// underneath the prompt instruction, not a replacement for it — even if a
+// model ignores the instruction once, nothing on this list reaches a client.
+// Deliberately not trying to catch every possible swear in existence, just
+// the ones that actually showed up and their obvious variants; word-boundary
+// matched so it never touches an unrelated word that happens to contain one
+// of these as a substring.
+const PROFANITY_PATTERN =
+  /\b(fuck(?:ing|ed|er|s)?|shit(?:ty|s)?|assholes?|bullshit|bitch(?:es|y|ing)?|bastards?|dickhead|goddamn(?:it)?)\b/gi;
+
+function stripProfanity(text: string): string {
+  return text
+    .replace(PROFANITY_PATTERN, "")
+    .replace(/[ \t]{2,}/g, " ")
+    .replace(/[ \t]+([,.!?])/g, "$1")
+    .replace(/^[,\s]+/, "")
+    .trim();
+}
+
 function cleanCopy(text: string): string {
   return (
-    text
+    stripProfanity(text)
       .replace(/\*\*/g, "")
       .replace(/^["']|["']$/g, "")
       // Added 2026-11-04 per Mike: "NEED TO REMOVE ALL DASHES IN ANY AI

@@ -49,6 +49,7 @@ import {
   addCalendarItem,
   updateCalendarItem,
   removeCalendarItem,
+  auditCalendarParsingFailures,
   readContentCalendar,
   generateMonthlyBatch,
   deleteMonthContent,
@@ -93,6 +94,7 @@ import {
   type ArchivedBatchSummary,
   type ChatMode,
   type ChatMessageRow,
+  type CalendarParsingAuditRow,
 } from "@/lib/marketing";
 // Connect status lives in voice-dna.ts (the "Connect Facebook & Instagram"
 // card on My Brand writes it) — read-only here, just to know whether the
@@ -6828,6 +6830,27 @@ function ManageCalendarScreen({ onBack }: { onBack: () => void }) {
   // listAllCalendarMonthsForAdmin so a past month can still be found again
   // to unarchive it.
   const [showArchived, setShowArchived] = useState(false);
+  // One-time audit (2026-11-25) — see auditCalendarParsingFailures's own
+  // comment in marketing.ts for why this exists: finds every calendar item,
+  // across every month, that would have silently failed to generate under
+  // the OLD strict parsing rules (fixed this same round), so Mike can tell
+  // who else besides Jen Almeida was affected before the fix went in.
+  const [auditResults, setAuditResults] = useState<CalendarParsingAuditRow[] | null>(null);
+  const [auditRunning, setAuditRunning] = useState(false);
+  const [auditError, setAuditError] = useState<string | null>(null);
+
+  async function runParsingAudit() {
+    setAuditRunning(true);
+    setAuditError(null);
+    try {
+      const rows = await auditCalendarParsingFailures();
+      setAuditResults(rows);
+    } catch (e) {
+      setAuditError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setAuditRunning(false);
+    }
+  }
 
   function reload() {
     setMonths(null);
@@ -6984,6 +7007,59 @@ function ManageCalendarScreen({ onBack }: { onBack: () => void }) {
               </div>
             ))}
           </div>
+        )}
+      </Card>
+
+      <Card>
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <div>
+            <h4 className="font-display text-sm font-semibold">Check for silently-dropped calendar items</h4>
+            <p className="mt-1 text-xs text-muted-foreground">
+              One-time check for a bug fixed today: items that didn't match the expected format used to disappear with
+              no error when agents generated content. This scans everything currently in the calendar and lists anything
+              that would have been silently skipped before today's fix.
+            </p>
+          </div>
+          <Button onClick={runParsingAudit} disabled={auditRunning}>
+            {auditRunning ? "Checking…" : "Run check"}
+          </Button>
+        </div>
+
+        {auditError && <p className="mt-3 text-xs text-destructive">{auditError}</p>}
+
+        {auditResults !== null && auditResults.length === 0 && (
+          <p className="mt-3 text-sm text-muted-foreground">
+            Nothing found — every calendar item currently in the system would have generated fine even before today's
+            fix.
+          </p>
+        )}
+
+        {auditResults !== null && auditResults.length > 0 && (
+          <>
+            <p className="mt-3 text-sm font-semibold text-destructive">
+              {auditResults.length} item{auditResults.length === 1 ? "" : "s"} would have been silently skipped — review
+              these and regenerate content for any affected month/agent.
+            </p>
+            <div className="mt-3 space-y-2">
+              {auditResults.map((r) => (
+                <div key={r.itemId} className="rounded-2xl border border-border bg-glass px-4 py-3 text-sm">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <span className="font-semibold">{r.month}</span>
+                    {r.monthArchived && (
+                      <span className="rounded-full bg-muted px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">
+                        Archived
+                      </span>
+                    )}
+                    <span className="rounded-full bg-muted px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">
+                      {DOC_TYPE_LABEL[r.docType]}
+                    </span>
+                    <span className="font-semibold">{r.title}</span>
+                  </div>
+                  <p className="mt-1 text-xs text-muted-foreground">{r.preview}…</p>
+                </div>
+              ))}
+            </div>
+          </>
         )}
       </Card>
     </div>

@@ -166,6 +166,65 @@ export async function requireAgentAccess(
   throw new Error("Not authorized for this agent's content");
 }
 
+// Added 2026-11-25 for the challenge onboarding redesign — per Mike,
+// replaces the old single "brand done or not" check (voice_summary +
+// headshot + logo) with the real 3-step chain the live challenge teaches:
+// My Brand, then Upload Photos (at least 8, photos only — video stays a
+// separate upsell, not part of this count), then Build Your Database (any
+// file ever uploaded there). Completing step3 is what unlocks Create My
+// Monthly Content and Individual Content together. `legacy` agents (anyone
+// who existed before this shipped — see the onboarding_legacy migration)
+// are reported as having cleared every step regardless of their real data,
+// per Mike: "any of the rules... will not be applied to any existing
+// users... even if they're missing some of the pieces." Each step's own
+// signal is still computed even if an earlier one is incomplete, rather
+// than short-circuited, so the Start Here page can show real per-step
+// status instead of just "stuck."
+export type OnboardingProgress = {
+  legacy: boolean;
+  step1Brand: boolean;
+  step2Photos: boolean;
+  step3Database: boolean;
+  photoCount: number;
+};
+
+export const MIN_ONBOARDING_PHOTOS = 8;
+
+export const getOnboardingProgress = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator((data: { agentId: string }) => data)
+  .handler(async ({ data, context }): Promise<OnboardingProgress> => {
+    const email = (context.claims as { email?: string } | undefined)?.email;
+    await requireAgentAccess(context.userId, email, data.agentId);
+    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+
+    const { data: row, error } = await supabaseAdmin
+      .from("agents")
+      .select("voice_summary, headshot_url, logo_url, onboarding_legacy")
+      .eq("id", data.agentId)
+      .maybeSingle();
+    if (error) throw error;
+
+    if (row?.onboarding_legacy) {
+      return { legacy: true, step1Brand: true, step2Photos: true, step3Database: true, photoCount: 0 };
+    }
+
+    const step1Brand = Boolean(row?.voice_summary) && Boolean(row?.headshot_url) && Boolean(row?.logo_url);
+
+    const { count: photoCount, error: photoErr } = await supabaseAdmin
+      .from("agent_photos")
+      .select("id", { count: "exact", head: true })
+      .eq("agent_id", data.agentId)
+      .eq("media_type", "photo");
+    if (photoErr) throw photoErr;
+    const step2Photos = (photoCount ?? 0) >= MIN_ONBOARDING_PHOTOS;
+
+    const { agentHasSoiUpload } = await import("@/lib/soi-builder");
+    const step3Database = await agentHasSoiUpload(email);
+
+    return { legacy: false, step1Brand, step2Photos, step3Database, photoCount: photoCount ?? 0 };
+  });
+
 // Guards for the shared content calendar below — it isn't scoped to any one
 // agent (every agent reads the same months/items), so these check the
 // caller's role directly rather than re-deriving a specific agentId match.

@@ -5377,7 +5377,7 @@ const WEB_SEARCH_INSTRUCTION =
 // that had actual profanity in them and a sarcastic, deflecting tone he
 // called out directly: "these are too vulgar," and "remove the sarcasm, we
 // arent trying to be an asshole, its being a total jerk and making the
-// agents look like total assholes." Two separate additions, both absolute
+// agents look like total assholes." Three separate additions, all absolute
 // (not "usually" or "mostly"): (1) no profanity or crude language, full
 // stop, regardless of how casual or edgy any individual agent's own voice
 // profile reads — there is also a hard regex backstop for this specifically,
@@ -5387,12 +5387,23 @@ const WEB_SEARCH_INSTRUCTION =
 // jokes about being late/unreliable) were too narrow — this failure mode is
 // bigger than those 3 examples, so the check now asks the general question
 // directly: does this read like the agent being a jerk, mean, or dismissive
-// toward anyone (a client, a colleague, themselves), even as a joke.
+// toward anyone (a client, a colleague, themselves), even as a joke; (3)
+// added same day, second pass, per Mike reviewing the SAME batch again:
+// "its making real estate seem like an inconvenience, we need to show they
+// like doing what they are doing and enjoy being an agent, not debbie
+// downer." This is a distinct failure mode from (2) — a line can be
+// perfectly polite and not dismissive of anyone, and still frame the actual
+// work of being an agent as a burden, an interruption, or something to
+// escape from ("the houses will still be there," "zero phone calls for
+// exactly seven minutes," "this job is hard until it isn't") — so rule 3
+// names that directly: the agent should come across as someone who likes
+// this job, not someone enduring it.
 export const EMOTIONAL_INTELLIGENCE_CHECK =
-  "\n\nBEFORE YOU FINISH, two absolute rules, then a read-back:\n" +
+  "\n\nBEFORE YOU FINISH, three absolute rules, then a read-back:\n" +
   "1. NO profanity or crude language, ever, under any circumstance — not even one word, not even if the agent's own voice sounds blunt, edgy, or unfiltered. Find a clean way to say it instead.\n" +
   "2. NO sarcasm, deflection, or joke that makes the agent sound dismissive, mean, or like a jerk toward anyone — a client, a colleague, or even themselves. Casual and funny is good; mean, eye-rolling, or 'ugh, people' in tone is not, even dressed up as relatable humor.\n" +
-  "Then read the whole thing back the way a client would, not just as a one-liner you'd laugh at writing. Would any line make a client think the agent doesn't actually care about them or their messages, finds the real work of being an agent (showing houses, answering clients) boring or beneath them, is joking about being late, unreliable, or unprepared, or is just generally being a jerk? Playful and personality-forward is good and should stay — sounding like you don't care about clients, your own reliability, or are mocking anyone is not. If a line could land that way, rework or cut it before finishing.";
+  "3. NEVER frame being an agent, or the actual work of it (showing houses, answering clients, closings, paperwork), as an inconvenience, a burden, or something to escape, avoid, or get through — even lightly, even as a throwaway line ('the houses will still be there,' 'finally some peace and quiet from the phone,' 'this job is hard until it isn't'). The agent should come across as someone who genuinely likes this job, not someone enduring it. A personal moment (coffee, a hobby, family time) can be the focus of a post — that's good, human content — but it should never be framed as relief FROM real estate, like the job is the thing getting in the way of their life.\n" +
+  "Then read the whole thing back the way a client would, not just as a one-liner you'd laugh at writing. Would any line make a client think the agent doesn't actually care about them or their messages, finds the real work of being an agent boring, a burden, or beneath them, is joking about being late, unreliable, or unprepared, or is just generally being a jerk or a Debbie Downer about the job? Playful and personality-forward is good and should stay — sounding like you don't care about clients, don't enjoy the work, or are mocking anyone is not. If a line could land that way, rework or cut it before finishing.";
 
 // Exported (was module-private) 2026-11-05 so soi-builder.ts's new contact
 // cleanup step can reuse the exact same Claude call this file already makes

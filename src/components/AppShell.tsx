@@ -1,5 +1,5 @@
 import { Link, Outlet, useNavigate } from "@tanstack/react-router";
-import { useEffect, useState, type ReactNode } from "react";
+import { createContext, useContext, useEffect, useState, type ReactNode } from "react";
 import { useAuth } from "@/hooks/useAuth";
 import { Sparkles, Calendar, MessagesSquare, Image, UserCircle, Lock, ListChecks } from "lucide-react";
 import { getMarketingAccess, getOnboardingProgress, type OnboardingProgress } from "@/lib/marketing";
@@ -87,37 +87,74 @@ const UNLOCKED_PROGRESS: OnboardingProgress = {
   photoCount: 0,
 };
 
-// Exported so index.tsx's home-page module cards (which duplicate part of
-// this same nav) can grey themselves out with the exact same signal instead
-// of re-deriving it.
-export function useOnboardingProgress(): OnboardingProgress {
+// Hotfix added 2026-11-25, same day as the step-gating feature itself,
+// after Mike reported "too many connections issued to the database" plus a
+// run of Anthropic credit errors right after it went live. Root cause: this
+// hook's fetch (getMarketingAccess -> getOnboardingProgress, and
+// getOnboardingProgress itself calls out to the SEPARATE SOI Builder
+// Supabase project via agentHasSoiUpload) was being re-run independently in
+// 3-4 different places on a single page view — once here in AppShell (every
+// page), again in index.tsx's WorkspaceHome (home page only), again in
+// OnboardingGate (/marketing, /posts), again in start-here.tsx. None of them
+// knew about each other, so a single page view could fire several times the
+// database round trips this feature actually needed, aimed at a project
+// that apparently can't absorb that kind of burst. Fix: AppShell is now the
+// ONE place that actually calls getOnboardingProgress for "the logged-in
+// agent's own progress" — everyone else reads the same fetch back out of
+// context instead of repeating it.
+type OnboardingContextValue = { agentId: string | null; progress: OnboardingProgress };
+const UNLOCKED_CONTEXT: OnboardingContextValue = { agentId: null, progress: UNLOCKED_PROGRESS };
+const OnboardingProgressContext = createContext<OnboardingContextValue>(UNLOCKED_CONTEXT);
+
+function useOnboardingProgressFetch(): OnboardingContextValue {
   const { user } = useAuth();
-  const [progress, setProgress] = useState<OnboardingProgress>(UNLOCKED_PROGRESS);
+  const [state, setState] = useState<OnboardingContextValue>(UNLOCKED_CONTEXT);
 
   useEffect(() => {
     if (!user) {
-      setProgress(UNLOCKED_PROGRESS);
+      setState(UNLOCKED_CONTEXT);
       return;
     }
     let cancelled = false;
     getMarketingAccess()
       .then(async (access) => {
         if (access.role !== "agent") {
-          if (!cancelled) setProgress(UNLOCKED_PROGRESS);
+          if (!cancelled) setState(UNLOCKED_CONTEXT);
           return;
         }
         const p = await getOnboardingProgress({ data: { agentId: access.agentId } });
-        if (!cancelled) setProgress(p);
+        if (!cancelled) setState({ agentId: access.agentId, progress: p });
       })
       .catch(() => {
-        if (!cancelled) setProgress(UNLOCKED_PROGRESS);
+        if (!cancelled) setState(UNLOCKED_CONTEXT);
       });
     return () => {
       cancelled = true;
     };
   }, [user]);
 
-  return progress;
+  return state;
+}
+
+// Exported so index.tsx's home-page module cards (which duplicate part of
+// this same nav) can grey themselves out with the exact same signal instead
+// of re-deriving it — now reads AppShell's own fetch via context rather than
+// firing a second copy of it.
+export function useOnboardingProgress(): OnboardingProgress {
+  return useContext(OnboardingProgressContext).progress;
+}
+
+// Exported for a page that knows which agentId it's actually showing
+// (OnboardingGate, start-here.tsx) so it can skip its own fetch entirely
+// when that agentId is the same one AppShell already fetched — true for
+// every ordinary agent viewing their own pages, which is the overwhelming
+// majority of traffic. An admin viewing a DIFFERENT agent's pages still
+// gets agentId === null here (admins aren't "an agent" to getMarketingAccess
+// unless they're also registered as one), so those call sites correctly
+// fall through to their own direct fetch instead of showing the admin's own
+// status by mistake.
+export function useOnboardingProgressContext(): OnboardingContextValue {
+  return useContext(OnboardingProgressContext);
 }
 
 // FIXED (2026-09-23) — this used to render a generic "YM" placeholder box.
@@ -143,25 +180,88 @@ export function AmbientBackground() {
 export function AppShell({ children }: { children?: ReactNode }) {
   const navigate = useNavigate();
   const { user, signOut } = useAuth();
-  const progress = useOnboardingProgress();
+  const onboardingCtx = useOnboardingProgressFetch();
+  const { progress } = onboardingCtx;
   return (
-    <div className="relative min-h-screen w-full overflow-hidden bg-background text-foreground">
-      <AmbientBackground />
-      <header className="relative z-10 mx-auto flex max-w-7xl items-center justify-between gap-4 px-6 py-5">
-        <Link to="/" className="flex items-center gap-2.5">
-          <BrandMark />
-        </Link>
-        <nav className="hidden items-center gap-1 rounded-full border border-border bg-glass px-1 py-1 backdrop-blur-xl md:flex">
+    <OnboardingProgressContext.Provider value={onboardingCtx}>
+      <div className="relative min-h-screen w-full overflow-hidden bg-background text-foreground">
+        <AmbientBackground />
+        <header className="relative z-10 mx-auto flex max-w-7xl items-center justify-between gap-4 px-6 py-5">
+          <Link to="/" className="flex items-center gap-2.5">
+            <BrandMark />
+          </Link>
+          <nav className="hidden items-center gap-1 rounded-full border border-border bg-glass px-1 py-1 backdrop-blur-xl md:flex">
+            {NAV.map((item) =>
+              item.requiresStep && !progress[item.requiresStep] ? (
+                <span
+                  key={item.to}
+                  title={LOCK_TITLE[item.requiresStep]}
+                  aria-disabled="true"
+                  className="flex cursor-not-allowed items-center gap-1.5 rounded-full px-4 py-1.5 text-sm text-muted-foreground/40"
+                >
+                  <Lock className="size-3" />
+                  {item.label}
+                </span>
+              ) : (
+                <Link
+                  key={item.to}
+                  to={item.to}
+                  activeOptions={{ exact: item.exact }}
+                  activeProps={{
+                    className: "rounded-full bg-secondary px-4 py-1.5 text-sm font-medium text-foreground",
+                  }}
+                  inactiveProps={{
+                    className:
+                      "rounded-full px-4 py-1.5 text-sm text-muted-foreground transition-colors hover:text-foreground",
+                  }}
+                >
+                  {item.label}
+                </Link>
+              ),
+            )}
+          </nav>
+          <div className="flex items-center gap-3">
+            {user ? (
+              <>
+                <span className="hidden text-sm text-muted-foreground sm:inline">{user.email}</span>
+                <button
+                  onClick={async () => {
+                    await signOut();
+                    navigate({ to: "/login" });
+                  }}
+                  className="rounded-full border border-border bg-glass px-5 py-2 text-sm font-semibold transition-colors hover:bg-secondary"
+                >
+                  Sign out
+                </button>
+              </>
+            ) : (
+              <button
+                onClick={() => navigate({ to: "/login" })}
+                className="rounded-full bg-primary px-5 py-2 text-sm font-semibold text-primary-foreground shadow-lg shadow-primary/30 transition-transform hover:-translate-y-0.5"
+              >
+                Sign in
+              </button>
+            )}
+          </div>
+        </header>
+        {/* Added 2026-11-13 per Mike: nothing stood in for the desktop pill-nav
+          above on mobile before this — that `nav` is `hidden` below the `md`
+          breakpoint with no equivalent, so none of these sections had any
+          way to be reached from a phone at all. A home-screen-style grid of
+          tiles (one per NAV entry, icon + label) is what he specifically
+          asked for when he said each section needed "its own tile to click
+          into" on mobile, not a cut-down version of the desktop pill row. */}
+        <nav className="relative z-10 mx-auto grid max-w-7xl grid-cols-3 gap-2 px-6 pb-3 sm:grid-cols-4 md:hidden">
           {NAV.map((item) =>
             item.requiresStep && !progress[item.requiresStep] ? (
               <span
                 key={item.to}
                 title={LOCK_TITLE[item.requiresStep]}
                 aria-disabled="true"
-                className="flex cursor-not-allowed items-center gap-1.5 rounded-full px-4 py-1.5 text-sm text-muted-foreground/40"
+                className="flex cursor-not-allowed flex-col items-center gap-1.5 rounded-2xl border border-border bg-glass px-2 py-3 text-center text-muted-foreground/30"
               >
-                <Lock className="size-3" />
-                {item.label}
+                <Lock className="size-5" />
+                <span className="text-[11px] font-medium leading-tight">{item.label}</span>
               </span>
             ) : (
               <Link
@@ -169,82 +269,22 @@ export function AppShell({ children }: { children?: ReactNode }) {
                 to={item.to}
                 activeOptions={{ exact: item.exact }}
                 activeProps={{
-                  className: "rounded-full bg-secondary px-4 py-1.5 text-sm font-medium text-foreground",
+                  className:
+                    "flex flex-col items-center gap-1.5 rounded-2xl border border-primary/50 bg-secondary px-2 py-3 text-center text-foreground",
                 }}
                 inactiveProps={{
                   className:
-                    "rounded-full px-4 py-1.5 text-sm text-muted-foreground transition-colors hover:text-foreground",
+                    "flex flex-col items-center gap-1.5 rounded-2xl border border-border bg-glass px-2 py-3 text-center text-muted-foreground transition-colors hover:text-foreground",
                 }}
               >
-                {item.label}
+                <item.Icon className="size-5" />
+                <span className="text-[11px] font-medium leading-tight">{item.label}</span>
               </Link>
             ),
           )}
         </nav>
-        <div className="flex items-center gap-3">
-          {user ? (
-            <>
-              <span className="hidden text-sm text-muted-foreground sm:inline">{user.email}</span>
-              <button
-                onClick={async () => {
-                  await signOut();
-                  navigate({ to: "/login" });
-                }}
-                className="rounded-full border border-border bg-glass px-5 py-2 text-sm font-semibold transition-colors hover:bg-secondary"
-              >
-                Sign out
-              </button>
-            </>
-          ) : (
-            <button
-              onClick={() => navigate({ to: "/login" })}
-              className="rounded-full bg-primary px-5 py-2 text-sm font-semibold text-primary-foreground shadow-lg shadow-primary/30 transition-transform hover:-translate-y-0.5"
-            >
-              Sign in
-            </button>
-          )}
-        </div>
-      </header>
-      {/* Added 2026-11-13 per Mike: nothing stood in for the desktop pill-nav
-          above on mobile before this — that `nav` is `hidden` below the `md`
-          breakpoint with no equivalent, so none of these sections had any
-          way to be reached from a phone at all. A home-screen-style grid of
-          tiles (one per NAV entry, icon + label) is what he specifically
-          asked for when he said each section needed "its own tile to click
-          into" on mobile, not a cut-down version of the desktop pill row. */}
-      <nav className="relative z-10 mx-auto grid max-w-7xl grid-cols-3 gap-2 px-6 pb-3 sm:grid-cols-4 md:hidden">
-        {NAV.map((item) =>
-          item.requiresStep && !progress[item.requiresStep] ? (
-            <span
-              key={item.to}
-              title={LOCK_TITLE[item.requiresStep]}
-              aria-disabled="true"
-              className="flex cursor-not-allowed flex-col items-center gap-1.5 rounded-2xl border border-border bg-glass px-2 py-3 text-center text-muted-foreground/30"
-            >
-              <Lock className="size-5" />
-              <span className="text-[11px] font-medium leading-tight">{item.label}</span>
-            </span>
-          ) : (
-            <Link
-              key={item.to}
-              to={item.to}
-              activeOptions={{ exact: item.exact }}
-              activeProps={{
-                className:
-                  "flex flex-col items-center gap-1.5 rounded-2xl border border-primary/50 bg-secondary px-2 py-3 text-center text-foreground",
-              }}
-              inactiveProps={{
-                className:
-                  "flex flex-col items-center gap-1.5 rounded-2xl border border-border bg-glass px-2 py-3 text-center text-muted-foreground transition-colors hover:text-foreground",
-              }}
-            >
-              <item.Icon className="size-5" />
-              <span className="text-[11px] font-medium leading-tight">{item.label}</span>
-            </Link>
-          ),
-        )}
-      </nav>
-      <main className="relative z-10 mx-auto max-w-7xl px-6 pb-20">{children ?? <Outlet />}</main>
-    </div>
+        <main className="relative z-10 mx-auto max-w-7xl px-6 pb-20">{children ?? <Outlet />}</main>
+      </div>
+    </OnboardingProgressContext.Provider>
   );
 }

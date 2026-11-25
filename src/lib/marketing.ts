@@ -5167,6 +5167,72 @@ async function fetchNativeCalendarDocs(monthId: string): Promise<CalendarDoc[]> 
   return docs;
 }
 
+export type CalendarParsingAuditRow = {
+  itemId: string;
+  month: string;
+  monthArchived: boolean;
+  docType: CalendarItem["docType"];
+  title: string;
+  preview: string;
+};
+
+// One-time admin audit (2026-11-25) — per Mike, after the Jen Almeida
+// "missing emails/video scripts/calendar posts" bug (see
+// parseCalendarItemWithFallback's comment above): before that fix, any
+// calendar item whose raw text didn't match the expected section-header
+// format was silently dropped by fetchNativeCalendarDocs with no error
+// anywhere. This scans every calendar item that currently exists (the
+// calendar is one shared list used by every agent, not per-agent — see
+// ManageCalendarScreen's own description) and reports every one that would
+// have failed under the OLD strict parsing (parseCalendarItemWithFallback,
+// before the raw-text fallback kicks in), so Mike can tell exactly which
+// items, across every month, were silently invisible until today's fix and
+// may need their affected agents' content regenerated. Read-only — doesn't
+// touch any data, just reports.
+export const auditCalendarParsingFailures = createServerFn({ method: "GET" })
+  .middleware([requireSupabaseAuth])
+  .handler(async ({ context }): Promise<CalendarParsingAuditRow[]> => {
+    const email = (context.claims as { email?: string } | undefined)?.email;
+    await requireAdmin(context.userId, email);
+    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+
+    const { data: months, error: monthsErr } = await supabaseAdmin
+      .from("content_calendar_months")
+      .select("id, month, archived");
+    if (monthsErr) throw monthsErr;
+    const monthInfoById = new Map((months ?? []).map((m) => [m.id, { month: m.month, archived: m.archived }]));
+
+    const { data: items, error: itemsErr } = await supabaseAdmin
+      .from("content_calendar_items")
+      .select("id, doc_type, title, raw_text, month_id")
+      .order("created_at", { ascending: true });
+    if (itemsErr) throw itemsErr;
+
+    const results: CalendarParsingAuditRow[] = [];
+    for (const row of items ?? []) {
+      const { rawText } = splitTargetDate(row.raw_text);
+      const cleaned = rawText
+        .replace(/\r\n/g, "\n")
+        .replace(/\\([[\]().*+?^${}|\\])/g, "$1")
+        .trim();
+      // A genuinely empty item was never going to generate anything either
+      // way — not what this audit is for.
+      if (!cleaned) continue;
+      const strictParsed = parseCalendarItemWithFallback(row.doc_type, cleaned, row.title);
+      if (strictParsed) continue;
+      const info = monthInfoById.get(row.month_id);
+      results.push({
+        itemId: row.id,
+        month: info?.month ?? "(month not found)",
+        monthArchived: info?.archived ?? false,
+        docType: row.doc_type as CalendarItem["docType"],
+        title: row.title,
+        preview: cleaned.slice(0, 160),
+      });
+    }
+    return results;
+  });
+
 export const readContentCalendar = createServerFn({ method: "GET" })
   .middleware([requireSupabaseAuth])
   .inputValidator((data: { agentId: string; monthId: string }) => data)

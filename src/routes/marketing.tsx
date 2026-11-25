@@ -95,13 +95,16 @@ import {
   type ChatMode,
   type ChatMessageRow,
   type CalendarParsingAuditRow,
+  getOnboardingProgress,
+  MIN_ONBOARDING_PHOTOS,
+  type OnboardingProgress,
 } from "@/lib/marketing";
 // Connect status lives in voice-dna.ts (the "Connect Facebook & Instagram"
 // card on My Brand writes it) — read-only here, just to know whether the
 // schedule box below should show platform options or a "connect first"
 // prompt. No cycle: voice-dna.ts imports FROM marketing.ts, not the other
 // way, and this file is a third module importing from both.
-import { getAgentSocialConnectStatus, getAgentVoiceProfile, type AgentSocialConnectStatus } from "@/lib/voice-dna";
+import { getAgentSocialConnectStatus, type AgentSocialConnectStatus } from "@/lib/voice-dna";
 // Type-only import (erased at build) — the runtime docx library is loaded
 // lazily inside buildContentDocxBlob() below instead of imported at the top
 // of the file, so its ~170KB gzipped bundle only ever downloads for someone
@@ -1054,7 +1057,16 @@ function MarketingPage() {
 // an agent's behalf is how onboarding usually gets finished in the first
 // place (uploading a headshot, running the interview with them on a call),
 // so locking admin out here would make it impossible to ever do that setup.
-function OnboardingGate({
+// UPGRADED 2026-11-25 per Mike's challenge-onboarding walkthrough — this
+// used to only check "brand done" (voice DNA + headshot + logo). Create My
+// Monthly Content now reflects the real Step 4 unlock: it only opens once
+// Step 3 (Build Your Database) is done, which itself requires Step 2
+// (photos) and Step 1 (brand) first. Reads the same getOnboardingProgress
+// this page's nav (AppShell) and Start Here already use, so the three
+// never disagree about whether someone's unlocked. Exported so Individual
+// Content (posts.tsx) — which unlocks on the exact same Step 3 signal — can
+// reuse this instead of growing its own separate copy.
+export function OnboardingGate({
   agentId,
   isAdmin,
   children,
@@ -1063,19 +1075,15 @@ function OnboardingGate({
   isAdmin: boolean;
   children: React.ReactNode;
 }) {
-  const [profile, setProfile] = useState<{
-    voice_summary: string | null;
-    headshot_url: string | null;
-    logo_url: string | null;
-  } | null>(null);
+  const [progress, setProgress] = useState<OnboardingProgress | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
     if (isAdmin) return;
-    setProfile(null);
+    setProgress(null);
     setError(null);
-    getAgentVoiceProfile({ data: { agentId } })
-      .then((p) => setProfile(p))
+    getOnboardingProgress({ data: { agentId } })
+      .then((p) => setProgress(p))
       .catch((e) => setError(e instanceof Error ? e.message : String(e)));
   }, [agentId, isAdmin]);
 
@@ -1087,32 +1095,30 @@ function OnboardingGate({
         <p className="text-sm text-destructive">{error}</p>
       </Card>
     );
-  if (!profile)
+  if (!progress)
     return (
       <Card className="mt-5">
         <p className="text-sm text-muted-foreground">Loading…</p>
       </Card>
     );
 
-  const complete = Boolean(profile.voice_summary) && Boolean(profile.headshot_url) && Boolean(profile.logo_url);
-  if (!complete) {
+  if (!progress.step3Database) {
     const missing = [
-      !profile.voice_summary && "the Voice DNA interview",
-      !profile.headshot_url && "a headshot",
-      !profile.logo_url && "a logo",
+      !progress.step1Brand && "My Brand",
+      !progress.step2Photos && `uploading at least ${MIN_ONBOARDING_PHOTOS} photos`,
+      !progress.step3Database && "building your database",
     ].filter((x): x is string => Boolean(x));
     return (
       <Card className="mt-5">
-        <h2 className="font-display text-lg font-semibold">Finish setting up your brand first</h2>
+        <h2 className="font-display text-lg font-semibold">Finish onboarding first</h2>
         <p className="mt-2 text-sm text-muted-foreground">
-          This section unlocks once you've completed {missing.join(", ")} — everything here is built from your Voice
-          DNA, headshot, and logo, so there isn't anything useful to show until those are in place.
+          This section unlocks once you've completed {missing.join(", ")} — see Start Here for exactly where you stand.
         </p>
         <Link
-          to="/voice"
+          to="/start-here"
           className="mt-4 inline-block rounded-2xl bg-primary px-5 py-2.5 text-sm font-semibold text-primary-foreground shadow-lg shadow-primary/30 transition-transform hover:-translate-y-0.5"
         >
-          Go finish my brand setup
+          Go to Start Here
         </Link>
       </Card>
     );

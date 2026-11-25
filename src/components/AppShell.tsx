@@ -1,9 +1,8 @@
 import { Link, Outlet, useNavigate } from "@tanstack/react-router";
 import { useEffect, useState, type ReactNode } from "react";
 import { useAuth } from "@/hooks/useAuth";
-import { Database, Sparkles, Calendar, MessagesSquare, Image, UserCircle, Lock } from "lucide-react";
-import { getMarketingAccess } from "@/lib/marketing";
-import { getAgentVoiceProfile } from "@/lib/voice-dna";
+import { Sparkles, Calendar, MessagesSquare, Image, UserCircle, Lock, ListChecks } from "lucide-react";
+import { getMarketingAccess, getOnboardingProgress, type OnboardingProgress } from "@/lib/marketing";
 // Real logo asset (2026-09-23) — restores Mike's actual white "Your
 // Marketing Dude" clapperboard logo after an earlier pass accidentally
 // reverted the header to a placeholder "YM" box (see the note on BrandMark
@@ -36,63 +35,89 @@ import logoWhite from "@/assets/logo-white.png";
 // the /posts and /media routes themselves keep their internal names
 // (AgentScopedPage's title prop in posts.tsx/media.tsx — updated to match),
 // only the label shown here changes.
-// `lockable` added 2026-11-16 per Mike's onboarding-gate follow-up: "No
-// other module, no app can be opened... until the DNA profile is taken...
-// They need to be grayed out, the buttons." The page-level OnboardingGate
-// (marketing.tsx) already blocks a locked agent's actual content once
-// they're on one of these pages; this is what blocks the NAV ITSELF from
-// ever being a clickable path there in the first place. My Brand stays
-// unlockable since it's where the gate gets satisfied, and Account stays
-// unlockable since it's just sign-out/account settings, not a content
-// module — same judgment call as leaving Build My Database out of the
-// page-level gate.
+//
+// RESTRUCTURED AGAIN 2026-11-25 per Mike's challenge-onboarding walkthrough:
+// "Start Here" is new and goes rightmost — a hub page for the 4-step
+// onboarding chain. "My Brand" and "Build My Database" move OUT of this top
+// nav entirely (they're still real pages, just reached only from Start Here
+// now) since both are "set up once, rarely revisited" — not worth the
+// top-nav real estate even though they're still open any time someone needs
+// to update their brand or database. Upload Photos/Videos stays here since
+// it's also Step 2 of onboarding AND the most frequently used screen day to
+// day. `requiresStep` replaces the old single `lockable` boolean — each item
+// now gates on whichever step actually unlocks it, not one shared "is brand
+// done" flag. See OnboardingProgress in marketing.ts for what each step
+// means and the 2026-11-06-style grandfather clause for existing agents.
 const NAV = [
-  { to: "/database", label: "Build My Database", exact: false, Icon: Database, lockable: true },
-  { to: "/voice", label: "My Brand", exact: false, Icon: Sparkles, lockable: false },
-  { to: "/marketing", label: "Create My Monthly Content", exact: false, Icon: Calendar, lockable: true },
-  { to: "/posts", label: "Individual Content", exact: false, Icon: MessagesSquare, lockable: true },
-  { to: "/media", label: "Upload Photos/Videos", exact: false, Icon: Image, lockable: true },
-  { to: "/account", label: "Account", exact: false, Icon: UserCircle, lockable: false },
+  {
+    to: "/marketing",
+    label: "Create My Monthly Content",
+    exact: false,
+    Icon: Calendar,
+    requiresStep: "step3Database" as const,
+  },
+  {
+    to: "/posts",
+    label: "Individual Content",
+    exact: false,
+    Icon: MessagesSquare,
+    requiresStep: "step3Database" as const,
+  },
+  { to: "/media", label: "Upload Photos/Videos", exact: false, Icon: Image, requiresStep: "step1Brand" as const },
+  { to: "/start-here", label: "Start Here", exact: false, Icon: ListChecks, requiresStep: null },
+  { to: "/account", label: "Account", exact: false, Icon: UserCircle, requiresStep: null },
 ] as const;
 
-const ONBOARDING_LOCK_TITLE = "Finish your Voice DNA profile, headshot, and logo in My Brand first";
+const LOCK_TITLE: Record<"step1Brand" | "step2Photos" | "step3Database", string> = {
+  step1Brand: "Finish your Voice DNA profile, headshot, and logo in My Brand first",
+  step2Photos: `Upload at least ${8} photos in Upload Photos/Videos first`,
+  step3Database: "Finish My Brand, upload your photos, and build your database first — see Start Here",
+};
 
-// Exported so index.tsx's home-page module cards (which duplicate this same
-// nav) can grey themselves out with the exact same signal instead of
-// re-deriving it.
-export function useOnboardingLock(): boolean {
+// A progress object that reports every step clear — the safe default for
+// admins, logged-out visitors, and any failed check. "Fail open" here on
+// purpose, same spirit as the rest of this file: a transient error should
+// never strand someone with a dead nav bar, and admins have never been
+// subject to this gate at all (they bypass it entirely elsewhere too).
+const UNLOCKED_PROGRESS: OnboardingProgress = {
+  legacy: true,
+  step1Brand: true,
+  step2Photos: true,
+  step3Database: true,
+  photoCount: 0,
+};
+
+// Exported so index.tsx's home-page module cards (which duplicate part of
+// this same nav) can grey themselves out with the exact same signal instead
+// of re-deriving it.
+export function useOnboardingProgress(): OnboardingProgress {
   const { user } = useAuth();
-  const [locked, setLocked] = useState(false);
+  const [progress, setProgress] = useState<OnboardingProgress>(UNLOCKED_PROGRESS);
 
   useEffect(() => {
     if (!user) {
-      setLocked(false);
+      setProgress(UNLOCKED_PROGRESS);
       return;
     }
     let cancelled = false;
     getMarketingAccess()
       .then(async (access) => {
         if (access.role !== "agent") {
-          if (!cancelled) setLocked(false);
+          if (!cancelled) setProgress(UNLOCKED_PROGRESS);
           return;
         }
-        const profile = await getAgentVoiceProfile({ data: { agentId: access.agentId } });
-        const complete =
-          Boolean(profile?.voice_summary) && Boolean(profile?.headshot_url) && Boolean(profile?.logo_url);
-        if (!cancelled) setLocked(!complete);
+        const p = await getOnboardingProgress({ data: { agentId: access.agentId } });
+        if (!cancelled) setProgress(p);
       })
       .catch(() => {
-        // A failed access/profile check should never strand someone with a
-        // dead nav bar — fail open, same spirit as every other
-        // transient-error fallback in this app.
-        if (!cancelled) setLocked(false);
+        if (!cancelled) setProgress(UNLOCKED_PROGRESS);
       });
     return () => {
       cancelled = true;
     };
   }, [user]);
 
-  return locked;
+  return progress;
 }
 
 // FIXED (2026-09-23) — this used to render a generic "YM" placeholder box.
@@ -118,7 +143,7 @@ export function AmbientBackground() {
 export function AppShell({ children }: { children?: ReactNode }) {
   const navigate = useNavigate();
   const { user, signOut } = useAuth();
-  const onboardingLocked = useOnboardingLock();
+  const progress = useOnboardingProgress();
   return (
     <div className="relative min-h-screen w-full overflow-hidden bg-background text-foreground">
       <AmbientBackground />
@@ -128,10 +153,10 @@ export function AppShell({ children }: { children?: ReactNode }) {
         </Link>
         <nav className="hidden items-center gap-1 rounded-full border border-border bg-glass px-1 py-1 backdrop-blur-xl md:flex">
           {NAV.map((item) =>
-            onboardingLocked && item.lockable ? (
+            item.requiresStep && !progress[item.requiresStep] ? (
               <span
                 key={item.to}
-                title={ONBOARDING_LOCK_TITLE}
+                title={LOCK_TITLE[item.requiresStep]}
                 aria-disabled="true"
                 className="flex cursor-not-allowed items-center gap-1.5 rounded-full px-4 py-1.5 text-sm text-muted-foreground/40"
               >
@@ -189,10 +214,10 @@ export function AppShell({ children }: { children?: ReactNode }) {
           into" on mobile, not a cut-down version of the desktop pill row. */}
       <nav className="relative z-10 mx-auto grid max-w-7xl grid-cols-3 gap-2 px-6 pb-3 sm:grid-cols-4 md:hidden">
         {NAV.map((item) =>
-          onboardingLocked && item.lockable ? (
+          item.requiresStep && !progress[item.requiresStep] ? (
             <span
               key={item.to}
-              title={ONBOARDING_LOCK_TITLE}
+              title={LOCK_TITLE[item.requiresStep]}
               aria-disabled="true"
               className="flex cursor-not-allowed flex-col items-center gap-1.5 rounded-2xl border border-border bg-glass px-2 py-3 text-center text-muted-foreground/30"
             >

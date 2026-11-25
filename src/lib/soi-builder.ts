@@ -41,7 +41,22 @@ import { callClaude } from "@/lib/marketing";
 // as a client instead.
 // ============================================================================
 
+// Cached across calls within the same server process/isolate (same pattern
+// as the main dashboard's own supabaseAdmin in client.server.ts) — added
+// 2026-11-25 as part of the "too many connections issued to the database"
+// hotfix. Before this, every single call on this page created a BRAND NEW
+// client, and after the challenge-onboarding step-gating change this file's
+// agentHasSoiUpload started getting called on nearly every page view across
+// the whole app (via getOnboardingProgress), not just when someone was
+// actually on Build My Database — a sharp, sustained jump in concurrent
+// connections to this SEPARATE Supabase project. Reusing one client doesn't
+// change behavior at all, it just stops multiplying connections for no
+// reason. See AppShell.tsx's OnboardingProgressContext for the other half of
+// this fix (cutting the actual number of calls, not just their cost).
+let _soiAdminClient: SupabaseClient | null = null;
+
 function getSoiAdminClient(): SupabaseClient {
+  if (_soiAdminClient) return _soiAdminClient;
   const url = process.env["SOI_SUPABASE_URL"];
   const serviceKey = process.env["SOI_SUPABASE_SERVICE_ROLE_KEY"];
   if (!url || !serviceKey) {
@@ -49,9 +64,10 @@ function getSoiAdminClient(): SupabaseClient {
       "Build My Database isn't connected yet — add SOI_SUPABASE_URL and SOI_SUPABASE_SERVICE_ROLE_KEY in Lovable Cloud -> Secrets.",
     );
   }
-  return createClient(url, serviceKey, {
+  _soiAdminClient = createClient(url, serviceKey, {
     auth: { persistSession: false, autoRefreshToken: false },
   });
+  return _soiAdminClient;
 }
 
 export type SoiAccess = { role: "team" } | { role: "client"; clientId: string; clientName: string } | { role: "none" };

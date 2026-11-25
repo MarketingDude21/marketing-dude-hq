@@ -110,6 +110,26 @@ export const getSoiAccess = createServerFn({ method: "GET" })
     return resolveAccessForEmail(admin, email);
   });
 
+// Added 2026-11-25 for the challenge onboarding gate (Step 3 — Build Your
+// Database): marketing.ts needs a cheap "has this agent ever uploaded
+// anything here" signal to decide whether Create My Monthly Content and
+// Individual Content unlock, per Mike: "any file ever uploaded" counts as
+// done — not file-processed, not contacts-extracted, just uploaded. Reuses
+// the exact same email-based access resolution every other function in this
+// file already goes through, rather than re-deriving a client id some other
+// way. Someone who's never opened Build My Database at all has no
+// client_access row yet (provisionSoiClient only creates one the first time
+// they visit) — that's role "none" below, correctly read as zero uploads.
+export async function agentHasSoiUpload(email: string | null | undefined): Promise<boolean> {
+  if (!email) return false;
+  const admin = getSoiAdminClient();
+  const access = await resolveAccessForEmail(admin, email);
+  if (access.role !== "client") return false;
+  const { data, error } = await admin.from("uploads").select("id").eq("client_id", access.clientId).limit(1);
+  if (error) throw error;
+  return (data ?? []).length > 0;
+}
+
 function randomSoiPassword(): string {
   const chars = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghjkmnpqrstuvwxyz23456789";
   let out = "";

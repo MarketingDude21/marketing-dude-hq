@@ -1146,10 +1146,21 @@ export function OnboardingGate({
 export function AgentScopedPage({
   title,
   tagline,
+  skipOnboardingGate = false,
   children,
 }: {
   title: string;
   tagline: string;
+  // Added 2026-11-25 — Start Here is the one AgentScopedPage caller whose
+  // entire job is showing onboarding progress, so it can never correctly sit
+  // behind OnboardingGate itself: that gate requires step3Database, which
+  // means a brand-new agent opening Start Here saw it lock its OWN content
+  // behind a "Go to Start Here" link back to the page they were already on
+  // (caught live on Pamala Spivey's account — Mike's "it's not going to the
+  // next page, it's stuck" report). Every other caller (media.tsx, posts.tsx,
+  // the exported AgentScopedPage usage generally) leaves this unset and keeps
+  // the real gate.
+  skipOnboardingGate?: boolean;
   children: (ctx: {
     agentId: string;
     agentEmail: string | null;
@@ -1325,14 +1336,23 @@ export function AgentScopedPage({
         agentName={selected.name}
         onChangeAgent={access.role === "admin" ? () => setSelected(null) : undefined}
       />
-      <OnboardingGate agentId={selected.id} isAdmin={access.role === "admin"}>
-        {children({
+      {skipOnboardingGate ? (
+        children({
           agentId: selected.id,
           agentEmail: selected.email,
           isAdmin: access.role === "admin",
           agentName: selected.name,
-        })}
-      </OnboardingGate>
+        })
+      ) : (
+        <OnboardingGate agentId={selected.id} isAdmin={access.role === "admin"}>
+          {children({
+            agentId: selected.id,
+            agentEmail: selected.email,
+            isAdmin: access.role === "admin",
+            agentName: selected.name,
+          })}
+        </OnboardingGate>
+      )}
     </AppShell>
   );
 }

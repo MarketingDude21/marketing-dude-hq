@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { createFileRoute, Link } from "@tanstack/react-router";
-import { AppShell } from "@/components/AppShell";
+import { AppShell, useOnboardingProgressContext } from "@/components/AppShell";
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { supabase } from "@/integrations/supabase/client";
 import {
@@ -1075,17 +1075,33 @@ export function OnboardingGate({
   isAdmin: boolean;
   children: React.ReactNode;
 }) {
-  const [progress, setProgress] = useState<OnboardingProgress | null>(null);
+  // Added 2026-11-25 (same-day hotfix) — reuse AppShell's own fetch of this
+  // agent's progress instead of firing a second, identical round trip
+  // (including a second hit on the separate SOI Builder project) whenever
+  // the agentId being viewed is the same one AppShell already fetched, which
+  // is always true for a non-admin agent viewing their own pages. See
+  // useOnboardingProgressContext in AppShell.tsx for why this is safe for
+  // admins too (it just won't match, so they fall through to the direct
+  // fetch below — moot anyway since admins bypass this gate entirely).
+  const shared = useOnboardingProgressContext();
+  const [progress, setProgress] = useState<OnboardingProgress | null>(
+    shared.agentId === agentId ? shared.progress : null,
+  );
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
     if (isAdmin) return;
+    if (shared.agentId === agentId) {
+      setProgress(shared.progress);
+      setError(null);
+      return;
+    }
     setProgress(null);
     setError(null);
     getOnboardingProgress({ data: { agentId } })
       .then((p) => setProgress(p))
       .catch((e) => setError(e instanceof Error ? e.message : String(e)));
-  }, [agentId, isAdmin]);
+  }, [agentId, isAdmin, shared.agentId, shared.progress]);
 
   if (isAdmin) return <>{children}</>;
 

@@ -98,7 +98,10 @@ import {
   getOnboardingProgress,
   MIN_ONBOARDING_PHOTOS,
   type OnboardingProgress,
+  sortAgentsByLastName,
+  getAgentApprovalDots,
 } from "@/lib/marketing";
+import { getStoredAdminAgent, setStoredAdminAgent } from "@/lib/admin-agent-selection";
 // Connect status lives in voice-dna.ts (the "Connect Facebook & Instagram"
 // card on My Brand writes it) — read-only here, just to know whether the
 // schedule box below should show platform options or a "connect first"
@@ -139,6 +142,23 @@ export const Route = createFileRoute("/marketing")({
 // pair of duplicate-looking rows has actually completed the Voice DNA
 // interview and which is the empty leftover.
 type AgentOption = { id: string; name: string; email: string | null; hasVoiceDna?: boolean };
+
+// Added 2026-11-26 per Mike's "Choose an agent" screen request — a small
+// colored dot per agent card showing whether their most recent month's
+// content still needs approval (red) or is fully approved (green); no dot
+// at all means they have no content yet. See getAgentApprovalDots in
+// marketing.ts for exactly what "most recent month" and "approved" mean.
+// Exported so voice.tsx's own separate "Choose an agent" picker can render
+// the exact same dot instead of a second copy that could drift.
+export function ApprovalDot({ status }: { status: "red" | "green" | undefined }) {
+  if (!status) return null;
+  return (
+    <span
+      title={status === "red" ? "Has content waiting on approval" : "This month's content is fully approved"}
+      className={`inline-block size-2 shrink-0 rounded-full ${status === "red" ? "bg-destructive" : "bg-emerald-500"}`}
+    />
+  );
+}
 
 type Post = {
   id: string;
@@ -810,7 +830,13 @@ function MarketingPage() {
   const [access, setAccess] = useState<MarketingAccess | null>(null);
   const [accessError, setAccessError] = useState<string | null>(null);
   const [agents, setAgents] = useState<AgentOption[]>([]);
-  const [selected, setSelected] = useState<AgentOption | null>(null);
+  // Initialized from sessionStorage (2026-11-26, per Mike: "you should
+  // remain in that profile until you click change agent") so this page
+  // opens straight into whichever agent was last picked on ANY of these
+  // admin picker screens, instead of always starting back at "Choose an
+  // agent" — see admin-agent-selection.ts.
+  const [selected, setSelected] = useState<AgentOption | null>(() => getStoredAdminAgent());
+  const [approvalDots, setApprovalDots] = useState<Record<string, "red" | "green">>({});
   const [showCalendarAdmin, setShowCalendarAdmin] = useState(false);
   // Delete-agent state (2026-09-30, per Mike's "duplicate accounts"
   // investigation) — confirmDeleteId gates a real click behind an inline
@@ -821,13 +847,21 @@ function MarketingPage() {
   const [deletingId, setDeletingId] = useState<string | null>(null);
   const [deleteError, setDeleteError] = useState<string | null>(null);
 
+  // Wraps setSelected so every pick/clear on this picker also updates the
+  // shared sessionStorage slot every other admin picker in the app reads —
+  // see admin-agent-selection.ts.
+  function selectAgent(agent: AgentOption | null) {
+    setSelected(agent);
+    setStoredAdminAgent(agent ? { id: agent.id, name: agent.name, email: agent.email } : null);
+  }
+
   useEffect(() => {
     getMarketingAccess()
       .then(async (a) => {
         setAccess(a);
         if (a.role === "admin") {
-          const list = await listMarketingAgents();
-          setAgents(
+          const [list, dots] = await Promise.all([listMarketingAgents(), getAgentApprovalDots()]);
+          const mapped = sortAgentsByLastName(
             list.map((ag) => ({
               id: ag.id,
               name: ag.full_name ?? ag.email ?? "Unnamed agent",
@@ -835,6 +869,21 @@ function MarketingPage() {
               hasVoiceDna: !!ag.voice_summary,
             })),
           );
+          setAgents(mapped);
+          setApprovalDots(dots);
+          // Reconcile a stored selection (from sessionStorage) against this
+          // fresh list — picks up the real hasVoiceDna flag, and clears the
+          // stored pick if that agent no longer exists (e.g. deleted since)
+          // so the picker shows instead of silently failing downstream.
+          setSelected((prev) => {
+            if (!prev) return prev;
+            const fresh = mapped.find((ag) => ag.id === prev.id);
+            if (!fresh) {
+              setStoredAdminAgent(null);
+              return null;
+            }
+            return fresh;
+          });
         } else if (a.role === "agent") {
           setSelected({ id: a.agentId, name: a.agentName, email: null });
         }
@@ -947,8 +996,9 @@ function MarketingPage() {
                   key={a.id}
                   className="relative rounded-2xl border border-border bg-glass px-4 py-3 text-sm font-medium transition-colors hover:bg-secondary"
                 >
-                  <button type="button" onClick={() => setSelected(a)} className="block w-full pr-14 text-left">
+                  <button type="button" onClick={() => selectAgent(a)} className="block w-full pr-14 text-left">
                     <span className="flex items-center gap-1.5">
+                      <ApprovalDot status={approvalDots[a.id]} />
                       {a.name}
                       {isDuplicateName && (
                         <span
@@ -1017,7 +1067,7 @@ function MarketingPage() {
     <AppShell>
       <PageHeader
         agentName={selected.name}
-        onChangeAgent={access.role === "admin" ? () => setSelected(null) : undefined}
+        onChangeAgent={access.role === "admin" ? () => selectAgent(null) : undefined}
       />
       <OnboardingGate agentId={selected.id} isAdmin={access.role === "admin"}>
         <Workspace agentId={selected.id} agentEmail={selected.email} isAdmin={access.role === "admin"} />
@@ -1171,18 +1221,28 @@ export function AgentScopedPage({
   const [access, setAccess] = useState<MarketingAccess | null>(null);
   const [accessError, setAccessError] = useState<string | null>(null);
   const [agents, setAgents] = useState<AgentOption[]>([]);
-  const [selected, setSelected] = useState<AgentOption | null>(null);
+  // Initialized from sessionStorage (2026-11-26, per Mike: "you should
+  // remain in that profile until you click change agent") — see
+  // admin-agent-selection.ts and the matching MarketingPage copy of this
+  // same pattern above.
+  const [selected, setSelected] = useState<AgentOption | null>(() => getStoredAdminAgent());
+  const [approvalDots, setApprovalDots] = useState<Record<string, "red" | "green">>({});
   const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
   const [deletingId, setDeletingId] = useState<string | null>(null);
   const [deleteError, setDeleteError] = useState<string | null>(null);
+
+  function selectAgent(agent: AgentOption | null) {
+    setSelected(agent);
+    setStoredAdminAgent(agent ? { id: agent.id, name: agent.name, email: agent.email } : null);
+  }
 
   useEffect(() => {
     getMarketingAccess()
       .then(async (a) => {
         setAccess(a);
         if (a.role === "admin") {
-          const list = await listMarketingAgents();
-          setAgents(
+          const [list, dots] = await Promise.all([listMarketingAgents(), getAgentApprovalDots()]);
+          const mapped = sortAgentsByLastName(
             list.map((ag) => ({
               id: ag.id,
               name: ag.full_name ?? ag.email ?? "Unnamed agent",
@@ -1190,6 +1250,17 @@ export function AgentScopedPage({
               hasVoiceDna: !!ag.voice_summary,
             })),
           );
+          setAgents(mapped);
+          setApprovalDots(dots);
+          setSelected((prev) => {
+            if (!prev) return prev;
+            const fresh = mapped.find((ag) => ag.id === prev.id);
+            if (!fresh) {
+              setStoredAdminAgent(null);
+              return null;
+            }
+            return fresh;
+          });
         } else if (a.role === "agent") {
           setSelected({ id: a.agentId, name: a.agentName, email: null });
         }
@@ -1266,8 +1337,9 @@ export function AgentScopedPage({
                   key={a.id}
                   className="relative rounded-2xl border border-border bg-glass px-4 py-3 text-sm font-medium transition-colors hover:bg-secondary"
                 >
-                  <button type="button" onClick={() => setSelected(a)} className="block w-full pr-14 text-left">
+                  <button type="button" onClick={() => selectAgent(a)} className="block w-full pr-14 text-left">
                     <span className="flex items-center gap-1.5">
+                      <ApprovalDot status={approvalDots[a.id]} />
                       {a.name}
                       {isDuplicateName && (
                         <span
@@ -1334,7 +1406,7 @@ export function AgentScopedPage({
         title={title}
         tagline={tagline}
         agentName={selected.name}
-        onChangeAgent={access.role === "admin" ? () => setSelected(null) : undefined}
+        onChangeAgent={access.role === "admin" ? () => selectAgent(null) : undefined}
       />
       {skipOnboardingGate ? (
         children({

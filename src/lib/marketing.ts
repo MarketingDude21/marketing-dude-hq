@@ -91,6 +91,90 @@ export const listMarketingAgents = createServerFn({ method: "GET" })
     return data;
   });
 
+// Added 2026-11-26 per Mike: "On any screen where we choose an agent's
+// profile to go into, these need to be in alphabetical order by last name."
+// listMarketingAgents itself still orders by full_name (first-name-first) —
+// sorting by LAST name needs each caller to re-sort client-side afterward,
+// since full_name is one column, not separate first/last ones. Takes the
+// final whitespace-separated token of the display name as the "last name"
+// key (good enough for every real name in this app — single-word names or
+// ones with a suffix just sort on their last token, which is harmless), and
+// falls back to the full name as a tiebreaker so two agents sharing a last
+// name stay in a stable order. Generic over anything with a `name` field so
+// every one of this app's 3 separate "Choose an agent" pickers (marketing.tsx
+// x2, voice.tsx) can reuse the exact same ordering instead of 3 copies that
+// could quietly drift apart.
+function lastNameKey(fullName: string): string {
+  const parts = fullName.trim().split(/\s+/).filter(Boolean);
+  const last = parts.length > 0 ? parts[parts.length - 1] : undefined;
+  return (last ?? fullName).toLowerCase();
+}
+
+export function sortAgentsByLastName<T extends { name: string }>(agents: T[]): T[] {
+  return [...agents].sort((a, b) => {
+    const byLast = lastNameKey(a.name).localeCompare(lastNameKey(b.name));
+    return byLast !== 0 ? byLast : a.name.localeCompare(b.name);
+  });
+}
+
+// Admin-only — added 2026-11-26 per Mike's "Choose an agent" screen request:
+// "We need a way to track when an agent approves their content after it's
+// generated... once content is generated per agent we want a red circle to
+// appear on their name card... Once the content is approved either by us or
+// by an agent it then turns green... Once the next month's content is
+// generated it resets to red again until it's approved." Computed live off
+// generated_posts rather than a stored flag, so there's nothing new to keep
+// in sync and no migration needed: "red" means this agent's MOST RECENT
+// month (the month string itself sorts correctly as YYYY-MM, so a plain
+// string max finds it) has at least one non-archived post that isn't
+// status "approved" yet (pending or flagged); "green" means that same
+// most-recent month has posts and every one of them is approved; an agent
+// with no non-archived posts in any month at all gets no entry (no dot).
+// This also self-corrects if more content gets added to an already-green
+// month later (goes red again immediately), which is the more correct
+// behavior even though Mike only described the cross-month case.
+export const getAgentApprovalDots = createServerFn({ method: "GET" })
+  .middleware([requireSupabaseAuth])
+  .handler(async ({ context }): Promise<Record<string, "red" | "green">> => {
+    const email = (context.claims as { email?: string } | undefined)?.email;
+    const access = await resolveAccess(context.userId, email);
+    if (access.role !== "admin") {
+      throw new Error("Only team members can view approval status.");
+    }
+    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+    const { data, error } = await supabaseAdmin
+      .from("generated_posts")
+      .select("agent_id, month, status")
+      .eq("archived", false);
+    if (error) throw error;
+    // month is nullable in the schema even though every real generated post
+    // has one set — filtering those out here (rather than widening every
+    // type below to `string | null`) means there's nothing to actually do
+    // with a monthless row anyway, since this whole function is "which
+    // month is most recent."
+    const rows = (data ?? []).filter((r): r is typeof r & { month: string } => r.month !== null);
+
+    const latestMonthByAgent = new Map<string, string>();
+    for (const row of rows) {
+      const current = latestMonthByAgent.get(row.agent_id);
+      if (!current || row.month > current) latestMonthByAgent.set(row.agent_id, row.month);
+    }
+
+    const hasAnyInLatestMonth = new Set<string>();
+    const hasUnapprovedInLatestMonth = new Set<string>();
+    for (const row of rows) {
+      if (latestMonthByAgent.get(row.agent_id) !== row.month) continue;
+      hasAnyInLatestMonth.add(row.agent_id);
+      if (row.status !== "approved") hasUnapprovedInLatestMonth.add(row.agent_id);
+    }
+
+    const result: Record<string, "red" | "green"> = {};
+    for (const agentId of hasAnyInLatestMonth) {
+      result[agentId] = hasUnapprovedInLatestMonth.has(agentId) ? "red" : "green";
+    }
+    return result;
+  });
+
 // Admin-only hard delete of a full agent record (2026-09-30, per Mike's
 // "duplicate accounts" investigation — he needs a way to remove a leftover
 // duplicate or an agent who's quit, and explicitly chose a real, permanent
@@ -5398,12 +5482,30 @@ const WEB_SEARCH_INSTRUCTION =
 // exactly seven minutes," "this job is hard until it isn't") — so rule 3
 // names that directly: the agent should come across as someone who likes
 // this job, not someone enduring it.
+//
+// FIXED same day, third pass — Mike reported live December content with
+// visible "READ BACK CHECK:" / "AUTHENTICITY CHECK:" / "QUALITY CHECK:"
+// blocks (full of checkmarks) saved directly into posts, reels, emails, and
+// video scripts, right alongside a web-search call's own "I'll search for
+// current data... Good, I have solid data now" narration showing up BEFORE
+// the actual script. Root cause: asking the model to "read the whole thing
+// back" (worded as an action) combined with webSearch mode (which already
+// makes a model more likely to narrate its own process as plain text) led
+// it to literally WRITE OUT its self-check as part of the answer instead of
+// just doing it and moving on. Added an explicit instruction telling it to
+// do the check silently and output nothing but the final content — see also
+// the stripProfanity-style backstop this same day in cleanCopy
+// (stripSelfCheckNarration) and the loosened HOOK regex in the video-script
+// branch of generateMonthlyBatch, both added as a second line of defense
+// since today's incident proved prompt compliance alone isn't reliable
+// enough for this.
 export const EMOTIONAL_INTELLIGENCE_CHECK =
   "\n\nBEFORE YOU FINISH, three absolute rules, then a read-back:\n" +
   "1. NO profanity or crude language, ever, under any circumstance — not even one word, not even if the agent's own voice sounds blunt, edgy, or unfiltered. Find a clean way to say it instead.\n" +
   "2. NO sarcasm, deflection, or joke that makes the agent sound dismissive, mean, or like a jerk toward anyone — a client, a colleague, or even themselves. Casual and funny is good; mean, eye-rolling, or 'ugh, people' in tone is not, even dressed up as relatable humor.\n" +
   "3. NEVER frame being an agent, or the actual work of it (showing houses, answering clients, closings, paperwork), as an inconvenience, a burden, or something to escape, avoid, or get through — even lightly, even as a throwaway line ('the houses will still be there,' 'finally some peace and quiet from the phone,' 'this job is hard until it isn't'). The agent should come across as someone who genuinely likes this job, not someone enduring it. A personal moment (coffee, a hobby, family time) can be the focus of a post — that's good, human content — but it should never be framed as relief FROM real estate, like the job is the thing getting in the way of their life.\n" +
-  "Then read the whole thing back the way a client would, not just as a one-liner you'd laugh at writing. Would any line make a client think the agent doesn't actually care about them or their messages, finds the real work of being an agent boring, a burden, or beneath them, is joking about being late, unreliable, or unprepared, or is just generally being a jerk or a Debbie Downer about the job? Playful and personality-forward is good and should stay — sounding like you don't care about clients, don't enjoy the work, or are mocking anyone is not. If a line could land that way, rework or cut it before finishing.";
+  "Then read the whole thing back the way a client would, not just as a one-liner you'd laugh at writing. Would any line make a client think the agent doesn't actually care about them or their messages, finds the real work of being an agent boring, a burden, or beneath them, is joking about being late, unreliable, or unprepared, or is just generally being a jerk or a Debbie Downer about the job? Playful and personality-forward is good and should stay — sounding like you don't care about clients, don't enjoy the work, or are mocking anyone is not. If a line could land that way, rework or cut it before finishing.\n\n" +
+  "Do this check silently, in your own head. Do NOT print the checklist, checkmarks, a 'READ BACK CHECK' section, word counts, source tables, or any other commentary about these rules as part of your answer — a client or agent will read your raw output directly, so it must contain ONLY the actual finished content in the exact Output format given below, nothing before it and nothing after it.";
 
 // Exported (was module-private) 2026-11-05 so soi-builder.ts's new contact
 // cleanup step can reuse the exact same Claude call this file already makes
@@ -5488,9 +5590,30 @@ function stripProfanity(text: string): string {
     .trim();
 }
 
+// Added 2026-11-25, same day, third pass — a hard backstop under the new
+// "do this check silently" instruction in EMOTIONAL_INTELLIGENCE_CHECK
+// above. Mike found live content (posts, reels, emails, video scripts) with
+// a visible "READ BACK CHECK:"/"AUTHENTICITY CHECK:"/"QUALITY CHECK:" block
+// (checkmarks and all) saved as part of the actual content, because the
+// model narrated its own self-check as output instead of doing it silently.
+// Every caller already extracts a specific labeled section out of Claude's
+// raw response (REWRITTEN:, EMAIL BODY:, HOOK onward) with a regex ending in
+// "to the end of the string" — so if the model appends a self-check AFTER
+// its real answer, that capture grabs it too. This cuts the text at the
+// first line that starts one of these sections, whichever extraction path a
+// caller used, so it's a backstop regardless of prompt compliance. None of
+// these phrases could ever legitimately open a line of real client-facing
+// copy, so this never risks cutting real content.
+const SELF_CHECK_PATTERN =
+  /\n{0,2}\s*(?:#+\s*)?(?:READ[- ]BACK CHECK|AUTHENTICITY CHECK|QUALITY CHECK|WORD COUNT|SOURCES?)\s*:[\s\S]*$/i;
+
+function stripSelfCheckNarration(text: string): string {
+  return text.replace(SELF_CHECK_PATTERN, "").trim();
+}
+
 function cleanCopy(text: string): string {
   return (
-    stripProfanity(text)
+    stripProfanity(stripSelfCheckNarration(text))
       .replace(/\*\*/g, "")
       .replace(/^["']|["']$/g, "")
       // Added 2026-11-04 per Mike: "NEED TO REMOVE ALL DASHES IN ANY AI
@@ -5863,8 +5986,21 @@ export const generateMonthlyBatch = createServerFn({ method: "POST" })
           // dropping anything Claude wrote before it. Falls back to the
           // full raw text if the model ever skips the HOOK label entirely,
           // so a format slip never means an empty script.
-          const hookMatch = videoRaw.match(/HOOK\s*(?:\([^)]*\))?\s*:[\s\S]*$/i);
-          const vraw = cleanCopy((hookMatch ? hookMatch[0] : videoRaw).trim());
+          //
+          // LOOSENED 2026-11-25 — this originally required a literal ":"
+          // right after "HOOK"/"HOOK (...)", which is exactly what the
+          // prompt's own template shows ("HOOK (first 3 seconds...):"). A
+          // live December script came back as "HOOK (0 to 3 sec)" with NO
+          // colon, so this regex's required `\s*:` never matched, hookMatch
+          // was null, and the full raw text — including a web-search
+          // narration preamble ("I'll search for current real estate
+          // data...") — got saved verbatim, the exact bug this fix was
+          // supposed to prevent. Now just finds the first LINE that starts
+          // with the word "HOOK" (anchored to line-start so it can't match
+          // "hook" used conversationally mid-sentence in narration) and
+          // keeps everything from there on, colon or no colon.
+          const hookLineMatch = videoRaw.match(/^[ \t]*HOOK\b.*$/im);
+          const vraw = cleanCopy((hookLineMatch ? videoRaw.slice(hookLineMatch.index!) : videoRaw).trim());
           return {
             agent_id: data.agentId,
             content: vraw,
@@ -6496,6 +6632,17 @@ async function captionPhotoInVoice(
     "Look at this photo and write a social media post that:\n1. Starts from what you actually see — the setting, the mood, the moment\n2. Sounds EXACTLY like this person based on their Voice DNA above\n3. Is 1-3 sentences max — short, human, texted-a-friend energy\n4. " +
     `${toneLine} Always work in a light, natural reminder that ` +
     `${agentName ?? "this person"} is in real estate — a quick aside, a joke, a callback, a one-liner — even when the photo has nothing to do with real estate (a coffee, a kid's game, a sunset). Keep the real estate nod small: a wink, never the whole point of the post, and never a pitch or a listing plug. If the photo IS an unmistakable real estate moment (a listing, a closing, a sign, a showing), let real estate be more central, same tone. ${reNodRule}\n` +
+    // Added 2026-11-25 per Mike, reviewing a real month's output: nearly
+    // every photo's real estate nod had converged on the exact same device —
+    // "same energy I bring to [helping someone find their home/closings/
+    // every client conversation]" — because these photos are each captioned
+    // independently (Promise.all, no caller sees what another photo in the
+    // same batch wrote), so every call, left with an open-ended "work in a
+    // nod" instruction, tends to land on the same safe, generic comparison.
+    // Named the exact overused line so the model actively avoids reaching
+    // for it again, and listed other devices so there's somewhere else to
+    // go instead of defaulting back to it.
+    'DO NOT default to "same energy I bring to..." or any close variant of it as your real estate nod — that exact device has been used so often it reads as a tic, not a voice. Vary HOW you make the nod from photo to photo: a direct one-line callback, a question, a specific client/listing memory, an observation about the moment that pivots naturally, or just an aside dropped mid-sentence. No two nods in different posts should use the same sentence structure.\n' +
     '5. Does NOT mention any specific location, city, neighborhood, or place name\n6. NO hyphens, NO corporate language, NO AI-tell phrases, no "As a real estate professional" or any version of that\n7. Standard capitalization — never write in all lowercase\n\n' +
     "Also describe what you see in the photo in one short sentence.\n\n" +
     "Separately, this photo may end up as a Reel with short text overlaid on screen — write 3 short text-overlay options for it (not captions, just the on-screen text itself), each using a different one of these frameworks, whichever actually fit what you see in THIS photo:\n\n" +

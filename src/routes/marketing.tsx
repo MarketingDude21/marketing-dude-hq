@@ -989,7 +989,6 @@ function MarketingPage() {
               // invisible, so each one now also shows its email — and any
               // name shared by more than one row gets a visible flag.
               const isDuplicateName = agents.filter((o) => o.name === a.name).length > 1;
-              const isConfirming = confirmDeleteId === a.id;
               const isDeleting = deletingId === a.id;
               return (
                 <div
@@ -1020,43 +1019,63 @@ function MarketingPage() {
                       {a.hasVoiceDna ? "✓ Voice DNA complete" : "— Voice DNA not started"}
                     </span>
                   </button>
-                  <div className="absolute right-2 top-2">
-                    {isConfirming ? (
-                      <div className="flex w-40 flex-col items-end gap-1.5 rounded-xl border border-destructive/40 bg-background p-2 shadow-lg">
-                        <p className="text-right text-[10px] leading-snug text-destructive">
-                          Permanently delete {a.name}? Their posts, photos, and Voice DNA go too — this can't be undone.
-                        </p>
-                        <div className="flex gap-1">
-                          <Button variant="danger" disabled={isDeleting} onClick={() => handleDeleteAgent(a.id)}>
-                            {isDeleting ? "Deleting…" : "Yes, delete"}
-                          </Button>
-                          <button
-                            type="button"
-                            disabled={isDeleting}
-                            onClick={() => setConfirmDeleteId(null)}
-                            className="rounded-full border border-border px-3 py-1 text-xs disabled:opacity-50"
-                          >
-                            Cancel
-                          </button>
-                        </div>
-                      </div>
-                    ) : (
-                      <button
-                        type="button"
-                        title="Delete this agent"
-                        onClick={() => setConfirmDeleteId(a.id)}
-                        className="rounded-full px-2 py-1 text-xs text-muted-foreground hover:text-destructive"
-                      >
-                        Delete
-                      </button>
-                    )}
-                  </div>
+                  <button
+                    type="button"
+                    title="Delete this agent"
+                    onClick={() => setConfirmDeleteId(a.id)}
+                    className="absolute right-2 top-2 rounded-full px-2 py-1 text-xs text-muted-foreground hover:text-destructive"
+                  >
+                    Delete
+                  </button>
                 </div>
               );
             })}
             {agents.length === 0 && <p className="text-sm text-muted-foreground">No agents yet.</p>}
           </div>
         </Card>
+        {/* Delete confirmation — added 2026-11-26 per Mike: "the delete button is
+            broken. It took me to Chuck Weibergs media libraby when I tried to
+            delete." This used to render as a small box anchored to that one
+            card's own top-right corner (position: absolute, right-2/top-2).
+            Once expanded with the confirm text + 2 buttons, that box is taller
+            than the small corner slot it's squeezed into, so for any agent NOT
+            in the last row it visually overflowed DOWN into the card directly
+            below it — a real misclick risk, not just a visual glitch, since
+            Mike was aiming for "Yes, delete"/"Cancel" and landed on that other
+            agent's own full-card button underneath instead, which is exactly
+            what happened. A single shared Dialog (this app's existing modal
+            component, already imported above) renders centered on screen with
+            its own backdrop instead, so there is nothing for it to ever overlap
+            no matter which agent or which grid position is being deleted. */}
+        <Dialog open={!!confirmDeleteId} onOpenChange={(open) => !open && setConfirmDeleteId(null)}>
+          <DialogContent>
+            <DialogHeader>
+              <DialogTitle>Permanently delete this agent?</DialogTitle>
+            </DialogHeader>
+            <p className="text-sm text-muted-foreground">
+              Permanently delete {agents.find((ag) => ag.id === confirmDeleteId)?.name ?? "this agent"}? Their posts,
+              photos, and Voice DNA go too — this can't be undone.
+            </p>
+            {deleteError && <p className="text-xs text-destructive">{deleteError}</p>}
+            <div className="flex justify-end gap-2">
+              <button
+                type="button"
+                disabled={!!deletingId}
+                onClick={() => setConfirmDeleteId(null)}
+                className="rounded-full border border-border px-4 py-2 text-sm disabled:opacity-50"
+              >
+                Cancel
+              </button>
+              <Button
+                variant="danger"
+                disabled={!!deletingId}
+                onClick={() => confirmDeleteId && handleDeleteAgent(confirmDeleteId)}
+              >
+                {deletingId ? "Deleting…" : "Yes, delete"}
+              </Button>
+            </div>
+          </DialogContent>
+        </Dialog>
       </AppShell>
     );
   }
@@ -1330,7 +1349,6 @@ export function AgentScopedPage({
           <div className="mt-4 grid gap-2 sm:grid-cols-2 lg:grid-cols-3">
             {agents.map((a) => {
               const isDuplicateName = agents.filter((o) => o.name === a.name).length > 1;
-              const isConfirming = confirmDeleteId === a.id;
               const isDeleting = deletingId === a.id;
               return (
                 <div
@@ -1357,43 +1375,63 @@ export function AgentScopedPage({
                       {a.hasVoiceDna ? "✓ Voice DNA complete" : "— Voice DNA not started"}
                     </span>
                   </button>
-                  <div className="absolute right-2 top-2">
-                    {isConfirming ? (
-                      <div className="flex w-40 flex-col items-end gap-1.5 rounded-xl border border-destructive/40 bg-background p-2 shadow-lg">
-                        <p className="text-right text-[10px] leading-snug text-destructive">
-                          Permanently delete {a.name}? Their posts, photos, and Voice DNA go too — this can't be undone.
-                        </p>
-                        <div className="flex gap-1">
-                          <Button variant="danger" disabled={isDeleting} onClick={() => handleDeleteAgent(a.id)}>
-                            {isDeleting ? "Deleting…" : "Yes, delete"}
-                          </Button>
-                          <button
-                            type="button"
-                            disabled={isDeleting}
-                            onClick={() => setConfirmDeleteId(null)}
-                            className="rounded-full border border-border px-3 py-1 text-xs disabled:opacity-50"
-                          >
-                            Cancel
-                          </button>
-                        </div>
-                      </div>
-                    ) : (
-                      <button
-                        type="button"
-                        title="Delete this agent"
-                        onClick={() => setConfirmDeleteId(a.id)}
-                        className="rounded-full px-2 py-1 text-xs text-muted-foreground hover:text-destructive"
-                      >
-                        Delete
-                      </button>
-                    )}
-                  </div>
+                  <button
+                    type="button"
+                    title="Delete this agent"
+                    onClick={() => setConfirmDeleteId(a.id)}
+                    className="absolute right-2 top-2 rounded-full px-2 py-1 text-xs text-muted-foreground hover:text-destructive"
+                  >
+                    Delete
+                  </button>
                 </div>
               );
             })}
             {agents.length === 0 && <p className="text-sm text-muted-foreground">No agents yet.</p>}
           </div>
         </Card>
+        {/* Delete confirmation — added 2026-11-26 per Mike: "the delete button is
+            broken. It took me to Chuck Weibergs media libraby when I tried to
+            delete." This used to render as a small box anchored to that one
+            card's own top-right corner (position: absolute, right-2/top-2).
+            Once expanded with the confirm text + 2 buttons, that box is taller
+            than the small corner slot it's squeezed into, so for any agent NOT
+            in the last row it visually overflowed DOWN into the card directly
+            below it — a real misclick risk, not just a visual glitch, since
+            Mike was aiming for "Yes, delete"/"Cancel" and landed on that other
+            agent's own full-card button underneath instead, which is exactly
+            what happened. A single shared Dialog (this app's existing modal
+            component, already imported above) renders centered on screen with
+            its own backdrop instead, so there is nothing for it to ever overlap
+            no matter which agent or which grid position is being deleted. */}
+        <Dialog open={!!confirmDeleteId} onOpenChange={(open) => !open && setConfirmDeleteId(null)}>
+          <DialogContent>
+            <DialogHeader>
+              <DialogTitle>Permanently delete this agent?</DialogTitle>
+            </DialogHeader>
+            <p className="text-sm text-muted-foreground">
+              Permanently delete {agents.find((ag) => ag.id === confirmDeleteId)?.name ?? "this agent"}? Their posts,
+              photos, and Voice DNA go too — this can't be undone.
+            </p>
+            {deleteError && <p className="text-xs text-destructive">{deleteError}</p>}
+            <div className="flex justify-end gap-2">
+              <button
+                type="button"
+                disabled={!!deletingId}
+                onClick={() => setConfirmDeleteId(null)}
+                className="rounded-full border border-border px-4 py-2 text-sm disabled:opacity-50"
+              >
+                Cancel
+              </button>
+              <Button
+                variant="danger"
+                disabled={!!deletingId}
+                onClick={() => confirmDeleteId && handleDeleteAgent(confirmDeleteId)}
+              >
+                {deletingId ? "Deleting…" : "Yes, delete"}
+              </Button>
+            </div>
+          </DialogContent>
+        </Dialog>
       </AppShell>
     );
   }

@@ -46,13 +46,21 @@ import {
 // exact same way here as it already is there, instead of a second copy of
 // that logic. See the "Build My Brand — admin act as agent" comment block
 // in voice-dna.ts for the full story on why this page needed it.
-import { getMarketingAccess, listMarketingAgents, type MarketingAccess, type ChatMessageRow } from "@/lib/marketing";
+import {
+  getMarketingAccess,
+  listMarketingAgents,
+  sortAgentsByLastName,
+  getAgentApprovalDots,
+  type MarketingAccess,
+  type ChatMessageRow,
+} from "@/lib/marketing";
+import { getStoredAdminAgent, setStoredAdminAgent } from "@/lib/admin-agent-selection";
 // MicButton is a UI component (not a server function), so it comes from the
 // routes file where it's defined, same path posts.tsx/media.tsx already use
 // to reuse AgentScopedPage from this same file — added 2026-11-15 so Content
 // Branding Strategy and the Bio Writer's free-text fields get the same
 // voice-dictation input every other long-text box in the app already has.
-import { MicButton } from "@/routes/marketing";
+import { MicButton, ApprovalDot } from "@/routes/marketing";
 
 export const Route = createFileRoute("/voice")({
   head: () => ({
@@ -252,7 +260,18 @@ function VoicePage() {
   const [access, setAccess] = useState<MarketingAccess | null>(null);
   const [accessError, setAccessError] = useState<string | null>(null);
   const [agents, setAgents] = useState<AgentOption[]>([]);
-  const [selected, setSelected] = useState<AgentOption | null>(null);
+  // Initialized from sessionStorage (2026-11-26, per Mike: "you should
+  // remain in that profile until you click change agent") — shared with
+  // marketing.tsx's 2 admin pickers via admin-agent-selection.ts, so picking
+  // an agent on Monthly Marketing/Media/Posts/Start Here and then clicking
+  // into My Brand lands on that same agent instead of asking again.
+  const [selected, setSelected] = useState<AgentOption | null>(() => getStoredAdminAgent());
+  const [approvalDots, setApprovalDots] = useState<Record<string, "red" | "green">>({});
+
+  function selectAgent(agent: AgentOption | null) {
+    setSelected(agent);
+    setStoredAdminAgent(agent ? { id: agent.id, name: agent.name, email: agent.email } : null);
+  }
 
   useEffect(() => {
     if (!user) return;
@@ -260,14 +279,25 @@ function VoicePage() {
       .then(async (a) => {
         setAccess(a);
         if (a.role === "admin") {
-          const list = await listMarketingAgents();
-          setAgents(
+          const [list, dots] = await Promise.all([listMarketingAgents(), getAgentApprovalDots()]);
+          const mapped = sortAgentsByLastName(
             list.map((ag) => ({
               id: ag.id,
               name: ag.full_name ?? ag.email ?? "Unnamed agent",
               email: ag.email ?? null,
             })),
           );
+          setAgents(mapped);
+          setApprovalDots(dots);
+          setSelected((prev) => {
+            if (!prev) return prev;
+            const fresh = mapped.find((ag) => ag.id === prev.id);
+            if (!fresh) {
+              setStoredAdminAgent(null);
+              return null;
+            }
+            return fresh;
+          });
         } else if (a.role === "agent") {
           setSelected({ id: a.agentId, name: a.agentName, email: null });
         }
@@ -337,10 +367,13 @@ function VoicePage() {
               {agents.map((a) => (
                 <button
                   key={a.id}
-                  onClick={() => setSelected(a)}
+                  onClick={() => selectAgent(a)}
                   className="rounded-2xl border border-border bg-glass px-4 py-3 text-left text-sm font-medium transition-colors hover:bg-secondary"
                 >
-                  {a.name}
+                  <span className="flex items-center gap-1.5">
+                    <ApprovalDot status={approvalDots[a.id]} />
+                    {a.name}
+                  </span>
                   {a.email && <span className="mt-0.5 block text-xs font-normal text-muted-foreground">{a.email}</span>}
                 </button>
               ))}
@@ -359,7 +392,7 @@ function VoicePage() {
       agentId={selected.id}
       agentName={selected.name}
       isAdmin={access.role === "admin"}
-      onChangeAgent={access.role === "admin" ? () => setSelected(null) : undefined}
+      onChangeAgent={access.role === "admin" ? () => selectAgent(null) : undefined}
     />
   );
 }

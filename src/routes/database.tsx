@@ -27,10 +27,14 @@ import {
   clearAppendDataStaging,
   cleanContactRows,
   updateReviewContact,
+  resolveSoiClientIdByEmail,
+  resolveSoiClientEmail,
   type SoiAccess,
   type ContactCleanupReport,
   type DatazappRowOverride,
 } from "@/lib/soi-builder";
+import { resolveAgentByEmail } from "@/lib/marketing";
+import { getStoredAdminAgent, setStoredAdminAgent } from "@/lib/admin-agent-selection";
 
 export const Route = createFileRoute("/database")({
   head: () => ({
@@ -588,6 +592,34 @@ function DatabasePage() {
   const [clients, setClients] = useState<ClientOption[]>([]);
   const [selected, setSelected] = useState<ClientOption | null>(null);
 
+  // Added 2026-11-27 per Mike: picking an agent on the main dashboard side
+  // (Monthly Marketing/My Brand/Start Here, which already share a
+  // sessionStorage selection — see admin-agent-selection.ts) should carry
+  // over here too, not land back on "Choose a client" every time — he hit
+  // this exact thing clicking Start Here's own "Build Your Database" step.
+  // Wraps setSelected so picking (or clearing) a client here also updates
+  // that same shared slot, resolving the client's email to the matching
+  // `agents` row over there first (see resolveSoiClientEmail /
+  // resolveAgentByEmail) since the 2 systems have no id in common.
+  function selectClient(client: ClientOption | null) {
+    setSelected(client);
+    if (!client) {
+      setStoredAdminAgent(null);
+      return;
+    }
+    resolveSoiClientEmail({ data: { clientId: client.id } })
+      .then(({ email }) => {
+        if (!email) return;
+        return resolveAgentByEmail({ data: { email } }).then((agent) => {
+          if (agent) setStoredAdminAgent({ id: agent.id, name: agent.name, email: agent.email });
+        });
+      })
+      .catch(() => {
+        // Non-fatal — worst case this pick just doesn't carry over to the
+        // other pages, same as before this feature existed.
+      });
+  }
+
   useEffect(() => {
     getSoiAccess()
       .then(async (a) => {
@@ -599,7 +631,21 @@ function DatabasePage() {
         setAccess(resolved);
         if (resolved.role === "team") {
           const list = await listSoiClients();
-          setClients(list.map((c) => ({ id: c.id, name: c.name })));
+          const mapped = list.map((c) => ({ id: c.id, name: c.name }));
+          setClients(mapped);
+          // Reconcile against whoever's selected on the main dashboard
+          // side, if anyone — see the comment on selectClient above.
+          const stored = getStoredAdminAgent();
+          if (stored?.email) {
+            try {
+              const { clientId } = await resolveSoiClientIdByEmail({ data: { email: stored.email } });
+              const match = clientId ? mapped.find((c) => c.id === clientId) : undefined;
+              if (match) setSelected(match);
+            } catch {
+              // Non-fatal — just shows the picker, same as before this
+              // feature existed.
+            }
+          }
         } else if (resolved.role === "client") {
           setSelected({ id: resolved.clientId, name: resolved.clientName });
         }
@@ -653,7 +699,7 @@ function DatabasePage() {
             {clients.map((c) => (
               <button
                 key={c.id}
-                onClick={() => setSelected(c)}
+                onClick={() => selectClient(c)}
                 className="rounded-2xl border border-border bg-glass px-4 py-3 text-left text-sm font-medium transition-colors hover:bg-secondary"
               >
                 {c.name}
@@ -672,7 +718,7 @@ function DatabasePage() {
     <AppShell>
       <PageHeader
         clientName={selected.name}
-        onChangeClient={access.role === "team" ? () => setSelected(null) : undefined}
+        onChangeClient={access.role === "team" ? () => selectClient(null) : undefined}
       />
       <Workspace clientId={selected.id} clientName={selected.name} />
     </AppShell>
@@ -1712,14 +1758,15 @@ function AppendDataTab({ clientId, clientName }: { clientId: string; clientName:
           <div>
             <h2 className="font-display text-lg font-semibold">Append Data</h2>
             <p className="mt-1 text-sm text-muted-foreground">
-              Upload the file DataZapp sent back after appending emails/direct mail addresses to the contacts you sent
-              it. Matching never looks anything up — it's a standalone pass over just this file, checking DataZapp's own
-              appended name against the original name already in the same file before trusting the appended data. Common
-              nicknames (Mike/Michael, Kate/Catherine) count as a match, and a same-household match (last name agrees,
-              first name doesn't) still gets the mailing address, just not the email. Once you review and keep a row
-              here, it gets saved as its own "Appended Full Data" list (next to Final Full Contact on the Export tab) as
-              well as a CSV you can download right away. Every checkbox below saves automatically as you click it —
-              anyone else who opens this screen for this client sees the same list, up to date.
+              Upload the file DataZapp sent back after appending emails or direct-mail addresses to the contacts you
+              sent them. We check DataZapp's own appended name against the original name already in the file before
+              trusting any of it — common nicknames (Mike/Michael, Kate/Catherine) count as a match, and a
+              same-household match (last name agrees, first name doesn't) still gets the mailing address, just not the
+              email. Once you check who to keep below and click to add them, that data is written straight into this
+              client's database — filling in whatever was missing (email, phone, address, city, state, zip) without
+              overwriting anything already there — and saved as its own "Appended Full Data" list (Export tab, under
+              Marketable). Every checkbox below saves automatically as you click it — anyone else who opens this screen
+              for this client sees the same list, up to date.
             </p>
           </div>
           {fileName && (
@@ -1753,7 +1800,11 @@ function AppendDataTab({ clientId, clientName }: { clientId: string; clientName:
       {preview && !finalizeResult && (
         <>
           <Card>
-            <h3 className="font-display text-base font-semibold">{preview.total} rows checked</h3>
+            <h3 className="font-display text-base font-semibold">Here's who we found data for</h3>
+            <p className="mt-1 text-sm text-muted-foreground">
+              Check the box next to everyone whose data you want added to this client's marketing lists — everyone
+              starts checked, so just uncheck anyone you don't want.
+            </p>
             <div className="mt-3 grid gap-2 sm:grid-cols-2">
               {(["confirmed", "household", "mismatch", "no_data"] as const).map((tier) => (
                 <div key={tier} className="rounded-2xl border border-border bg-glass px-4 py-3">
@@ -1762,14 +1813,6 @@ function AppendDataTab({ clientId, clientName }: { clientId: string; clientName:
                 </div>
               ))}
             </div>
-            {preview.doNotCallCount > 0 && (
-              <p className="mt-3 text-sm text-muted-foreground">
-                {preview.doNotCallCount} row{preview.doNotCallCount === 1 ? "" : "s"} came back flagged Do Not Call by
-                DataZapp. That flag is informational only here - it has never excluded anyone from review, from being
-                kept below, or from the email list. These are relationships, not cold-call targets, so nothing in this
-                app filters on it.
-              </p>
-            )}
             {preview.possibleBusinessCount > 0 && (
               <p className="mt-1 text-sm text-muted-foreground">
                 {preview.possibleBusinessCount} came back with a company name attached — worth a look before treating
@@ -1798,7 +1841,7 @@ function AppendDataTab({ clientId, clientName }: { clientId: string; clientName:
                   uncheck anyone you don't want on the final list.
                 </p>
                 <Button onClick={handleFinalize} disabled={busy || checkedCount === 0}>
-                  {busy ? "Working…" : `Download the list (${checkedCount} kept)`}
+                  {busy ? "Saving…" : `Add ${checkedCount} to database`}
                 </Button>
               </div>
               <input
@@ -2056,7 +2099,7 @@ function AppendDataTab({ clientId, clientName }: { clientId: string; clientName:
                   kept — uncheck anyone you don't want on the email list.
                 </p>
                 <Button onClick={handleEmailFinalize} disabled={emailBusy || emailCheckedCount === 0}>
-                  {emailBusy ? "Working…" : `Download the email list (${emailCheckedCount} kept)`}
+                  {emailBusy ? "Saving…" : `Add ${emailCheckedCount} to database`}
                 </Button>
               </div>
               <input

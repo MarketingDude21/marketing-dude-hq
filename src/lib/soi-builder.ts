@@ -2254,6 +2254,7 @@ export type ContactCleanupReport = {
   addressesSplit: number;
   phonesFormatted: number;
   internationalRemoved: number;
+  phonesRecoveredFromNotes: number;
 };
 
 // A clear "+" followed by a digit that isn't "1" is the only signal this
@@ -2284,6 +2285,133 @@ function normalizePhone(raw: string): { formatted: string; isInternational: bool
   // stray extension, etc.) - leave it exactly as it was rather than guess.
   return { formatted: trimmed, isInternational: false, wasFormatted: false };
 }
+
+// ----------------------------------------------------------------------
+// Phone numbers trapped in a free-text Notes field. Added 2026-11-27 per
+// Mike, looking at real exports (the "Sean Buffine FInal" / O'Donnell list)
+// where the Phone column is blank but the Notes column has something like
+// "PHONE NUMBER--PRIMARY: 760-468-5482 Randy OTHER PHONE #1: 760-420-5625
+// Martha" - a note written once for a couple, sitting on only ONE of their
+// two contact rows. The trailing word after a number (when there is
+// exactly one number in that callout) is read as a first name saying who
+// that number actually belongs to - which is very often NOT the row it's
+// sitting on. parsePhoneTagsFromNotes pulls out {phone, nameTag, isPrimary}
+// for every "PHONE NUMBER--PRIMARY:" / "OTHER PHONE #<n>:" callout in one
+// notes string; recoverPhonesFromNotesRows then uses those tags across a
+// whole batch of rows at once: first to fill in a row's OWN blank phone
+// from a tag matching ITS OWN first name (or an untagged PRIMARY callout,
+// which in every real example is the row owner's own number), then, for
+// anyone still blank, by checking every OTHER row at the SAME address for a
+// tag matching THIS row's first name (Martha's blank phone gets filled from
+// the "Martha" tag sitting inside Randy's notes, because they share an
+// address). Two deliberately conservative calls: a callout with more than
+// one number in it (slash-separated alternates) never gets a name tag at
+// all, even if one follows - with two candidates and one name there's no
+// way to tell which number it means, and a silent wrong guess on a shared
+// household phone is worse than leaving that one blank; and this never
+// touches the Notes column itself, only ever fills an EMPTY Phone field -
+// same blank-fill-only rule as everywhere else in this file.
+const PHONE_MARKER_RE = /PHONE NUMBER--PRIMARY:|OTHER PHONE #\d+:/gi;
+const PHONE_NUMBER_RE_G = /(?:\+?1[\s.-]?)?\(?\d{3}\)?[\s.-]?\d{3}[\s.-]?\d{4}/g;
+
+type NotesPhoneTag = { phone: string; nameTag: string | null; isPrimary: boolean };
+
+function parsePhoneTagsFromNotes(notes: string | null | undefined): NotesPhoneTag[] {
+  if (!notes) return [];
+  const markers = [...notes.matchAll(PHONE_MARKER_RE)];
+  if (markers.length === 0) return [];
+  const tags: NotesPhoneTag[] = [];
+  for (let i = 0; i < markers.length; i++) {
+    const marker = markers[i];
+    if (!marker) continue;
+    const next = markers[i + 1];
+    const start = (marker.index ?? 0) + marker[0].length;
+    const end = next ? (next.index ?? notes.length) : notes.length;
+    const segment = notes.slice(start, end).trim();
+    const numberMatches = [...segment.matchAll(PHONE_NUMBER_RE_G)];
+    const firstNumber = numberMatches[0];
+    if (!firstNumber) continue;
+    const normalized = normalizePhone(firstNumber[0]);
+    if (normalized.isInternational || !normalized.formatted) continue;
+    let rest = segment;
+    for (const m of numberMatches) rest = rest.split(m[0]).join(" ");
+    rest = rest.replace(/[/,]/g, " ").replace(/\s+/g, " ").trim();
+    // Only a single clean word, and only when there was exactly one number
+    // in this callout - see the ambiguity note above.
+    const nameTag = numberMatches.length === 1 && /^[A-Za-z][A-Za-z'.-]{1,24}$/.test(rest) ? rest : null;
+    tags.push({ phone: normalized.formatted, nameTag, isPrimary: /PRIMARY/i.test(marker[0]) });
+  }
+  return tags;
+}
+
+type NotesPhoneItem<K> = {
+  key: K;
+  firstName: string | null | undefined;
+  phone: string | null | undefined;
+  notes: string | null | undefined;
+  address: string | null | undefined;
+  city: string | null | undefined;
+  state: string | null | undefined;
+  zip: string | null | undefined;
+};
+
+// Generic over the "key" used to identify a row (a row index for a freshly
+// uploaded CSV, a contact id for an existing database backfill) so both
+// cleanContactRows below and the one-time backfill action can share this
+// exact same matching logic rather than two versions drifting apart.
+function recoverPhonesFromNotesRows<K>(items: NotesPhoneItem<K>[]): Map<K, string> {
+  const addrOf = (it: NotesPhoneItem<K>) =>
+    [it.address, it.city, it.state, it.zip].map((v) => (v ?? "").trim().toLowerCase()).join("|");
+
+  const ownByKey = new Map<K, string | null>();
+  const byAddress = new Map<string, { phone: string; nameTag: string }[]>();
+
+  for (const it of items) {
+    const tags = parsePhoneTagsFromNotes(it.notes);
+    if (tags.length === 0) {
+      ownByKey.set(it.key, null);
+      continue;
+    }
+    const ownFirst = (it.firstName ?? "").trim().toLowerCase();
+    let ownPhone: string | null = null;
+    const others: { phone: string; nameTag: string }[] = [];
+    for (const tag of tags) {
+      const matchesOwn = !!ownFirst && !!tag.nameTag && tag.nameTag.trim().toLowerCase() === ownFirst;
+      const untaggedPrimary = tag.isPrimary && !tag.nameTag;
+      if (!ownPhone && (matchesOwn || untaggedPrimary)) {
+        ownPhone = tag.phone;
+      } else if (tag.nameTag) {
+        others.push({ phone: tag.phone, nameTag: tag.nameTag.trim().toLowerCase() });
+      }
+    }
+    ownByKey.set(it.key, ownPhone);
+    if (others.length > 0) {
+      const addrKey = addrOf(it);
+      if (addrKey.replace(/\|+/g, "") !== "") {
+        const list = byAddress.get(addrKey) ?? [];
+        list.push(...others);
+        byAddress.set(addrKey, list);
+      }
+    }
+  }
+
+  const result = new Map<K, string>();
+  for (const it of items) {
+    if ((it.phone ?? "").trim()) continue;
+    let found = ownByKey.get(it.key) ?? null;
+    if (!found) {
+      const ownFirst = (it.firstName ?? "").trim().toLowerCase();
+      const addrKey = addrOf(it);
+      if (ownFirst && addrKey.replace(/\|+/g, "") !== "") {
+        const match = byAddress.get(addrKey)?.find((c) => c.nameTag === ownFirst);
+        if (match) found = match.phone;
+      }
+    }
+    if (found) result.set(it.key, found);
+  }
+  return result;
+}
+// ----------------------------------------------------------------------
 
 // Claude is told to reply with ONLY a JSON array, but this strips a
 // markdown code fence defensively in case it wraps the answer in one
@@ -2404,6 +2532,7 @@ export const cleanContactRows = createServerFn({ method: "POST" })
         addressesSplit: 0,
         phonesFormatted: 0,
         internationalRemoved: 0,
+        phonesRecoveredFromNotes: 0,
       };
       let rows = data.rows.map((r) => ({ ...r }));
       const mapping = { ...data.mapping };
@@ -2549,6 +2678,87 @@ export const cleanContactRows = createServerFn({ method: "POST" })
         }
       }
 
+      // Phone trapped in notes: mechanical, no AI needed. Runs last so it
+      // reads off the BEST available first_name/address/city/state/zip -
+      // the "__clean_*" versions above when the AI steps ran, the original
+      // columns otherwise. See recoverPhonesFromNotesRows' own comment for
+      // the full matching logic (own name tag first, then the same tag on
+      // a different row at the same address).
+      const notesKeyForPhones = mapping["notes"];
+      if (notesKeyForPhones) {
+        const effectivePhoneKey = phoneKey || "__notes_phone";
+        const firstNameKeyNow = mapping["first_name"];
+        const addressKeyNow = mapping["address"];
+        const cityKeyNow = mapping["city"];
+        const stateKeyNow = mapping["state"];
+        const zipKeyNow = mapping["zip"];
+        const items = rows.map((row, i) => ({
+          key: i,
+          firstName: firstNameKeyNow ? row[firstNameKeyNow] : "",
+          phone: row[effectivePhoneKey],
+          notes: row[notesKeyForPhones],
+          address: addressKeyNow ? row[addressKeyNow] : "",
+          city: cityKeyNow ? row[cityKeyNow] : "",
+          state: stateKeyNow ? row[stateKeyNow] : "",
+          zip: zipKeyNow ? row[zipKeyNow] : "",
+        }));
+        const recovered = recoverPhonesFromNotesRows(items);
+        if (recovered.size > 0) {
+          for (const [i, phone] of recovered) {
+            const row = rows[i];
+            if (row) row[effectivePhoneKey] = phone;
+          }
+          report.phonesRecoveredFromNotes = recovered.size;
+          if (!phoneKey) mapping["phone"] = effectivePhoneKey;
+        }
+      }
+
       return { rows, mapping, report };
     },
   );
+
+// One-time cleanup for contacts that were already uploaded BEFORE the
+// notes-phone recovery step above existed (every client's existing
+// database, not just new uploads going forward). Re-fetches everyone this
+// client has, runs the exact same recoverPhonesFromNotesRows matching used
+// in cleanContactRows above (so the two never drift apart), and updates
+// ONLY the phone column on whoever gets a match - never touches notes,
+// never touches anyone who already has a phone. Mike's call, 2026-11-27:
+// run this once per client rather than some blind global migration, same
+// human-in-the-loop spirit as every other admin action on this page.
+export const recoverPhonesFromNotesForClient = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator((data: { clientId: string }) => data)
+  .handler(async ({ data, context }): Promise<{ scanned: number; recovered: number }> => {
+    const admin = getSoiAdminClient();
+    const email = (context.claims as { email?: string } | undefined)?.email;
+    await requireClientAccess(admin, email, data.clientId);
+
+    const existing = await fetchAllContactsForClient(admin, data.clientId);
+    const items = existing.map((c) => ({
+      key: c.id,
+      firstName: c.first_name,
+      phone: c.phone,
+      notes: c.notes,
+      address: c.address,
+      city: c.city,
+      state: c.state,
+      zip: c.zip,
+    }));
+    const recovered = recoverPhonesFromNotesRows(items);
+
+    const updates: Promise<unknown>[] = [];
+    for (const [id, phone] of recovered) {
+      updates.push(
+        Promise.resolve(admin.from("contacts").update({ phone }).eq("id", id)).then(({ error }) => {
+          if (error) throw error;
+        }),
+      );
+    }
+    // Same bounded-concurrency reasoning as upsertAppendedContacts above.
+    for (let i = 0; i < updates.length; i += 25) {
+      await Promise.all(updates.slice(i, i + 25));
+    }
+
+    return { scanned: existing.length, recovered: recovered.size };
+  });

@@ -239,6 +239,85 @@ export const provisionSoiClient = createServerFn({ method: "POST" })
     return { role: "client", clientId: clientRow.id, clientName: clientRow.name ?? clientName };
   });
 
+// Added 2026-11-27 per Mike: "When I clicked into the start here menu on
+// Puja Yagniks account it still brought me back to this screen to choose
+// agent. I shiuld remain in agents account until I switch agent even
+// within the start here menu items." Start Here's own "Build Your
+// Database" step routes here, but this page's "Choose a client" picker has
+// always been entirely independent of the main dashboard's own agent
+// selection (marketing.tsx/voice.tsx/start-here.tsx, which share a
+// sessionStorage slot — see admin-agent-selection.ts). The 2 systems have
+// no id in common to carry across directly: this project's `clients.id` is
+// generated fresh here, unrelated to the main dashboard's `agents.id`
+// (which is itself that person's main-dashboard Supabase Auth user id).
+// EMAIL is the one thing both sides can resolve the same real person by —
+// the same bridge resolveAccessForEmail already uses for login, just run
+// in each direction below so database.tsx can look up "does the agent
+// selected over there have a client record here" and, the other way,
+// voice.tsx/marketing.tsx/start-here.tsx can look up "who, over there, is
+// the client I just picked here."
+async function findSoiUserIdByEmail(admin: SupabaseClient, email: string): Promise<string | null> {
+  const cleanEmail = email.toLowerCase().trim();
+  for (let page = 1; ; page++) {
+    const { data, error } = await admin.auth.admin.listUsers({ page, perPage: 1000 });
+    if (error) throw error;
+    const found = data.users.find((u) => (u.email ?? "").toLowerCase() === cleanEmail);
+    if (found) return found.id;
+    if (data.users.length < 1000) break;
+  }
+  return null;
+}
+
+async function findSoiUserEmailById(admin: SupabaseClient, userId: string): Promise<string | null> {
+  const { data, error } = await admin.auth.admin.getUserById(userId);
+  if (error) return null;
+  return data.user?.email ?? null;
+}
+
+// Team-only. Given the email of whoever is selected on the main dashboard
+// side, finds their Build My Database client_id, if they have one yet (no
+// client_access row means they've simply never opened this section — not
+// an error, just nothing to auto-select).
+export const resolveSoiClientIdByEmail = createServerFn({ method: "GET" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator((data: { email: string }) => data)
+  .handler(async ({ context, data }): Promise<{ clientId: string | null }> => {
+    const callerEmail = (context.claims as { email?: string } | undefined)?.email;
+    const admin = getSoiAdminClient();
+    const callerAccess = callerEmail ? await resolveAccessForEmail(admin, callerEmail) : { role: "none" as const };
+    if (callerAccess.role !== "team") {
+      throw new Error("Only team members can look up a client by email.");
+    }
+    const soiUserId = await findSoiUserIdByEmail(admin, data.email);
+    if (!soiUserId) return { clientId: null };
+    const { data: accessRow } = await admin
+      .from("client_access")
+      .select("client_id")
+      .eq("user_id", soiUserId)
+      .maybeSingle();
+    return { clientId: accessRow?.client_id ?? null };
+  });
+
+// The reverse direction — given a client_id just picked here, finds that
+// client's own email (via client_access -> their SOI Builder login) so the
+// main dashboard's shared agent-selection storage can be updated to match.
+export const resolveSoiClientEmail = createServerFn({ method: "GET" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator((data: { clientId: string }) => data)
+  .handler(async ({ context, data }): Promise<{ email: string | null }> => {
+    const admin = getSoiAdminClient();
+    const email = (context.claims as { email?: string } | undefined)?.email;
+    await requireClientAccess(admin, email, data.clientId);
+    const { data: accessRow } = await admin
+      .from("client_access")
+      .select("user_id")
+      .eq("client_id", data.clientId)
+      .maybeSingle();
+    if (!accessRow) return { email: null };
+    const soiEmail = await findSoiUserEmailById(admin, accessRow.user_id);
+    return { email: soiEmail };
+  });
+
 // Team members manage multiple clients - the picker list for that view.
 export const listSoiClients = createServerFn({ method: "GET" })
   .middleware([requireSupabaseAuth])
@@ -1218,8 +1297,26 @@ function sameLastName(a: string, b: string): boolean {
 // anywhere else.
 type DatazappRawRow = Record<string, string>;
 
+// Case/whitespace-tolerant header lookup, added 2026-11-27 per Mike: "The
+// header columns might not all match exactly to our rules so I think we are
+// missing data there with it potentially." This file's address/city/state/
+// zip/email/DoNotCall/company-name reads (everything that goes through this
+// function) previously required DataZapp's header to match byte-for-byte -
+// same class of silent-failure bug as the first/last name and phone/email
+// fixes above, just never hit yet for these columns. Exact match is tried
+// first (zero behavior change for the normal case); only on a miss does it
+// fall back to scanning every column for a case/whitespace-insensitive
+// match.
 function dzField(row: DatazappRawRow, header: string): string {
-  return (row[header] ?? "").trim();
+  if (row[header] != null) return row[header].trim();
+  const target = header.trim().toLowerCase();
+  for (const key of Object.keys(row)) {
+    if (key.trim().toLowerCase() === target) {
+      const v = row[key];
+      if (v != null) return v.trim();
+    }
+  }
+  return "";
 }
 
 // Mirrors the main Upload tab's multi-column consolidation fix (2026-10-15,

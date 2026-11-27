@@ -91,6 +91,36 @@ export const listMarketingAgents = createServerFn({ method: "GET" })
     return data;
   });
 
+// Admin-only — added 2026-11-27, the main-dashboard half of the Build My
+// Database cross-system agent-selection bridge (see resolveSoiClientIdByEmail
+// / resolveSoiClientEmail in soi-builder.ts for the full story on why email
+// is the shared key between these 2 separate Supabase projects). Given an
+// email just picked as a client over in Build My Database, finds the
+// matching `agents` row here so the shared sessionStorage selection
+// (admin-agent-selection.ts) can be updated to match — returns null rather
+// than throwing when nobody matches, since "picked a client who's never
+// been set up as an agent on this side" is a normal, expected case, not an
+// error.
+export const resolveAgentByEmail = createServerFn({ method: "GET" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator((data: { email: string }) => data)
+  .handler(async ({ context, data }): Promise<{ id: string; name: string; email: string | null } | null> => {
+    const callerEmail = (context.claims as { email?: string } | undefined)?.email;
+    const access = await resolveAccess(context.userId, callerEmail);
+    if (access.role !== "admin") {
+      throw new Error("Only team members can look up an agent by email.");
+    }
+    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+    const { data: agent, error } = await supabaseAdmin
+      .from("agents")
+      .select("id, full_name, email")
+      .eq("email", data.email.toLowerCase().trim())
+      .maybeSingle();
+    if (error) throw error;
+    if (!agent) return null;
+    return { id: agent.id, name: agent.full_name ?? agent.email ?? "Unnamed agent", email: agent.email ?? null };
+  });
+
 // Added 2026-11-26 per Mike: "On any screen where we choose an agent's
 // profile to go into, these need to be in alphabetical order by last name."
 // listMarketingAgents itself still orders by full_name (first-name-first) —

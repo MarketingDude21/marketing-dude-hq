@@ -339,7 +339,7 @@ export const generateVoiceDnaProfile = createServerFn({ method: "POST" })
         "anthropic-version": "2023-06-01",
       },
       body: JSON.stringify({
-        model: "claude-haiku-4-5-20251001",
+        model: "claude-sonnet-5-5",
         max_tokens: 2000,
         messages: [{ role: "user", content: prompt }],
       }),
@@ -1309,7 +1309,7 @@ export const generateBrandBios = createServerFn({ method: "POST" })
       method: "POST",
       headers: { "Content-Type": "application/json", "x-api-key": apiKey, "anthropic-version": "2023-06-01" },
       body: JSON.stringify({
-        model: "claude-haiku-4-5-20251001",
+        model: "claude-sonnet-5-5",
         max_tokens: 2000,
         messages: [{ role: "user", content: prompt }],
       }),
@@ -1397,7 +1397,7 @@ export const regenerateBrandBio = createServerFn({ method: "POST" })
       method: "POST",
       headers: { "Content-Type": "application/json", "x-api-key": apiKey, "anthropic-version": "2023-06-01" },
       body: JSON.stringify({
-        model: "claude-haiku-4-5-20251001",
+        model: "claude-sonnet-5-5",
         max_tokens: 800,
         messages: [{ role: "user", content: prompt }],
       }),
@@ -1535,7 +1535,7 @@ export const sendBioFeedbackMessage = createServerFn({ method: "POST" })
       method: "POST",
       headers: { "Content-Type": "application/json", "x-api-key": apiKey, "anthropic-version": "2023-06-01" },
       body: JSON.stringify({
-        model: "claude-haiku-4-5-20251001",
+        model: "claude-sonnet-5-5",
         max_tokens: 1000,
         system: systemPrompt,
         messages: claudeMessages,

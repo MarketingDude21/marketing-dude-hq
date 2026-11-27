@@ -2011,7 +2011,7 @@ export const sendPostFeedbackMessage = createServerFn({ method: "POST" })
       method: "POST",
       headers: { "Content-Type": "application/json", "x-api-key": apiKey, "anthropic-version": "2023-06-01" },
       body: JSON.stringify({
-        model: "claude-haiku-4-5-20251001",
+        model: "claude-sonnet-5-5",
         max_tokens: existing.content_type === "email" ? 2200 : existing.content_type === "video" ? 900 : 700,
         system: systemPrompt,
         messages: claudeMessages,
@@ -4316,7 +4316,7 @@ export const generateMarketingContent = createServerFn({ method: "POST" })
         "anthropic-version": "2023-06-01",
       },
       body: JSON.stringify({
-        model: "claude-haiku-4-5-20251001",
+        model: "claude-sonnet-5-5",
         max_tokens: data.contentType === "video" ? 600 : data.contentType === "email" ? 2000 : 800,
         messages: [{ role: "user", content: prompt }],
       }),
@@ -4642,7 +4642,7 @@ export const sendAgentChatMessage = createServerFn({ method: "POST" })
         "anthropic-version": "2023-06-01",
       },
       body: JSON.stringify({
-        model: "claude-haiku-4-5-20251001",
+        model: "claude-sonnet-5-5",
         // Bumped 1200 -> 1800 alongside adding web search below — a real
         // search-then-write turn needs more response budget than pure text
         // generation, same reasoning as the video-script bump in
@@ -5550,7 +5550,7 @@ export async function callClaude(
   opts?: { webSearch?: boolean },
 ): Promise<string> {
   const body: Record<string, unknown> = {
-    model: "claude-haiku-4-5-20251001",
+    model: "claude-sonnet-5-5",
     max_tokens: maxTokens,
     messages: [{ role: "user", content: opts?.webSearch ? `${prompt}${WEB_SEARCH_INSTRUCTION}` : prompt }],
   };
@@ -6695,7 +6695,7 @@ async function captionPhotoInVoice(
     method: "POST",
     headers: { "Content-Type": "application/json", "x-api-key": anthropicKey, "anthropic-version": "2023-06-01" },
     body: JSON.stringify({
-      model: "claude-haiku-4-5-20251001",
+      model: "claude-sonnet-5-5",
       max_tokens: 450,
       messages: [
         {
@@ -6807,7 +6807,7 @@ async function captionVideoFramesInVoice(
     method: "POST",
     headers: { "Content-Type": "application/json", "x-api-key": anthropicKey, "anthropic-version": "2023-06-01" },
     body: JSON.stringify({
-      model: "claude-haiku-4-5-20251001",
+      model: "claude-sonnet-5-5",
       max_tokens: 450,
       messages: [
         {

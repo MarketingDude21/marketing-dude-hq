@@ -26,6 +26,7 @@ import {
   saveAppendDataCheckedRows,
   clearAppendDataStaging,
   cleanContactRows,
+  recoverPhonesFromNotesForClient,
   updateReviewContact,
   resolveSoiClientIdByEmail,
   resolveSoiClientEmail,
@@ -881,6 +882,10 @@ function formatCleanupSummary(report: ContactCleanupReport): string | null {
     parts.push(
       `${report.internationalRemoved} international contact${report.internationalRemoved === 1 ? "" : "s"} removed`,
     );
+  if (report.phonesRecoveredFromNotes > 0)
+    parts.push(
+      `${report.phonesRecoveredFromNotes} phone number${report.phonesRecoveredFromNotes === 1 ? "" : "s"} found in notes`,
+    );
   if (parts.length === 0) return null;
   return `Cleaned: ${parts.join(", ")}`;
 }
@@ -910,6 +915,13 @@ function UploadTab({
   const [resetBusy, setResetBusy] = useState(false);
   const [resetError, setResetError] = useState<string | null>(null);
   const [resetDone, setResetDone] = useState<{ deletedContacts: number; deletedUploads: number } | null>(null);
+  // One-time cleanup for contacts that were already in the database before
+  // the notes-phone recovery step existed — see recoverPhonesFromNotesForClient's
+  // own comment in soi-builder.ts. Safe/non-destructive (only ever fills an
+  // empty phone field), so no "type to confirm" gate like Reset above.
+  const [recoverBusy, setRecoverBusy] = useState(false);
+  const [recoverError, setRecoverError] = useState<string | null>(null);
+  const [recoverDone, setRecoverDone] = useState<{ scanned: number; recovered: number } | null>(null);
   // The current drag/pick batch and how far it's gotten — files upload
   // automatically the moment they're picked (parsed, columns auto-matched,
   // sent) with no per-file "confirm and click Upload" step, so a whole
@@ -1080,6 +1092,19 @@ function UploadTab({
     }
   }
 
+  async function handleRecoverPhones() {
+    setRecoverBusy(true);
+    setRecoverError(null);
+    try {
+      const result = await recoverPhonesFromNotesForClient({ data: { clientId } });
+      setRecoverDone(result);
+    } catch (e) {
+      setRecoverError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setRecoverBusy(false);
+    }
+  }
+
   return (
     <div className="grid gap-5 lg:grid-cols-2">
       <Card>
@@ -1192,6 +1217,36 @@ function UploadTab({
               tab.
             </p>
           )}
+        </div>
+      </Card>
+
+      {/* One-time cleanup for contacts uploaded before the notes-phone
+          recovery step existed — Mike's call, 2026-11-27, after seeing real
+          lists (Sean Buffine / O'Donnell) with a phone sitting unused in
+          Notes because a shared household note only lives on one person's
+          row. Safe to run any time: it only ever fills an empty Phone
+          field, never touches Notes, and never overwrites a phone that's
+          already there, so running it twice just finds nothing new the
+          second time. */}
+      <Card className="lg:col-span-2">
+        <h2 className="font-display text-lg font-semibold">Recover phone numbers from notes</h2>
+        <p className="mt-1 text-sm text-muted-foreground">
+          Some uploaded lists have a phone number sitting in the Notes field instead of the Phone field — usually
+          because one note was written for a couple and only one of them has an actual Phone column filled in. This
+          scans every contact {clientName} already has and fills in anyone's blank Phone field from their notes, without
+          changing the notes or touching anyone who already has a phone. Safe to run any time.
+        </p>
+        {recoverDone && (
+          <p className="mt-3 text-sm text-muted-foreground">
+            Done — checked {recoverDone.scanned} contact{recoverDone.scanned === 1 ? "" : "s"}, filled in{" "}
+            {recoverDone.recovered} phone number{recoverDone.recovered === 1 ? "" : "s"}.
+          </p>
+        )}
+        {recoverError && <p className="mt-3 text-sm text-destructive">{recoverError}</p>}
+        <div className="mt-3">
+          <Button variant="secondary" onClick={handleRecoverPhones} disabled={recoverBusy}>
+            {recoverBusy ? "Scanning…" : "Recover phone numbers"}
+          </Button>
         </div>
       </Card>
 
